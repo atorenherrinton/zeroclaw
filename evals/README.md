@@ -15,6 +15,7 @@ Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zerocla
 - Every case must declare at least one effective expectation. Unknown keys,
   omitted or empty expectation blocks, and zero-length string expectations are
   load errors; assertion-free smoke cases do not certify the regression gate.
+- `expects` supports response checks (`response_contains`/`response_not_contains`/`response_matches`/`response_json`), tool checks (`tools_used`/`tools_not_used`/`max_tool_calls`/`all_tools_succeeded`), workspace end-state checks (`workspace.file_exists`/`file_absent`/`file_contains`), and resource budgets (`budget.max_*`). See the eval-harness book page for the full field reference. Do not assert tool-call order or tool arguments; agents find valid alternate paths, so those checks are deliberately excluded.
 - Privacy: fixtures ship forever. Placeholder identities only (`zeroclaw_user`, `example.com`) per `docs/book/src/contributing/privacy.md`. Never paste real transcripts, names, keys, or hostnames.
 
 Suite owner: the maintainer group for `crates/zeroclaw-eval` (update when a named owner volunteers).
