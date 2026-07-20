@@ -208,8 +208,11 @@ fn ensure_real_sandbox(sandbox: &dyn Sandbox) -> anyhow::Result<()> {
 }
 
 /// Drive one live case: build a sandboxed agent, run each turn under a wall-clock
-/// timeout, and capture the run for grading.
-pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<RunRecord> {
+/// timeout, capture the run, and grade it while the workspace is still alive.
+pub async fn run_live_case(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+) -> anyhow::Result<crate::runner::CaseOutcome> {
     ensure_no_scripted_steps(trace)?;
 
     let effective = effective_live_tools(trace.tools.as_deref(), &deps.live_tools);
@@ -312,14 +315,17 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
-    Ok(RunRecord {
+    let record = RunRecord {
         final_response,
         history: agent.history().to_vec(),
         tools_called: observer.tool_names(),
         all_tools_succeeded: observer.all_tools_succeeded(),
         input_tokens,
         output_tokens,
-    })
+    };
+    // Grade while the temp workspace is still alive, then let `tmp` drop.
+    let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
+    Ok(crate::runner::CaseOutcome { record, grades })
 }
 
 #[cfg(test)]
@@ -430,7 +436,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let record = run_live_case(&trace, &deps).await.unwrap();
+        let record = run_live_case(&trace, &deps).await.unwrap().record;
         assert!(
             !record.tools_called.contains(&"shell".to_string()),
             "shell must be auto-denied before it ever reaches tool \
@@ -663,7 +669,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let record = run_live_case(&trace, &deps).await.unwrap();
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
         assert!(
             !canary.exists(),
             "sandbox breach: file_write wrote outside the workspace to {}",
@@ -677,7 +683,7 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !record.all_tools_succeeded,
+            !outcome.record.all_tools_succeeded,
             "the out-of-workspace file_write must not report success"
         );
     }
