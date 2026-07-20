@@ -72,6 +72,8 @@ pub struct RunDeps {
     pub mode: Mode,
     /// Builds the model provider for one case run.
     pub provider: ProviderFactory,
+    /// Receipt provider identity: `"scripted"` for replay; `"<type>.<alias>:<model>"` for live.
+    pub provider_ref: String,
     /// Config tool allowlist for live runs; intersected per case with
     /// `case.tools` by `live::effective_live_tools`, which then drops any
     /// tool in `live::LIVE_TOOL_DENYLIST` (e.g. `shell`) regardless of
@@ -97,6 +99,7 @@ impl RunDeps {
                     finish_turn: Some(Box::new(move |turn_index| handle.finish_turn(turn_index))),
                 })
             }),
+            provider_ref: "scripted".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(120),
         }
@@ -134,12 +137,14 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
             Ok(outcome) => CaseReport {
                 name,
                 source,
+                record: Some(outcome.record),
                 grades: outcome.grades,
                 error: None,
             },
             Err(e) => CaseReport {
                 name,
                 source,
+                record: None,
                 grades: vec![],
                 error: Some(e.to_string()),
             },
@@ -254,6 +259,16 @@ async fn run_replay_case(
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {
+        schema: crate::record::RECORD_SCHEMA.to_string(),
+        mode: Mode::Replay,
+        case_id: trace.display_id().to_string(),
+        case_hash: crate::case::case_hash(trace)?,
+        provider_ref: deps.provider_ref.clone(),
+        tool_surface: Vec::new(),
+        sandbox: crate::record::SandboxStamp {
+            autonomy: "supervised".to_string(),
+            workspace_only: false,
+        },
         final_response,
         history: agent.history().to_vec(),
         tools_called: observer.tool_names(),
