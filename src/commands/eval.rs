@@ -507,11 +507,12 @@ fn print_capability_summary(report: &SuiteReport, baseline: Option<&Baseline>) {
 /// config so live mode can resolve its provider. Replay injects the deterministic
 /// trace-replay provider; live resolves `[eval].live_provider` per case.
 fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
-    match mode {
+    let judge = build_judge_deps(config)?;
+    let mut deps = match mode {
         // Replay's provider wiring is owned by `RunDeps::replay()`; delegate so the
         // trace-replay factory has a single definition. Replay ignores the live-only
         // tool allowlist and timeout.
-        Mode::Replay => Ok(RunDeps::replay()),
+        Mode::Replay => RunDeps::replay(),
         Mode::Live => {
             // Trim so validation (which trims) and runtime resolution agree: a
             // whitespace-padded ref must not pass `Config::validate` then miss here.
@@ -523,8 +524,16 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
             let (_, _provider_type, resolved_model) =
                 build_session_model_provider(config, &provider_ref, None)?;
             let receipt_ref = format!("{provider_ref}:{resolved_model}");
+            if judge
+                .as_ref()
+                .is_some_and(|item| item.judge_ref.split(':').next() == Some(provider_ref.as_str()))
+            {
+                println!(
+                    "  warning: judge and live provider are the same provider reference (self-judging bias)"
+                );
+            }
             let cfg = config.clone();
-            Ok(RunDeps {
+            RunDeps {
                 mode,
                 provider: Box::new(move |_trace: &LlmTrace| {
                     let (provider, provider_type, resolved_model) =
@@ -539,9 +548,54 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 provider_ref: receipt_ref,
                 live_tools: config.eval.live_allowed_tools.clone(),
                 case_timeout: Duration::from_secs(config.eval.case_timeout_secs),
-            })
+                judge: None,
+            }
         }
+    };
+    deps.judge = judge;
+    Ok(deps)
+}
+
+/// Convert a model-inclusive judge reference into a safe calibration filename.
+fn calibration_stem(judge_ref: &str) -> String {
+    judge_ref
+        .chars()
+        .map(|character| match character {
+            '/' | '.' | ':' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+/// Resolve optional judge dependencies. Judge grades become authoritative only
+/// when gating is requested and the corresponding calibration artifact exists.
+fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
+    let provider_ref = config.eval.judge_provider.as_str().trim().to_string();
+    if provider_ref.is_empty() {
+        return Ok(None);
     }
+
+    let (provider, _provider_type, model) =
+        build_session_model_provider(config, &provider_ref, None)?;
+    let judge_ref = format!("{provider_ref}:{model}");
+    let path = PathBuf::from(format!(
+        "evals/calibration/{}.json",
+        calibration_stem(&judge_ref)
+    ));
+    let calibrated = path.exists();
+    let gates = config.eval.judge_gate && calibrated;
+    if config.eval.judge_gate && !calibrated {
+        println!(
+            "  warning: [eval].judge_gate is set but no calibration file for {judge_ref}; judge grades stay diagnostic"
+        );
+    }
+
+    Ok(Some(zeroclaw_eval::grader::JudgeDeps {
+        provider: std::sync::Arc::from(provider),
+        model,
+        judge_ref,
+        gates,
+    }))
 }
 
 /// One run's artifact lifecycle: a private, uniquely named directory that is
@@ -764,6 +818,7 @@ mod tests {
                 autonomy: "supervised".to_string(),
                 workspace_only: false,
             },
+            judge_ref: None,
         }
     }
 
@@ -870,6 +925,18 @@ mod tests {
             write_baseline: Some(path.to_path_buf()),
             suite_kind: None,
         }
+    }
+
+    #[test]
+    fn calibration_stem_includes_model_identity() {
+        assert_eq!(
+            calibration_stem("anthropic.sonnet:claude-x"),
+            "anthropic_sonnet_claude-x"
+        );
+        assert_ne!(
+            calibration_stem("anthropic.sonnet:model-a"),
+            calibration_stem("anthropic.sonnet:model-b")
+        );
     }
 
     #[test]

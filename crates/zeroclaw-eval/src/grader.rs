@@ -43,6 +43,10 @@ pub struct GradeResult {
     pub detail: String,
     /// Which run dimension this check scores.
     pub category: GradeCategory,
+    /// Informational grade that never fails the case, such as an uncalibrated
+    /// judge result.
+    #[serde(default)]
+    pub diagnostic: bool,
 }
 
 impl GradeResult {
@@ -60,7 +64,14 @@ impl GradeResult {
             passed,
             detail: detail.into(),
             category,
+            diagnostic: false,
         }
+    }
+
+    /// Mark this result informational rather than gating.
+    fn diagnostic(mut self) -> Self {
+        self.diagnostic = true;
+        self
     }
 }
 
@@ -239,6 +250,162 @@ impl Grader for BudgetGrader {
             ));
         }
         out
+    }
+}
+
+/// System prompt for the LLM judge. One dimension of one run against one rubric.
+pub const JUDGE_SYSTEM: &str =
+    "You are an evaluation judge for an AI agent harness. You grade one dimension
+of one agent run against one rubric. Think through the evidence first, then
+answer with ONLY a JSON object on the final line, no other text after it:
+{\"score\": <float 0.0-1.0>, \"unknown\": <bool>, \"reason\": \"<one sentence>\"}
+Set \"unknown\": true when the transcript lacks the evidence to judge the
+rubric; never guess. Scores: 1.0 fully satisfies the rubric, 0.0 clearly
+violates it.";
+
+/// Runtime dependencies for judge grading.
+#[derive(Clone)]
+pub struct JudgeDeps {
+    pub provider: std::sync::Arc<dyn zeroclaw_api::model_provider::ModelProvider>,
+    pub model: String,
+    pub judge_ref: String,
+    pub gates: bool,
+}
+
+/// Grades per-dimension LLM-judge rubrics with one isolated judge call each.
+pub struct JudgeGrader {
+    pub rubrics: Vec<crate::case::JudgeRubric>,
+    pub task_turns: Vec<String>,
+    pub deps: JudgeDeps,
+}
+
+/// Render a bounded transcript from the run history.
+fn render_transcript(history: &[zeroclaw_api::model_provider::ConversationMessage]) -> String {
+    let mut out = String::new();
+    for message in history {
+        let line = format!("{message:?}");
+        let truncated: String = line.chars().take(500).collect();
+        out.push_str(&truncated);
+        out.push('\n');
+    }
+    out
+}
+
+/// Build the judge user message for one rubric without including the case's
+/// expectations, which would leak the answer key.
+fn judge_message(
+    task_turns: &[String],
+    final_response: &str,
+    history: &[zeroclaw_api::model_provider::ConversationMessage],
+    rubric: &crate::case::JudgeRubric,
+) -> String {
+    let mut tasks = String::new();
+    for (index, task) in task_turns.iter().enumerate() {
+        tasks.push_str(&format!("{}. {task}\n", index + 1));
+    }
+    let mut message = format!(
+        "## Task given to the agent\n{tasks}\n## Agent's final response\n{final_response}\n"
+    );
+    if rubric.include_transcript {
+        message.push_str(&format!(
+            "\n## Transcript (tool calls and results)\n{}",
+            render_transcript(history)
+        ));
+    }
+    message.push_str(&format!("\n## Rubric: {}\n{}", rubric.name, rubric.rubric));
+    message
+}
+
+/// Parse the last JSON-object line carrying a numeric score.
+fn parse_judge_reply(reply: &str) -> Option<(f64, bool, String)> {
+    for line in reply.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        let Some(score) = object.get("score").and_then(serde_json::Value::as_f64) else {
+            continue;
+        };
+        let unknown = object
+            .get("unknown")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let reason = object
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return Some((score.clamp(0.0, 1.0), unknown, reason));
+    }
+    None
+}
+
+#[async_trait::async_trait]
+impl Grader for JudgeGrader {
+    fn name(&self) -> &str {
+        "judge"
+    }
+
+    async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
+        let completion = run.completion_or_default();
+        let mut results = Vec::new();
+        for rubric in &self.rubrics {
+            let message = judge_message(
+                &self.task_turns,
+                &completion.final_response,
+                &completion.history,
+                rubric,
+            );
+            let check = format!("judge:{}", rubric.name);
+            let reply = self
+                .deps
+                .provider
+                .chat_with_system(Some(JUDGE_SYSTEM), &message, &self.deps.model, Some(0.0))
+                .await;
+            let grade = match reply {
+                Err(error) => GradeResult::new(
+                    check,
+                    true,
+                    format!("UNKNOWN (diagnostic): transport error: {error}"),
+                    GradeCategory::Judge,
+                )
+                .diagnostic(),
+                Ok(text) => match parse_judge_reply(&text) {
+                    None => GradeResult::new(
+                        check,
+                        true,
+                        "UNKNOWN (diagnostic): judge output was not parseable JSON",
+                        GradeCategory::Judge,
+                    )
+                    .diagnostic(),
+                    Some((_, true, reason)) => GradeResult::new(
+                        check,
+                        true,
+                        format!("UNKNOWN (diagnostic): {reason}"),
+                        GradeCategory::Judge,
+                    )
+                    .diagnostic(),
+                    Some((score, false, reason)) => {
+                        let passed = score >= rubric.threshold;
+                        let detail = if passed {
+                            format!("score={score:.2}")
+                        } else {
+                            format!("score={score:.2} reason={reason}")
+                        };
+                        let grade = GradeResult::new(check, passed, detail, GradeCategory::Judge);
+                        if self.deps.gates {
+                            grade
+                        } else {
+                            grade.diagnostic()
+                        }
+                    }
+                },
+            };
+            results.push(grade);
+        }
+        results
     }
 }
 
@@ -429,6 +596,27 @@ pub fn default_graders(trace: &crate::case::LlmTrace) -> Vec<Box<dyn Grader>> {
     graders
 }
 
+/// Build the canonical grader catalog, adding a judge only when both a rubric
+/// and configured judge exist.
+pub(crate) fn graders_for_case(
+    trace: &crate::case::LlmTrace,
+    judge: Option<&JudgeDeps>,
+) -> Vec<Box<dyn Grader>> {
+    let mut graders = default_graders(trace);
+    if let Some(deps) = judge.filter(|_| !trace.expects.judge.is_empty()) {
+        graders.push(Box::new(JudgeGrader {
+            rubrics: trace.expects.judge.clone(),
+            task_turns: trace
+                .turns
+                .iter()
+                .map(|turn| turn.user_input.clone())
+                .collect(),
+            deps: deps.clone(),
+        }));
+    }
+    graders
+}
+
 /// Run a supplied grader catalog while the workspace is alive, returning all
 /// grades in catalog order.
 pub async fn grade_with(
@@ -526,6 +714,7 @@ mod tests {
                     autonomy: "supervised".to_string(),
                     workspace_only: false,
                 },
+                judge_ref: None,
             },
             completion: Some(crate::record::RunCompletion {
                 final_response: resp.to_string(),
@@ -795,6 +984,139 @@ mod tests {
             let serde_label = serde_json::to_value(cat).unwrap();
             assert_eq!(serde_label.as_str(), Some(cat.as_str()));
         }
+    }
+
+    fn judge_provider(
+        replies: &[&str],
+    ) -> std::sync::Arc<dyn zeroclaw_api::model_provider::ModelProvider> {
+        let steps: Vec<String> = replies
+            .iter()
+            .map(|reply| {
+                format!(
+                    r#"{{"response":{{"type":"text","content":{}}}}}"#,
+                    serde_json::to_string(reply).unwrap()
+                )
+            })
+            .collect();
+        let json = format!(
+            r#"{{"model_name":"j","turns":[{{"user_input":"","steps":[{}]}}]}}"#,
+            steps.join(",")
+        );
+        let trace: crate::case::LlmTrace = serde_json::from_str(&json).unwrap();
+        std::sync::Arc::new(crate::replay::TraceLlmProvider::try_from_trace(&trace).unwrap())
+    }
+
+    fn rubric(name: &str, threshold: f64) -> crate::case::JudgeRubric {
+        crate::case::JudgeRubric {
+            name: name.to_string(),
+            rubric: "grade it".to_string(),
+            threshold,
+            include_transcript: false,
+        }
+    }
+
+    async fn judge_grade(
+        replies: &[&str],
+        rubrics: Vec<crate::case::JudgeRubric>,
+        gates: bool,
+    ) -> Vec<GradeResult> {
+        let grader = JudgeGrader {
+            rubrics,
+            task_turns: vec!["do the task".to_string()],
+            deps: JudgeDeps {
+                provider: judge_provider(replies),
+                model: "m".to_string(),
+                judge_ref: "judge.m:x".to_string(),
+                gates,
+            },
+        };
+        grader
+            .grade(&run("final response", &[], true), &dummy_ctx())
+            .await
+    }
+
+    #[tokio::test]
+    async fn judge_passes_at_threshold_boundary() {
+        let grades = judge_grade(
+            &[r#"{"score":0.7,"unknown":false,"reason":"ok"}"#],
+            vec![rubric("helpfulness", 0.7)],
+            true,
+        )
+        .await;
+        assert_eq!(grades[0].check, "judge:helpfulness");
+        assert!(grades[0].passed, "score equal to threshold must pass");
+    }
+
+    #[tokio::test]
+    async fn judge_below_threshold_fails_dimension() {
+        let grades = judge_grade(
+            &[r#"{"score":0.5,"unknown":false,"reason":"weak"}"#],
+            vec![rubric("helpfulness", 0.7)],
+            true,
+        )
+        .await;
+        assert!(!grades[0].passed);
+        assert!(grades[0].detail.contains("reason=weak"));
+    }
+
+    #[tokio::test]
+    async fn judge_malformed_json_is_unknown_diagnostic() {
+        let grades = judge_grade(&["not json"], vec![rubric("h", 0.7)], true).await;
+        assert!(grades[0].passed);
+        assert!(grades[0].diagnostic);
+        assert!(grades[0].detail.contains("UNKNOWN"));
+    }
+
+    #[tokio::test]
+    async fn judge_unknown_never_affects_exit() {
+        let grades = judge_grade(
+            &[r#"{"score":0.0,"unknown":true,"reason":"no evidence"}"#],
+            vec![rubric("h", 0.7)],
+            true,
+        )
+        .await;
+        assert!(grades[0].passed);
+        assert!(grades[0].diagnostic);
+    }
+
+    #[tokio::test]
+    async fn ungated_judge_failure_stays_diagnostic() {
+        let grades = judge_grade(
+            &[r#"{"score":0.5,"unknown":false,"reason":"weak"}"#],
+            vec![rubric("h", 0.7)],
+            false,
+        )
+        .await;
+        assert!(!grades[0].passed);
+        assert!(grades[0].diagnostic);
+    }
+
+    #[tokio::test]
+    async fn gated_judge_failure_is_authoritative() {
+        let grades = judge_grade(
+            &[r#"{"score":0.5,"unknown":false,"reason":"weak"}"#],
+            vec![rubric("h", 0.7)],
+            true,
+        )
+        .await;
+        assert!(!grades[0].passed);
+        assert!(!grades[0].diagnostic);
+    }
+
+    #[tokio::test]
+    async fn judge_dimensions_use_isolated_calls() {
+        let grades = judge_grade(
+            &[
+                r#"{"score":0.9,"unknown":false,"reason":"a"}"#,
+                r#"{"score":0.2,"unknown":false,"reason":"b"}"#,
+            ],
+            vec![rubric("first", 0.5), rubric("second", 0.5)],
+            true,
+        )
+        .await;
+        assert_eq!(grades.len(), 2);
+        assert!(grades[0].passed);
+        assert!(!grades[1].passed);
     }
 
     #[tokio::test]
