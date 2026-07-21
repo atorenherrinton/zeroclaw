@@ -186,6 +186,10 @@ async fn run_replay_case(
     deps: &RunDeps,
     graders: Vec<Box<dyn Grader>>,
 ) -> anyhow::Result<CaseOutcome> {
+    if trace.declares_memory() {
+        anyhow::bail!("replay cases cannot seed or grade memory; run this case with --mode live");
+    }
+
     // Each case gets an isolated temp workspace and an ephemeral "none" memory
     // backend so cases cannot observe one another.
     let tmp = tempfile::tempdir()?;
@@ -264,7 +268,7 @@ async fn run_replay_case(
         llm_calls: observer.llm_calls(),
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
-    let grades = grade_with(&graders, &record, tmp.path()).await;
+    let grades = grade_with(&graders, &record, tmp.path(), None).await;
     Ok(CaseOutcome { record, grades })
 }
 
@@ -377,6 +381,18 @@ pub(crate) mod tests {
             "default catalog must include the fixture's expectation grades: {:?}",
             checks(&via_wrapper)
         );
+    }
+
+    fn counting_replay_deps(provider_calls: Arc<AtomicUsize>) -> RunDeps {
+        RunDeps {
+            mode: Mode::Replay,
+            provider: Box::new(move |_| {
+                provider_calls.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("provider must not be invoked for rejected replay case")
+            }),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+        }
     }
 
     const SMOKE: &str = r#"{
@@ -528,6 +544,50 @@ pub(crate) mod tests {
             err.to_string().contains("no scripted steps"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_memory_setup_before_provider_invocation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "memory-setup",
+                "turns": [],
+                "setup": { "memory": { "project/role": "zeroclaw_operator" } }
+            }"#,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let deps = counting_replay_deps(provider_calls.clone());
+
+        let error = run_case(&trace, &deps).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("--mode live"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_memory_expectations_before_provider_invocation() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "memory-expects",
+                "turns": [],
+                "expects": { "memory": { "present": ["project/role"] } }
+            }"#,
+        )
+        .unwrap();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let deps = counting_replay_deps(provider_calls.clone());
+
+        let error = run_case(&trace, &deps).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("--mode live"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

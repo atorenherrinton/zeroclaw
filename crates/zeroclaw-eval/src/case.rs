@@ -39,6 +39,10 @@ pub struct CaseSetup {
     /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
     #[serde(default)]
     pub workspace_files: std::collections::BTreeMap<String, String>,
+    /// Memory entries seeded before the run. Keys use the same safe relative-path
+    /// contract as workspace setup and expectation keys.
+    #[serde(default)]
+    pub memory: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
@@ -121,6 +125,9 @@ pub struct TraceExpects {
     /// End-state checks against the case workspace after the run.
     #[serde(default)]
     pub workspace: Option<WorkspaceExpects>,
+    /// End-state checks against the case memory after the run.
+    #[serde(default)]
+    pub memory: Option<MemoryExpects>,
     /// Resource ceilings for the run.
     #[serde(default)]
     pub budget: Option<BudgetExpects>,
@@ -144,6 +151,21 @@ pub struct WorkspaceExpects {
     /// Path -> substrings that must appear in that file.
     #[serde(default)]
     pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// End-state checks against the case memory after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryExpects {
+    /// Memory keys that must be present after the run.
+    #[serde(default)]
+    pub present: Vec<String>,
+    /// Memory keys that must be absent after the run.
+    #[serde(default)]
+    pub absent: Vec<String>,
+    /// Memory key -> substrings that must appear in that entry.
+    #[serde(default)]
+    pub contains: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 /// Resource ceilings for the run (all optional; each present bound is one
@@ -186,6 +208,7 @@ impl TraceExpects {
                 .workspace
                 .as_ref()
                 .is_none_or(WorkspaceExpects::is_empty)
+            && self.memory.as_ref().is_none_or(MemoryExpects::is_empty)
             && self.budget.as_ref().is_none_or(BudgetExpects::is_empty)
     }
 
@@ -249,6 +272,12 @@ impl WorkspaceExpects {
     }
 }
 
+impl MemoryExpects {
+    fn is_empty(&self) -> bool {
+        self.present.is_empty() && self.absent.is_empty() && self.contains.is_empty()
+    }
+}
+
 impl BudgetExpects {
     fn is_empty(&self) -> bool {
         self.max_input_tokens.is_none()
@@ -264,6 +293,14 @@ impl LlmTrace {
     /// otherwise `model_name`.
     pub fn display_id(&self) -> &str {
         self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
+    /// Whether this trace seeds memory or declares memory expectations.
+    pub fn declares_memory(&self) -> bool {
+        self.setup
+            .as_ref()
+            .is_some_and(|setup| !setup.memory.is_empty())
+            || self.expects.memory.is_some()
     }
 
     /// Load a trace from a JSON file.
@@ -410,6 +447,77 @@ mod tests {
         // Deserialization still tolerates the omitted field; `from_file` is
         // the layer that refuses to admit the resulting no-op case.
         assert!(t.expects.is_empty());
+        assert!(t.expects.memory.is_none());
+    }
+
+    #[test]
+    fn memory_fields_use_serde_defaults_when_omitted() {
+        let setup: CaseSetup = serde_json::from_str("{}").unwrap();
+        assert!(setup.workspace_files.is_empty());
+        assert!(setup.memory.is_empty());
+
+        let expects: MemoryExpects = serde_json::from_str("{}").unwrap();
+        assert!(expects.present.is_empty());
+        assert!(expects.absent.is_empty());
+        assert!(expects.contains.is_empty());
+    }
+
+    #[test]
+    fn memory_fields_deserialize_from_trace() {
+        let t: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "m",
+                "turns": [],
+                "setup": { "memory": { "project/role": "zeroclaw_operator" } },
+                "expects": {
+                    "memory": {
+                        "present": ["project/role"],
+                        "absent": ["obsolete"],
+                        "contains": { "project/role": ["zeroclaw"] }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let setup = t.setup.as_ref().unwrap();
+        assert_eq!(setup.memory["project/role"], "zeroclaw_operator");
+        let expects = t.expects.memory.as_ref().unwrap();
+        assert_eq!(expects.present, ["project/role"]);
+        assert_eq!(expects.absent, ["obsolete"]);
+        assert_eq!(expects.contains["project/role"], ["zeroclaw"]);
+    }
+
+    #[test]
+    fn declares_memory_detects_seeds_and_expectations() {
+        let no_memory: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"setup":{}}"#).unwrap();
+        assert!(!no_memory.declares_memory());
+
+        let with_seed: LlmTrace = serde_json::from_str(
+            r#"{"model_name":"m","turns":[],"setup":{"memory":{"key":"value"}}}"#,
+        )
+        .unwrap();
+        assert!(with_seed.declares_memory());
+
+        let with_expectations: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[],"expects":{"memory":{}}}"#)
+                .unwrap();
+        assert!(with_expectations.declares_memory());
+    }
+
+    #[test]
+    fn workspace_only_setup_does_not_declare_memory() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{
+                "model_name": "m",
+                "turns": [],
+                "setup": { "workspace_files": { "input.txt": "hello" }, "memory": {} }
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!trace.declares_memory());
     }
 
     #[test]
