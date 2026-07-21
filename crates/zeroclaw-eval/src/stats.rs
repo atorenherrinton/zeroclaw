@@ -2,7 +2,7 @@
 //! suites. Pure math, no agent I/O.
 
 use crate::Mode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A repeat-policy adjustment that the CLI should explain to the operator.
 ///
@@ -254,7 +254,8 @@ impl RepeatAttemptReceipt {
 }
 
 /// Aggregated statistics over k isolated runs of one case.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct RepeatStats {
     /// Repetitions requested by the effective repeat policy.
     pub k: u32,

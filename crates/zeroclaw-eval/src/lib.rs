@@ -3,6 +3,7 @@
 pub mod baseline;
 pub mod case;
 pub mod grader;
+pub mod history;
 pub mod junit;
 pub mod live;
 pub mod observer;
@@ -15,6 +16,9 @@ pub mod tools;
 
 pub use case::{CaseSetup, LlmTrace, ToolPayloadExpect, TraceExpects};
 pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_graders};
+pub use history::{
+    HISTORY_SCHEMA, HistoryCase, HistoryReceipt, HistoryRepeatCi, HistoryRun, write_history_receipt,
+};
 pub use observer::RecordedCall;
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
