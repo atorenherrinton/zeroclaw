@@ -57,6 +57,12 @@ harness stores each seed as an unscoped Core memory entry before the first turn.
 Memory keys follow the same rules as workspace expectation paths: they must be
 non-empty, relative, and cannot contain `..`.
 
+Seeds pass through the production memory content scanner before persistence.
+Flagged secret-like content or unsafe instructions fail the case before the live
+provider is constructed. Eval fixtures are durable repository content and may be
+sent to an external provider through normal memory context, so use synthetic
+placeholders and never put real secrets or credentials in a seed.
+
 The normal turn-memory policy can automatically recall relevant seeded entries
 into the prompt context. Automatic recall uses the raw user input and the normal
 relevance and context-budget filters, so it is not an exact-key guarantee.
@@ -72,7 +78,7 @@ Declaring `setup.memory` or `expects.memory` does not grant a memory tool. For
 example, a case that asserts tool-driven retrieval needs `memory_recall` in both
 places.
 
-Each live case runs inside a sandbox:
+Each live case runs inside a constrained execution envelope:
 
 | Control | Behavior |
 |---|---|
@@ -255,7 +261,8 @@ Memory checks (category `side_effect`), under `memory`:
 
 - `present` / `absent`: exact keys that must / must not exist after the run.
 - `contains`: a map of exact key to substrings that must appear in that entry's
-  content.
+  content. Each map value must contain at least one substring; an empty list is
+  a failed malformed expectation rather than a vacuous pass.
 
 Memory checks query the case's isolated memory backend by exact key rather than
 using ranked recall. Each key is validated before the backend is queried; an
