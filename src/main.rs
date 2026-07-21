@@ -5922,7 +5922,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 // Footer is a table affordance only; never emit it in JSON mode, or
                 // it would corrupt the machine-readable stdout artifact.
                 if wrote_auto && format == commands::eval::OutputFormat::Table {
-                    println!("  failed-case records: {}/", commands::eval::AUTO_DUMP_DIR);
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-eval-failed-case-records",
+                            &[("dir", commands::eval::AUTO_DUMP_DIR)],
+                            &format!("  failed-case records: {}/", commands::eval::AUTO_DUMP_DIR),
+                        )
+                    );
                 }
                 // Only a failing suite needs the hard exit to carry a non-zero
                 // status; a passing run returns normally so shutdown runs.
