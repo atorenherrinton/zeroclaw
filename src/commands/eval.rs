@@ -7,9 +7,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
+use zeroclaw_eval::calibration::{JudgeRunRecord, append_judge_records};
 use zeroclaw_eval::{CaseProvider, CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
+
+#[cfg(test)]
+use zeroclaw_eval::calibration::calibration_stem;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -294,16 +298,26 @@ pub struct FinalizeOpts {
     pub suite_kind: Option<SuiteKind>,
 }
 
+/// One completed suite plus the calibratable judge results collected while it ran.
+pub struct EvalRun {
+    report: SuiteReport,
+    judge_records: Vec<JudgeRunRecord>,
+}
+
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
 /// the process exit code. Kept together so `main` only wires flags.
 pub async fn finalize(
     config: &Config,
     mode: Mode,
     suite_path: &Path,
-    report: SuiteReport,
+    run: EvalRun,
     artifacts: RunArtifacts,
     opts: FinalizeOpts,
 ) -> Result<i32> {
+    let EvalRun {
+        report,
+        judge_records,
+    } = run;
     let kind = SuiteKind::resolve(suite_path, opts.suite_kind);
     // Table mode prints incrementally; JSON is one complete document, so it is
     // deferred until after the baseline comparison (when any) so the artifact
@@ -312,9 +326,17 @@ pub async fn finalize(
         println!("{}", report.render_table());
     }
 
-    let dump_result = write_dumps(&report, opts.dump_records.as_deref(), &artifacts.staged);
-    let wrote_auto = match dump_result {
-        Ok(wrote_auto) => wrote_auto,
+    let dump_result = (|| {
+        let wrote_auto = write_dumps(&report, opts.dump_records.as_deref(), &artifacts.staged)?;
+        let judge_dump = opts
+            .dump_records
+            .as_deref()
+            .map(|dir| write_judge_dump(dir, &judge_records))
+            .transpose()?;
+        Ok::<_, anyhow::Error>((wrote_auto, judge_dump))
+    })();
+    let (wrote_auto, judge_dump) = match dump_result {
+        Ok(result) => result,
         Err(error) => {
             if let Err(cleanup_error) = artifacts.discard() {
                 return Err(error.context(format!(
@@ -334,6 +356,19 @@ pub async fn finalize(
                 &[("dir", dir.as_str())],
             )
         );
+    }
+    if let Some((count, path)) = judge_dump {
+        let count = count.to_string();
+        let path = path.display().to_string();
+        let message = get_required_cli_string_with_args(
+            "cli-eval-calibrate-records-appended",
+            &[("count", count.as_str()), ("path", path.as_str())],
+        );
+        if opts.format == OutputFormat::Json {
+            eprintln!("{message}");
+        } else {
+            println!("{message}");
+        }
     }
 
     // --write-baseline: persist the run and exit with its normal code.
@@ -595,6 +630,7 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
+        records_sink: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     }))
 }
 
@@ -652,17 +688,26 @@ fn validate_suite_dir(suite: &Path) -> Result<()> {
 /// Ordering matters: provider and suite validation plus execution happen before
 /// staging. A rejected invocation therefore leaves no new artifact state, and
 /// two completed concurrent runs still receive unique staging directories.
-pub async fn run(
-    config: &Config,
-    suite: PathBuf,
-    mode: Mode,
-) -> Result<(SuiteReport, RunArtifacts)> {
+pub async fn run(config: &Config, suite: PathBuf, mode: Mode) -> Result<(EvalRun, RunArtifacts)> {
     let deps = build_run_deps(config, mode)?;
     validate_suite_dir(&suite)?;
 
     let report = Box::pin(zeroclaw_eval::run_suite(&suite, &deps)).await?;
+    let judge_records = deps.judge.as_ref().map_or_else(Vec::new, |judge| {
+        let mut records = match judge.records_sink.lock() {
+            Ok(records) => records,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        std::mem::take(&mut *records)
+    });
     let artifacts = prepare_artifacts(config)?;
-    Ok((report, artifacts))
+    Ok((
+        EvalRun {
+            report,
+            judge_records,
+        },
+        artifacts,
+    ))
 }
 
 /// Sanitize a case id into a filesystem-safe stem.
@@ -746,6 +791,14 @@ fn write_case_dump(dir: &Path, case: &CaseReport) -> Result<PathBuf> {
         case.name,
         dir.display()
     )
+}
+
+/// Append this suite's calibratable judge results to the explicit dump directory.
+fn write_judge_dump(dir: &Path, records: &[JudgeRunRecord]) -> Result<(usize, PathBuf)> {
+    let path = dir.join("judge-runs.jsonl");
+    let count = append_judge_records(&path, records)
+        .map_err(|error| super::eval_calibrate::localized_jsonl_error(&path, &error))?;
+    Ok((count, path))
 }
 
 /// Write case dumps: `explicit_dir` (from `--dump-records`) receives every case;
@@ -855,6 +908,28 @@ mod tests {
         }
     }
 
+    fn judge_record(case_id: &str, score: f64) -> JudgeRunRecord {
+        JudgeRunRecord::new(zeroclaw_eval::calibration::JudgeRunRecordInput {
+            judge_ref: "judge.provider:model".to_string(),
+            case_id: case_id.to_string(),
+            case_hash: format!("hash-{case_id}"),
+            rubric_name: "helpfulness".to_string(),
+            rubric_text: "Be helpful".to_string(),
+            threshold: 0.7,
+            task_turns: vec!["Help me".to_string()],
+            final_response: "Done".to_string(),
+            score,
+            reason: format!("reason-{case_id}"),
+        })
+    }
+
+    fn eval_run(report: SuiteReport) -> EvalRun {
+        EvalRun {
+            report,
+            judge_records: Vec::new(),
+        }
+    }
+
     #[test]
     fn dump_records_writes_all_cases() {
         let report = SuiteReport {
@@ -865,6 +940,60 @@ mod tests {
         write_dumps(&report, Some(explicit.path()), auto.path()).unwrap();
         assert!(explicit.path().join("pass.json").exists());
         assert!(explicit.path().join("fail.json").exists());
+    }
+
+    #[test]
+    fn calibration_stem_keys_on_model_inclusive_judge_ref() {
+        // The stem is derived from judge_ref (provider:model), not the bare
+        // provider, so calibration is model-specific and matches the docs.
+        assert_eq!(
+            calibration_stem("anthropic.sonnet:claude-x"),
+            "anthropic_sonnet_claude-x"
+        );
+        // A model swap under the same provider produces a different stem.
+        assert_ne!(
+            calibration_stem("anthropic.sonnet:model-a"),
+            calibration_stem("anthropic.sonnet:model-b")
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_accumulates_structured_judge_runs_across_two_runs() {
+        let explicit = tempfile::tempdir().unwrap();
+        let artifacts_root = tempfile::tempdir().unwrap();
+        let first = judge_record("first", 0.8);
+        let second = judge_record("second", 0.4);
+        for (case_id, judge_records) in [
+            ("first", vec![first.clone()]),
+            ("second", vec![second.clone()]),
+        ] {
+            let code = finalize(
+                &Config::default(),
+                Mode::Replay,
+                Path::new("evals/regression"),
+                EvalRun {
+                    report: SuiteReport {
+                        cases: vec![case_report(case_id, true)],
+                    },
+                    judge_records,
+                },
+                test_artifacts(artifacts_root.path()),
+                FinalizeOpts {
+                    format: OutputFormat::Json,
+                    dump_records: Some(explicit.path().to_path_buf()),
+                    baseline: None,
+                    write_baseline: None,
+                    suite_kind: Some(SuiteKind::Regression),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(code, 0);
+        }
+
+        let judge_runs = explicit.path().join("judge-runs.jsonl");
+        let records = zeroclaw_eval::calibration::load_judge_records(&judge_runs).unwrap();
+        assert_eq!(records, vec![first, second]);
     }
 
     #[test]
@@ -993,7 +1122,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
-            report,
+            eval_run(report),
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )
@@ -1024,7 +1153,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
-            good,
+            eval_run(good),
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )
@@ -1040,7 +1169,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
-            broken,
+            eval_run(broken),
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )

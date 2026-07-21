@@ -274,6 +274,8 @@ pub struct JudgeDeps {
     pub provider: std::sync::Arc<dyn zeroclaw_api::model_provider::ModelProvider>,
     pub model: String,
     pub judge_ref: String,
+    /// Canonical per-suite collection of judge results eligible for calibration.
+    pub records_sink: std::sync::Arc<std::sync::Mutex<Vec<crate::calibration::JudgeRunRecord>>>,
 }
 
 /// Grades per-dimension LLM-judge rubrics with one isolated judge call each.
@@ -439,6 +441,26 @@ impl Grader for JudgeGrader {
                     )
                     .diagnostic(),
                     Some((score, false, reason)) => {
+                        let record = crate::calibration::JudgeRunRecord::new(
+                            crate::calibration::JudgeRunRecordInput {
+                                judge_ref: self.deps.judge_ref.clone(),
+                                case_id: run.provenance.case_id.clone(),
+                                case_hash: run.provenance.case_hash.clone(),
+                                rubric_name: rubric.name.clone(),
+                                rubric_text: rubric.rubric.clone(),
+                                threshold: rubric.threshold,
+                                task_turns: self.task_turns.clone(),
+                                final_response: completion.final_response.clone(),
+                                score,
+                                reason: reason.clone(),
+                            },
+                        );
+                        let mut records = match self.deps.records_sink.lock() {
+                            Ok(records) => records,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        records.push(record);
+
                         let passed = score >= rubric.threshold;
                         let detail = if passed {
                             format!("score={score:.2}")
@@ -753,7 +775,7 @@ mod tests {
                 schema: crate::record::RECORD_SCHEMA.to_string(),
                 mode: crate::Mode::Replay,
                 case_id: "test".to_string(),
-                case_hash: String::new(),
+                case_hash: "case-hash".to_string(),
                 provider_ref: "scripted".to_string(),
                 tool_surface: crate::record::ToolSurface::default(),
                 sandbox: crate::record::SandboxStamp {
@@ -1109,6 +1131,14 @@ mod tests {
         replies: &[&str],
         rubrics: Vec<crate::case::JudgeRubric>,
     ) -> Vec<GradeResult> {
+        judge_grade_with_records(replies, rubrics).await.0
+    }
+
+    async fn judge_grade_with_records(
+        replies: &[&str],
+        rubrics: Vec<crate::case::JudgeRubric>,
+    ) -> (Vec<GradeResult>, Vec<crate::calibration::JudgeRunRecord>) {
+        let records_sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let grader = JudgeGrader {
             rubrics,
             task_turns: vec!["do the task".to_string()],
@@ -1116,11 +1146,17 @@ mod tests {
                 provider: judge_provider(replies),
                 model: "m".to_string(),
                 judge_ref: "judge.m:x".to_string(),
+                records_sink: records_sink.clone(),
             },
         };
-        grader
+        let grades = grader
             .grade(&run("final response", &[], true), &dummy_ctx())
-            .await
+            .await;
+        let records = match records_sink.lock() {
+            Ok(records) => records.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        (grades, records)
     }
 
     #[tokio::test]
@@ -1239,6 +1275,7 @@ mod tests {
                 provider: provider.clone(),
                 model: "judge-model".to_string(),
                 judge_ref: "custom.judge:judge-model".to_string(),
+                records_sink: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             },
         };
         let mut record = run("final answer", &[], true);
@@ -1292,7 +1329,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn judge_records_sink_captures_only_calibratable_results() {
+        let (grades, records) = judge_grade_with_records(
+            &[
+                r#"{"score":0.83,"unknown":false,"reason":"solid"}"#,
+                r#"{"score":0.1,"unknown":true,"reason":"insufficient evidence"}"#,
+            ],
+            vec![
+                rubric("helpfulness", 0.8),
+                rubric("unknown", 0.5),
+                rubric("transport", 0.5),
+            ],
+        )
+        .await;
+
+        assert_eq!(grades.len(), 3);
+        assert_eq!(
+            records.len(),
+            1,
+            "unknown and transport errors are excluded"
+        );
+        let record = &records[0];
+        assert_eq!(record.schema, crate::calibration::JUDGE_RECORD_SCHEMA);
+        assert_eq!(record.judge_ref, "judge.m:x");
+        assert_eq!(record.case_id, "test");
+        assert_eq!(record.case_hash, "case-hash");
+        assert_eq!(record.rubric_name, "helpfulness");
+        assert_eq!(record.rubric_text, "grade it");
+        assert_eq!(record.threshold, 0.8);
+        assert_eq!(record.task_turns, ["do the task"]);
+        assert_eq!(record.final_response, "final response");
+        assert_eq!(record.score, 0.83);
+        assert!(record.judge_pass);
+        assert_eq!(record.reason, "solid");
+    }
+
+    #[tokio::test]
     async fn judge_dimensions_use_isolated_calls() {
+        // Two rubrics consume two distinct scripted replies -> two isolated calls.
         let grades = judge_grade(
             &[
                 r#"{"score":0.9,"unknown":false,"reason":"a"}"#,
