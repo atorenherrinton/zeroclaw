@@ -2,6 +2,16 @@
 
 use crate::grader::GradeResult;
 
+/// A case's comparison id: the record's `case_id` when present, else its name.
+/// The single canonical case-identity derivation (baseline skip-matching and the
+/// JUnit writer both rely on it).
+pub(crate) fn case_id(case: &CaseReport) -> &str {
+    case.record
+        .as_ref()
+        .map(|record| record.provenance.case_id.as_str())
+        .unwrap_or(&case.name)
+}
+
 /// The result of running a single eval case.
 #[derive(Debug)]
 pub struct CaseReport {

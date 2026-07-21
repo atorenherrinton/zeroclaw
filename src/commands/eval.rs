@@ -386,9 +386,25 @@ pub async fn finalize(
         }
     };
 
-    if opts.format == OutputFormat::Json {
-        println!("{}", report.to_json(kind, comparison.as_ref()));
+    match opts.format {
+        OutputFormat::Json => println!("{}", report.to_json(kind, comparison.as_ref())),
+        OutputFormat::Junit => {
+            // Cases unverifiable against the baseline render as <skipped/>.
+            let skipped: Vec<&str> = comparison
+                .as_ref()
+                .map(|cmp| {
+                    cmp.per_case
+                        .iter()
+                        .filter(|(_, c)| matches!(c, CaseComparison::Unverifiable))
+                        .map(|(id, _)| id.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            print!("{}", zeroclaw_eval::junit::render_junit(&report, &skipped));
+        }
+        OutputFormat::Table => {}
     }
+
     Ok(report.exit_code(kind, comparison.as_ref()))
 }
 
@@ -798,6 +814,8 @@ pub enum OutputFormat {
     Table,
     /// Machine-readable JSON, for CI artifacts.
     Json,
+    /// JUnit XML, for CI test reporters.
+    Junit,
 }
 
 #[cfg(test)]
