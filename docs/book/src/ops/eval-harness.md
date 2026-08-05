@@ -136,7 +136,7 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface, sandbox)` — the sandbox posture is part of the key, so runs under
+tool_surface, sandbox)`. The sandbox posture is part of the key, so runs under
 different sandbox policies are never called comparable:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
@@ -148,7 +148,7 @@ different sandbox policies are never called comparable:
   **removed** (warned). Per-case token deltas are reported as a percentage and are
   never gated.
 - A current case that errored before producing a record is reported as a
-  **run error** (`CurrentError`) — never `removed` — and always gates.
+  **run error** (`CurrentError`), never `removed`, and always gates.
 
 Baseline inputs fail closed: a baseline file with an unrecognized `schema` tag,
 an empty case id, or duplicate case ids is rejected at parse time, and a current
@@ -181,6 +181,37 @@ The process exit code is the CI gate, and it is suite-kind aware:
 
 The decision is the pure function
 `SuiteReport::exit_code(kind, comparison)` so it can be tested at its real boundary.
+
+## Machine-readable output (`--format json`)
+
+`--format json` emits one complete JSON document on stdout. Every document
+carries `suite_kind` and the `exit_code` the process exits with. When
+`--baseline` was given, a top-level `baseline` section explains the gate:
+
+```json
+{
+  "passed": 5, "failed": 1, "total": 6, "all_passed": false,
+  "suite_kind": "regression", "exit_code": 1,
+  "cases": [ ... ],
+  "baseline": {
+    "per_case": {
+      "case-a": { "classification": "regression", "categories": ["tool"] },
+      "case-b": { "classification": "unchanged", "token_delta_pct": 2.0 }
+    },
+    "confirmed_regressions": 1,
+    "current_errors": 0,
+    "flaky_unconfirmed": 0,
+    "gates": true
+  }
+}
+```
+
+`per_case` classifications are `new`, `removed`, `current_error`,
+`unverifiable`, `regression` (with flipped `categories`),
+`flaky_unconfirmed`, `improvement`, and `unchanged` (with
+`token_delta_pct` when comparable). A failing CI artifact therefore always
+states why the gate failed; the exit code never encodes information missing
+from the document.
 
 ## Run receipts and record dumps
 

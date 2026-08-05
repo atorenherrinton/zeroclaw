@@ -26,6 +26,14 @@ pub enum SuiteKind {
 }
 
 impl SuiteKind {
+    /// The snake_case label used in machine-readable output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuiteKind::Regression => "regression",
+            SuiteKind::Capability => "capability",
+        }
+    }
+
     /// Resolve the suite kind from the suite directory's final component,
     /// unless an explicit override is given.
     pub fn resolve(suite_dir: &std::path::Path, override_kind: Option<SuiteKind>) -> SuiteKind {
@@ -213,6 +221,59 @@ impl BaselineComparison {
             .filter(|(_, c)| matches!(c, CaseComparison::Removed))
             .map(|(id, _)| id.as_str())
             .collect()
+    }
+
+    /// Count of live regressions downgraded to flaky-unconfirmed.
+    pub fn flaky_unconfirmed(&self) -> usize {
+        self.per_case
+            .values()
+            .filter(|c| matches!(c, CaseComparison::FlakyUnconfirmed))
+            .count()
+    }
+
+    /// The comparison as a JSON value for machine-readable reports: per-case
+    /// classifications plus the aggregate gate summary. The `exit_code` a CI
+    /// artifact would otherwise have to reverse-engineer is carried explicitly
+    /// by the caller embedding this value.
+    pub fn to_json_value(&self) -> serde_json::Value {
+        let per_case: serde_json::Map<String, serde_json::Value> = self
+            .per_case
+            .iter()
+            .map(|(id, c)| {
+                let v = match c {
+                    CaseComparison::New => serde_json::json!({ "classification": "new" }),
+                    CaseComparison::Removed => serde_json::json!({ "classification": "removed" }),
+                    CaseComparison::CurrentError => {
+                        serde_json::json!({ "classification": "current_error" })
+                    }
+                    CaseComparison::Unverifiable => {
+                        serde_json::json!({ "classification": "unverifiable" })
+                    }
+                    CaseComparison::Regression { categories } => {
+                        let cats: Vec<&str> = categories.iter().map(|c| c.as_str()).collect();
+                        serde_json::json!({ "classification": "regression", "categories": cats })
+                    }
+                    CaseComparison::FlakyUnconfirmed => {
+                        serde_json::json!({ "classification": "flaky_unconfirmed" })
+                    }
+                    CaseComparison::Improvement => {
+                        serde_json::json!({ "classification": "improvement" })
+                    }
+                    CaseComparison::Unchanged { token_delta_pct } => serde_json::json!({
+                        "classification": "unchanged",
+                        "token_delta_pct": token_delta_pct,
+                    }),
+                };
+                (id.clone(), v)
+            })
+            .collect();
+        serde_json::json!({
+            "per_case": per_case,
+            "confirmed_regressions": self.confirmed_regressions(),
+            "current_errors": self.current_errors(),
+            "flaky_unconfirmed": self.flaky_unconfirmed(),
+            "gates": self.gates(),
+        })
     }
 }
 

@@ -191,7 +191,17 @@ impl SuiteReport {
     }
 
     /// Render the report as pretty JSON for machine consumption / CI artifacts.
-    pub fn to_json(&self) -> String {
+    ///
+    /// When a baseline comparison was performed, it MUST be passed here along
+    /// with the resolved suite kind: the artifact then carries a top-level
+    /// `baseline` section (per-case classifications, gate summary) and the
+    /// `exit_code` the process will exit with, so CI never receives a failing
+    /// artifact that omits why the gate failed.
+    pub fn to_json(
+        &self,
+        kind: crate::baseline::SuiteKind,
+        comparison: Option<&crate::baseline::BaselineComparison>,
+    ) -> String {
         let cases: Vec<serde_json::Value> = self
             .cases
             .iter()
@@ -238,13 +248,18 @@ impl SuiteReport {
             })
             .collect();
 
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "passed": self.passed_count(),
             "failed": self.failed_count(),
             "total": self.cases.len(),
             "all_passed": self.all_passed(),
+            "suite_kind": kind.as_str(),
+            "exit_code": self.exit_code(kind, comparison),
             "cases": cases,
         });
+        if let (Some(cmp), Some(map)) = (comparison, value.as_object_mut()) {
+            map.insert("baseline".into(), cmp.to_json_value());
+        }
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 }
@@ -563,11 +578,16 @@ mod tests {
                 case("bad", vec![grade("c", false, "")], None),
             ],
         };
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
         assert_eq!(json["passed"].as_u64(), Some(1));
         assert_eq!(json["failed"].as_u64(), Some(1));
         assert_eq!(json["total"].as_u64(), Some(2));
         assert_eq!(json["all_passed"].as_bool(), Some(false));
+        assert_eq!(json["suite_kind"].as_str(), Some("regression"));
+        // No baseline: exit code mirrors all_passed, and no baseline section.
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert!(json.get("baseline").is_none());
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
@@ -575,6 +595,59 @@ mod tests {
         assert_eq!(
             json["cases"][0]["grades"][0]["category"].as_str(),
             Some("response")
+        );
+    }
+
+    #[test]
+    fn to_json_with_baseline_carries_gate_outcome() {
+        // A failing case classified New: reported in the artifact, gate open.
+        let suite = SuiteReport {
+            cases: vec![case("fresh", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("fresh", CaseComparison::New)]);
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(0));
+        assert_eq!(json["baseline"]["gates"].as_bool(), Some(false));
+        assert_eq!(json["baseline"]["confirmed_regressions"].as_u64(), Some(0));
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["classification"].as_str(),
+            Some("new")
+        );
+
+        // A confirmed regression: the artifact says why the gate failed.
+        let cmp = cmp_of(vec![(
+            "fresh",
+            CaseComparison::Regression {
+                categories: vec![crate::grader::GradeCategory::Tool],
+            },
+        )]);
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert_eq!(json["baseline"]["gates"].as_bool(), Some(true));
+        assert_eq!(json["baseline"]["confirmed_regressions"].as_u64(), Some(1));
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["classification"].as_str(),
+            Some("regression")
+        );
+        assert_eq!(
+            json["baseline"]["per_case"]["fresh"]["categories"][0].as_str(),
+            Some("tool")
+        );
+
+        // A current run error is carried explicitly.
+        let err_suite = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        let cmp = cmp_of(vec![("err", CaseComparison::CurrentError)]);
+        let json: serde_json::Value =
+            serde_json::from_str(&err_suite.to_json(SuiteKind::Regression, Some(&cmp))).unwrap();
+        assert_eq!(json["exit_code"].as_i64(), Some(1));
+        assert_eq!(json["baseline"]["current_errors"].as_u64(), Some(1));
+        assert_eq!(
+            json["baseline"]["per_case"]["err"]["classification"].as_str(),
+            Some("current_error")
         );
     }
 
