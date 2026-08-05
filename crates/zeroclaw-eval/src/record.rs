@@ -1,13 +1,13 @@
 //! The artifact produced by running one eval case — what graders score.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::ConversationMessage;
 
 /// The schema tag stamped on every serialized run record.
 pub const RECORD_SCHEMA: &str = "zeroclaw-eval/record/v1";
 
 /// Informational stamp of the sandbox posture a case ran under.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxStamp {
     pub autonomy: String,
     pub workspace_only: bool,

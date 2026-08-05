@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Mode;
 use crate::grader::GradeCategory;
+use crate::record::SandboxStamp;
 use crate::report::{CaseReport, SuiteReport};
 
 /// The schema tag stamped on every baseline file.
@@ -54,6 +55,10 @@ pub struct BaselineEntry {
     pub mode: Mode,
     pub provider_ref: String,
     pub tool_surface: Vec<String>,
+    /// The sandbox posture the baseline run executed under. Part of the
+    /// comparability key: runs under different sandbox policies are not
+    /// comparable.
+    pub sandbox: SandboxStamp,
     pub verdict: Verdict,
     /// Per-check pass/fail, keyed by check name.
     pub checks: BTreeMap<String, bool>,
@@ -63,12 +68,13 @@ pub struct BaselineEntry {
 
 impl BaselineEntry {
     /// The comparability key: two entries are comparable only when these agree.
-    fn key(&self) -> (&str, Mode, &str, &[String]) {
+    fn key(&self) -> (&str, Mode, &str, &[String], &SandboxStamp) {
         (
             self.case_hash.as_str(),
             self.mode,
             self.provider_ref.as_str(),
             self.tool_surface.as_slice(),
+            &self.sandbox,
         )
     }
 }
@@ -96,9 +102,30 @@ impl Baseline {
         serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
     }
 
-    /// Parse a baseline from JSON text.
+    /// Parse and validate a baseline from JSON text. Fails closed: an
+    /// unrecognized schema tag, an empty case id, or a duplicate case id is an
+    /// error, never a silently accepted or collapsed input.
     pub fn from_json(text: &str) -> anyhow::Result<Baseline> {
-        Ok(serde_json::from_str(text)?)
+        let baseline: Baseline = serde_json::from_str(text)?;
+        if baseline.schema != BASELINE_SCHEMA {
+            anyhow::bail!(
+                "unsupported baseline schema {:?} (expected {BASELINE_SCHEMA:?})",
+                baseline.schema
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &baseline.entries {
+            if entry.case_id.is_empty() {
+                anyhow::bail!("baseline entry with empty case_id");
+            }
+            if !seen.insert(entry.case_id.as_str()) {
+                anyhow::bail!(
+                    "duplicate case_id {:?} in baseline: one entry could silently mask another",
+                    entry.case_id
+                );
+            }
+        }
+        Ok(baseline)
     }
 }
 
@@ -110,6 +137,7 @@ fn entry_from_case(case: &CaseReport) -> Option<BaselineEntry> {
         mode: rec.mode,
         provider_ref: rec.provider_ref.clone(),
         tool_surface: rec.tool_surface.clone(),
+        sandbox: rec.sandbox.clone(),
         verdict: if case.passed() {
             Verdict::Pass
         } else {
@@ -132,6 +160,9 @@ pub enum CaseComparison {
     New,
     /// In the baseline, absent now (warned, never gated).
     Removed,
+    /// The current run errored before producing a record; no trustworthy
+    /// comparison exists. Always gates (a run error, not a check failure).
+    CurrentError,
     /// Comparability key changed; cannot be compared or gated.
     Unverifiable,
     /// Baseline passed, current failed: a confirmed regression, with the
@@ -160,6 +191,21 @@ impl BaselineComparison {
             .count()
     }
 
+    /// Count of current cases that errored before producing a record.
+    pub fn current_errors(&self) -> usize {
+        self.per_case
+            .values()
+            .filter(|c| matches!(c, CaseComparison::CurrentError))
+            .count()
+    }
+
+    /// Whether this comparison gates the run: at least one confirmed
+    /// regression or one current run error. The single gating authority for
+    /// baseline runs.
+    pub fn gates(&self) -> bool {
+        self.confirmed_regressions() > 0 || self.current_errors() > 0
+    }
+
     /// Case ids removed since the baseline (warned).
     pub fn removed(&self) -> Vec<&str> {
         self.per_case
@@ -170,12 +216,13 @@ impl BaselineComparison {
     }
 }
 
-fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &[String]) {
+fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &[String], &SandboxStamp) {
     (
         rec.case_hash.as_str(),
         rec.mode,
         rec.provider_ref.as_str(),
         rec.tool_surface.as_slice(),
+        &rec.sandbox,
     )
 }
 
@@ -192,17 +239,36 @@ fn flipped_categories(case: &CaseReport) -> Vec<GradeCategory> {
 
 /// Compare a suite report against a baseline, keyed by case id. Pure: the live
 /// flakiness retry is applied separately by the caller.
-pub fn compare(current: &SuiteReport, baseline: &Baseline) -> BaselineComparison {
+///
+/// Fails closed: duplicate case ids in the current run are an error (one
+/// result could silently mask another). The baseline side is validated at
+/// parse time by [`Baseline::from_json`]. A current case that errored before
+/// producing a record is classified [`CaseComparison::CurrentError`] rather
+/// than being absent (which would misreport it as `Removed`).
+pub fn compare(current: &SuiteReport, baseline: &Baseline) -> anyhow::Result<BaselineComparison> {
     let base_map: BTreeMap<&str, &BaselineEntry> = baseline
         .entries
         .iter()
         .map(|e| (e.case_id.as_str(), e))
         .collect();
-    let cur_map: BTreeMap<&str, &CaseReport> = current
-        .cases
-        .iter()
-        .filter_map(|c| c.record.as_ref().map(|r| (r.case_id.as_str(), c)))
-        .collect();
+
+    let mut cur_map: BTreeMap<&str, &CaseReport> = BTreeMap::new();
+    for case in &current.cases {
+        // An errored case has no record; its report identity is its name.
+        let id = case
+            .record
+            .as_ref()
+            .map(|r| r.case_id.as_str())
+            .unwrap_or(case.name.as_str());
+        if id.is_empty() {
+            anyhow::bail!("current run case with empty id cannot be compared");
+        }
+        if cur_map.insert(id, case).is_some() {
+            anyhow::bail!(
+                "duplicate case id {id:?} in current run: one result could silently mask another"
+            );
+        }
+    }
 
     let mut per_case = BTreeMap::new();
     let ids: std::collections::BTreeSet<&str> =
@@ -210,37 +276,43 @@ pub fn compare(current: &SuiteReport, baseline: &Baseline) -> BaselineComparison
 
     for id in ids {
         let classification = match (cur_map.get(id), base_map.get(id)) {
-            (Some(_), None) => CaseComparison::New,
-            (None, Some(_)) => CaseComparison::Removed,
-            (Some(case), Some(base)) => {
-                // Safe: cur_map only holds cases with a record.
-                let rec = case.record.as_ref().expect("cur_map cases have a record");
-                if current_key(rec) != base.key() {
-                    CaseComparison::Unverifiable
-                } else {
-                    let base_pass = base.verdict == Verdict::Pass;
-                    let cur_pass = case.passed();
-                    match (base_pass, cur_pass) {
-                        (true, false) => CaseComparison::Regression {
-                            categories: flipped_categories(case),
-                        },
-                        (false, true) => CaseComparison::Improvement,
-                        _ => {
-                            let cur_total = rec.input_tokens + rec.output_tokens;
-                            let delta = token_delta_pct(base.total_tokens, cur_total);
-                            CaseComparison::Unchanged {
-                                token_delta_pct: delta,
+            (Some(case), _) if case.error.is_some() => CaseComparison::CurrentError,
+            (Some(case), base) => match case.record.as_ref() {
+                // No record and no error should not happen, but if it does the
+                // case cannot be compared; fail closed as a current error.
+                None => CaseComparison::CurrentError,
+                Some(rec) => match base {
+                    None => CaseComparison::New,
+                    Some(base) => {
+                        if current_key(rec) != base.key() {
+                            CaseComparison::Unverifiable
+                        } else {
+                            let base_pass = base.verdict == Verdict::Pass;
+                            let cur_pass = case.passed();
+                            match (base_pass, cur_pass) {
+                                (true, false) => CaseComparison::Regression {
+                                    categories: flipped_categories(case),
+                                },
+                                (false, true) => CaseComparison::Improvement,
+                                _ => {
+                                    let cur_total = rec.input_tokens + rec.output_tokens;
+                                    let delta = token_delta_pct(base.total_tokens, cur_total);
+                                    CaseComparison::Unchanged {
+                                        token_delta_pct: delta,
+                                    }
+                                }
                             }
                         }
                     }
-                }
-            }
+                },
+            },
+            (None, Some(_)) => CaseComparison::Removed,
             (None, None) => unreachable!("id came from one of the maps"),
         };
         per_case.insert(id.to_string(), classification);
     }
 
-    BaselineComparison { per_case }
+    Ok(BaselineComparison { per_case })
 }
 
 /// Downgrade live regressions that passed on a single re-run to
@@ -342,7 +414,7 @@ mod tests {
         let current = SuiteReport {
             cases: vec![failing],
         };
-        let cmp = compare(&current, &baseline);
+        let cmp = compare(&current, &baseline).unwrap();
         assert_eq!(cmp.per_case["a"], CaseComparison::Unverifiable);
         assert_eq!(cmp.confirmed_regressions(), 0);
     }
@@ -370,7 +442,7 @@ mod tests {
                 10,
             )],
         };
-        let cmp = compare(&current, &baseline);
+        let cmp = compare(&current, &baseline).unwrap();
         match &cmp.per_case["a"] {
             CaseComparison::Regression { categories } => {
                 assert_eq!(categories, &vec![GradeCategory::Tool]);
@@ -400,7 +472,7 @@ mod tests {
                 case("d", vec![grade("c", true, GradeCategory::Response)], 10),
             ],
         };
-        let cmp = compare(&current, &baseline);
+        let cmp = compare(&current, &baseline).unwrap();
         assert_eq!(cmp.per_case["a"], CaseComparison::Improvement);
         assert!(matches!(
             cmp.per_case["b"],
@@ -450,7 +522,7 @@ mod tests {
         let current = SuiteReport {
             cases: vec![current],
         };
-        let mut cmp = compare(&current, &base_live);
+        let mut cmp = compare(&current, &base_live).unwrap();
         assert_eq!(cmp.confirmed_regressions(), 1);
 
         let mut rerun = BTreeMap::new();
@@ -461,7 +533,7 @@ mod tests {
         assert_eq!(cmp.confirmed_regressions(), 0);
 
         // Replay never retries: the regression stands.
-        let mut cmp2 = compare(&current, &base_live);
+        let mut cmp2 = compare(&current, &base_live).unwrap();
         let flaky2 = downgrade_flaky_regressions(&mut cmp2, Mode::Replay, &rerun);
         assert!(flaky2.is_empty());
         assert_eq!(cmp2.confirmed_regressions(), 1);
@@ -478,9 +550,143 @@ mod tests {
         };
         let baseline = baseline_of(&base_report);
         let current = SuiteReport { cases: vec![] };
-        let cmp = compare(&current, &baseline);
+        let cmp = compare(&current, &baseline).unwrap();
         assert_eq!(cmp.per_case["gone"], CaseComparison::Removed);
         assert_eq!(cmp.removed(), vec!["gone"]);
+    }
+
+    #[test]
+    fn from_json_rejects_wrong_schema() {
+        let mut baseline = Baseline {
+            schema: "zeroclaw-eval/baseline/v999".to_string(),
+            entries: Vec::new(),
+        };
+        let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
+        assert!(err.to_string().contains("unsupported baseline schema"));
+        // Arbitrary non-baseline schema strings are rejected too.
+        baseline.schema = "not-a-baseline".to_string();
+        assert!(Baseline::from_json(&baseline.to_json()).is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_duplicate_and_empty_case_ids() {
+        let report = SuiteReport {
+            cases: vec![
+                case("dup", vec![grade("c", true, GradeCategory::Response)], 10),
+                case("dup", vec![grade("c", false, GradeCategory::Response)], 10),
+            ],
+        };
+        let baseline = Baseline::from_report(&report);
+        let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
+        assert!(err.to_string().contains("duplicate case_id"));
+
+        let empty_report = SuiteReport {
+            cases: vec![case(
+                "",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let empty_baseline = Baseline::from_report(&empty_report);
+        let err = Baseline::from_json(&empty_baseline.to_json()).unwrap_err();
+        assert!(err.to_string().contains("empty case_id"));
+    }
+
+    #[test]
+    fn compare_rejects_duplicate_current_case_ids() {
+        let base_report = SuiteReport {
+            cases: vec![case(
+                "dup",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = baseline_of(&base_report);
+        let current = SuiteReport {
+            cases: vec![
+                case("dup", vec![grade("c", true, GradeCategory::Response)], 10),
+                case("dup", vec![grade("c", false, GradeCategory::Response)], 10),
+            ],
+        };
+        let err = compare(&current, &baseline).unwrap_err();
+        assert!(err.to_string().contains("duplicate case id"));
+    }
+
+    #[test]
+    fn changed_sandbox_posture_is_unverifiable_not_comparable() {
+        let pass = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = baseline_of(&pass);
+        // Same hash/mode/provider/tools, but the sandbox posture changed and
+        // the case now fails: not comparable, must not be a regression.
+        let mut failing = case("a", vec![grade("c", false, GradeCategory::Response)], 10);
+        failing.record.as_mut().unwrap().sandbox = SandboxStamp {
+            autonomy: "full".to_string(),
+            workspace_only: true,
+        };
+        let current = SuiteReport {
+            cases: vec![failing],
+        };
+        let cmp = compare(&current, &baseline).unwrap();
+        assert_eq!(cmp.per_case["a"], CaseComparison::Unverifiable);
+        assert_eq!(cmp.confirmed_regressions(), 0);
+    }
+
+    #[test]
+    fn errored_current_case_is_current_error_not_removed() {
+        let base_report = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = baseline_of(&base_report);
+        // The case errored before producing a record: it is present in the
+        // suite (by name) but absent from the record map.
+        let errored = CaseReport {
+            name: "a".to_string(),
+            source: "f.json".to_string(),
+            record: None,
+            grades: Vec::new(),
+            error: Some("trace exhausted".to_string()),
+        };
+        let current = SuiteReport {
+            cases: vec![errored],
+        };
+        let cmp = compare(&current, &baseline).unwrap();
+        assert_eq!(cmp.per_case["a"], CaseComparison::CurrentError);
+        assert_eq!(cmp.current_errors(), 1);
+        assert!(cmp.gates());
+        assert!(cmp.removed().is_empty());
+    }
+
+    #[test]
+    fn gates_reflects_regressions_and_current_errors_only() {
+        let mut per_case = BTreeMap::new();
+        per_case.insert("new".to_string(), CaseComparison::New);
+        per_case.insert(
+            "unchanged".to_string(),
+            CaseComparison::Unchanged {
+                token_delta_pct: None,
+            },
+        );
+        per_case.insert("flaky".to_string(), CaseComparison::FlakyUnconfirmed);
+        per_case.insert("changed".to_string(), CaseComparison::Unverifiable);
+        let mut cmp = BaselineComparison { per_case };
+        assert!(!cmp.gates());
+        cmp.per_case.insert(
+            "bad".to_string(),
+            CaseComparison::Regression {
+                categories: vec![GradeCategory::Response],
+            },
+        );
+        assert!(cmp.gates());
     }
 
     #[test]

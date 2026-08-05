@@ -92,11 +92,12 @@ impl SuiteReport {
     /// Process exit code for a completed run. Gating is strictly per-case:
     /// - Regression suites, no baseline: 0 iff every case passed.
     /// - Regression suites, with a baseline: the comparison is the single
-    ///   authority — 1 iff there is at least one confirmed per-case Pass->Fail
-    ///   regression (`BaselineComparison::confirmed_regressions`) or a genuine
-    ///   run error. Failures classified `New`, `Unchanged`, `Unverifiable`, or
-    ///   `FlakyUnconfirmed` are reported but never gate; a case that failed in
-    ///   both runs is not a flip.
+    ///   authority — 1 iff [`BaselineComparison::gates`], i.e. at least one
+    ///   confirmed per-case Pass->Fail regression or a current run error
+    ///   (classified `CurrentError`; an errored case has no trustworthy
+    ///   comparison). Failures classified `New`, `Unchanged`, `Unverifiable`,
+    ///   or `FlakyUnconfirmed` are reported but never gate; a case that failed
+    ///   in both runs is not a flip.
     /// - Capability suites: always 0 unless a case ERRORED (a run error, not a
     ///   check failure), which still exits 1.
     ///
@@ -110,13 +111,9 @@ impl SuiteReport {
         match kind {
             SuiteKind::Regression => match comparison {
                 None => i32::from(!self.all_passed()),
-                Some(cmp) => {
-                    // One authoritative policy: the per-case classification
-                    // decides the gate. Run errors always gate — an errored
-                    // case has no trustworthy comparison.
-                    let run_error = self.cases.iter().any(|c| c.error.is_some());
-                    i32::from(run_error || cmp.confirmed_regressions() > 0)
-                }
+                // One authoritative policy: the per-case classification decides
+                // the gate (confirmed regressions + current run errors).
+                Some(cmp) => i32::from(cmp.gates()),
             },
             SuiteKind::Capability => {
                 // Never gate on failing checks; only a run error fails a capability run.
@@ -455,12 +452,12 @@ mod tests {
 
     #[test]
     fn exit_regression_run_error_gates_even_with_baseline() {
-        // An errored case has no trustworthy comparison; it must gate
-        // regardless of its classification.
+        // An errored case has no trustworthy comparison; `compare` classifies
+        // it CurrentError and it must gate.
         let s = SuiteReport {
             cases: vec![case("err", vec![], Some("boom"))],
         };
-        let cmp = cmp_of(vec![("err", CaseComparison::New)]);
+        let cmp = cmp_of(vec![("err", CaseComparison::CurrentError)]);
         assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
     }
 

@@ -136,7 +136,8 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface)`:
+tool_surface, sandbox)` — the sandbox posture is part of the key, so runs under
+different sandbox policies are never called comparable:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
   compared or gated.
@@ -146,6 +147,13 @@ tool_surface)`:
   case only in the current run is **new**; a case only in the baseline is
   **removed** (warned). Per-case token deltas are reported as a percentage and are
   never gated.
+- A current case that errored before producing a record is reported as a
+  **run error** (`CurrentError`) — never `removed` — and always gates.
+
+Baseline inputs fail closed: a baseline file with an unrecognized `schema` tag,
+an empty case id, or duplicate case ids is rejected at parse time, and a current
+run with duplicate case ids is rejected at comparison time, so malformed or
+ambiguous inputs can never produce a trusted gate result.
 
 **Live flakiness rule:** in live mode, a comparable case that regressed is re-run
 once; if the re-run passes it is reported as `flaky (unconfirmed regression)` and

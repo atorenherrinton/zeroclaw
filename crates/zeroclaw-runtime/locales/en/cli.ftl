@@ -1193,6 +1193,7 @@ cli-eval-baseline-comparison =   baseline comparison:
 cli-eval-comparison-new = new
 cli-eval-comparison-removed = removed (warn) - in baseline, absent now
 cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-current-error = RUN ERROR - errored before producing a record
 cli-eval-comparison-improvement = improvement
 cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
 cli-eval-comparison-regression = REGRESSION ({$categories})

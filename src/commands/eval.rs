@@ -348,7 +348,7 @@ pub async fn finalize(
     let comparison = match &opts.baseline {
         Some(path) => {
             let baseline = Baseline::from_json(&std::fs::read_to_string(path)?)?;
-            let mut cmp = baseline::compare(&report, &baseline);
+            let mut cmp = baseline::compare(&report, &baseline)?;
             if mode == Mode::Live {
                 let rerun_passed =
                     Box::pin(rerun_live_regressions(config, suite_path, &cmp)).await?;
@@ -431,6 +431,9 @@ fn print_comparison(
             CaseComparison::Removed => get_required_cli_string("cli-eval-comparison-removed"),
             CaseComparison::Unverifiable => {
                 get_required_cli_string("cli-eval-comparison-unverifiable")
+            }
+            CaseComparison::CurrentError => {
+                get_required_cli_string("cli-eval-comparison-current-error")
             }
             CaseComparison::Improvement => {
                 get_required_cli_string("cli-eval-comparison-improvement")
