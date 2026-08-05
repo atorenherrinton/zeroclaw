@@ -1199,3 +1199,7 @@ cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
 cli-eval-comparison-regression = REGRESSION ({$categories})
 cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
 cli-eval-comparison-unchanged = unchanged
+cli-eval-capability-pass-rate = pass rate {$rate}%
+cli-eval-capability-pass-rate-was = pass rate {$rate}% (was {$baseline_rate}%)
+cli-eval-capability-saturation-warning = {"  "}saturation warning: >=95% - consider graduating to regression/
+cli-eval-unknown-suite-kind = unknown --suite-kind '{$kind}' (expected 'regression' or 'capability')

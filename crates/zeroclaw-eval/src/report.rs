@@ -76,6 +76,18 @@ pub struct SuiteReport {
     pub cases: Vec<CaseReport>,
 }
 
+/// Capability-suite presentation statistics (see
+/// [`SuiteReport::capability_stats`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapabilityStats {
+    /// Current pass rate as a percentage (0.0 when the suite is empty).
+    pub pass_rate: f64,
+    /// The baseline's pass rate as a percentage, when a baseline was given.
+    pub baseline_rate: Option<f64>,
+    /// Whether the suite is saturated (>= 95% pass rate).
+    pub saturated: bool,
+}
+
 impl SuiteReport {
     pub fn passed_count(&self) -> usize {
         self.cases.iter().filter(|c| c.passed()).count()
@@ -122,34 +134,38 @@ impl SuiteReport {
         }
     }
 
-    /// A one-line capability summary: current pass rate, the baseline's pass rate
-    /// when given, and a saturation warning at or above 95%.
-    pub fn capability_summary(&self, baseline: Option<&crate::baseline::Baseline>) -> String {
+    /// Capability-suite statistics for presentation: the current pass rate, the
+    /// baseline's pass rate when given, and whether the suite is saturated
+    /// (>= 95% pass rate, a candidate for graduating to regression/).
+    /// Rendering is the caller's concern (the CLI localizes it).
+    pub fn capability_stats(
+        &self,
+        baseline: Option<&crate::baseline::Baseline>,
+    ) -> CapabilityStats {
         let total = self.cases.len();
-        let rate = if total == 0 {
+        let pass_rate = if total == 0 {
             0.0
         } else {
             self.passed_count() as f64 / total as f64 * 100.0
         };
-        let mut s = format!("pass rate {rate:.0}%");
-        if let Some(base) = baseline {
+        let baseline_rate = baseline.map(|base| {
             let bt = base.entries.len();
             let bp = base
                 .entries
                 .iter()
                 .filter(|e| e.verdict == crate::baseline::Verdict::Pass)
                 .count();
-            let brate = if bt == 0 {
+            if bt == 0 {
                 0.0
             } else {
                 bp as f64 / bt as f64 * 100.0
-            };
-            s.push_str(&format!(" (was {brate:.0}%)"));
+            }
+        });
+        CapabilityStats {
+            pass_rate,
+            baseline_rate,
+            saturated: pass_rate >= 95.0,
         }
-        if rate >= 95.0 {
-            s.push_str("\n  saturation warning: >=95% - consider graduating to regression/");
-        }
-        s
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -524,13 +540,19 @@ mod tests {
     }
 
     #[test]
-    fn capability_summary_reports_rate_trend_and_saturation() {
+    fn capability_stats_report_rate_trend_and_saturation() {
         let s = SuiteReport {
             cases: vec![case("ok", vec![grade("c", true, "")], None)],
         };
-        let sum = s.capability_summary(None);
-        assert!(sum.contains("pass rate 100%"), "got: {sum}");
-        assert!(sum.contains("saturation warning"), "got: {sum}");
+        let stats = s.capability_stats(None);
+        assert!((stats.pass_rate - 100.0).abs() < f64::EPSILON);
+        assert!(stats.saturated);
+        assert_eq!(stats.baseline_rate, None);
+        // An empty suite is 0% and not saturated.
+        let empty = SuiteReport { cases: vec![] };
+        let stats = empty.capability_stats(None);
+        assert!(stats.pass_rate.abs() < f64::EPSILON);
+        assert!(!stats.saturated);
     }
 
     #[test]

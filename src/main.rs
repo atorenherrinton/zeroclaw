@@ -537,12 +537,12 @@ enum EvalCommands {
 
         /// Compare the run against a baseline file (JSON) and gate on regressions.
         // i18n-exempt: clap derive help — framework requires a compile-time literal
-        #[arg(long)]
+        #[arg(long, conflicts_with = "write_baseline")]
         baseline: Option<String>,
 
         /// Write the run's results as a baseline file (JSON), then exit.
         // i18n-exempt: clap derive help — framework requires a compile-time literal
-        #[arg(long)]
+        #[arg(long, conflicts_with = "baseline")]
         write_baseline: Option<String>,
 
         /// Override the suite kind: `regression` (gating) or `capability` (tracked).
@@ -5935,9 +5935,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     Some("regression") => Some(zeroclaw_eval::baseline::SuiteKind::Regression),
                     Some("capability") => Some(zeroclaw_eval::baseline::SuiteKind::Capability),
                     Some(other) => {
-                        anyhow::bail!(
-                            "unknown --suite-kind '{other}' (expected 'regression' or 'capability')"
-                        )
+                        anyhow::bail!(ta(
+                            "cli-eval-unknown-suite-kind",
+                            &[("kind", other)],
+                            "unknown --suite-kind (expected 'regression' or 'capability')"
+                        ))
                     }
                 };
                 let (report, artifacts) =

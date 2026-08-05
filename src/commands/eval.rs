@@ -380,7 +380,7 @@ pub async fn finalize(
         }
         None => {
             if kind == SuiteKind::Capability && opts.format == OutputFormat::Table {
-                println!("  {}", report.capability_summary(None));
+                print_capability_summary(&report, None);
             }
             None
         }
@@ -474,7 +474,32 @@ fn print_comparison(
         println!("    {id}: {line}");
     }
     if kind == SuiteKind::Capability {
-        println!("  {}", report.capability_summary(Some(baseline)));
+        print_capability_summary(report, Some(baseline));
+    }
+}
+
+/// Print the localized capability summary (pass rate, trend, saturation).
+fn print_capability_summary(report: &SuiteReport, baseline: Option<&Baseline>) {
+    let stats = report.capability_stats(baseline);
+    let rate = format!("{:.0}", stats.pass_rate);
+    let line = match stats.baseline_rate {
+        Some(brate) => {
+            let brate = format!("{brate:.0}");
+            get_required_cli_string_with_args(
+                "cli-eval-capability-pass-rate-was",
+                &[("rate", rate.as_str()), ("baseline_rate", brate.as_str())],
+            )
+        }
+        None => {
+            get_required_cli_string_with_args("cli-eval-capability-pass-rate", &[("rate", &rate)])
+        }
+    };
+    println!("  {line}");
+    if stats.saturated {
+        println!(
+            "{}",
+            get_required_cli_string("cli-eval-capability-saturation-warning")
+        );
     }
 }
 
