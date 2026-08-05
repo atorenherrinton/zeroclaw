@@ -2,14 +2,6 @@
 
 use crate::grader::GradeResult;
 
-/// A case's comparison id: the record's `case_id` when present, else its name.
-fn case_id(case: &CaseReport) -> &str {
-    case.record
-        .as_ref()
-        .map(|r| r.case_id.as_str())
-        .unwrap_or(&case.name)
-}
-
 /// The result of running a single eval case.
 #[derive(Debug)]
 pub struct CaseReport {
@@ -99,8 +91,12 @@ impl SuiteReport {
 
     /// Process exit code for a completed run. Gating is strictly per-case:
     /// - Regression suites, no baseline: 0 iff every case passed.
-    /// - Regression suites, with a baseline: 0 iff every case passed AND there are
-    ///   zero confirmed per-case Pass->Fail regressions.
+    /// - Regression suites, with a baseline: the comparison is the single
+    ///   authority — 1 iff there is at least one confirmed per-case Pass->Fail
+    ///   regression (`BaselineComparison::confirmed_regressions`) or a genuine
+    ///   run error. Failures classified `New`, `Unchanged`, `Unverifiable`, or
+    ///   `FlakyUnconfirmed` are reported but never gate; a case that failed in
+    ///   both runs is not a flip.
     /// - Capability suites: always 0 unless a case ERRORED (a run error, not a
     ///   check failure), which still exits 1.
     ///
@@ -110,23 +106,16 @@ impl SuiteReport {
         kind: crate::baseline::SuiteKind,
         comparison: Option<&crate::baseline::BaselineComparison>,
     ) -> i32 {
-        use crate::baseline::{CaseComparison, SuiteKind};
+        use crate::baseline::SuiteKind;
         match kind {
             SuiteKind::Regression => match comparison {
                 None => i32::from(!self.all_passed()),
                 Some(cmp) => {
-                    // A failing case gates unless the comparison excuses it: an
-                    // Unverifiable case (hash changed, refresh the baseline) or a
-                    // FlakyUnconfirmed live case (regressed but passed on re-run).
-                    let gating_failure = self.cases.iter().any(|c| {
-                        !c.passed()
-                            && !matches!(
-                                cmp.per_case.get(case_id(c)),
-                                Some(CaseComparison::FlakyUnconfirmed)
-                                    | Some(CaseComparison::Unverifiable)
-                            )
-                    });
-                    i32::from(gating_failure)
+                    // One authoritative policy: the per-case classification
+                    // decides the gate. Run errors always gate — an errored
+                    // case has no trustworthy comparison.
+                    let run_error = self.cases.iter().any(|c| c.error.is_some());
+                    i32::from(run_error || cmp.confirmed_regressions() > 0)
                 }
             },
             SuiteKind::Capability => {
@@ -435,6 +424,44 @@ mod tests {
         };
         let cmp = cmp_of(vec![("changed", CaseComparison::Unverifiable)]);
         assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_new_failing_case_does_not_gate() {
+        // A newly added failing case is classified `New`: reported, not a
+        // confirmed Pass->Fail flip, so it does not gate the baseline run.
+        let s = SuiteReport {
+            cases: vec![case("fresh", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![("fresh", CaseComparison::New)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_failed_in_both_runs_does_not_gate() {
+        // A case that failed in the baseline and still fails is `Unchanged`:
+        // no verdict flip, so no gate.
+        let s = SuiteReport {
+            cases: vec![case("still-bad", vec![grade("c", false, "")], None)],
+        };
+        let cmp = cmp_of(vec![(
+            "still-bad",
+            CaseComparison::Unchanged {
+                token_delta_pct: None,
+            },
+        )]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 0);
+    }
+
+    #[test]
+    fn exit_regression_run_error_gates_even_with_baseline() {
+        // An errored case has no trustworthy comparison; it must gate
+        // regardless of its classification.
+        let s = SuiteReport {
+            cases: vec![case("err", vec![], Some("boom"))],
+        };
+        let cmp = cmp_of(vec![("err", CaseComparison::New)]);
+        assert_eq!(s.exit_code(SuiteKind::Regression, Some(&cmp)), 1);
     }
 
     #[test]

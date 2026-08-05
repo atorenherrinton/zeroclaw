@@ -160,10 +160,14 @@ gate. To refresh a baseline after an intentional behavior change, re-run with
 The process exit code is the CI gate, and it is suite-kind aware:
 
 - **Regression suite, no baseline:** `0` iff every case passed, else `1`.
-- **Regression suite, with `--baseline`:** `0` iff every failing case is excused,
-  i.e. `1` if any case fails that is not `Unverifiable` (comparability key changed)
-  or `flaky (unconfirmed regression)`. Confirmed per-case Pass to Fail flips gate;
-  aggregate score or token deltas never do.
+- **Regression suite, with `--baseline`:** the per-case comparison is the single
+  gating authority. `1` iff there is at least one confirmed Pass to Fail flip on
+  a comparable case, or a case ERRORED (a run error has no trustworthy
+  comparison). Failures classified `new`, `unchanged` (failed in both runs),
+  `unverifiable` (comparability key changed), or `flaky (unconfirmed
+  regression)` are reported but never gate; aggregate score or token deltas
+  never do either. A new or still-failing case gates on the next run without
+  `--baseline`, or once a refreshed baseline records it as passing.
 - **Capability suite:** always `0` unless a case ERRORED (a run error, not a check
   failure), which still exits `1`.
 
