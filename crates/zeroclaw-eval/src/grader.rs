@@ -115,7 +115,10 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                 GradeResult::new(
                     check,
                     false,
-                    format!("{tool:?} was never called; tools called: {:?}", run.tools_called),
+                    format!(
+                        "{tool:?} was never called; tools called: {:?}",
+                        run.tools_called
+                    ),
                 )
             } else {
                 let passed = matching.iter().any(|p| p.contains(needle));
@@ -485,7 +488,11 @@ mod tests {
     fn tool_results_contain_fails_when_result_mutated() {
         let record = run_with_calls(
             "Echoed: naïve café 日本語 ✓",
-            vec![call("echo", r#"{"message":"naïve café 日本語 ✓"}"#, "(empty)")],
+            vec![call(
+                "echo",
+                r#"{"message":"naïve café 日本語 ✓"}"#,
+                "(empty)",
+            )],
         );
         let expects = TraceExpects {
             tool_results_contain: vec![ToolPayloadExpect {
@@ -524,7 +531,10 @@ mod tests {
         // The reviewer's counterexample verbatim: one `echo` call, a scripted
         // "Echoed: beta" final response, everything successful. The old
         // expectations pass; `exact_tool_calls(2)` must not.
-        let record = run_with_calls("Echoed: beta", vec![call("echo", r#"{"message":"beta"}"#, "beta")]);
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![call("echo", r#"{"message":"beta"}"#, "beta")],
+        );
         let expects = TraceExpects {
             response_contains: vec!["beta".to_string()],
             tools_used: vec!["echo".to_string()],
@@ -543,7 +553,10 @@ mod tests {
             let g = out.iter().find(|g| g.check.starts_with(name)).unwrap();
             assert!(g.passed, "{name} should still pass: {g:?}");
         }
-        let exact = out.iter().find(|g| g.check.starts_with("exact_tool_calls")).unwrap();
+        let exact = out
+            .iter()
+            .find(|g| g.check.starts_with("exact_tool_calls"))
+            .unwrap();
         assert!(!exact.passed, "a missing dispatch must fail: {exact:?}");
         assert!(exact.detail.contains("1 tool call(s)"));
     }
@@ -610,7 +623,10 @@ mod tests {
 
     #[test]
     fn indexed_payload_expect_fails_when_index_out_of_range() {
-        let record = run_with_calls("Echoed: beta", vec![call("echo", r#"{"message":"beta"}"#, "beta")]);
+        let record = run_with_calls(
+            "Echoed: beta",
+            vec![call("echo", r#"{"message":"beta"}"#, "beta")],
+        );
         let expects = TraceExpects {
             tool_arguments_contain: vec![ToolPayloadExpect {
                 tool: "echo".to_string(),
