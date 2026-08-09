@@ -13,8 +13,9 @@ pub mod runner;
 pub mod stats;
 pub mod tools;
 
-pub use case::{CaseSetup, LlmTrace, TraceExpects};
+pub use case::{CaseSetup, LlmTrace, ToolPayloadExpect, TraceExpects};
 pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_graders};
+pub use observer::RecordedCall;
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
 pub use runner::{

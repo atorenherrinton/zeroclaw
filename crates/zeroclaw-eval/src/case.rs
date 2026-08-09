@@ -132,6 +132,18 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// Lower bound on the number of tool calls.
+    #[serde(default)]
+    pub min_tool_calls: Option<usize>,
+    /// Exact number of tool calls the run must have made.
+    #[serde(default)]
+    pub exact_tool_calls: Option<usize>,
+    /// Substrings that must appear in arguments dispatched to a tool.
+    #[serde(default)]
+    pub tool_arguments_contain: Vec<ToolPayloadExpect>,
+    /// Substrings that must appear in results returned by a tool.
+    #[serde(default)]
+    pub tool_results_contain: Vec<ToolPayloadExpect>,
     /// End-state checks against the case workspace after the run.
     #[serde(default)]
     pub workspace: Option<WorkspaceExpects>,
@@ -145,6 +157,19 @@ pub struct TraceExpects {
     /// accompanied by at least one deterministic expectation.
     #[serde(default)]
     pub judge: Vec<JudgeRubric>,
+}
+
+/// An expectation over one dispatched tool call's argument or result payload.
+///
+/// `call_index` selects one call to the named tool using zero-based dispatch
+/// order. When omitted, any matching call satisfies the expectation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPayloadExpect {
+    pub tool: String,
+    pub needle: String,
+    #[serde(default)]
+    pub call_index: Option<usize>,
 }
 
 fn default_judge_threshold() -> f64 {
@@ -218,6 +243,10 @@ impl TraceExpects {
             && self.tools_used.is_empty()
             && self.tools_not_used.is_empty()
             && self.max_tool_calls.is_none()
+            && self.min_tool_calls.is_none()
+            && self.exact_tool_calls.is_none()
+            && self.tool_arguments_contain.is_empty()
+            && self.tool_results_contain.is_empty()
             && self.all_tools_succeeded.is_none()
             && self.response_matches.is_empty()
             && self.response_json.is_empty()

@@ -1,6 +1,9 @@
 //! Grading: non-panicking checks over a [`RunRecord`].
 
-use crate::case::{BudgetExpects, TraceExpects, WorkspaceExpects, validate_workspace_rel_path};
+use crate::case::{
+    BudgetExpects, ToolPayloadExpect, TraceExpects, WorkspaceExpects,
+    validate_workspace_rel_path,
+};
 use crate::record::RunRecord;
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +105,68 @@ impl Grader for ExpectationsGrader {
     async fn grade(&self, run: &RunRecord, _ctx: &GradeContext<'_>) -> Vec<GradeResult> {
         evaluate_expects(&self.expects, run)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadKind {
+    Arguments,
+    Result,
+}
+
+impl PayloadKind {
+    fn check_name(self) -> &'static str {
+        match self {
+            Self::Arguments => "tool_arguments_contain",
+            Self::Result => "tool_results_contain",
+        }
+    }
+}
+
+fn grade_payload(
+    expect: &ToolPayloadExpect,
+    run: &crate::record::RunCompletion,
+    kind: PayloadKind,
+) -> GradeResult {
+    let tool = expect.tool.as_str();
+    let needle = expect.needle.as_str();
+    let matching = run
+        .tool_calls
+        .iter()
+        .filter(|call| call.name == tool)
+        .map(|call| match kind {
+            PayloadKind::Arguments => call.arguments.clone(),
+            PayloadKind::Result => call.result.clone(),
+        })
+        .collect::<Vec<_>>();
+    let check = match expect.call_index {
+        Some(index) => format!("{}({tool:?}[{index}], {needle:?})", kind.check_name()),
+        None => format!("{}({tool:?}, {needle:?})", kind.check_name()),
+    };
+    let (passed, detail) = match expect.call_index {
+        Some(index) => match matching.get(index) {
+            Some(payload) if payload.contains(needle) => (true, format!("found in call {index}")),
+            Some(payload) => (false, format!("call {index} payload was {payload:?}")),
+            None => (
+                false,
+                format!(
+                    "no call {index} to {tool:?}; only {} call(s) observed: {matching:?}",
+                    matching.len()
+                ),
+            ),
+        },
+        None if matching.is_empty() => (
+            false,
+            format!("{tool:?} was never called; tools called: {:?}", run.tools_called),
+        ),
+        None if matching.iter().any(|payload| payload.contains(needle)) => {
+            (true, "found".to_string())
+        }
+        None => (
+            false,
+            format!("not found; observed payloads: {matching:?}"),
+        ),
+    };
+    GradeResult::new(check, passed, detail, GradeCategory::Tool)
 }
 
 /// Grades end-state files in the case workspace. Every path is validated first;
@@ -576,6 +641,33 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
             format!("{actual} tool call(s)"),
             GradeCategory::Tool,
         ));
+    }
+
+    if let Some(minimum) = expects.min_tool_calls {
+        let actual = run.tools_called.len();
+        out.push(GradeResult::new(
+            format!("min_tool_calls({minimum})"),
+            actual >= minimum,
+            format!("{actual} tool call(s)"),
+            GradeCategory::Tool,
+        ));
+    }
+
+    if let Some(exact) = expects.exact_tool_calls {
+        let actual = run.tools_called.len();
+        out.push(GradeResult::new(
+            format!("exact_tool_calls({exact})"),
+            actual == exact,
+            format!("{actual} tool call(s): {:?}", run.tools_called),
+            GradeCategory::Tool,
+        ));
+    }
+
+    for expect in &expects.tool_arguments_contain {
+        out.push(grade_payload(expect, &run, PayloadKind::Arguments));
+    }
+    for expect in &expects.tool_results_contain {
+        out.push(grade_payload(expect, &run, PayloadKind::Result));
     }
 
     if let Some(expected) = expects.all_tools_succeeded {

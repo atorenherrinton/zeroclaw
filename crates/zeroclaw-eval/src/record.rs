@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::model_provider::ConversationMessage;
 
+use crate::observer::RecordedCall;
+
 /// The schema tag stamped on every serialized run record.
 pub const RECORD_SCHEMA: &str = "zeroclaw-eval/record/v1";
 
@@ -95,6 +97,8 @@ pub struct RunCompletion {
     pub history: Vec<ConversationMessage>,
     /// Names of tools that were dispatched, in call order.
     pub tools_called: Vec<String>,
+    /// Every dispatched tool call with its arguments and result, in order.
+    pub tool_calls: Vec<RecordedCall>,
     /// Whether every dispatched tool call succeeded.
     pub all_tools_succeeded: bool,
     /// Accumulated input tokens reported by the provider.
@@ -113,6 +117,7 @@ impl Default for RunCompletion {
             final_response: String::new(),
             history: Vec::new(),
             tools_called: Vec::new(),
+            tool_calls: Vec::new(),
             all_tools_succeeded: true,
             input_tokens: 0,
             output_tokens: 0,
