@@ -144,28 +144,30 @@ pub fn print_report(report: &SuiteReport, format: OutputFormat) {
 mod tests {
     use super::*;
     use zeroclaw_eval::RunRecord;
-    use zeroclaw_eval::record::SandboxStamp;
+    use zeroclaw_eval::record::{CaseProvenance, RunCompletion, SandboxStamp, ToolSurface};
 
-    fn record(case_id: &str) -> RunRecord {
-        RunRecord {
+    fn provenance(case_id: &str) -> CaseProvenance {
+        CaseProvenance {
             schema: zeroclaw_eval::record::RECORD_SCHEMA.to_string(),
             mode: Mode::Replay,
             case_id: case_id.to_string(),
             case_hash: "deadbeef".to_string(),
             provider_ref: "scripted".to_string(),
-            tool_surface: Vec::new(),
+            tool_surface: ToolSurface::default(),
             sandbox: SandboxStamp {
                 autonomy: "supervised".to_string(),
                 workspace_only: false,
             },
-            final_response: "x".to_string(),
-            history: Vec::new(),
-            tools_called: Vec::new(),
-            all_tools_succeeded: true,
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
+        }
+    }
+
+    fn record(case_id: &str) -> RunRecord {
+        RunRecord {
+            provenance: provenance(case_id),
+            completion: Some(RunCompletion {
+                final_response: "x".to_string(),
+                ..RunCompletion::default()
+            }),
         }
     }
 
@@ -231,9 +233,36 @@ mod tests {
     }
 
     #[test]
+    fn errored_case_auto_dump_retains_provenance() {
+        // The auto-dump exists for failed cases. Writing `"record": null` there
+        // strips the case hash, mode, provider, tool surface, and sandbox stamp
+        // from exactly the artifact a diagnosing operator opens.
+        let mut errored = case_report("timeout-case", false);
+        errored.record = Some(RunRecord::from_provenance(provenance("timeout-case")));
+        let report = SuiteReport {
+            cases: vec![errored],
+        };
+        let auto = tempfile::tempdir().unwrap();
+        write_dumps(&report, None, auto.path()).unwrap();
+
+        let content = std::fs::read_to_string(auto.path().join("timeout-case.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(
+            !v["record"].is_null(),
+            "an errored case's dump must not carry \"record\": null: {content}"
+        );
+        assert_eq!(v["record"]["case_hash"], "deadbeef");
+        assert_eq!(v["record"]["mode"], "replay");
+        assert_eq!(v["record"]["provider_ref"], "scripted");
+        assert!(v["record"]["tool_surface"].is_object());
+        assert!(v["record"]["sandbox"].is_object());
+    }
+
+    #[test]
     fn errored_case_is_dumped_with_error() {
         let mut errored = case_report("err", false);
-        errored.record = None; // an errored case has no record, only an error string
+        // An errored case never completed, so it carries provenance only.
+        errored.record = Some(RunRecord::from_provenance(provenance("err")));
         let report = SuiteReport {
             cases: vec![errored],
         };

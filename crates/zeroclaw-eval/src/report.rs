@@ -149,26 +149,33 @@ impl SuiteReport {
                     "grades": c.grades,
                 });
                 if let (Some(rec), Some(map)) = (&c.record, obj.as_object_mut()) {
-                    map.insert("schema".into(), rec.schema.clone().into());
+                    // Provenance is emitted unconditionally: it is knowable before
+                    // execution, so an errored case still carries a joinable receipt.
+                    let p = &rec.provenance;
+                    map.insert("schema".into(), p.schema.clone().into());
                     map.insert(
                         "mode".into(),
-                        serde_json::to_value(rec.mode).unwrap_or_default(),
+                        serde_json::to_value(p.mode).unwrap_or_default(),
                     );
-                    map.insert("case_id".into(), rec.case_id.clone().into());
-                    map.insert("case_hash".into(), rec.case_hash.clone().into());
-                    map.insert("provider_ref".into(), rec.provider_ref.clone().into());
+                    map.insert("case_id".into(), p.case_id.clone().into());
+                    map.insert("case_hash".into(), p.case_hash.clone().into());
+                    map.insert("provider_ref".into(), p.provider_ref.clone().into());
                     map.insert(
                         "tool_surface".into(),
-                        serde_json::to_value(&rec.tool_surface).unwrap_or_default(),
+                        serde_json::to_value(&p.tool_surface).unwrap_or_default(),
                     );
                     map.insert(
                         "sandbox".into(),
-                        serde_json::to_value(&rec.sandbox).unwrap_or_default(),
+                        serde_json::to_value(&p.sandbox).unwrap_or_default(),
                     );
-                    map.insert(
-                        "total_tokens".into(),
-                        (rec.input_tokens + rec.output_tokens).into(),
-                    );
+                    // Completion-only fields stay absent for a run that never
+                    // finished, rather than being reported as a real zero.
+                    if let Some(done) = &rec.completion {
+                        map.insert(
+                            "total_tokens".into(),
+                            done.input_tokens.saturating_add(done.output_tokens).into(),
+                        );
+                    }
                 }
                 obj
             })

@@ -363,8 +363,20 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
+    let mut identities = std::collections::BTreeMap::new();
     for path in paths {
         let trace = LlmTrace::from_file(&path)?;
+        let identity = trace.display_id().to_string();
+        if let Some(first_path) = identities.insert(identity.clone(), path.clone()) {
+            anyhow::bail!(
+                "eval suite {} declares duplicate case identity {:?} in {} and {}; \
+                 reports, receipts, and baseline joins require unique identities",
+                dir.display(),
+                identity,
+                first_path.display(),
+                path.display()
+            );
+        }
         out.push((path, trace));
     }
     Ok(out)
@@ -668,6 +680,27 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_duplicate_display_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.json"),
+            r#"{"model_name":"first","id":"same","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.json"),
+            r#"{"model_name":"second","id":"same","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .unwrap();
+
+        let err = load_suite(dir.path()).expect_err("duplicate receipt identities must fail");
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("duplicate case identity \"same\""));
+        assert!(rendered.contains("a.json"));
+        assert!(rendered.contains("b.json"));
     }
 
     /// Write `body` to a fixture file and load it, returning the loader result.
