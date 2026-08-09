@@ -483,3 +483,10 @@ Example combining a workspace and a budget check:
   }
 }
 ```
+
+Expectations that grade the *dispatch boundary* rather than scripted text —
+`tool_arguments_contain`, `tool_results_contain`, and `exact_tool_calls` — are
+documented in `crates/zeroclaw-eval/README.md`. Reach for them whenever a case
+claims that a value round-tripped through a tool or that a specific number of
+tool calls happened; expectations over the final response alone cannot show
+either, because the replay provider scripts that response itself.
