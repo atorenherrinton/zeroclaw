@@ -11,7 +11,7 @@ use zeroclaw_runtime::agent::agent::Agent;
 use zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher;
 
 use crate::Mode;
-use crate::case::{LlmTrace, load_suite};
+use crate::case::{LlmTrace, load_suite_entries};
 use crate::grader::{GradeResult, Grader, default_graders, grade_with};
 use crate::observer::RecordingObserver;
 use crate::record::{RunRecord, duration_millis_saturating};
@@ -116,19 +116,36 @@ pub fn ensure_live_provider(provider_ref: &str) -> anyhow::Result<()> {
 
 /// Run every `*.json` trace fixture in `dir` and return an aggregated report.
 pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport> {
-    let traces = load_suite(dir)?;
+    let traces = load_suite_entries(dir)?;
     if traces.is_empty() {
         anyhow::bail!("no *.json trace fixtures found in {}", dir.display());
     }
 
     let mut cases = Vec::with_capacity(traces.len());
     for (path, trace) in traces {
-        let name = trace.display_id().to_string();
         let source = path
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("<unknown>")
             .to_string();
+
+        // A fixture that fails to parse or validate becomes a named FAILED case with
+        // zero grades. `CaseReport::passed()` is false whenever `error` is set, so a
+        // malformed fixture can never render green.
+        let trace = match trace {
+            Ok(trace) => trace,
+            Err(e) => {
+                cases.push(CaseReport {
+                    name: source.clone(),
+                    source,
+                    grades: vec![],
+                    error: Some(format!("{e:#}")),
+                });
+                continue;
+            }
+        };
+
+        let name = trace.display_id().to_string();
 
         let report = match run_case(&trace, deps).await {
             Ok(outcome) => CaseReport {
@@ -600,5 +617,75 @@ pub(crate) mod tests {
             "error must name the config key: {err}"
         );
         assert!(ensure_live_provider("anthropic.sonnet").is_ok());
+    }
+
+    #[tokio::test]
+    async fn malformed_memory_fixture_does_not_report_passing() {
+        // End-to-end guard for B1: a fixture whose `expects.memory` asserts nothing
+        // must not render green. Before validation, the MemoryGrader emitted zero
+        // grades and `all_passed()` (which is `all()` over an empty vec) was true.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vacuous.json"),
+            r#"{
+                "model_name": "vacuous-memory",
+                "turns": [{ "user_input": "Hi", "steps": [{ "response": { "type": "text", "content": "Hello." } }] }],
+                "expects": { "memory": {} }
+            }"#,
+        )
+        .unwrap();
+
+        let report = run_suite(dir.path(), &RunDeps::replay()).await.unwrap();
+
+        assert!(
+            !report.all_passed(),
+            "a fixture that asserts nothing must not pass: {report:?}"
+        );
+        assert_eq!(report.cases.len(), 1);
+        let case = &report.cases[0];
+        assert_eq!(case.source, "vacuous.json");
+        let error = case.error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("expects.memory"),
+            "the failure should name the offending block: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_workspace_fixture_does_not_report_passing() {
+        // Same guard for the `WorkspaceExpects` / `file_contains` mirror, using the
+        // always-true empty-string needle shape.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("vacuous_ws.json"),
+            r#"{
+                "model_name": "vacuous-workspace",
+                "turns": [{ "user_input": "Hi", "steps": [{ "response": { "type": "text", "content": "Hello." } }] }],
+                "expects": { "workspace": { "file_contains": { "out.txt": [""] } } }
+            }"#,
+        )
+        .unwrap();
+
+        let report = run_suite(dir.path(), &RunDeps::replay()).await.unwrap();
+
+        assert!(
+            !report.all_passed(),
+            "an always-true needle must not pass: {report:?}"
+        );
+        let error = report.cases[0].error.as_deref().unwrap_or_default();
+        assert!(
+            error.contains("empty-string needle"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn well_formed_fixture_still_passes_through_run_suite() {
+        // Control for the two guards above: validation must not turn healthy
+        // fixtures red.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("smoke.json"), SMOKE).unwrap();
+        let report = run_suite(dir.path(), &RunDeps::replay()).await.unwrap();
+        assert!(report.all_passed(), "{report:?}");
     }
 }

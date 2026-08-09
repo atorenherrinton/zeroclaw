@@ -230,8 +230,32 @@ impl TraceExpects {
                 }
                 if needles.iter().any(String::is_empty) {
                     anyhow::bail!(
-                        "expects.workspace.file_contains[{rel:?}] contains an empty needle, \
+                        "expects.workspace.file_contains[{rel:?}] contains an empty needle \
+                         (empty-string needle), \
                          which every file trivially satisfies"
+                    );
+                }
+            }
+        }
+        if let Some(memory) = &self.memory {
+            if memory.is_empty() {
+                anyhow::bail!(
+                    "expects.memory is present but declares no checks; \
+                     remove the block or add present / absent / contains entries"
+                );
+            }
+            for (key, needles) in &memory.contains {
+                if needles.is_empty() {
+                    anyhow::bail!(
+                        "expects.memory.contains[{key:?}] is an empty list; \
+                         remove the entry or add at least one needle"
+                    );
+                }
+                if needles.iter().any(String::is_empty) {
+                    anyhow::bail!(
+                        "expects.memory.contains[{key:?}] contains an empty needle \
+                         (empty-string needle), \
+                         which every memory value trivially satisfies"
                     );
                 }
             }
@@ -313,6 +337,10 @@ impl LlmTrace {
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        trace
+            .expects
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
         if trace.expects.is_empty() {
             anyhow::bail!(
                 "trace fixture {} declares no effective expectation; a case that asserts \
@@ -328,10 +356,6 @@ impl LlmTrace {
                 family
             );
         }
-        trace
-            .expects
-            .validate()
-            .with_context(|| format!("validating trace fixture {}", path.display()))?;
         Ok(trace)
     }
 }
@@ -382,7 +406,20 @@ pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
+/// Fails on the first fixture that does not parse or does not validate.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
+    let mut out = Vec::new();
+    for (path, trace) in load_suite_entries(dir)? {
+        out.push((path, trace?));
+    }
+    Ok(out)
+}
+
+/// Like [`load_suite`], but keeps the per-fixture load error instead of aborting the
+/// whole directory. The runner uses this so a single malformed fixture becomes one
+/// FAILED case in the report — named, and counted against `all_passed()` — rather
+/// than either aborting the suite or, worse, grading green.
+pub fn load_suite_entries(dir: &Path) -> anyhow::Result<Vec<(PathBuf, anyhow::Result<LlmTrace>)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
@@ -390,7 +427,7 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
-        let trace = LlmTrace::from_file(&path)?;
+        let trace = LlmTrace::from_file(&path);
         out.push((path, trace));
     }
     Ok(out)
@@ -810,6 +847,73 @@ mod tests {
             chain.contains("empty list"),
             "error must explain the empty list: {chain}"
         );
+    }
+
+    #[test]
+    fn unknown_memory_expectation_key_is_rejected() {
+        let err = load_fixture(
+            "unknown_memory_key",
+            r#"{"model_name":"m","turns":[],"expects":{"memory":{"presnt":["project/status"]}}}"#,
+        )
+        .expect_err("an unknown memory expectation key must be a load error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("presnt"),
+            "error must name the typo: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_memory_block_is_rejected() {
+        let err = load_fixture(
+            "empty_memory",
+            r#"{"model_name":"m","turns":[],"expects":{"memory":{}}}"#,
+        )
+        .expect_err("a present-but-empty memory block must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("expects.memory"),
+            "error must name the vacuous block: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_memory_contains_list_is_rejected() {
+        let err = load_fixture(
+            "empty_memory_list",
+            r#"{"model_name":"m","turns":[],"expects":{"memory":{"contains":{"project/status":[]}}}}"#,
+        )
+        .expect_err("an empty memory contains list must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("project/status") && chain.contains("empty list"),
+            "error must name the key and empty list: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_memory_contains_needle_is_rejected() {
+        let err = load_fixture(
+            "empty_memory_needle",
+            r#"{"model_name":"m","turns":[],"expects":{"memory":{"contains":{"project/status":[""]}}}}"#,
+        )
+        .expect_err("an empty memory contains needle must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty needle"),
+            "error must explain the empty needle: {chain}"
+        );
+    }
+
+    #[test]
+    fn populated_memory_and_workspace_blocks_are_admitted() {
+        let trace = load_fixture(
+            "populated_side_effects",
+            r#"{"model_name":"m","turns":[],"expects":{"memory":{"contains":{"project/status":["green"]}},"workspace":{"file_exists":["out.txt"]}}}"#,
+        )
+        .expect("non-empty side-effect expectations must load");
+        assert!(trace.expects.memory.is_some());
+        assert!(trace.expects.workspace.is_some());
     }
 
     #[test]
