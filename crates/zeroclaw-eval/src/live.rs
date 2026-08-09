@@ -213,6 +213,19 @@ pub async fn run_live_case(
     trace: &LlmTrace,
     deps: &RunDeps,
 ) -> anyhow::Result<crate::runner::CaseOutcome> {
+    let graders = crate::grader::default_graders(trace);
+    run_live_case_with_graders(trace, deps, graders).await
+}
+
+/// Injection seam for the live path, mirroring
+/// [`crate::runner::run_case_with_graders`]: the caller supplies the grader
+/// catalog so a test can observe the grade-before-workspace-drop ordering from
+/// inside a real live run.
+pub async fn run_live_case_with_graders(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    graders: Vec<Box<dyn crate::grader::Grader>>,
+) -> anyhow::Result<crate::runner::CaseOutcome> {
     ensure_no_scripted_steps(trace)?;
 
     let effective = effective_live_tools(trace.tools.as_deref(), &deps.live_tools);
@@ -324,7 +337,7 @@ pub async fn run_live_case(
         output_tokens,
     };
     // Grade while the temp workspace is still alive, then let `tmp` drop.
-    let grades = crate::grader::grade_run(trace, &record, tmp.path()).await;
+    let grades = crate::grader::grade_with(&graders, &record, tmp.path()).await;
     Ok(crate::runner::CaseOutcome { record, grades })
 }
 
@@ -775,6 +788,53 @@ mod tests {
         assert!(
             seen.iter().all(|m| m == "model-under-test"),
             "every chat call must carry the configured model: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_runner_grades_before_dropping_the_case_workspace() {
+        // The live path duplicates the replay path's grade-then-drop sequence
+        // (`live.rs` vs `runner.rs`), so it needs its own guard: a duplicated
+        // ordering contract is a duplicated regression risk. Same probe, same
+        // assertion, driven through `run_live_case_with_graders`.
+        //
+        // No `#[ignore]`/env guard is needed: the provider is injected, so this
+        // exercises the live runner's ordering without a real provider, a token,
+        // or any network egress.
+        let (probe, seen_alive, calls) = crate::runner::tests::WorkspaceProbe::new();
+
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "live-workspace-probe", "turns": [{ "user_input": "hi" }] }"#,
+        )
+        .unwrap();
+
+        let deps = live_deps(
+            |_trace| {
+                Ok(driver_provider(
+                    r#"{ "model_name": "driver", "turns": [{ "user_input": "x", "steps": [{ "response": { "type": "text", "content": "ok" } }] }] }"#,
+                ))
+            },
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let outcome = run_live_case_with_graders(&trace, &deps, vec![Box::new(probe)])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the injected grader must actually run on the real live path"
+        );
+        assert!(
+            seen_alive.load(std::sync::atomic::Ordering::SeqCst),
+            "live case workspace was torn down before the runner awaited grading"
+        );
+        assert!(
+            outcome.grades.iter().all(|g| g.passed),
+            "grades: {:?}",
+            outcome.grades
         );
     }
 }

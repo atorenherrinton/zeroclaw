@@ -30,7 +30,10 @@ pub struct GradeResult {
 }
 
 impl GradeResult {
-    fn new(
+    /// Construct a grade. Public because [`Grader`] is a public trait: an
+    /// out-of-crate grader (including the live-path integration tests) needs a
+    /// way to produce results without depending on field order.
+    pub fn new(
         check: String,
         passed: bool,
         detail: impl Into<String>,
