@@ -342,14 +342,18 @@ pub async fn finalize(
 
     // --write-baseline: persist the run and exit with its normal code.
     if let Some(path) = &opts.write_baseline {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(path, Baseline::from_report(&report).to_json())?;
+        // Fail closed BEFORE touching the filesystem: an incomplete baseline must
+        // neither be created nor replace an existing good one. The run's own exit
+        // code is carried in the error context so it is reported alongside the write
+        // failure rather than replaced by it.
+        let run_code = report.exit_code(kind, None);
+        let baseline = Baseline::from_report(&report)
+            .with_context(|| format!("--write-baseline aborted (run exit code {run_code})"))?;
+        write_baseline_atomically(path, &baseline.to_json())?;
         if opts.format == OutputFormat::Json {
             println!("{}", report.to_json(kind, None));
         }
-        return Ok(report.exit_code(kind, None));
+        return Ok(run_code);
     }
 
     // --baseline: compare, apply the live flakiness rule, and report.
@@ -717,6 +721,30 @@ pub fn write_dumps(
     Ok(any_auto)
 }
 
+/// Write `contents` to `path` via a sibling temp file plus rename, so the target is
+/// either the old file or the complete new one — never a truncated intermediate.
+/// A failure to serialize or write leaves any existing baseline untouched.
+fn write_baseline_atomically(path: &Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("baseline.json");
+    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
+    // Clean up the scratch file on any failure so a botched write leaves no litter.
+    if let Err(e) = std::fs::write(&tmp, contents) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Output format for the eval report.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutputFormat {
@@ -825,6 +853,107 @@ mod tests {
         write_dumps(&report, Some(explicit.path()), auto.path()).unwrap();
         let count = std::fs::read_dir(explicit.path()).unwrap().count();
         assert_eq!(count, 2, "colliding ids must produce two files, not one");
+    }
+
+    /// An errored case: no record, only an error string — exactly the shape
+    /// `--write-baseline` must refuse to serialize.
+    fn errored_case(name: &str) -> CaseReport {
+        let mut c = case_report(name, false);
+        c.record = None;
+        c
+    }
+
+    fn write_baseline_opts(path: &Path) -> FinalizeOpts {
+        FinalizeOpts {
+            format: OutputFormat::Table,
+            dump_records: None,
+            baseline: None,
+            write_baseline: Some(path.to_path_buf()),
+            suite_kind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_baseline_does_not_create_file_on_run_error() {
+        // A case errored before producing a record. The baseline would be silently
+        // short by that case, so the write must be refused outright — no file at all.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("baseline.json");
+        let report = SuiteReport {
+            cases: vec![case_report("ok", true), errored_case("boom-case")],
+        };
+
+        let err = finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            report,
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect_err("an errored report must fail --write-baseline");
+        assert!(
+            format!("{err:#}").contains("boom-case"),
+            "the failure must name the errored case: {err:#}"
+        );
+        assert!(
+            !target.exists(),
+            "no partial baseline may be left behind at {}",
+            target.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn write_baseline_preserves_existing_file_on_run_error() {
+        // An existing good baseline must survive a failed run byte-for-byte: the
+        // refusal happens before the target is created, truncated, or replaced.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("baseline.json");
+        let good = SuiteReport {
+            cases: vec![case_report("ok", true)],
+        };
+        finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            good,
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect("a complete report writes a baseline");
+        let before = std::fs::read(&target).unwrap();
+        assert!(!before.is_empty());
+
+        let broken = SuiteReport {
+            cases: vec![case_report("ok", true), errored_case("boom-case")],
+        };
+        let err = finalize(
+            &Config::default(),
+            Mode::Replay,
+            Path::new("evals/regression"),
+            broken,
+            write_baseline_opts(&target),
+        )
+        .await
+        .expect_err("an errored report must fail --write-baseline");
+        assert!(format!("{err:#}").contains("boom-case"));
+
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(
+            before, after,
+            "the existing baseline must be byte-identical after a failed run"
+        );
+        // The atomic write must not leave its scratch file behind either.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n != "baseline.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "stray files left behind: {leftovers:?}"
+        );
     }
 
     #[test]

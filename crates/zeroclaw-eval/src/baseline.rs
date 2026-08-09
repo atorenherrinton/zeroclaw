@@ -95,14 +95,34 @@ pub struct Baseline {
 }
 
 impl Baseline {
-    /// Build a baseline from a completed suite report (cases without a record,
-    /// i.e. errored before producing one, are skipped).
-    pub fn from_report(report: &SuiteReport) -> Baseline {
+    /// Build a baseline from a completed suite report.
+    ///
+    /// Fails closed: a baseline must describe **every** case in the suite. A case
+    /// that errored before producing a `RunRecord` cannot be represented, and
+    /// silently omitting it would make the case merely `New` on a later run —
+    /// and a failing `New` case is explicitly non-gating, so an incomplete
+    /// reference permanently excuses a regression.
+    pub fn from_report(report: &SuiteReport) -> anyhow::Result<Baseline> {
+        let mut missing: Vec<&str> = report
+            .cases
+            .iter()
+            .filter(|c| c.record.is_none())
+            .map(|c| c.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            missing.sort_unstable();
+            anyhow::bail!(
+                "refusing to write a baseline: {} case(s) produced no run record ({}); \
+                 fix the run errors and regenerate",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
         let entries = report.cases.iter().filter_map(entry_from_case).collect();
-        Baseline {
+        Ok(Baseline {
             schema: BASELINE_SCHEMA.to_string(),
             entries,
-        }
+        })
     }
 
     /// Serialize as pretty JSON.
@@ -456,7 +476,7 @@ mod tests {
     }
 
     fn baseline_of(current: &SuiteReport) -> Baseline {
-        Baseline::from_report(current)
+        Baseline::from_report(current).expect("every fixture case carries a record")
     }
 
     #[test]
@@ -546,6 +566,49 @@ mod tests {
     }
 
     #[test]
+    fn from_report_rejects_report_with_missing_record() {
+        // A case that errored before producing a RunRecord cannot be represented in a
+        // baseline. Skipping it would make the case merely `New` on a later run, and a
+        // failing `New` case never gates — permanently excusing the regression.
+        let mut errored = case("errored", vec![], 0);
+        errored.record = None;
+        errored.error = Some("provider exploded".to_string());
+        let report = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, GradeCategory::Response)], 10),
+                errored,
+            ],
+        };
+        let err = Baseline::from_report(&report)
+            .expect_err("a report with an errored case must not yield a baseline");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("errored"),
+            "the error must name the offending case_id: {msg}"
+        );
+        assert!(
+            msg.contains("refusing to write a baseline"),
+            "the error must state the refusal: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_report_accepts_a_complete_report() {
+        // Every case has a record — including a *failing* one. Only a missing record
+        // (a run error) blocks the write; an honest failure is baseline-able.
+        let report = SuiteReport {
+            cases: vec![
+                case("pass", vec![grade("c", true, GradeCategory::Response)], 10),
+                case("fail", vec![grade("c", false, GradeCategory::Response)], 10),
+            ],
+        };
+        let baseline = Baseline::from_report(&report).expect("a complete report is baseline-able");
+        assert_eq!(baseline.entries.len(), 2);
+        assert_eq!(baseline.entries[0].verdict, Verdict::Pass);
+        assert_eq!(baseline.entries[1].verdict, Verdict::Fail);
+    }
+
+    #[test]
     fn baseline_round_trips_through_json() {
         let report = SuiteReport {
             cases: vec![case(
@@ -554,7 +617,7 @@ mod tests {
                 35,
             )],
         };
-        let baseline = Baseline::from_report(&report);
+        let baseline = Baseline::from_report(&report).unwrap();
         let parsed = Baseline::from_json(&baseline.to_json()).unwrap();
         assert_eq!(parsed.schema, BASELINE_SCHEMA);
         assert_eq!(parsed.entries.len(), 1);
@@ -637,7 +700,7 @@ mod tests {
                 case("dup", vec![grade("c", false, GradeCategory::Response)], 10),
             ],
         };
-        let baseline = Baseline::from_report(&report);
+        let baseline = Baseline::from_report(&report).unwrap();
         let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
         assert!(err.to_string().contains("duplicate case_id"));
 
@@ -648,7 +711,7 @@ mod tests {
                 10,
             )],
         };
-        let empty_baseline = Baseline::from_report(&empty_report);
+        let empty_baseline = Baseline::from_report(&empty_report).unwrap();
         let err = Baseline::from_json(&empty_baseline.to_json()).unwrap_err();
         assert!(err.to_string().contains("empty case_id"));
     }
