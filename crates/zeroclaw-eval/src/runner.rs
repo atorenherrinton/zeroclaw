@@ -699,6 +699,47 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn run_record_carries_dispatched_arguments_and_tool_results() {
+        // End-to-end proof that the boundary payloads survive a real agent run:
+        // the Unicode argument reaches the tool and the tool's own output comes
+        // back, independent of whatever text the replay provider scripted.
+        const UNICODE: &str = r#"{
+            "model_name": "test-unicode-roundtrip",
+            "turns": [{
+                "user_input": "Répète: naïve café 日本語 ✓",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "naïve café 日本語 ✓"} }] } },
+                    { "response": { "type": "text", "content": "done" } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(UNICODE).unwrap();
+        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
+        let completion = outcome.record.completion_or_default();
+        assert_eq!(
+            completion.tool_calls.len(),
+            1,
+            "calls: {:?}",
+            completion.tool_calls
+        );
+        let call = &completion.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("naïve café 日本語 ✓"),
+            "dispatched arguments did not carry the Unicode message: {:?}",
+            call.arguments
+        );
+        assert_eq!(
+            call.result, "naïve café 日本語 ✓",
+            "tool result did not round-trip the Unicode message"
+        );
+        // The final response is scripted text and deliberately does NOT contain the
+        // Unicode string, so this assertion can only be satisfied by the boundary.
+        assert_eq!(completion.final_response, "done");
+    }
+
     const MULTI_TURN: &str = r#"{
         "model_name": "test-multi-turn",
         "turns": [

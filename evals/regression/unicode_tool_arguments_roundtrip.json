@@ -9,6 +9,13 @@
   "expects": {
     "response_contains": ["naïve café 日本語 ✓"],
     "tools_used": ["echo"],
-    "all_tools_succeeded": true
+    "exact_tool_calls": 1,
+    "all_tools_succeeded": true,
+    "tool_arguments_contain": [
+      { "tool": "echo", "needle": "naïve café 日本語 ✓" }
+    ],
+    "tool_results_contain": [
+      { "tool": "echo", "needle": "naïve café 日本語 ✓" }
+    ]
   }
 }
