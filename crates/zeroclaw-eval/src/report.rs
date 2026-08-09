@@ -30,13 +30,15 @@ impl CaseReport {
         self.grades.iter().filter(|g| g.passed).count()
     }
 
-    /// Partial-credit score: fraction of checks passed. A case with no checks
-    /// scores 1.0 (it passes vacuously). Informational; the gate is pass/fail.
-    pub fn score(&self) -> f64 {
+    /// Partial-credit score: fraction of checks passed, or `None` when the case
+    /// produced no checks (it errored before grading, or asserted nothing).
+    /// A vacuous case is not a perfect one, so it has no score rather than 1.0.
+    /// Informational; the gate is pass/fail.
+    pub fn score(&self) -> Option<f64> {
         if self.grades.is_empty() {
-            1.0
+            None
         } else {
-            self.checks_passed() as f64 / self.grades.len() as f64
+            Some(self.checks_passed() as f64 / self.grades.len() as f64)
         }
     }
 
@@ -205,6 +207,37 @@ mod tests {
     }
 
     #[test]
+    fn case_with_no_grades_has_no_score_and_does_not_pass() {
+        let vacuous = case("vacuous", vec![], None);
+        assert!(
+            !vacuous.passed(),
+            "a case with zero checks must not pass vacuously"
+        );
+        assert_eq!(
+            vacuous.score(),
+            None,
+            "a case with zero checks has no score, not a perfect one"
+        );
+    }
+
+    #[test]
+    fn errored_case_reports_null_score_in_json() {
+        // Regression: an errored case used to emit `passed: false` next to
+        // `score: 1.0`, so machine consumers read a provider/setup failure as a
+        // perfect run.
+        let suite = SuiteReport {
+            cases: vec![case("err", vec![], Some("provider timed out"))],
+        };
+        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        assert_eq!(json["cases"][0]["passed"].as_bool(), Some(false));
+        assert!(
+            json["cases"][0]["score"].is_null(),
+            "errored case must not report a numeric score, got: {}",
+            json["cases"][0]["score"]
+        );
+    }
+
+    #[test]
     fn suite_counts_reflect_per_case_pass_fail() {
         let suite = SuiteReport {
             cases: vec![
@@ -320,7 +353,7 @@ mod tests {
             error: None,
         };
         // score = 3/4 passed.
-        assert!((report.score() - 0.75).abs() < f64::EPSILON);
+        assert!((report.score().unwrap() - 0.75).abs() < f64::EPSILON);
         let totals = report.category_totals();
         assert_eq!(totals["response"]["passed"].as_u64(), Some(1));
         assert_eq!(totals["response"]["total"].as_u64(), Some(2));

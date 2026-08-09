@@ -14,6 +14,8 @@ pub enum GradeCategory {
     SideEffect,
     Budget,
     Judge,
+    /// The case itself is misconfigured (e.g. it declares no effective checks).
+    Config,
 }
 
 impl GradeCategory {
@@ -25,6 +27,7 @@ impl GradeCategory {
             GradeCategory::SideEffect => "side_effect",
             GradeCategory::Budget => "budget",
             GradeCategory::Judge => "judge",
+            GradeCategory::Config => "config",
         }
     }
 }
@@ -436,6 +439,18 @@ pub async fn grade_with(
     for grader in graders {
         grades.extend(grader.grade(record, &ctx).await);
     }
+    // Fail closed: a case that produced no grade asserted nothing about the run,
+    // so an empty grade list must not read as success. `TraceExpects::validate`
+    // rejects most of these at load time; this is the runtime backstop for cases
+    // built in-process (tests, embedded fixtures) that never went through it.
+    if grades.is_empty() {
+        grades.push(GradeResult::new(
+            "effective_checks".to_string(),
+            false,
+            "case declares no effective checks",
+            GradeCategory::Config,
+        ));
+    }
     grades
 }
 
@@ -510,9 +525,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_expectations_produce_no_results() {
-        let out = evaluate_expects(&TraceExpects::default(), &run("hi", &[], true));
-        assert!(out.is_empty());
+    fn empty_expectations_grade_as_an_explicit_configuration_failure() {
+        // Replaces `empty_expectations_produce_no_results`, which codified the
+        // silent-green behavior. A case that declares nothing must now surface a
+        // failing `config` grade rather than an empty (vacuously passing) list.
+        let trace: crate::case::LlmTrace =
+            serde_json::from_str(r#"{"model_name":"vacuous","turns":[],"expects":{}}"#).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let grades = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(grade_run(&trace, &run("hi", &[], true), tmp.path()));
+        assert_eq!(grades.len(), 1, "expected one config grade: {grades:?}");
+        assert!(!grades[0].passed, "the config grade must fail: {grades:?}");
+        assert_eq!(grades[0].category, GradeCategory::Config);
+        assert!(
+            grades[0].detail.contains("no effective checks"),
+            "detail must explain the failure: {:?}",
+            grades[0].detail
+        );
+        // The raw expectation evaluator still emits nothing; the fail-closed
+        // decision lives in grade_run, so this documents the boundary.
+        assert!(evaluate_expects(&TraceExpects::default(), &run("hi", &[], true)).is_empty());
     }
 
     #[test]

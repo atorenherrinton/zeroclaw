@@ -33,6 +33,7 @@ pub struct LlmTrace {
 
 /// Pre-run environment preparation for a case.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseSetup {
     /// Files written into the case's temp workspace before the run.
     /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
@@ -45,6 +46,7 @@ pub struct CaseSetup {
 /// `steps` is optional: replay cases script every LLM round-trip, while live
 /// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TraceTurn {
     pub user_input: String,
     #[serde(default)]
@@ -129,6 +131,7 @@ pub struct TraceExpects {
 
 /// End-state checks against the case workspace after the run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceExpects {
     /// Workspace-relative paths that must exist as a regular file after the run
     /// (a directory at the path does not satisfy the check).
@@ -146,6 +149,7 @@ pub struct WorkspaceExpects {
 /// Resource ceilings for the run (all optional; each present bound is one
 /// inclusive check, `actual <= max`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetExpects {
     /// Max accumulated input tokens reported by the provider.
     #[serde(default)]
@@ -167,10 +171,8 @@ pub struct BudgetExpects {
 impl TraceExpects {
     /// True when the fixture declares no effective assertion.
     ///
-    /// `evaluate_expects` produces one grade per declared expectation, and
-    /// `CaseReport::passed()` is vacuously true over zero grades. A case in
-    /// this state exercises the agent but certifies nothing, so a required
-    /// gate must reject it at load time rather than report it green.
+    /// A case in this state exercises the agent but certifies nothing, so a
+    /// required gate must reject it at load time rather than report it green.
     pub fn is_empty(&self) -> bool {
         self.response_contains.is_empty()
             && self.response_not_contains.is_empty()
@@ -179,6 +181,45 @@ impl TraceExpects {
             && self.max_tool_calls.is_none()
             && self.all_tools_succeeded.is_none()
             && self.response_matches.is_empty()
+            && self.response_json.is_empty()
+            && self
+                .workspace
+                .as_ref()
+                .is_none_or(WorkspaceExpects::is_empty)
+            && self.budget.as_ref().is_none_or(BudgetExpects::is_empty)
+    }
+
+    /// Reject nested expectation declarations that would produce no useful grade.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(workspace) = &self.workspace {
+            if workspace.is_empty() {
+                anyhow::bail!(
+                    "expects.workspace is present but declares no checks; \
+                     remove the block or add file_exists / file_absent / file_contains entries"
+                );
+            }
+            for (rel, needles) in &workspace.file_contains {
+                if needles.is_empty() {
+                    anyhow::bail!(
+                        "expects.workspace.file_contains[{rel:?}] is an empty list; \
+                         remove the entry or add at least one needle"
+                    );
+                }
+                if needles.iter().any(String::is_empty) {
+                    anyhow::bail!(
+                        "expects.workspace.file_contains[{rel:?}] contains an empty needle, \
+                         which every file trivially satisfies"
+                    );
+                }
+            }
+        }
+        if self.budget.as_ref().is_some_and(BudgetExpects::is_empty) {
+            anyhow::bail!(
+                "expects.budget is present but declares no bounds; \
+                 remove the block or set at least one max_* field"
+            );
+        }
+        Ok(())
     }
 
     /// The name of the first string-backed family holding a zero-length entry.
@@ -186,11 +227,8 @@ impl TraceExpects {
     /// A zero-length entry is admitted by [`is_empty`](Self::is_empty) because
     /// the vector is non-empty, yet it asserts nothing: every response contains
     /// the empty substring, the empty regex matches every response, and no tool
-    /// is ever recorded under an empty name. In the positive families that
-    /// yields a tautological pass and in `tools_not_used` a degenerate one, so
-    /// such an entry can certify the required gate green without testing any
-    /// behavior. The negative families are rejected on the same rule for a
-    /// consistent schema, even though they fail rather than falsely certify.
+    /// is ever recorded under an empty name. The negative families are rejected
+    /// on the same rule for a consistent schema.
     fn empty_entry_family(&self) -> Option<&'static str> {
         [
             ("response_contains", &self.response_contains),
@@ -200,8 +238,24 @@ impl TraceExpects {
             ("response_matches", &self.response_matches),
         ]
         .into_iter()
-        .find(|(_, values)| values.iter().any(|value| value.is_empty()))
+        .find(|(_, values)| values.iter().any(String::is_empty))
         .map(|(name, _)| name)
+    }
+}
+
+impl WorkspaceExpects {
+    fn is_empty(&self) -> bool {
+        self.file_exists.is_empty() && self.file_absent.is_empty() && self.file_contains.is_empty()
+    }
+}
+
+impl BudgetExpects {
+    fn is_empty(&self) -> bool {
+        self.max_input_tokens.is_none()
+            && self.max_output_tokens.is_none()
+            && self.max_total_tokens.is_none()
+            && self.max_duration_ms.is_none()
+            && self.max_llm_calls.is_none()
     }
 }
 
@@ -213,6 +267,10 @@ impl LlmTrace {
     }
 
     /// Load a trace from a JSON file.
+    ///
+    /// Fixture validation is part of loading: unknown keys are rejected by
+    /// `deny_unknown_fields`, and [`TraceExpects::validate`] rejects declarations
+    /// that would grade green without asserting anything.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
@@ -233,6 +291,10 @@ impl LlmTrace {
                 family
             );
         }
+        trace
+            .expects
+            .validate()
+            .with_context(|| format!("validating trace fixture {}", path.display()))?;
         Ok(trace)
     }
 }
@@ -567,6 +629,118 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write `body` to a fixture file and load it, returning the loader result.
+    fn load_fixture(name: &str, body: &str) -> anyhow::Result<LlmTrace> {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_fixture_validation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.json"));
+        std::fs::write(&path, body).unwrap();
+        let out = LlmTrace::from_file(&path);
+        let _ = std::fs::remove_file(&path);
+        out
+    }
+
+    #[test]
+    fn unknown_expectation_key_is_rejected() {
+        // A one-character typo (`workspce`) used to be silently ignored, turning
+        // a real regression check into permanent green.
+        let err = load_fixture(
+            "unknown_key",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"workspce":{"file_exists":["out.txt"]}}}"#,
+        )
+        .expect_err("an unknown expects key must be a load error");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("workspce"),
+            "error must name the unknown key: {chain}"
+        );
+        assert!(
+            chain.contains("unknown_key.json"),
+            "error must name the fixture path: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_workspace_block_is_rejected() {
+        let err = load_fixture(
+            "empty_workspace",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"workspace":{}}}"#,
+        )
+        .expect_err("a present-but-empty workspace block must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("expects.workspace"),
+            "error must name the vacuous block: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_budget_block_is_rejected() {
+        let err = load_fixture(
+            "empty_budget",
+            r#"{"model_name":"m","turns":[],"expects":{"response_contains":["hi"],"budget":{}}}"#,
+        )
+        .expect_err("a present-but-empty budget block must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("expects.budget"),
+            "error must name the vacuous block: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_expectation_list_is_rejected() {
+        let err = load_fixture(
+            "empty_list",
+            r#"{"model_name":"m","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[]}}}}"#,
+        )
+        .expect_err("an empty file_contains list must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty list"),
+            "error must explain the empty list: {chain}"
+        );
+    }
+
+    #[test]
+    fn empty_file_contains_needle_is_rejected() {
+        // `String::contains("")` is always true, so an empty needle always passes.
+        let err = load_fixture(
+            "empty_needle",
+            r#"{"model_name":"m","turns":[],"expects":{"workspace":{"file_contains":{"out.txt":[""]}}}}"#,
+        )
+        .expect_err("an empty file_contains needle must be rejected");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("empty needle"),
+            "error must explain the empty needle: {chain}"
+        );
+    }
+
+    #[test]
+    fn expects_declaring_no_effective_checks_is_rejected() {
+        let err = load_fixture("no_checks", r#"{"model_name":"m","turns":[],"expects":{}}"#)
+            .expect_err("a case that asserts nothing must be rejected at load time");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("no effective expectation"),
+            "error must explain the vacuous case: {chain}"
+        );
+    }
+
+    #[test]
+    fn a_single_real_check_is_enough_to_load() {
+        // Anti-vacuity for the rejections above: the validator is not simply
+        // refusing every fixture.
+        let trace = load_fixture(
+            "one_check",
+            r#"{"model_name":"m","turns":[],"expects":{"max_tool_calls":0}}"#,
+        )
+        .expect("a case with one real check must load");
+        assert_eq!(trace.expects.max_tool_calls, Some(0));
+        assert!(!trace.expects.is_empty());
     }
 
     #[test]
