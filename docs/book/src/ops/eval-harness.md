@@ -46,6 +46,28 @@ are cases.
 case to a `<testcase>`: a failing case becomes a `<failure>`, a run error an
 `<error>`, and a case that is unverifiable against a baseline a `<skipped/>`.
 
+Every accepted flag combination emits exactly one document in the requested
+format. In particular `--format junit --write-baseline <file>` writes the
+baseline **and** renders the report: a baseline refresh has no prior baseline to
+diff against, so it is rendered with an explicit *no-comparison* policy — no case
+is `<skipped/>`, because nothing was compared.
+
+A live case classified `flaky-unconfirmed` (it regressed against the baseline but
+passed on its single re-run) renders as `<skipped/>` with a `message` naming the
+reason, and its failing checks are preserved in `<system-out>`. This matches the
+"reported, never gated" contract and the process exit code: rendering it as
+`<failure>` while exiting 0 would put the XML and the exit status in
+contradiction.
+
+> ⚠️ **JUnit failure bodies can carry model output.** A failed `response_contains`
+> check reports what the model actually produced, so the complete final response
+> can land in a `<failure>` or `<system-out>` body — and CI reporters retain those
+> as build artifacts and PR annotations, often with wider visibility than the raw
+> logs. XML escaping protects document structure, not confidentiality. Treat a
+> JUnit artifact with the same care as a record dump (see *Record dumps* below),
+> and do not publish it from a suite whose fixtures or provider responses carry
+> sensitive content.
+
 ## Live mode
 
 Live mode (`--mode live`) runs each case against a real configured provider, so it
@@ -343,6 +365,14 @@ check becomes one graded result, tagged with a category (`response`, `tool`,
 with a per-case `score` and `category_totals`. The harness emits a failing
 `config` grade only as a runtime backstop when an in-process case bypasses the
 fixture loader and declares no effective checks.
+
+Unknown keys are **rejected** at fixture load, in `expects` and in the trace
+around it. A misspelled key would otherwise be silently discarded, leaving the
+case with no graded checks — and a case with no checks passes vacuously, so a
+typo in a new assertion would delete the assertion instead of failing loudly. A
+suite containing such a fixture now fails to load, naming the file and the
+offending key. A deliberately empty `"expects": {}` block is still valid and
+still yields a 0/0 case, so assertion-free smoke fixtures are unaffected.
 
 Response checks (category `response`):
 

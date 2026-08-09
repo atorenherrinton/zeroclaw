@@ -351,7 +351,7 @@ pub async fn finalize(
         match opts.format {
             OutputFormat::Json => println!("{}", report.to_json(kind, None)),
             OutputFormat::Junit => {
-                print!("{}", zeroclaw_eval::junit::render_junit(&report, &[]));
+                print!("{}", zeroclaw_eval::junit::render_junit(&report, &[], &[]));
             }
             OutputFormat::Table => {}
         }
@@ -406,7 +406,24 @@ pub async fn finalize(
                         .collect()
                 })
                 .unwrap_or_default();
-            print!("{}", zeroclaw_eval::junit::render_junit(&report, &skipped));
+            // Flaky-unconfirmed live cases are "reported, never gated" and exit
+            // 0, so they must not render as <failure>. Read them off the
+            // comparison rather than the local list, so the XML classification
+            // and the exit code are driven by the same source of truth.
+            let flaky: Vec<&str> = comparison
+                .as_ref()
+                .map(|cmp| {
+                    cmp.per_case
+                        .iter()
+                        .filter(|(_, c)| matches!(c, CaseComparison::FlakyUnconfirmed))
+                        .map(|(id, _)| id.as_str())
+                        .collect()
+                })
+                .unwrap_or_default();
+            print!(
+                "{}",
+                zeroclaw_eval::junit::render_junit(&report, &skipped, &flaky)
+            );
         }
         OutputFormat::Table => {}
     }

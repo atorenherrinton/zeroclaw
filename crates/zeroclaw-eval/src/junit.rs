@@ -67,19 +67,45 @@ fn escape_attr(input: &str) -> String {
     out
 }
 
+/// The `message` on a `<skipped/>` produced by a flaky-unconfirmed live case.
+pub const FLAKY_UNCONFIRMED_MESSAGE: &str = "flaky-unconfirmed: regressed against the baseline but passed on re-run (reported, never gated)";
+
 fn duration_secs(case: &CaseReport) -> f64 {
-    case.record
-        .as_ref()
-        .map_or(0.0, |record| {
-            record.completion_or_default().duration_ms as f64 / 1000.0
-        })
+    case.record.as_ref().map_or(0.0, |record| {
+        record.completion_or_default().duration_ms as f64 / 1000.0
+    })
 }
 
-/// Render a suite report as JUnit XML. `skipped` holds case ids that are
-/// unverifiable against a baseline (rendered as `<skipped/>`, neither pass nor
-/// fail).
-pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
-    let is_skipped = |case: &CaseReport| skipped.contains(&case_id(case));
+/// The `check: detail` lines for every failing grade, in order. Used for both
+/// the `<failure>` body and the flaky case's `<system-out>`.
+///
+/// ⚠️ These details can carry the model's complete final response (a failed
+/// `response_contains` check reports what was actually produced). CI reporters
+/// retain JUnit bodies as artifacts and annotations — see the handling note in
+/// `docs/book/src/ops/eval-harness.md`. Escaping protects document structure,
+/// not confidentiality.
+fn failure_body(case: &CaseReport) -> String {
+    case.grades
+        .iter()
+        .filter(|g| !g.passed)
+        .map(|g| format!("{}: {}", g.check, g.detail))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Render a suite report as JUnit XML.
+///
+/// `skipped` holds case ids that are unverifiable against a baseline; `flaky`
+/// holds live case ids that regressed but passed on their single re-run. Both
+/// render as `<skipped/>` — neither pass nor fail — because both are documented
+/// as "reported, never gated" and both exit 0. Rendering a flaky case as
+/// `<failure>` while the process exits 0 would put the XML and the exit status
+/// in direct contradiction, which is the first thing a CI consumer hits. A
+/// flaky case additionally carries its reason in the `<skipped message=…>` and
+/// the failing check details in `<system-out>`, so the signal is not lost.
+pub fn render_junit(report: &SuiteReport, skipped: &[&str], flaky: &[&str]) -> String {
+    let is_flaky = |case: &CaseReport| flaky.contains(&case_id(case));
+    let is_skipped = |case: &CaseReport| skipped.contains(&case_id(case)) || is_flaky(case);
 
     let mut tests = 0usize;
     let mut failures = 0usize;
@@ -111,7 +137,18 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
             escape_attr(&case.source),
             duration_secs(case)
         ));
-        if is_skipped(case) {
+        if is_flaky(case) {
+            // Reported, never gated: skipped, with the reason and the failing
+            // checks preserved so the run is still diagnosable.
+            xml.push_str(&format!(
+                "<skipped message=\"{}\"/>",
+                escape_attr(FLAKY_UNCONFIRMED_MESSAGE)
+            ));
+            let detail = failure_body(case);
+            if !detail.is_empty() {
+                xml.push_str(&format!("<system-out>{}</system-out>", escape(&detail)));
+            }
+        } else if is_skipped(case) {
             xml.push_str("<skipped/>");
         } else if let Some(err) = &case.error {
             xml.push_str(&format!(
@@ -123,15 +160,10 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
             let failing: Vec<&crate::grader::GradeResult> =
                 case.grades.iter().filter(|g| !g.passed).collect();
             if let Some(first) = failing.first() {
-                let body: String = failing
-                    .iter()
-                    .map(|g| format!("{}: {}", g.check, g.detail))
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 xml.push_str(&format!(
                     "<failure message=\"{}\">{}</failure>",
                     escape_attr(&first.check),
-                    escape(&body)
+                    escape(&failure_body(case))
                 ));
             }
         }
@@ -169,7 +201,7 @@ mod tests {
                 None,
             )],
         };
-        let xml = render_junit(&report, &[]);
+        let xml = render_junit(&report, &[], &[]);
         // The case name is escaped in the attribute.
         assert!(xml.contains("name=\"weird &lt;&quot;&amp;&apos;&gt; name\""));
         // The failure body escapes and replaces the control char (bell), keeps newline.
@@ -236,7 +268,7 @@ mod tests {
         c.source = format!("source{hostile}.json");
         let report = SuiteReport { cases: vec![c] };
 
-        let xml = render_junit(&report, &[]);
+        let xml = render_junit(&report, &[], &[]);
         let elements = parse_elements(&xml).expect("rendered JUnit must parse as XML 1.0");
 
         // No non-`Char` scalar survives anywhere in the document.
@@ -297,7 +329,7 @@ mod tests {
                 None,
             )],
         };
-        let xml = render_junit(&report, &[]);
+        let xml = render_junit(&report, &[], &[]);
         // Raw markup never reaches the body verbatim.
         assert!(xml.contains("a &lt; b &amp; c &gt; d"));
 
@@ -313,7 +345,7 @@ mod tests {
         let report = SuiteReport {
             cases: vec![case("err-id", vec![], Some("boom \u{FFFF}<bad>"))],
         };
-        let xml = render_junit(&report, &[]);
+        let xml = render_junit(&report, &[], &[]);
         let elements = parse_elements(&xml).expect("errored case must still parse");
         assert_eq!(
             attr(&elements, "error", "message"),
@@ -328,7 +360,7 @@ mod tests {
         let report = SuiteReport {
             cases: vec![case("two\nlines\there", vec![], None)],
         };
-        let xml = render_junit(&report, &[]);
+        let xml = render_junit(&report, &[], &[]);
         let elements = parse_elements(&xml).expect("must parse");
         assert_eq!(
             attr(&elements, "testcase", "name"),
@@ -346,12 +378,67 @@ mod tests {
                 case("changed", vec![grade("c", false, "")], None),
             ],
         };
-        let xml = render_junit(&report, &["changed"]);
+        let xml = render_junit(&report, &["changed"], &[]);
         assert!(xml.contains("tests=\"4\""));
         assert!(xml.contains("failures=\"1\"")); // only "bad"
         assert!(xml.contains("errors=\"1\"")); // only "err"
         assert!(xml.contains("skipped=\"1\"")); // only "changed"
         assert!(xml.contains("<skipped/>"));
         assert!(xml.contains("<error message=\"boom\">boom</error>"));
+    }
+
+    #[test]
+    fn flaky_unconfirmed_case_is_skipped_not_failed() {
+        // "Reported, never gated" and exit 0: rendering the case as <failure>
+        // would put the XML in direct contradiction with the exit status.
+        let report = SuiteReport {
+            cases: vec![
+                case("solid", vec![grade("c", true, "")], None),
+                case(
+                    "flappy",
+                    vec![grade("response_contains", false, "wanted 'hi', got 'yo'")],
+                    None,
+                ),
+            ],
+        };
+        let xml = render_junit(&report, &[], &["flappy"]);
+        let elements = parse_elements(&xml).expect("must parse");
+
+        assert!(xml.contains("skipped=\"1\""));
+        assert!(
+            xml.contains("failures=\"0\""),
+            "a flaky-unconfirmed case must not be counted as a failure: {xml}"
+        );
+        assert!(
+            !xml.contains("<failure"),
+            "a flaky-unconfirmed case must not render as <failure>: {xml}"
+        );
+        assert_eq!(
+            attr(&elements, "skipped", "message"),
+            Some(FLAKY_UNCONFIRMED_MESSAGE),
+            "the skip must state why it was not gated"
+        );
+        // The signal is preserved rather than discarded.
+        let text = parse_text(&xml).expect("must parse");
+        assert!(
+            text.contains("response_contains: wanted 'hi', got 'yo'"),
+            "the failing check must survive in <system-out>, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn flaky_and_unverifiable_both_skip_without_double_counting() {
+        let report = SuiteReport {
+            cases: vec![
+                case("hashchanged", vec![grade("c", false, "")], None),
+                case("flappy", vec![grade("c", false, "")], None),
+            ],
+        };
+        // A case listed in both lists must be counted once.
+        let xml = render_junit(&report, &["hashchanged", "flappy"], &["flappy"]);
+        assert!(xml.contains("tests=\"2\""));
+        assert!(xml.contains("skipped=\"2\""));
+        assert!(xml.contains("failures=\"0\""));
+        parse_elements(&xml).expect("must parse");
     }
 }
