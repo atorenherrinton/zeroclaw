@@ -2,20 +2,66 @@
 
 use crate::report::{CaseReport, SuiteReport, case_id};
 
-/// Escape XML text/attribute content and strip control characters (below 0x20
-/// except tab and newline), which are illegal in XML 1.0.
+/// The `name` attribute of the emitted `<testsuite>` root.
+pub const SUITE_NAME: &str = "zeroclaw-eval";
+
+/// The character used to replace scalars that no XML 1.0 document may contain.
+/// Replacement (rather than deletion) keeps otherwise-distinct ids distinct.
+const XML_REPLACEMENT: char = '\u{FFFD}';
+
+/// The XML 1.0 §2.2 `Char` production.
+///
+/// Anything outside this set makes a document unparseable no matter how it is
+/// escaped, so it must be replaced before it reaches an attribute value or an
+/// element body. Note this excludes `U+FFFE` and `U+FFFF`, which an "everything
+/// below `U+0020`" filter lets through.
+fn is_xml_char(c: char) -> bool {
+    matches!(c,
+        '\u{9}' | '\u{A}' | '\u{D}'
+        | '\u{20}'..='\u{D7FF}'
+        | '\u{E000}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{10FFFF}')
+}
+
+/// Escape one character for an element body. `\t`, `\n` and `\r` are legal
+/// literal characters in content, so they are passed through.
+fn push_escaped_text(out: &mut String, c: char) {
+    match c {
+        '&' => out.push_str("&amp;"),
+        '<' => out.push_str("&lt;"),
+        '>' => out.push_str("&gt;"),
+        '"' => out.push_str("&quot;"),
+        '\'' => out.push_str("&apos;"),
+        c => out.push(c),
+    }
+}
+
+/// Escape XML element-body content: replace every non-`Char` scalar, then escape
+/// markup. Order matters — sanitising after escaping would leave the illegal
+/// scalars in place.
 fn escape(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for c in input.chars() {
+        let c = if is_xml_char(c) { c } else { XML_REPLACEMENT };
+        push_escaped_text(&mut out, c);
+    }
+    out
+}
+
+/// Escape XML attribute content.
+///
+/// Same sanitising as [`escape`], plus numeric references for `\t`, `\n` and
+/// `\r`: an XML parser normalises literal whitespace in an attribute value to a
+/// space, so a raw newline in a case id would silently change on round-trip.
+fn escape_attr(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        let c = if is_xml_char(c) { c } else { XML_REPLACEMENT };
         match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            '\t' | '\n' => out.push(c),
-            c if (c as u32) < 0x20 => {} // drop other control chars
-            c => out.push(c),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c => push_escaped_text(&mut out, c),
         }
     }
     out
@@ -51,14 +97,16 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
     }
 
     let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     xml.push_str(&format!(
-        "<testsuite name=\"zeroclaw-eval\" tests=\"{tests}\" failures=\"{failures}\" errors=\"{errors}\" skipped=\"{skipped_count}\" time=\"{time:.3}\">\n"
+        "<testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failures}\" errors=\"{errors}\" skipped=\"{skipped_count}\" time=\"{time:.3}\">\n",
+        escape_attr(SUITE_NAME)
     ));
     for case in &report.cases {
         xml.push_str(&format!(
             "  <testcase name=\"{}\" classname=\"{}\" time=\"{:.3}\">",
-            escape(case_id(case)),
-            escape(&case.source),
+            escape_attr(case_id(case)),
+            escape_attr(&case.source),
             duration_secs(case)
         ));
         if is_skipped(case) {
@@ -66,7 +114,7 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
         } else if let Some(err) = &case.error {
             xml.push_str(&format!(
                 "<error message=\"{}\">{}</error>",
-                escape(err),
+                escape_attr(err),
                 escape(err)
             ));
         } else {
@@ -80,7 +128,7 @@ pub fn render_junit(report: &SuiteReport, skipped: &[&str]) -> String {
                     .join("\n");
                 xml.push_str(&format!(
                     "<failure message=\"{}\">{}</failure>",
-                    escape(&first.check),
+                    escape_attr(&first.check),
                     escape(&body)
                 ));
             }
@@ -127,9 +175,164 @@ mod tests {
         let xml = render_junit(&report, &[]);
         // The case name is escaped in the attribute.
         assert!(xml.contains("name=\"weird &lt;&quot;&amp;&apos;&gt; name\""));
-        // The failure body escapes and drops the control char (bell), keeps newline.
-        assert!(xml.contains("check&lt;x&gt;: line1\nline2bell"));
+        // The failure body escapes and replaces the control char (bell), keeps newline.
+        assert!(xml.contains("check&lt;x&gt;: line1\nline2\u{FFFD}bell"));
         assert!(!xml.contains('\u{0007}'));
+    }
+
+    /// Read the whole document with a real XML parser, returning every element
+    /// start (name plus its attribute values, already entity-decoded).
+    fn parse_elements(xml: &str) -> Result<Vec<(String, Vec<(String, String)>)>, String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut out = Vec::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Eof) => return Ok(out),
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                    let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                    let mut attrs = Vec::new();
+                    for a in e.attributes() {
+                        let a = a.map_err(|err| format!("attribute: {err}"))?;
+                        let key = String::from_utf8_lossy(a.key.as_ref()).into_owned();
+                        let value = a
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Explicit1_0,
+                                reader.decoder(),
+                            )
+                            .map_err(|err| format!("attribute value: {err}"))?
+                            .into_owned();
+                        attrs.push((key, value));
+                    }
+                    out.push((name, attrs));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("parse error at {}: {e}", reader.error_position())),
+            }
+        }
+    }
+
+    fn attr<'a>(
+        elements: &'a [(String, Vec<(String, String)>)],
+        element: &str,
+        key: &str,
+    ) -> Option<&'a str> {
+        elements
+            .iter()
+            .find(|(name, _)| name == element)?
+            .1
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn junit_output_parses_with_xml_edge_characters() {
+        // U+FFFE and U+FFFF are outside the XML 1.0 `Char` production: escaping
+        // cannot rescue them, so they must be replaced before they reach a sink.
+        let hostile = "id\u{FFFE}a\u{FFFF}b\u{1}c\u{B}d<>&\"'";
+        let mut c = case(
+            hostile,
+            vec![grade(hostile, false, &format!("detail {hostile}"))],
+            None,
+        );
+        c.source = format!("source{hostile}.json");
+        let report = SuiteReport { cases: vec![c] };
+
+        let xml = render_junit(&report, &[]);
+        let elements = parse_elements(&xml).expect("rendered JUnit must parse as XML 1.0");
+
+        // No non-`Char` scalar survives anywhere in the document.
+        assert!(!xml.contains('\u{FFFE}'));
+        assert!(!xml.contains('\u{FFFF}'));
+        assert!(!xml.contains('\u{1}'));
+        assert!(!xml.contains('\u{B}'));
+
+        let expected = "id\u{FFFD}a\u{FFFD}b\u{FFFD}c\u{FFFD}d<>&\"'";
+        assert_eq!(attr(&elements, "testcase", "name"), Some(expected));
+        assert_eq!(
+            attr(&elements, "testcase", "classname"),
+            Some(format!("source{expected}.json").as_str())
+        );
+        assert_eq!(attr(&elements, "failure", "message"), Some(expected));
+        assert_eq!(
+            elements.iter().filter(|(n, _)| n == "testsuite").count(),
+            1,
+            "exactly one <testsuite> root"
+        );
+    }
+
+    /// Read the document's character data with a real parser, resolving entity
+    /// and character references back to the text the writer was handed.
+    fn parse_text(xml: &str) -> Result<String, String> {
+        use quick_xml::events::Event;
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut text = String::new();
+        loop {
+            match reader.read_event() {
+                Ok(Event::Eof) => return Ok(text),
+                Ok(Event::Text(t)) => {
+                    text.push_str(&t.xml10_content().map_err(|e| format!("text: {e}"))?);
+                }
+                Ok(Event::GeneralRef(r)) => {
+                    if let Some(c) = r.resolve_char_ref().map_err(|e| format!("charref: {e}"))? {
+                        text.push(c);
+                    } else {
+                        let name = r.decode().map_err(|e| format!("ref: {e}"))?;
+                        let resolved = quick_xml::escape::resolve_predefined_entity(&name)
+                            .ok_or_else(|| format!("unresolved entity &{name};"))?;
+                        text.push_str(resolved);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => return Err(format!("parse error at {}: {e}", reader.error_position())),
+            }
+        }
+    }
+
+    #[test]
+    fn junit_escapes_markup_in_failure_bodies() {
+        let body_input = "a < b & c > d \" e ' f\u{FFFE}g";
+        let report = SuiteReport {
+            cases: vec![case("plain-id", vec![grade("chk", false, body_input)], None)],
+        };
+        let xml = render_junit(&report, &[]);
+        // Raw markup never reaches the body verbatim.
+        assert!(xml.contains("a &lt; b &amp; c &gt; d"));
+
+        let text = parse_text(&xml).expect("failure body must parse");
+        assert!(
+            text.contains("chk: a < b & c > d \" e ' f\u{FFFD}g"),
+            "round-tripped failure body was {text:?}"
+        );
+    }
+
+    #[test]
+    fn junit_error_sink_sanitizes_message_and_body() {
+        let report = SuiteReport {
+            cases: vec![case("err-id", vec![], Some("boom \u{FFFF}<bad>"))],
+        };
+        let xml = render_junit(&report, &[]);
+        let elements = parse_elements(&xml).expect("errored case must still parse");
+        assert_eq!(
+            attr(&elements, "error", "message"),
+            Some("boom \u{FFFD}<bad>")
+        );
+    }
+
+    #[test]
+    fn junit_attribute_newlines_survive_round_trip() {
+        // A literal newline in an attribute value is normalised to a space by
+        // any conforming parser, so it must be written as a numeric reference.
+        let report = SuiteReport {
+            cases: vec![case("two\nlines\there", vec![], None)],
+        };
+        let xml = render_junit(&report, &[]);
+        let elements = parse_elements(&xml).expect("must parse");
+        assert_eq!(
+            attr(&elements, "testcase", "name"),
+            Some("two\nlines\there")
+        );
     }
 
     #[test]
