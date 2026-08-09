@@ -40760,6 +40760,54 @@ allowed_users = []
     }
 
     #[tokio::test]
+    async fn renaming_a_provider_keeps_eval_live_provider_valid() {
+        // The corruption path B1 names: renaming a provider alias used to leave
+        // eval.live_provider pointing at the old name, so the config failed its
+        // own validation on the next load.
+        use crate::alias_refs::{AliasKind, ProviderCategory, rename_with_cascade};
+        let mut cfg = eval_live_provider_config("custom.default");
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        rename_with_cascade(&mut cfg, &kind, "default", "renamed").expect("rename must succeed");
+
+        assert_eq!(cfg.eval.live_provider.as_str(), "custom.renamed");
+        cfg.validate()
+            .expect("config must still validate after the rename");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_keeps_eval_live_provider_valid() {
+        // The delete half of B1: deleting an otherwise-unreferenced provider
+        // used to report success while leaving eval.live_provider dangling.
+        use crate::alias_refs::{AliasKind, CascadePolicy, ProviderCategory, delete_with_cascade};
+        let mut cfg = eval_live_provider_config("custom.spare");
+        cfg.providers
+            .models
+            .ensure("custom", "spare")
+            .expect("ensure the spare provider");
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = AliasKind::Provider {
+            category: ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        delete_with_cascade(&mut cfg, &kind, "spare", CascadePolicy::RefuseOnHard)
+            .expect("a soft eval ref must not block the delete");
+
+        assert!(
+            cfg.eval.live_provider.is_empty(),
+            "the dangling ref must be cleared, got {:?}",
+            cfg.eval.live_provider
+        );
+        cfg.validate()
+            .expect("config must still validate after the delete");
+    }
+
+    #[tokio::test]
     async fn config_validate_accepts_empty_eval_live_provider() {
         // Empty is the opt-out; it must validate.
         let cfg = eval_live_provider_config("");
