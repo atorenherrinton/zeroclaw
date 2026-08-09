@@ -155,6 +155,25 @@ an empty case id, or duplicate case ids is rejected at parse time, and a current
 run with duplicate case ids is rejected at comparison time, so malformed or
 ambiguous inputs can never produce a trusted gate result.
 
+Baseline *writes* fail closed too. A baseline must describe every case in the
+suite, so `--write-baseline` refuses to write at all when any case errored before
+producing a run record; the error names the offending case ids. This is deliberate:
+an omitted case would be classified merely `new` on the next run, and a failing
+`new` case never gates — so a silently shortened baseline would convert a hard
+regression into a permanently excused case. The check runs before any filesystem
+work and the write itself is atomic (temp file plus rename), so a failed run
+neither creates a new baseline nor replaces an existing one. A case that *failed
+its checks* is still recorded normally; only a missing record blocks the write.
+
+### Baseline schema compatibility
+
+Baseline entries carry a `sandbox` stamp, which is part of the comparability key.
+This widens the `zeroclaw-eval/baseline/v1` entry schema, and the parser is
+strict: **baseline files written before this change are rejected and must be
+regenerated once** with `--write-baseline`. This is a one-time migration —
+regenerate on a known-green run so the new reference is trustworthy, and commit
+the refreshed file.
+
 **Live flakiness rule:** in live mode, a comparable case that regressed is re-run
 once; if the re-run passes it is reported as `flaky (unconfirmed regression)` and
 does not gate. Replay flips the gate directly with no retry (it is deterministic).

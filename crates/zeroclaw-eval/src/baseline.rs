@@ -137,7 +137,8 @@ impl Baseline {
         let baseline: Baseline = serde_json::from_str(text)?;
         if baseline.schema != BASELINE_SCHEMA {
             anyhow::bail!(
-                "unsupported baseline schema {:?} (expected {BASELINE_SCHEMA:?})",
+                "unsupported baseline schema {:?} (expected {BASELINE_SCHEMA:?}); \
+                 regenerate the baseline once with --write-baseline on a known-green run",
                 baseline.schema
             );
         }
@@ -687,6 +688,12 @@ mod tests {
         };
         let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
         assert!(err.to_string().contains("unsupported baseline schema"));
+        // The message must tell the operator how to recover: the `sandbox` field
+        // widened the entry schema, so pre-existing baselines need one regeneration.
+        assert!(
+            err.to_string().contains("--write-baseline"),
+            "the rejection must name the regeneration step: {err}"
+        );
         // Arbitrary non-baseline schema strings are rejected too.
         baseline.schema = "not-a-baseline".to_string();
         assert!(Baseline::from_json(&baseline.to_json()).is_err());
