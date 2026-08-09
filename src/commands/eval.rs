@@ -296,6 +296,8 @@ pub struct FinalizeOpts {
 
 /// Handle the post-run flow (dumps, baselines, comparison, printing) and return
 /// the process exit code. Kept together so `main` only wires flags.
+///
+/// Every accepted format is emitted exactly once, including baseline writes.
 pub async fn finalize(
     config: &Config,
     mode: Mode,
@@ -346,8 +348,12 @@ pub async fn finalize(
         let baseline = Baseline::from_report(&report)
             .with_context(|| format!("--write-baseline aborted (run exit code {run_code})"))?;
         write_baseline_atomically(path, &baseline.to_json()?)?;
-        if opts.format == OutputFormat::Json {
-            println!("{}", report.to_json(kind, None));
+        match opts.format {
+            OutputFormat::Json => println!("{}", report.to_json(kind, None)),
+            OutputFormat::Junit => {
+                print!("{}", zeroclaw_eval::junit::render_junit(&report, &[]));
+            }
+            OutputFormat::Table => {}
         }
         return Ok(run_code);
     }

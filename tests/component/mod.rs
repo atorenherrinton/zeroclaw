@@ -13,6 +13,7 @@ mod daemon_startup_feedback;
 mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
+mod eval_junit_cli;
 mod gateway;
 mod gemini_capabilities;
 mod otel_dependency_feature_regression;

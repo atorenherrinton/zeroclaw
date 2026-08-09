@@ -70,7 +70,9 @@ fn escape_attr(input: &str) -> String {
 fn duration_secs(case: &CaseReport) -> f64 {
     case.record
         .as_ref()
-        .map_or(0.0, |r| r.duration_ms as f64 / 1000.0)
+        .map_or(0.0, |record| {
+            record.completion_or_default().duration_ms as f64 / 1000.0
+        })
 }
 
 /// Render a suite report as JUnit XML. `skipped` holds case ids that are
@@ -145,12 +147,7 @@ mod tests {
     use crate::grader::{GradeCategory, GradeResult};
 
     fn grade(check: &str, passed: bool, detail: &str) -> GradeResult {
-        GradeResult {
-            check: check.to_string(),
-            passed,
-            detail: detail.to_string(),
-            category: GradeCategory::Response,
-        }
+        GradeResult::new(check.to_string(), passed, detail, GradeCategory::Response)
     }
 
     fn case(name: &str, grades: Vec<GradeResult>, error: Option<&str>) -> CaseReport {
@@ -294,7 +291,11 @@ mod tests {
     fn junit_escapes_markup_in_failure_bodies() {
         let body_input = "a < b & c > d \" e ' f\u{FFFE}g";
         let report = SuiteReport {
-            cases: vec![case("plain-id", vec![grade("chk", false, body_input)], None)],
+            cases: vec![case(
+                "plain-id",
+                vec![grade("chk", false, body_input)],
+                None,
+            )],
         };
         let xml = render_junit(&report, &[]);
         // Raw markup never reaches the body verbatim.
