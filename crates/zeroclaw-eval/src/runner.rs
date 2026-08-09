@@ -123,11 +123,13 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     }
 
     let (input_tokens, output_tokens) = observer.tokens();
+    let tool_calls = observer.calls();
     Ok(RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: observer.tool_names(),
+        tools_called: tool_calls.iter().map(|c| c.name.clone()).collect(),
         all_tools_succeeded: observer.all_tools_succeeded(),
+        tool_calls,
         input_tokens,
         output_tokens,
     })
