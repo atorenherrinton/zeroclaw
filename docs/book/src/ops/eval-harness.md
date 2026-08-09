@@ -141,16 +141,20 @@ them).
 Records can be dumped as JSON:
 
 - `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
-  every case.
-- On every run, any failed or errored case is auto-dumped to
-  `target/eval-last-run/<case_id>.json` (cleared at the start of each run). When
-  any exist, the table footer prints `failed-case records: target/eval-last-run/`.
+  every case. The directory and files are restricted to the current user.
+- On every completed run, failed or errored cases are auto-dumped under
+  `<install>/eval-artifacts/runs/<run-id>/`. The table footer prints the exact
+  directory when any failed-case records exist. The owner-only
+  `<install>/eval-artifacts/last-run` pointer names that completed run.
 
 Dumps are debugging artifacts, not fixtures. A live transcript can embed
 workspace file content and model output, so **never commit a dump**;
-`target/` is gitignored. Promoting a dump into a suite fixture requires the same
-privacy placeholder pass as any other fixture (see the privacy contract): no real
-names, transcripts, hostnames, or credentials.
+the automatic directory is private runtime state outside the current working
+directory. Completed-run publication is serialized across processes: a new run
+replaces the pointer atomically, then retires the previous completed run while
+leaving other processes' active staging directories alone. Promoting a dump into
+a suite fixture requires the same privacy placeholder pass as any other fixture
+(see the privacy contract): no real names, transcripts, hostnames, or credentials.
 
 ## Case format
 

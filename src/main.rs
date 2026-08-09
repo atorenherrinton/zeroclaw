@@ -5911,23 +5911,39 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report =
+                let (report, artifacts) =
                     commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                let wrote_auto = commands::eval::write_dumps(
+                // Dumps land in this run's private staging dir. Publication moves
+                // that directory into the immutable completed-run area and swaps
+                // the `last-run` pointer while holding the cross-process lock.
+                let dump_result = commands::eval::write_dumps(
                     &report,
                     dump_records.as_deref().map(std::path::Path::new),
-                    std::path::Path::new(commands::eval::AUTO_DUMP_DIR),
-                )?;
+                    &artifacts.staged,
+                );
+                let wrote_auto = match dump_result {
+                    Ok(wrote_auto) => wrote_auto,
+                    Err(error) => {
+                        if let Err(cleanup_error) = artifacts.discard() {
+                            return Err(error.context(format!(
+                                "also failed to discard unpublished eval artifacts: {cleanup_error}"
+                            )));
+                        }
+                        return Err(error);
+                    }
+                };
+                let published = artifacts.publish()?;
                 // Footer is a table affordance only; never emit it in JSON mode, or
                 // it would corrupt the machine-readable stdout artifact.
                 if wrote_auto && format == commands::eval::OutputFormat::Table {
+                    let dir = published.display().to_string();
                     println!(
                         "{}",
                         ta(
                             "cli-eval-failed-case-records",
-                            &[("dir", commands::eval::AUTO_DUMP_DIR)],
-                            &format!("  failed-case records: {}/", commands::eval::AUTO_DUMP_DIR),
+                            &[("dir", dir.as_str())],
+                            &format!("  failed-case records: {dir}/"),
                         )
                     );
                 }
