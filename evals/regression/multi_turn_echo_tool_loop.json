@@ -13,7 +13,15 @@
   "expects": {
     "response_contains": ["beta"],
     "tools_used": ["echo"],
-    "max_tool_calls": 2,
-    "all_tools_succeeded": true
+    "exact_tool_calls": 2,
+    "all_tools_succeeded": true,
+    "tool_arguments_contain": [
+      { "tool": "echo", "needle": "alpha", "call_index": 0 },
+      { "tool": "echo", "needle": "beta", "call_index": 1 }
+    ],
+    "tool_results_contain": [
+      { "tool": "echo", "needle": "alpha", "call_index": 0 },
+      { "tool": "echo", "needle": "beta", "call_index": 1 }
+    ]
   }
 }

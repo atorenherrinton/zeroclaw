@@ -181,6 +181,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_record_carries_dispatched_arguments_and_tool_results() {
+        // End-to-end proof that the boundary payloads survive a real agent run:
+        // the Unicode argument reaches the tool and the tool's own output comes
+        // back, independent of whatever text the replay provider scripted.
+        const UNICODE: &str = r#"{
+            "model_name": "test-unicode-roundtrip",
+            "turns": [{
+                "user_input": "Répète: naïve café 日本語 ✓",
+                "steps": [
+                    { "response": { "type": "tool_calls", "tool_calls": [{ "id": "call_1", "name": "echo", "arguments": {"message": "naïve café 日本語 ✓"} }] } },
+                    { "response": { "type": "text", "content": "done" } }
+                ]
+            }],
+            "expects": {}
+        }"#;
+        let trace: LlmTrace = serde_json::from_str(UNICODE).unwrap();
+        let record = run_case(&trace).await.unwrap();
+        assert_eq!(record.tool_calls.len(), 1, "calls: {:?}", record.tool_calls);
+        let call = &record.tool_calls[0];
+        assert_eq!(call.name, "echo");
+        assert!(
+            call.arguments.contains("naïve café 日本語 ✓"),
+            "dispatched arguments did not carry the Unicode message: {:?}",
+            call.arguments
+        );
+        assert_eq!(
+            call.result, "naïve café 日本語 ✓",
+            "tool result did not round-trip the Unicode message"
+        );
+        // The final response is scripted text and deliberately does NOT contain the
+        // Unicode string, so this assertion can only be satisfied by the boundary.
+        assert_eq!(record.final_response, "done");
+    }
+
+    #[tokio::test]
     async fn live_mode_is_rejected_in_phase_0() {
         let dir = tempfile::tempdir().unwrap();
         let err = run_suite(dir.path(), Mode::Live).await.unwrap_err();
