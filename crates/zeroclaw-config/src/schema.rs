@@ -40763,6 +40763,104 @@ allowed_users = []
         );
     }
 
+    /// The regression that actually bricks a config: rename the provider alias the
+    /// eval harness points at, serialize, reload, and validate. Before the alias
+    /// walkers knew about `eval.*_provider`, the saved TOML kept the old alias and
+    /// the next startup refused to load it — with no in-product recovery.
+    #[tokio::test]
+    async fn save_reload_after_alias_rename_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.default"
+            judge_provider = "custom.default"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::rename_with_cascade(&mut cfg, &kind, "default", "prod")
+            .expect("provider rename succeeds");
+
+        // Round-trip through the serialized form, exactly as a save + next startup would.
+        let saved = toml::to_string(&cfg).expect("serialize renamed config");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert_eq!(reloaded.eval.live_provider.as_str(), "custom.prod");
+        assert_eq!(reloaded.eval.judge_provider.as_str(), "custom.prod");
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias rename");
+    }
+
+    /// Deleting the alias must cascade into both eval refs, so the saved config
+    /// does not carry a dangling reference that validation rejects on reload.
+    #[tokio::test]
+    async fn save_reload_after_alias_delete_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [providers.models.custom.spare]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.spare"
+            judge_provider = "custom.spare"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::delete_with_cascade(
+            &mut cfg,
+            &kind,
+            "spare",
+            crate::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft eval refs must not block the delete");
+
+        let saved = toml::to_string(&cfg).expect("serialize config after delete");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert!(reloaded.eval.live_provider.is_empty());
+        assert!(reloaded.eval.judge_provider.is_empty());
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias delete");
+    }
+
     #[tokio::test]
     async fn renaming_a_provider_keeps_eval_live_provider_valid() {
         // The corruption path B1 names: renaming a provider alias used to leave
