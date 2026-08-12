@@ -159,7 +159,7 @@ Baseline *writes* fail closed too. A baseline must describe every case in the
 suite, so `--write-baseline` refuses to write at all when any case errored before
 producing a run record; the error names the offending case ids. This is deliberate:
 an omitted case would be classified merely `new` on the next run, and a failing
-`new` case never gates — so a silently shortened baseline would convert a hard
+`new` case never gates, so a silently shortened baseline would convert a hard
 regression into a permanently excused case. The check runs before any filesystem
 work and the write itself is atomic (temp file plus rename), so a failed run
 neither creates a new baseline nor replaces an existing one. A case that *failed
@@ -170,7 +170,7 @@ its checks* is still recorded normally; only a missing record blocks the write.
 Baseline entries carry a `sandbox` stamp, which is part of the comparability key.
 This widens the `zeroclaw-eval/baseline/v1` entry schema, and the parser is
 strict: **baseline files written before this change are rejected and must be
-regenerated once** with `--write-baseline`. This is a one-time migration —
+regenerated once** with `--write-baseline`. This is a one-time migration:
 regenerate on a known-green run so the new reference is trustworthy, and commit
 the refreshed file.
 
