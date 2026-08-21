@@ -33,8 +33,8 @@ pub use capability::{
 };
 pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
 pub use executor::{
-    SopDriverHandles, SopDriverRegistry, SopDriverSink, drive_resumed_broker_action,
-    register_sop_driver, spawn_headless_run_driver,
+    SopDriverHandles, SopDriverRegistry, SopDriverSink, admit_sop_driver,
+    drive_resumed_broker_action, spawn_and_register_sop_driver, spawn_headless_run_driver,
 };
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,

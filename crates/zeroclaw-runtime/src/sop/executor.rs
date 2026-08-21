@@ -260,16 +260,22 @@ impl SopDriverSink {
         ) {
             return;
         }
-        let driver = spawn_headless_run_driver(
+        spawn_and_register_sop_driver(
+            &self.handles,
             self.config.as_ref().clone(),
             Arc::clone(&self.engine),
             self.audit.clone(),
             action.clone(),
         );
-        register_sop_driver(&self.handles, driver);
     }
 }
 
+/// Start a headless run driver **without** registering it with a generation.
+///
+/// Only for a caller that has no generation to register with, where the
+/// process itself bounds the driver's life. Every generation-owned surface uses
+/// [`spawn_and_register_sop_driver`], which cannot create a driver that the
+/// generation has not already accepted.
 pub fn spawn_headless_run_driver(
     config: zeroclaw_config::schema::Config,
     engine: Arc<Mutex<SopEngine>>,
@@ -281,38 +287,66 @@ pub fn spawn_headless_run_driver(
     })
 }
 
-/// Register a headless driver in a generation-owned handle set: prune the
-/// finished entries, then add the new one. The set's owner (the daemon
-/// generation's driver supervisor) drains it at reload and shutdown, which is
-/// what keeps every registered driver inside one configuration boundary.
+/// Admit a headless driver into a generation-owned handle set, creating the
+/// task only once the generation has accepted it.
 ///
-/// Returns `false` when the set is already closed. A driver produced after its
-/// generation drained has no owner left to drain it, so it is aborted rather
-/// than tracked: letting it run would continue SOP work under superseded
-/// configuration and permissions, which is what the generation boundary
-/// forbids.
-pub fn register_sop_driver(
-    handles: &SopDriverHandles,
-    handle: tokio::task::JoinHandle<()>,
-) -> bool {
+/// `spawn` is called while the registry lock is held, so the admission check
+/// and the task's creation are one indivisible step that `close_and_take`
+/// cannot interleave with. That ordering is the whole point. Spawning first and
+/// registering afterwards leaves a window in which Tokio can poll the driver
+/// before registration discovers the generation is closed: the rejected driver
+/// can already be mutating the SOP engine under superseded configuration and
+/// permissions. Cancelling it afterwards does not close that window either,
+/// because `abort` only requests cancellation at the next await point — a
+/// driver that reaches none would have to be abandoned mid-flight.
+///
+/// Returns `false` when the set is already closed, in which case `spawn` is
+/// never called. No task exists to cancel, own, or lose: the work is refused
+/// before its body can run, which is the guarantee the generation boundary
+/// needs. Prunes finished entries on the way in so a long-lived daemon does not
+/// accumulate them.
+pub fn admit_sop_driver<F>(handles: &SopDriverHandles, spawn: F) -> bool
+where
+    F: FnOnce() -> tokio::task::JoinHandle<()>,
+{
     let mut guard = match handles.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     if guard.is_closed() {
-        handle.abort();
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-            "Refused a SOP driver registered after its generation drained; aborted it rather \
-             than leaving it running under superseded configuration"
+            "Refused a SOP driver whose generation had already drained; it was never started, so \
+             no step ran under superseded configuration"
         );
         return false;
     }
     guard.drivers.retain(|existing| !existing.is_finished());
-    guard.drivers.push(handle);
+    guard.drivers.push(spawn());
     true
+}
+
+/// Start a headless run driver and register it with its generation in one
+/// atomic step.
+///
+/// The supported way for a generation-owned surface — cron, channel ingress,
+/// the dashboard, an approval resume — to start a driver: [`admit_sop_driver`]
+/// holds the registry lock across both halves, so a driver either belongs to an
+/// open generation or is never created. A caller with no generation to belong
+/// to (a one-shot command, whose process ends with it) uses
+/// [`spawn_headless_run_driver`] directly instead.
+pub fn spawn_and_register_sop_driver(
+    handles: &SopDriverHandles,
+    config: zeroclaw_config::schema::Config,
+    engine: Arc<Mutex<SopEngine>>,
+    audit: Option<Arc<SopAuditLogger>>,
+    first_action: SopRunAction,
+) -> bool {
+    admit_sop_driver(handles, move || {
+        spawn_headless_run_driver(config, engine, audit, first_action)
+    })
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -332,20 +366,31 @@ pub fn drive_resumed_broker_action(
         return;
     };
 
-    let handle = spawn_headless_run_driver(config.clone(), engine, audit, action.as_ref().clone());
     match handles {
         // Generation-owned: the daemon's driver supervisor drains this set at
         // reload and shutdown, so an approval-resumed driver cannot keep
-        // working under superseded configuration unobserved.
-        // A refusal here means the generation drained between the approval
-        // resolving and this registration; `register_sop_driver` has already
-        // aborted the driver, so there is nothing further to do.
+        // working under superseded configuration unobserved. An approval can
+        // resolve on a connection task that outlived its listener, so the
+        // generation may already have drained by the time this runs; admission
+        // and creation share one lock, so that case refuses the driver instead
+        // of starting one nothing will drain.
         Some(handles) => {
-            register_sop_driver(handles, handle);
+            spawn_and_register_sop_driver(
+                handles,
+                config.clone(),
+                engine,
+                audit,
+                action.as_ref().clone(),
+            );
         }
         // No generation supervisor on this surface (a one-shot command): the
         // process ends with the command, so the driver cannot outlive policy.
-        None => drop(handle),
+        None => drop(spawn_headless_run_driver(
+            config.clone(),
+            engine,
+            audit,
+            action.as_ref().clone(),
+        )),
     }
 }
 

@@ -246,23 +246,29 @@ pub async fn handle_sop_run(
                 );
                 if needs_driver {
                     let config = state.config.read().clone();
-                    let driver = zeroclaw_runtime::sop::spawn_headless_run_driver(
-                        config,
-                        std::sync::Arc::clone(engine),
-                        Some(std::sync::Arc::clone(audit)),
-                        action.as_ref().clone(),
-                    );
                     // A dashboard run outlives the request that started it, but
                     // it does not outlive the daemon generation whose config and
-                    // engine it captured: it registers with that generation's
+                    // engine it captured: it is admitted into that generation's
                     // set like every other surface, so one reload drains all of
-                    // them. Only a caller with no generation to belong to (a
-                    // standalone gateway) detaches.
+                    // them, and a generation that has already drained refuses it
+                    // before it starts. Only a caller with no generation to
+                    // belong to (a standalone gateway) detaches.
                     match state.sop_driver_handles.as_ref() {
                         Some(handles) => {
-                            zeroclaw_runtime::sop::register_sop_driver(handles, driver);
+                            zeroclaw_runtime::sop::spawn_and_register_sop_driver(
+                                handles,
+                                config,
+                                std::sync::Arc::clone(engine),
+                                Some(std::sync::Arc::clone(audit)),
+                                action.as_ref().clone(),
+                            );
                         }
-                        None => drop(driver),
+                        None => drop(zeroclaw_runtime::sop::spawn_headless_run_driver(
+                            config,
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        )),
                     }
                 }
                 return Json(serde_json::json!({ "run_id": run_id })).into_response();
