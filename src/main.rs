@@ -11064,6 +11064,49 @@ mod tests {
         );
     }
 
+    /// The open half of the same boundary, and the control for the refusal test
+    /// above: admission creates the driver AND takes ownership of it in one
+    /// step, so the set a generation drains really does hold the task it
+    /// started — and a driver body that is allowed to run does run, which is
+    /// what stops the refusal test from passing vacuously.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_admitted_into_an_open_generation_is_created_and_owned() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drivers = SopDriverSet::default();
+        let body_ran = std::sync::Arc::new(AtomicBool::new(false));
+        let body_flag = std::sync::Arc::clone(&body_ran);
+
+        let admitted = zeroclaw_runtime::sop::admit_sop_driver(&drivers, || {
+            ::zeroclaw_spawn::spawn!(async move {
+                body_flag.store(true, Ordering::SeqCst);
+            })
+        });
+
+        assert!(admitted, "an open generation admits a driver");
+        assert_eq!(
+            drivers.lock().unwrap().len(),
+            1,
+            "the admitted driver is owned by the generation that admitted it"
+        );
+
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.is_empty(),
+            "the admitted driver finished well inside the drain"
+        );
+        assert!(
+            body_ran.load(Ordering::SeqCst),
+            "an admitted driver's body must actually run, or the refusal test proves nothing"
+        );
+    }
+
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn agent_fallback_uses_hardcoded_when_config_uses_default() {
