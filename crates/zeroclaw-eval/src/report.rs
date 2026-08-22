@@ -104,8 +104,10 @@ impl SuiteReport {
     /// Process exit code for a completed run. Gating is strictly per-case:
     /// - Regression suites, no baseline: 0 iff every case passed.
     /// - Regression suites, with a baseline: the comparison is the single
-    ///   authority — 1 iff [`BaselineComparison::gates`], i.e. at least one
-    ///   confirmed per-case Pass->Fail regression or a current run error
+    ///   authority — 1 iff
+    ///   [`BaselineComparison::gates`](crate::baseline::BaselineComparison::gates),
+    ///   i.e. at least one confirmed per-case Pass->Fail regression or a
+    ///   current run error
     ///   (classified `CurrentError`; an errored case has no trustworthy
     ///   comparison). Failures classified `New`, `Unchanged`, `Unverifiable`,
     ///   or `FlakyUnconfirmed` are reported but never gate; a case that failed
