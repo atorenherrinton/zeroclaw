@@ -209,9 +209,13 @@ mod tests {
         assert!(!xml.contains('\u{0007}'));
     }
 
+    /// One element start: its name plus its attributes as entity-decoded
+    /// `(key, value)` pairs, in document order.
+    type Element = (String, Vec<(String, String)>);
+
     /// Read the whole document with a real XML parser, returning every element
     /// start (name plus its attribute values, already entity-decoded).
-    fn parse_elements(xml: &str) -> Result<Vec<(String, Vec<(String, String)>)>, String> {
+    fn parse_elements(xml: &str) -> Result<Vec<Element>, String> {
         use quick_xml::events::Event;
         let mut reader = quick_xml::Reader::from_str(xml);
         let mut out = Vec::new();
@@ -242,7 +246,7 @@ mod tests {
     }
 
     fn attr<'a>(
-        elements: &'a [(String, Vec<(String, String)>)],
+        elements: &'a [Element],
         element: &str,
         key: &str,
     ) -> Option<&'a str> {
