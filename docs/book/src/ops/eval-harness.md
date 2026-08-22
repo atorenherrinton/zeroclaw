@@ -46,11 +46,11 @@ are cases.
 case to a `<testcase>`: a failing case becomes a `<failure>`, a run error an
 `<error>`, and a case that is unverifiable against a baseline a `<skipped/>`.
 
-Every accepted flag combination emits exactly one document in the requested
-format. In particular `--format junit --write-baseline <file>` writes the
+Every accepted JUnit flag combination emits exactly one XML document. In
+particular `--format junit --write-baseline <file>` writes the
 baseline **and** renders the report: a baseline refresh has no prior baseline to
-diff against, so it is rendered with an explicit *no-comparison* policy — no case
-is `<skipped/>`, because nothing was compared.
+diff against, so it is rendered with an explicit *no-comparison* policy: no
+case is `<skipped/>`, because nothing was compared.
 
 A live case classified `flaky-unconfirmed` (it regressed against the baseline but
 passed on its single re-run) renders as `<skipped/>` with a `message` naming the
@@ -61,12 +61,12 @@ contradiction.
 
 > ⚠️ **JUnit failure bodies can carry model output.** A failed `response_contains`
 > check reports what the model actually produced, so the complete final response
-> can land in a `<failure>` or `<system-out>` body — and CI reporters retain those
-> as build artifacts and PR annotations, often with wider visibility than the raw
-> logs. XML escaping protects document structure, not confidentiality. Treat a
-> JUnit artifact with the same care as a record dump (see *Record dumps* below),
-> and do not publish it from a suite whose fixtures or provider responses carry
-> sensitive content.
+> can land in a `<failure>` or `<system-out>` body, and CI reporters retain
+> those as build artifacts and PR annotations, often with wider visibility than
+> the raw logs. XML escaping protects document structure, not confidentiality.
+> Treat a JUnit artifact with the same care as a record dump (see *Record dumps*
+> below), and do not publish it from a suite whose fixtures or provider responses
+> carry sensitive content.
 
 ## Live mode
 
@@ -326,12 +326,11 @@ with a per-case `score` and `category_totals`. The harness emits a failing
 fixture loader and declares no effective checks.
 
 Unknown keys are **rejected** at fixture load, in `expects` and in the trace
-around it. A misspelled key would otherwise be silently discarded, leaving the
-case with no graded checks — and a case with no checks passes vacuously, so a
-typo in a new assertion would delete the assertion instead of failing loudly. A
-suite containing such a fixture now fails to load, naming the file and the
-offending key. A deliberately empty `"expects": {}` block is still valid and
-still yields a 0/0 case, so assertion-free smoke fixtures are unaffected.
+around it. A misspelled key would otherwise be silently discarded and delete
+the intended assertion. A suite containing such a fixture fails to load,
+naming the file and offending key. Omitted, empty, or otherwise ineffective
+expectations are rejected by the same fail-closed loader contract described
+above.
 
 Response checks (category `response`):
 
