@@ -12958,6 +12958,13 @@ mod tests {
 
         let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
         let watch = tempfile::tempdir().expect("watch dir");
+        // Canonical, not as handed out: on macOS the temp dir sits under
+        // `/var`, a symlink to `/private/var`, and the watcher reports the
+        // resolved path. Configuring the trigger with the unresolved one makes
+        // `filesystem_path_matches` compare two spellings of the same
+        // directory and never fire, so the adapter would look broken on a
+        // platform where it is not.
+        let watch_dir = std::fs::canonicalize(watch.path()).expect("canonical watch dir");
         {
             let mut engine = harness.engine.lock().unwrap();
             engine.set_sops_for_test(vec![Sop {
@@ -12967,7 +12974,7 @@ mod tests {
                 execution_mode: SopExecutionMode::Auto,
                 priority: SopPriority::Normal,
                 triggers: vec![SopTrigger::Filesystem {
-                    path: watch.path().to_string_lossy().into_owned(),
+                    path: watch_dir.to_string_lossy().into_owned(),
                     events: vec![],
                     condition: None,
                 }],
@@ -13004,7 +13011,7 @@ mod tests {
             zeroclaw_channels::filesystem::FilesystemChannelConfig {
                 config: zeroclaw_config::schema::FilesystemConfig {
                     enabled: true,
-                    paths: vec![watch.path().to_string_lossy().into_owned()],
+                    paths: vec![watch_dir.to_string_lossy().into_owned()],
                     events: vec!["created".into(), "modified".into()],
                     debounce_ms: 50,
                     ..Default::default()
