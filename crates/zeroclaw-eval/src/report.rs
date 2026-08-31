@@ -16,9 +16,14 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error, produced at least one grade,
+    /// and every grade passed.
+    ///
+    /// Fixture admission rejects assertion-free cases, but this aggregation
+    /// boundary also fails closed so a caller cannot manufacture a green
+    /// report from an empty grade vector.
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
     }
 
     fn checks_passed(&self) -> usize {
@@ -159,8 +164,8 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
-        // No checks and no error passes vacuously.
-        assert!(case("a", vec![], None).passed());
+        // No checks cannot certify a passing case.
+        assert!(!case("a", vec![], None).passed());
     }
 
     #[test]
