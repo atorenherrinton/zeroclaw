@@ -55,22 +55,35 @@ pub fn scrub_credentials(input: &str) -> String {
 static SENSITIVE_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(authorization|token|api[_-]?key|password|secret|user[_-]?key|bearer|credential|set[_-]?cookie|cookie)"#).unwrap()
 });
+const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
+
+/// Whether a JSON key denotes a credential value on a human-facing surface.
+///
+/// Keep every rendering boundary on this classifier so a top-level scalar does
+/// not lose the credential context before structured redaction can inspect it.
+pub fn is_credential_key(key: &str) -> bool {
+    crate::approval::looks_like_secret_key(key) || SENSITIVE_KEY_REGEX.is_match(key)
+}
 
 /// Structured-aware credential scrub for a JSON value bound for a human-facing
-/// surface. Object entries whose key names a credential have their string value
-/// redacted in place, preserving the key; every other string leaf still runs
-/// through the text [`scrub_credentials`] so inline `token=...` patterns inside
-/// unrelated fields are caught too. Serialize-then-scrub would corrupt key names
-/// that merely contain a sensitive word (e.g. `access_token`), so this walks the
-/// value instead. Same rendering-boundary contract as [`scrub_credentials`].
+/// surface. Object entries whose key names a credential have their entire value
+/// replaced with a marker, preserving the key. Every other string leaf still
+/// runs through the text [`scrub_credentials`] so inline `token=...` patterns
+/// inside unrelated fields are caught too. Serialize-then-scrub would corrupt
+/// key names that merely contain a sensitive word (e.g. `access_token`), so this
+/// walks the value instead. Same rendering-boundary contract as
+/// [`scrub_credentials`].
 pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             let scrubbed = map
                 .into_iter()
                 .map(|(key, val)| {
-                    if SENSITIVE_KEY_REGEX.is_match(&key) {
-                        (key, redact_credential_leaf(val))
+                    if is_credential_key(&key) {
+                        (
+                            key,
+                            serde_json::Value::String(REDACTED_CREDENTIAL_VALUE.to_string()),
+                        )
                     } else {
                         (key, scrub_credentials_value(val))
                     }
@@ -86,41 +99,27 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Redact a value sitting under a credential-named key. A string keeps a short
-/// prefix for context; every other shape is replaced outright.
-///
-/// Recursing into containers instead would only redact descendants that
-/// themselves name a credential, and a secret under such a key is routinely
-/// carried by something that does not: `{"api_key": {"value": "..."}}`,
-/// `{"token": ["..."]}`, `{"password": 12345678}`. Tool arguments are arbitrary
-/// JSON, so the shape cannot be assumed — the key alone has to be enough.
-/// `null` is left as-is: it carries nothing, and preserving it keeps presence
-/// checks on the redacted document meaningful.
-fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(s) => {
-            let prefix = s
-                .char_indices()
-                .nth(4)
-                .map(|(byte_idx, _)| &s[..byte_idx])
-                .filter(|_| s.chars().count() > 4)
-                .unwrap_or("");
-            serde_json::Value::String(format!("{prefix}*[REDACTED]"))
-        }
-        serde_json::Value::Null => serde_json::Value::Null,
-        _ => serde_json::Value::String("*[REDACTED]".into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{scrub_credentials, scrub_credentials_value};
+    use super::{is_credential_key, scrub_credentials, scrub_credentials_value};
 
     #[test]
+    fn credential_key_classification_combines_shared_secret_policies() {
+        for key in ["private_key", "api_key", "cookie", "set-cookie", "user-key"] {
+            assert!(is_credential_key(key), "expected credential key: {key}");
+        }
+        assert!(!is_credential_key("status"));
+    }
+
+    /// The shape the RPC run-detail response leans on: tool arguments are
+    /// arbitrary JSON, so a secret under a credential-named key is routinely
+    /// carried by a descendant that names nothing sensitive. A key-based walk
+    /// that recursed would leave every one of these intact. Sibling coverage in
+    /// `scrub_credentials_value_replaces_every_credential_value_shape` takes the
+    /// nested-object, numeric, and boolean shapes; this one adds the array and
+    /// `null` cases and asserts no seeded secret reaches the wire.
+    #[test]
     fn a_credential_key_redacts_its_value_whatever_the_shape() {
-        // Each secret sits under a credential-named key but is carried by a
-        // descendant that names nothing sensitive, so a key-based walk that
-        // recursed would leave every one of them intact.
         let value = serde_json::json!({
             "api_key": {"value": "NESTEDSECRET"},
             "token": ["ARRAYSECRET"],
@@ -138,15 +137,13 @@ mod tests {
                 "{secret} must not survive scrubbing"
             );
         }
-        assert_eq!(scrubbed["api_key"], "*[REDACTED]");
-        assert_eq!(scrubbed["token"], "*[REDACTED]");
-        assert_eq!(scrubbed["password"], "*[REDACTED]");
-        assert_eq!(scrubbed["secret"], "*[REDACTED]");
-        assert_eq!(
-            scrubbed["credential"],
-            serde_json::Value::Null,
-            "null carries nothing, so presence stays observable"
-        );
+        for key in ["api_key", "token", "password", "secret"] {
+            assert_eq!(scrubbed[key], "[REDACTED]", "{key} must be replaced whole");
+        }
+        // Even `null` is replaced rather than preserved: the marker is what
+        // tells a reader the key was withheld, and a surviving `null` would
+        // read as a value the run genuinely had.
+        assert_eq!(scrubbed["credential"], "[REDACTED]");
     }
 
     #[test]
@@ -183,6 +180,33 @@ mod tests {
         let set_cookie = out["body"]["set-cookie"].as_str().unwrap();
         assert!(set_cookie.contains("[REDACTED]"));
         assert!(!set_cookie.contains("9f8e7d6c5b4a3210feed"));
+        assert_eq!(out["body"]["status"], "ok");
+    }
+
+    #[test]
+    fn scrub_credentials_value_matches_summary_secret_key_policy() {
+        let input = serde_json::json!({"body": {"private_key": "tiny"}});
+        let out = scrub_credentials_value(input);
+
+        assert_eq!(out["body"]["private_key"], "[REDACTED]");
+        assert_ne!(out["body"]["private_key"], "tiny");
+    }
+
+    #[test]
+    fn scrub_credentials_value_replaces_every_credential_value_shape() {
+        let input = serde_json::json!({
+            "body": {
+                "numeric_token": 1234,
+                "credentials": {"value": "tiny"},
+                "auth_enabled": true,
+                "status": "ok"
+            }
+        });
+        let out = scrub_credentials_value(input);
+
+        for key in ["numeric_token", "credentials", "auth_enabled"] {
+            assert_eq!(out["body"][key], "[REDACTED]");
+        }
         assert_eq!(out["body"]["status"], "ok");
     }
 
