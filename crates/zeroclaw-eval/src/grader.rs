@@ -186,23 +186,38 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     out
 }
 
-/// Build the case's graders and run them while the workspace is alive, returning
-/// every grade concatenated. Phase 0 / this milestone's grader set is just
-/// [`ExpectationsGrader`]; later milestones extend it from the case declarations.
+/// Build the production grader catalog for a case.
+///
+/// Keeping construction separate lets the runner accept a test-supplied
+/// catalog while production still has one canonical default.
+pub fn default_graders(trace: &crate::case::LlmTrace) -> Vec<Box<dyn Grader>> {
+    vec![Box::new(ExpectationsGrader {
+        expects: trace.expects.clone(),
+    })]
+}
+
+/// Run a supplied grader catalog while the workspace is alive, returning all
+/// grades in catalog order.
+pub async fn grade_with(
+    graders: &[Box<dyn Grader>],
+    record: &RunRecord,
+    workspace: &std::path::Path,
+) -> Vec<GradeResult> {
+    let ctx = GradeContext { workspace };
+    let mut grades = Vec::new();
+    for grader in graders {
+        grades.extend(grader.grade(record, &ctx).await);
+    }
+    grades
+}
+
+/// Build the case's default graders and run them while the workspace is alive.
 pub async fn grade_run(
     trace: &crate::case::LlmTrace,
     record: &RunRecord,
     workspace: &std::path::Path,
 ) -> Vec<GradeResult> {
-    let ctx = GradeContext { workspace };
-    let graders: Vec<Box<dyn Grader>> = vec![Box::new(ExpectationsGrader {
-        expects: trace.expects.clone(),
-    })];
-    let mut grades = Vec::new();
-    for grader in &graders {
-        grades.extend(grader.grade(record, &ctx).await);
-    }
-    grades
+    grade_with(&default_graders(trace), record, workspace).await
 }
 
 #[cfg(test)]

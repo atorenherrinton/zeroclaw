@@ -11,9 +11,7 @@ pub mod runner;
 pub mod tools;
 
 pub use case::{CaseSetup, LlmTrace, TraceExpects};
-pub use grader::{
-    GradeCategory, GradeContext, GradeResult, Grader, RunCompletedGrader, default_graders,
-};
+pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_graders};
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
 pub use runner::{
