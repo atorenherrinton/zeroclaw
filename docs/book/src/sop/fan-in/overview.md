@@ -19,12 +19,14 @@ Every SOP trigger type, its fields, and its dispatch status, projected directly 
 
 {{#sop-trigger-index}}
 
-Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener) start runs as events arrive; cron triggers are dispatched by the daemon's periodic SOP maintenance tick; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); the remaining defined-but-unwired sources (webhook, peripheral, calendar) validate and match but have no live event source routing into the dispatcher yet.
+Each source has a dedicated guide in the sidebar. Live sources (delivered by a running listener or authenticated gateway request) start runs as events arrive; cron triggers are dispatched by the daemon's periodic SOP maintenance tick; agent-initiated runs start from inside an agent turn via [`sop_execute`](./manual.md); the remaining defined-but-unwired sources (peripheral and calendar) validate and match but have no live event source routing into the dispatcher yet.
 
 ## Security defaults
 
 | Concern | Mechanism |
 |---|---|
+| **Webhook authentication** | Gateway pairing bearer authentication plus optional `gateway.webhook_secret`/`X-Webhook-Secret`; `/sop/*` and `/webhook` share the same rate limiter. At least one control must be configured for SOP dispatch, and every configured control must pass. The separate `[channels.webhook]` alias secrets never authorize these routes |
+| **Webhook replay protection** | Optional `X-Idempotency-Key`, namespaced per SOP path as well as separately between `/sop/*` and `/webhook`. Keys are reserved before dispatch and mean at-most-once attempt, not proof that a prior run started |
 | **MQTT transport** | `mqtts://` with `use_tls = true` for TLS transport |
 | **Filesystem roots** | Broad roots (`/`, `/home`, `/etc`, `/var`, `/proc`, `/sys`, `/dev`, `/tmp`) rejected at config validation unless `allow_broad_roots`; include/exclude globs scope events |
 | **Filesystem symlinks** | Symlink event paths are rejected before any metadata, hash, or content read by default; `follow_symlinks = true` opts in but still requires the canonical target to resolve inside a watched root |
@@ -46,7 +48,8 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | Cron SOP fails every run with "which is disabled" | the owning agent is configured with `enabled = false` | Re-enable the agent, or point `agent` at one that is enabled |
 | Dashboard run button returns `422` for a manual SOP | the procedure's `execute` steps declare no owner, and a dashboard run has no agent turn to inherit one from | Set `agent` in `SOP.toml` (or on the step), or start the procedure from an agent with `sop_execute` |
 | A cron step cannot call a tool it used interactively | the step's `scope` excludes it under `step_scope_enforce`, or it is a SOP control tool | Widen the step's `scope`; the SOP control tools stay excluded by design |
-| Webhook, peripheral, or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
+| Webhook trigger never fires | exact trigger path mismatch, SOP subsystem unavailable, or authentication rejected | Run `zeroclaw daemon` with `sop.sops_dir` configured, match the full request path exactly, and provide the configured bearer/secret headers |
+| Peripheral or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([Webhook](./webhook.md), [MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
 | Cron trigger never fires | maintenance tick not running (no `zeroclaw daemon` or `zeroclaw channel start`; standalone `gateway start` does not run it), `sops_dir` unset/empty, or `maintenance_interval_secs = 0` | Run `zeroclaw daemon` (or `zeroclaw channel start`) with `sop.sops_dir` set to a non-empty value (unset by default; the documented value is `shared/sops`) and `sop.maintenance_interval_secs` non-zero (default `60`) |
 
 ## See also

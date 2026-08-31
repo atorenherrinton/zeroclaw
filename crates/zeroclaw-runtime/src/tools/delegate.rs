@@ -38,6 +38,15 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
 }
 
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|source| source.is::<zeroclaw_providers::ReliableProviderTerminalFailure>())
+    {
+        // Reliable's aggregate is the durable retry diagnostic for delegated
+        // task records; other typed terminal failures use the delivery projection.
+        return format!("Agent '{agent_name}' failed: {error}");
+    }
+
     crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
@@ -152,6 +161,15 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// The daemon's shared live-config handle, when the registry that built
+    /// this tool had one. `root_config` above is a *snapshot* taken at
+    /// construction; every nested registry this tool builds must additionally
+    /// receive this handle so the target's per-execution resolvers (plugin
+    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
+    /// config reloads and credential rotation instead of the startup snapshot.
+    /// `None` for one-shot / non-daemon callers, which keep the documented
+    /// snapshot fallback.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -209,8 +227,8 @@ impl DelegateAction {
     }
 }
 
-struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+pub(crate) struct IndependentTargetTools {
+    pub(crate) tools: crate::tools::scoped::ScopedToolRegistry,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
@@ -267,6 +285,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -314,6 +333,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -417,6 +437,21 @@ impl DelegateTool {
         self
     }
 
+    /// Attach the daemon's shared live-config handle alongside
+    /// [`Self::with_root_config`].
+    ///
+    /// `with_root_config` supplies the snapshot this tool reads synchronously
+    /// (reachability, target mode, per-target policy). This supplies the handle
+    /// that every *nested* registry built for a delegated target needs so its
+    /// per-execution resolvers follow reloads. Passing `None` is the documented
+    /// one-shot behavior and keeps the snapshot fallback; dropping the handle
+    /// when the caller has one silently pins delegated plugin tools to startup
+    /// config for the parent's whole lifetime.
+    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+        self.live_config = live_config;
+        self
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -425,7 +460,10 @@ impl DelegateTool {
         self
     }
 
-    fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+    pub(crate) fn policy_for_target(
+        &self,
+        target_alias: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -688,7 +726,7 @@ impl DelegateTool {
         ]
     }
 
-    async fn independent_agentic_tools_for_target(
+    pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
@@ -752,7 +790,15 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // The delegated target's registry is built once, here, but its
+            // plugin tools and `send_via` authority resolve per execution. They
+            // must resolve against the daemon's shared handle, not the
+            // `root_config` snapshot this DelegateTool captured at
+            // construction - otherwise a reload or credential rotation is
+            // invisible to every delegated plugin tool for the parent's whole
+            // lifetime. `None` only when the parent registry itself had no live
+            // handle (one-shot callers), which keeps the snapshot fallback.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -788,14 +834,16 @@ impl DelegateTool {
         // destructure could (see `ScopedAssembled::combined_mcp_prompt_section`).
         let deferred_section = assembled.combined_mcp_prompt_section();
         let crate::tools::scoped::ScopedAssembled {
-            registry,
+            mut registry,
             activated_handle,
             ..
         } = assembled;
-        let mut tools = registry.into_inner();
-        tools.retain(|tool| tool.name() != Self::NAME);
+        // Strip the delegate tool from the ALREADY-sealed registry via the
+        // `retain` mutator - no unseal/reseal round-trip through a raw `Vec`.
+        // Same set removed as before (`tool.name() != Self::NAME`).
+        registry.retain(|tool| tool.name() != Self::NAME);
         Ok(IndependentTargetTools {
-            tools,
+            tools: registry,
             deferred_section,
             activated_handle,
             workspace_dir: target_workspace,
@@ -1610,6 +1658,9 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        // Carried, not dropped: the background task rebuilds a DelegateTool that
+        // will construct its own nested registries.
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
@@ -1643,6 +1694,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
                 };
 
@@ -1873,6 +1925,9 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            // Carried, not dropped: each fan-out task rebuilds a DelegateTool
+            // that will construct its own nested registries.
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let step_scope = parent_step_scope.clone();
@@ -1899,6 +1954,7 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
@@ -2445,8 +2501,6 @@ impl DelegateTool {
             }
         };
 
-        // Determine shell policy instructions when the `shell` tool is in the
-        // effective tool list.
         let empty_tools: &[Box<dyn Tool>] = &[];
         let expose_text_tools =
             sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
@@ -2455,17 +2509,8 @@ impl DelegateTool {
         } else {
             empty_tools
         };
-        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
-        let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
-        } else {
-            String::new()
-        };
+
+        let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
         let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
@@ -2483,24 +2528,21 @@ impl DelegateTool {
             identity_config: None,
             dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
-
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            shell_profile,
         };
 
         let builder = SystemPromptBuilder::default()
             .add_section(Box::new(crate::agent::prompt::ToolsSection))
             .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
             .add_section(Box::new(crate::agent::prompt::DateTimeSection));
 
         let mut enriched = builder.build(&ctx).unwrap_or_default();
-
-        if !shell_policy.is_empty() {
-            enriched.push_str(&shell_policy);
-            enriched.push_str("\n\n");
-        }
 
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
@@ -2605,7 +2647,7 @@ impl DelegateTool {
         // describes exactly the assembled skill tools rather than the local bundle resolver's
         // narrower view. None for bounded delegation (local resolution).
         let mut sub_skills: Option<Vec<crate::skills::Skill>> = None;
-        let mut sub_tools: Vec<Box<dyn Tool>> = match target_mode {
+        let mut sub_tools: crate::tools::scoped::ScopedToolRegistry = match target_mode {
             DelegateExecutionMode::Independent => {
                 match self
                     .independent_agentic_tools_for_target(agent_name, Arc::clone(&target_policy))
@@ -2660,18 +2702,60 @@ impl DelegateTool {
                     HashMap::new()
                 };
 
-                let parent_tools = self.parent_tools.read();
-                parent_tools
-                    .iter()
-                    .filter(|tool| tool.name() != Self::NAME)
-                    .filter(|tool| self.security.is_tool_allowed(tool.name()))
-                    .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
-                    .map(|tool| {
-                        target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
-                            Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                // Build the bounded tool set exactly as before: the parent's
+                // tools, filtered by the caller's own `is_tool_allowed` +
+                // `delegate_admits_with_mcp`, with the target's memory tools
+                // substituted in. The `parent_tools` read guard is scoped to
+                // this block so it drops BEFORE the `assemble().await` below - a
+                // parking_lot guard held across an await would make the delegate
+                // future `!Send`.
+                let filtered: Vec<Box<dyn Tool>> = {
+                    let parent_tools = self.parent_tools.read();
+                    parent_tools
+                        .iter()
+                        .filter(|tool| tool.name() != Self::NAME)
+                        .filter(|tool| self.security.is_tool_allowed(tool.name()))
+                        .filter(|tool| Self::delegate_admits_with_mcp(&tool_policy, tool.name()))
+                        .map(|tool| {
+                            target_memory_tools.remove(tool.name()).unwrap_or_else(|| {
+                                Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>
+                            })
                         })
-                    })
-                    .collect()
+                        .collect()
+                };
+                // Seal the already-filtered set through the one assembly seam.
+                // The policy is `SecurityPolicy::default()` (no allow/deny
+                // lists), so `assemble`'s built-in filter is a provable identity
+                // over `filtered`: it drops nothing the delegate filter kept.
+                // Re-applying `self.security` here would double-filter and could
+                // REGRESS delegate scoping, so it is deliberately NOT reused. No
+                // peripherals / MCP / skills / memory-strip. A default config is
+                // load-bearing here: the caller's config could synthesize pipeline
+                // tools and violate the bounded parent-registry ceiling.
+                let bounded_default_config = Config::default();
+                let bounded_security = Arc::new(SecurityPolicy::default());
+                let assembled_bounded = crate::tools::scoped::ScopedToolRegistry::assemble(
+                    crate::tools::scoped::ScopedAssembly {
+                        config: &bounded_default_config,
+                        agent_alias: agent_name,
+                        security: &bounded_security,
+                        built: crate::tools::AllToolsResult::from_prebuilt_tools(filtered),
+                        // Empty is load-bearing: bounded children inherit no target skill
+                        // tools, and a non-empty list would make this default policy active.
+                        skills: &[],
+                        runtime: Arc::new(crate::platform::NativeRuntime::new()),
+                        caller_allowed: None,
+                        connect_mcp: false,
+                        connect_peripherals: false,
+                        exclude_memory: false,
+                        acp_delivery: false,
+                        list_deferred_mcp_specs: false,
+                        emit_assembly_logs: false,
+                        mcp_registry: None,
+                    },
+                )
+                .await;
+                assembled_bounded.registry
             }
         };
 
@@ -2695,6 +2779,21 @@ impl DelegateTool {
         let native_tools = model_provider
             .capabilities_for_model(model)
             .native_tool_calling;
+
+        // Independent delegates execute as target-owned turns, so their thinking policy
+        // must override the parent task-local scope for the child loop. Bounded delegates
+        // deliberately retain the caller's turn context.
+        let thinking_params = (target_mode == DelegateExecutionMode::Independent).then(|| {
+            crate::agent::thinking::apply_thinking_level_with_config(
+                loop_runtime.thinking.default_level,
+                &loop_runtime.thinking,
+            )
+        });
+        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
+            temperature.map(|value| {
+                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
+            })
+        });
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2720,6 +2819,16 @@ impl DelegateTool {
             native_tools,
             loop_runtime.strict_tool_parsing,
         );
+        let enriched_system_prompt = match (
+            enriched_system_prompt,
+            thinking_params
+                .as_ref()
+                .and_then(|params| params.system_prompt_prefix.as_deref()),
+        ) {
+            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+            (None, Some(prefix)) => Some(prefix.to_string()),
+            (prompt, None) => prompt,
+        };
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -2739,7 +2848,9 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let result = tokio::time::timeout(
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let loop_knobs = LoopKnobs::default();
+        let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
@@ -2748,7 +2859,7 @@ impl DelegateTool {
                         model_provider,
                         provider_name: provider_type,
                         model,
-                        temperature,
+                        temperature: effective_temperature,
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
@@ -2775,14 +2886,14 @@ impl DelegateTool {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
+                        knobs: &loop_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2809,8 +2920,15 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
-        )
-        .await;
+        );
+        let result = match thinking_params {
+            Some(params) => {
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(params.native_thinking, execution)
+                    .await
+            }
+            None => execution.await,
+        };
 
         match result {
             Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
@@ -2859,6 +2977,9 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -2888,6 +3009,10 @@ impl Tool for ToolArcRef {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -2920,13 +3045,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
+    use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
         ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
-    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+    use zeroclaw_providers::{
+        ChatRequest, ChatResponse, ReliableProviderTerminalFailure,
+        ReliableProviderTerminalFailureKind, ToolCall,
+    };
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
@@ -5463,6 +5592,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_retains_provider_terminal_diagnostic() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "custom",
+            "model",
+            Err(anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Connection,
+                None,
+                "All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+                    .to_string(),
+            ))),
+        );
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'delegate' failed: All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+            )
+        );
+    }
+
+    #[test]
+    fn delegate_failure_projects_provider_tools_terminal_category() {
+        let error = anyhow::Error::new(
+            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse { usage: None },
+        );
+        let expected = crate::agent::turn::outcome::terminal_completion_error_message(
+            &error,
+            Some("delegate"),
+        )
+        .expect("provider-tools terminal category must project");
+
+        assert_eq!(delegate_failure_error("delegate", &error), expected);
+        assert_ne!(
+            expected,
+            "Agent 'delegate' failed: provider stream ended after provider-executed tools without a final response"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_rejects_empty_terminal_completion() {
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -5520,7 +5690,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 
@@ -5948,6 +6118,282 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RecordedThinkingRequest {
+        thinking_budget: Option<u32>,
+        system_prompt: Option<String>,
+        temperature: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct ThinkingRecordingModelProvider {
+        requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
+    }
+
+    impl ThinkingRecordingModelProvider {
+        fn request(&self) -> RecordedThinkingRequest {
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "expected exactly one provider request");
+            requests.pop().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("tool loop must use ChatRequest")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let thinking_budget = request.thinking.map(|params| params.budget_tokens);
+            let system_prompt = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone());
+            self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                thinking_budget,
+                system_prompt,
+                temperature,
+            });
+            Ok(ChatResponse {
+                text: Some("delegate complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingRecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkingRecordingModelProvider"
+        }
+    }
+
+    fn thinking_delegate_fixture(
+        mode: DelegateExecutionMode,
+        thinking: ThinkingConfig,
+    ) -> (DelegateTool, AliasedAgentConfig) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target-runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                thinking,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "custom.unused".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target = AliasedAgentConfig {
+            risk_profile: "target".into(),
+            runtime_profile: "target-runtime".into(),
+            model_provider: "custom.unused".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("target".to_string(), target.clone());
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+        (tool, target)
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "the target scope must not leak into the parent turn"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(50_000));
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prepends_target_non_native_thinking_prompt() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "a non-native target must clear the override only inside its child scope"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, None);
+        assert!(
+            request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("Think very carefully and exhaustively.")),
+            "target thinking prefix must precede the delegated system prompt: {request:?}"
+        );
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retains_parent_thinking_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(10_000));
+        assert_eq!(request.temperature, Some(0.2));
+    }
+
     #[tokio::test]
     async fn mcp_tools_included_in_subagent_tool_list() {
         // Build DelegateTool with NO parent tools initially
@@ -6115,6 +6561,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
         };
         let handle = Arc::clone(&parent_tools);
         let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
@@ -6298,11 +6745,40 @@ mod tests {
             }
         }
 
+        struct PosixRuntime;
+        impl crate::platform::RuntimeAdapter for PosixRuntime {
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::Posix
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
         let workspace = std::env::temp_dir();
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_workspace_dir(workspace.to_path_buf());
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PosixRuntime));
 
         let prompt = tool
             .build_enriched_system_prompt(
@@ -6317,8 +6793,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            prompt.contains("## Shell Policy"),
-            "should contain shell policy when shell tool is present"
+            prompt.contains("## Shell"),
+            "should contain shell section when shell tool is present"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -6377,6 +6857,112 @@ mod tests {
         assert!(
             !prompt.contains("## Shell Policy"),
             "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_reports_powershell_dialect_for_delegate_with_shell_tool() {
+        let config = AliasedAgentConfig::default();
+
+        struct MockShellTool;
+        impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        struct PsRuntime;
+        impl crate::platform::RuntimeAdapter for PsRuntime {
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::PowerShell
+            }
+            fn shell_profile(&self) -> Option<zeroclaw_api::runtime_traits::ShellProfile> {
+                Some(zeroclaw_api::runtime_traits::ShellProfile {
+                    name: "powershell".to_string(),
+                    dialect: crate::platform::ShellDialect::PowerShell,
+                })
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-Command", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PsRuntime));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prompt.contains("Shell: powershell") || prompt.contains("powershell"),
+            "prompt must identify powershell dialect; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("trash"),
+            "POSIX deletion advice must not appear in a PowerShell delegate prompt"
+        );
+        assert!(
+            prompt.contains("Get-ChildItem") || prompt.contains("Remove-Item"),
+            "PowerShell deletion guidance must appear; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -7958,6 +8544,9 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        // The bounded sealing pass must not synthesize a PipelineTool from
+        // caller config when the parent registry did not contain one.
+        config.pipeline.enabled = true;
         config.risk_profiles.insert(
             "caller".to_string(),
             RiskProfileConfig {
@@ -8023,6 +8612,132 @@ mod tests {
                 "test-model",
                 &ToolCountModelProvider { expected_tools: 0 },
                 "run shell",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success, "got: {:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn bounded_agentic_tools_drop_deliver_file_without_acp_transport() {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, RiskProfileConfig, RuntimeProfileConfig,
+        };
+
+        struct DeliverFileFixture;
+
+        impl zeroclaw_api::attribution::Attributable for DeliverFileFixture {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+
+            fn alias(&self) -> &str {
+                "deliver_file"
+            }
+        }
+
+        #[async_trait]
+        impl Tool for DeliverFileFixture {
+            fn name(&self) -> &str {
+                "deliver_file"
+            }
+
+            fn description(&self) -> &str {
+                "Test-only ACP delivery capability"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                unreachable!("the fixture must be removed before child execution")
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["deliver_file".to_string(), DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "target".to_string(),
+            RiskProfileConfig {
+                allowed_tools: vec!["deliver_file".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "ollama.caller".into(),
+                delegates: vec![DelegateTargetConfig::bounded("target")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "target".into(),
+                runtime_profile: "agentic".into(),
+                model_provider: "ollama.target".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        assert!(caller_policy.is_tool_allowed("deliver_file"));
+
+        let tool = DelegateTool::new(config.agents.clone(), None, Arc::clone(&caller_policy))
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone())
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(DeliverFileFixture)])));
+        let target_config = config
+            .agents
+            .get("target")
+            .expect("target agent exists")
+            .clone();
+        let target_tool_policy = tool
+            .resolve_tool_policy(&target_config.risk_profile)
+            .expect("target tool policy resolves");
+        assert!(DelegateTool::delegate_admits_with_mcp(
+            &target_tool_policy,
+            "deliver_file"
+        ));
+
+        let result = tool
+            .execute_agentic(
+                "target",
+                &target_config,
+                "ollama",
+                "test-model",
+                &ToolCountModelProvider { expected_tools: 0 },
+                "deliver a file",
                 None,
             )
             .await
@@ -9674,6 +10389,71 @@ mod tool_arc_ref_spec_tests {
             Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
             "ToolArcRef must forward spec() so the inner Arc-shared schema \
              survives; the trait default deep-clones it every call"
+        );
+    }
+
+    /// Trigger-owning tool standing in for `send_via` behind bounded
+    /// delegation's `ToolArcRef` wrapper.
+    struct TriggerOwningTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "trigger-owning-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TriggerOwningTool {
+        fn name(&self) -> &str {
+            "trigger_owning_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with invocation triggers"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn invocation_triggers(&self) -> Vec<String> {
+            vec!["send this to".into(), "as a voice message".into()]
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_invocation_triggers() {
+        // Regression: bounded delegation re-wraps every admitted parent tool
+        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
+        // explicit forwarding the trait default returns an empty vocabulary,
+        // silently erasing a trigger-owning tool's metadata for any consumer
+        // scanning a delegate's assembled tools.
+        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert_eq!(
+            wrapped.invocation_triggers(),
+            inner.invocation_triggers(),
+            "ToolArcRef must forward invocation_triggers(); the trait \
+             default erases the inner tool's vocabulary"
+        );
+        assert!(
+            wrapped
+                .invocation_triggers()
+                .iter()
+                .any(|t| t == "send this to"),
+            "wrapped trigger vocabulary must survive bounded delegation"
         );
     }
 }

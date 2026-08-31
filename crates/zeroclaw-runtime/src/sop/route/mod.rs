@@ -231,6 +231,7 @@ mod tests {
             total_steps: 2,
             started_at: "now".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
