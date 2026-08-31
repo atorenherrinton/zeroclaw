@@ -7846,6 +7846,7 @@ path = "{trigger_path}"
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,

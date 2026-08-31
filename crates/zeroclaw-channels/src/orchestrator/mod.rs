@@ -30020,7 +30020,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None, None);
         let entry = channels
             .iter()
             .find(|entry| entry.display_name == "VoiceWake")
