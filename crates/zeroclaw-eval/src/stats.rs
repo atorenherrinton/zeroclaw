@@ -2,6 +2,7 @@
 //! suites. Pure math, no agent I/O.
 
 use crate::Mode;
+use serde::Serialize;
 
 /// Clamp a requested repeat count to 1..=50 and resolve it for the mode. Returns
 /// the effective count and any warnings (clamping, replay-ignore). Replay is
@@ -150,14 +151,90 @@ pub fn suspect_note(passes: u32, k: u32) -> Option<String> {
 /// One run's summary, fed into [`RepeatStats::from_runs`].
 pub struct RunSample {
     pub passed: bool,
-    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
     pub duration_ms: u64,
+    pub llm_calls: u32,
     /// Per-check `(name, passed)` for flip counting across runs.
     pub checks: Vec<(String, bool)>,
 }
 
+/// Outcome recorded for one attempted repetition. Execution errors are kept
+/// distinct from completed runs whose grades failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatAttemptOutcome {
+    Passed,
+    Failed,
+    Error,
+}
+
+/// Minimal, transcript-free evidence for one attempted repetition.
+///
+/// Case-level provenance remains on the representative [`crate::record::RunRecord`]
+/// instead of being duplicated here. Completed attempts retain the metrics and
+/// check verdicts needed to substantiate the aggregate; an execution error keeps
+/// its stable one-based index and diagnostic without inventing zero-valued data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepeatAttemptReceipt {
+    pub attempt: u32,
+    pub outcome: RepeatAttemptOutcome,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub llm_calls: Option<u32>,
+    pub checks: Vec<RepeatCheckReceipt>,
+    pub error: Option<String>,
+}
+
+/// One named grade verdict retained in an attempt receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepeatCheckReceipt {
+    pub check: String,
+    pub passed: bool,
+}
+
+impl RepeatAttemptReceipt {
+    fn completed(attempt: u32, run: &RunSample) -> Self {
+        Self {
+            attempt,
+            outcome: if run.passed {
+                RepeatAttemptOutcome::Passed
+            } else {
+                RepeatAttemptOutcome::Failed
+            },
+            input_tokens: Some(run.input_tokens),
+            output_tokens: Some(run.output_tokens),
+            duration_ms: Some(run.duration_ms),
+            llm_calls: Some(run.llm_calls),
+            checks: run
+                .checks
+                .iter()
+                .map(|(check, passed)| RepeatCheckReceipt {
+                    check: check.clone(),
+                    passed: *passed,
+                })
+                .collect(),
+            error: None,
+        }
+    }
+
+    fn error(attempt: u32, error: String) -> Self {
+        Self {
+            attempt,
+            outcome: RepeatAttemptOutcome::Error,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            llm_calls: None,
+            checks: Vec::new(),
+            error: Some(error),
+        }
+    }
+}
+
 /// Aggregated statistics over k isolated runs of one case.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RepeatStats {
     /// Repetitions requested by the effective repeat policy.
     pub k: u32,
@@ -170,6 +247,10 @@ pub struct RepeatStats {
     /// The error that truncated the repetition loop, if any. Evidence from the
     /// repetitions completed before it is still retained.
     pub error: Option<String>,
+    /// Stable, one-based evidence for every attempted repetition. Completed
+    /// runs carry metrics and check verdicts; the attempt that truncated the
+    /// loop carries an explicit error entry.
+    pub attempts: Vec<RepeatAttemptReceipt>,
     pub token_mean: f64,
     pub token_stddev: f64,
     pub duration_mean: f64,
@@ -182,8 +263,16 @@ pub struct RepeatStats {
 impl RepeatStats {
     pub fn from_runs(k: u32, runs: &[RunSample]) -> RepeatStats {
         let passes = runs.iter().filter(|r| r.passed).count() as u32;
-        let tokens: Vec<f64> = runs.iter().map(|r| r.total_tokens as f64).collect();
+        let tokens: Vec<f64> = runs
+            .iter()
+            .map(|r| (r.input_tokens + r.output_tokens) as f64)
+            .collect();
         let durations: Vec<f64> = runs.iter().map(|r| r.duration_ms as f64).collect();
+        let attempts = runs
+            .iter()
+            .enumerate()
+            .map(|(index, run)| RepeatAttemptReceipt::completed(index as u32 + 1, run))
+            .collect();
 
         // Flip counts: per check, runs differing from the modal result.
         let mut per_check: std::collections::BTreeMap<String, Vec<bool>> =
@@ -208,6 +297,7 @@ impl RepeatStats {
             passes,
             completed: runs.len() as u32,
             error: None,
+            attempts,
             token_mean: mean(&tokens),
             token_stddev: sample_stddev(&tokens),
             duration_mean: mean(&durations),
@@ -220,10 +310,13 @@ impl RepeatStats {
     /// completed repetitions are aggregated as usual and the error is retained
     /// alongside them, so paid live runs are never discarded as evidence.
     pub fn from_partial_runs(k: u32, runs: &[RunSample], error: String) -> RepeatStats {
-        RepeatStats {
-            error: Some(error),
-            ..RepeatStats::from_runs(k, runs)
-        }
+        let mut stats = RepeatStats::from_runs(k, runs);
+        stats.attempts.push(RepeatAttemptReceipt::error(
+            runs.len() as u32 + 1,
+            error.clone(),
+        ));
+        stats.error = Some(error);
+        stats
     }
 
     /// True when the repetition loop ended early. `passes` and `proportion()`
@@ -246,6 +339,13 @@ impl RepeatStats {
 
     pub fn pass_hat_k(&self) -> bool {
         pass_hat_k(self.passes, self.k)
+    }
+
+    /// Whether this result is complete and satisfies the consistency gate.
+    /// Partial evidence remains reportable, but can never clear a baseline
+    /// regression.
+    pub fn establishes_pass_hat_k(&self) -> bool {
+        !self.truncated() && self.pass_hat_k()
     }
 
     pub fn suspect_note(&self) -> Option<String> {
