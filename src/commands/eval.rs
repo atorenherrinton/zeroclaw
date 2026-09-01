@@ -893,6 +893,8 @@ mod tests {
             } else {
                 Some("boom".to_string())
             },
+            repeat: None,
+            cluster: None,
         }
     }
 
