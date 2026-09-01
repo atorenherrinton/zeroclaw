@@ -607,6 +607,57 @@ fn sendmessage_body_error(body: &str) -> Option<String> {
     Some(format!("ret={ret}, errcode={errcode}, errmsg={errmsg:?}"))
 }
 
+/// Whether an identical `sendmessage` request may succeed when replayed.
+///
+/// Transport failures and explicitly transient HTTP responses can clear on
+/// their own. Authentication/client failures and an iLink response envelope
+/// that explicitly rejects the request require changed credentials, context,
+/// or input, so replaying the retained batch cannot repair them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendMessageFailureDisposition {
+    Retryable,
+    Permanent,
+}
+
+#[derive(Debug)]
+struct SendMessageFailure {
+    disposition: SendMessageFailureDisposition,
+    detail: String,
+}
+
+impl SendMessageFailure {
+    fn new(disposition: SendMessageFailureDisposition, detail: impl Into<String>) -> Self {
+        Self {
+            disposition,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for SendMessageFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for SendMessageFailure {}
+
+fn send_message_failure_disposition(error: &anyhow::Error) -> SendMessageFailureDisposition {
+    error
+        .downcast_ref::<SendMessageFailure>()
+        .map_or(SendMessageFailureDisposition::Retryable, |failure| {
+            failure.disposition
+        })
+}
+
+fn http_send_failure_disposition(status: reqwest::StatusCode) -> SendMessageFailureDisposition {
+    if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
+        SendMessageFailureDisposition::Retryable
+    } else {
+        SendMessageFailureDisposition::Permanent
+    }
+}
+
 /// Reply selected by a pairing attempt whose getUpdates cursor is still
 /// pending. The Fluent catalogue remains the source of the actual text; this
 /// records only which response must be retried.
@@ -628,6 +679,10 @@ enum PendingPairingEffect {
     ReplyPending(PendingPairingReply),
     /// The attempt and its response both completed.
     ReplyDelivered,
+    /// The attempt completed, but iLink deterministically rejected its
+    /// response. The listener may commit the batch instead of wedging every
+    /// later update behind an identical request that cannot recover by retry.
+    ReplyUndeliverable(PendingPairingReply),
 }
 
 /// The single in-memory owner for pairing replay state while a getUpdates
@@ -2297,7 +2352,12 @@ impl WeChatChannel {
         item_list: Vec<serde_json::Value>,
         context_token: Option<&str>,
     ) -> anyhow::Result<()> {
-        let token = self.get_token().context("not logged in, cannot send")?;
+        let token = self.get_token().ok_or_else(|| {
+            anyhow::Error::new(SendMessageFailure::new(
+                SendMessageFailureDisposition::Permanent,
+                "not logged in, cannot send",
+            ))
+        })?;
 
         let client_id = format!("zeroclaw-{}", uuid::Uuid::new_v4());
         let body = serde_json::json!({
@@ -2320,22 +2380,36 @@ impl WeChatChannel {
             .json(&body)
             .timeout(API_TIMEOUT)
             .send()
-            .await?;
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(SendMessageFailure::new(
+                    SendMessageFailureDisposition::Retryable,
+                    format!("sendMessage request failed: {error}"),
+                ))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("sendMessage failed ({status}): {err}");
+            return Err(anyhow::Error::new(SendMessageFailure::new(
+                http_send_failure_disposition(status),
+                format!("sendMessage failed ({status}): {err}"),
+            )));
         }
 
         // The API reports failures as HTTP 200 with a non-zero ret/errcode
         // in the body; a status check alone silently drops the message.
-        let body = resp
-            .text()
-            .await
-            .context("failed to read sendMessage response body")?;
+        let body = resp.text().await.map_err(|error| {
+            anyhow::Error::new(SendMessageFailure::new(
+                SendMessageFailureDisposition::Retryable,
+                format!("failed to read sendMessage response body: {error}"),
+            ))
+        })?;
         if let Some(err) = sendmessage_body_error(&body) {
-            anyhow::bail!("sendMessage failed ({err})");
+            return Err(anyhow::Error::new(SendMessageFailure::new(
+                SendMessageFailureDisposition::Permanent,
+                format!("sendMessage failed ({err})"),
+            )));
         }
 
         Ok(())
@@ -2528,14 +2602,37 @@ impl WeChatChannel {
                 true
             }
             Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
-                    "failed to deliver WeChat pairing response; retained batch replay may retry it"
-                );
-                false
+                let disposition = send_message_failure_disposition(&e);
+                if disposition == SendMessageFailureDisposition::Permanent {
+                    self.set_pending_pairing_effect(
+                        batch_cursor,
+                        from_user_id,
+                        message_id,
+                        PendingPairingEffect::ReplyUndeliverable(reply),
+                    );
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": e.to_string(),
+                                "retryable": false,
+                            })),
+                        "WeChat pairing response is permanently undeliverable; advancing the batch so later updates can flow"
+                    );
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "error": e.to_string(),
+                                "retryable": true,
+                            })),
+                        "failed to deliver WeChat pairing response; retained batch replay may retry it"
+                    );
+                }
+                disposition == SendMessageFailureDisposition::Permanent
             }
         }
     }
@@ -3385,6 +3482,40 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("sendMessage failed"), "{message}");
         assert!(message.contains("errcode=301"), "{message}");
+        assert_eq!(
+            send_message_failure_disposition(&err),
+            SendMessageFailureDisposition::Permanent,
+            "an explicit iLink rejection cannot recover by replaying an identical response"
+        );
+    }
+
+    #[test]
+    fn sendmessage_http_status_classification_separates_transient_and_permanent_failures() {
+        use reqwest::StatusCode;
+
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_EARLY,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                http_send_failure_disposition(status),
+                SendMessageFailureDisposition::Retryable,
+                "{status} should retain the batch for retry"
+            );
+        }
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_eq!(
+                http_send_failure_disposition(status),
+                SendMessageFailureDisposition::Permanent,
+                "{status} should not wedge later updates"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4609,6 +4740,158 @@ mod tests {
                 .count(),
             2,
             "replay must produce one eventual invalid-code response after the failed send"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn permanent_pairing_reply_failure_is_recorded_as_undeliverable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let channel = test_wechat_channel_for_api(mock_server.uri(), temp.path());
+        assert_eq!(
+            channel.reserve_pending_pairing_attempt("cursor", "new_user", "message-1"),
+            None
+        );
+        channel.set_pending_pairing_effect(
+            "cursor",
+            "new_user",
+            "message-1",
+            PendingPairingEffect::ReplyPending(PendingPairingReply::BoundSuccess),
+        );
+
+        assert!(
+            channel
+                .retry_pending_pairing_reply("cursor", "new_user", "message-1")
+                .await,
+            "a permanent send failure must be terminal for this pairing control"
+        );
+        assert_eq!(
+            channel.pending_pairing_effect("cursor", "new_user", "message-1"),
+            Some(PendingPairingEffect::ReplyUndeliverable(
+                PendingPairingReply::BoundSuccess
+            ))
+        );
+    }
+
+    /// A deterministic sendmessage rejection must not retain the getUpdates
+    /// cursor forever. The bind remains canonical, its response is attempted
+    /// once, and a later inbound update from that user still reaches the
+    /// channel receiver.
+    #[tokio::test]
+    async fn listen_advances_after_permanent_pairing_reply_failure() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_pairing",
+                serde_json::json!([{
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "context_token": "pairing_context",
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                }]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_pairing"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_later_update",
+                serde_json::json!([{
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "context_token": "fresh_context",
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": "later update"}
+                    }]
+                }]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_later_update"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_later_update",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ret": -2,
+                "errcode": SESSION_EXPIRED_ERRCODE,
+                "errmsg": "session timeout"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("permanent pairing-response failure wedged the later update")
+            .expect("listener closed before delivering the later update");
+        assert_eq!(delivered.sender, "new_user");
+        assert_eq!(delivered.content, "later update");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_later_update");
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()],
+            "response delivery failure must not roll back canonical authorization"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "a permanent rejection must not be replayed"
         );
 
         handle.abort();
