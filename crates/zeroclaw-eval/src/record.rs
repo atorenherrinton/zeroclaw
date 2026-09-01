@@ -89,7 +89,7 @@ pub struct CaseProvenance {
 
 /// The data that only exists once a run finishes: the transcript, the tool
 /// trajectory, and the usage counters.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RunCompletion {
     /// The agent's final text response for the case.
     pub final_response: String,
@@ -107,20 +107,6 @@ pub struct RunCompletion {
     pub duration_ms: u64,
     /// Number of LLM responses observed during the run.
     pub llm_calls: u32,
-}
-
-impl Default for RunCompletion {
-    fn default() -> Self {
-        Self {
-            final_response: String::new(),
-            history: Vec::new(),
-            tool_calls: Vec::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-        }
-    }
 }
 
 impl RunCompletion {
