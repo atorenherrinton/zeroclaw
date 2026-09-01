@@ -500,6 +500,8 @@ mod tests {
             record: Some(rec(id, tokens)),
             grades,
             error: None,
+            repeat: None,
+            cluster: None,
         }
     }
 
