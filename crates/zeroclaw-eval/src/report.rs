@@ -196,6 +196,7 @@ impl SuiteReport {
         let items: Vec<(Option<String>, f64)> = self
             .cases
             .iter()
+            .filter(|c| c.error.is_none())
             .filter_map(|c| {
                 c.repeat
                     .as_ref()
@@ -362,6 +363,7 @@ impl SuiteReport {
                             "completed": r.completed,
                             "truncated": r.truncated(),
                             "error": r.error,
+                            "attempts": r.attempts,
                             "pass_at_k": r.pass_at_k(),
                             "pass_hat_k": r.pass_hat_k(),
                             "token_mean": r.token_mean,
@@ -420,23 +422,23 @@ mod tests {
     }
 
     fn repeated_case(name: &str, passes: u32, k: u32, cluster: Option<&str>) -> CaseReport {
+        let runs: Vec<crate::stats::RunSample> = (0..k)
+            .map(|index| crate::stats::RunSample {
+                passed: index < passes,
+                input_tokens: index as u64 + 1,
+                output_tokens: 1,
+                duration_ms: 10 + index as u64,
+                llm_calls: 1,
+                checks: vec![("response".to_string(), index < passes)],
+            })
+            .collect();
         CaseReport {
             name: name.to_string(),
             source: "fixture.json".to_string(),
             record: None,
             grades: Vec::new(),
             error: None,
-            repeat: Some(crate::stats::RepeatStats {
-                k,
-                passes,
-                completed: k,
-                error: None,
-                token_mean: 0.0,
-                token_stddev: 0.0,
-                duration_mean: 0.0,
-                duration_stddev: 0.0,
-                check_flips: std::collections::BTreeMap::new(),
-            }),
+            repeat: Some(crate::stats::RepeatStats::from_runs(k, &runs)),
             cluster: cluster.map(str::to_string),
         }
     }
@@ -521,12 +523,14 @@ mod tests {
     /// suite so the exclusion is visible.
     #[test]
     fn repeat_population_discloses_errored_and_single_run_cases() {
+        let mut errored = repeated_case("errored", 0, 2, None);
+        errored.error = Some("provider exploded".to_string());
         let suite = SuiteReport {
             cases: vec![
                 repeated_case("rep-a", 2, 2, None),
                 repeated_case("rep-b", 1, 2, None),
                 case("single", vec![grade("c", true, "")], None),
-                case("errored", vec![], Some("provider exploded")),
+                errored,
             ],
         };
 
@@ -565,11 +569,29 @@ mod tests {
     #[test]
     fn truncated_repeat_set_fails_and_retains_partial_evidence() {
         let mut c = repeated_case("truncated", 2, 5, None);
-        {
-            let r = c.repeat.as_mut().expect("repeat stats");
-            r.completed = 2;
-            r.error = Some("provider timeout".to_string());
-        }
+        let completed = vec![
+            crate::stats::RunSample {
+                passed: true,
+                input_tokens: 2,
+                output_tokens: 1,
+                duration_ms: 10,
+                llm_calls: 1,
+                checks: vec![("response".to_string(), true)],
+            },
+            crate::stats::RunSample {
+                passed: true,
+                input_tokens: 3,
+                output_tokens: 1,
+                duration_ms: 11,
+                llm_calls: 1,
+                checks: vec![("response".to_string(), true)],
+            },
+        ];
+        c.repeat = Some(crate::stats::RepeatStats::from_partial_runs(
+            5,
+            &completed,
+            "provider timeout".to_string(),
+        ));
         // Mirrors what the runner records for a truncated set.
         c.error = Some(
             "repeat 2/5 runs completed (pass^k not established): provider timeout".to_string(),
@@ -597,6 +619,14 @@ mod tests {
             "the truncating error must be reported: {table}"
         );
         assert!(suite.to_json().contains("\"truncated\": true"));
+        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let attempts = json["cases"][0]["repeat"]["attempts"]
+            .as_array()
+            .expect("repeat attempts are serialized");
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0]["attempt"].as_u64(), Some(1));
+        assert_eq!(attempts[2]["outcome"].as_str(), Some("error"));
+        assert_eq!(attempts[2]["error"].as_str(), Some("provider timeout"));
     }
 
     #[test]

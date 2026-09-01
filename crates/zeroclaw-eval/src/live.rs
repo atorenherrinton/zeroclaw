@@ -1134,6 +1134,29 @@ mod tests {
         assert_eq!(repeat.completed, 2, "both completed runs are retained");
         assert_eq!(repeat.passes, 2, "their passing evidence survives");
         assert!(repeat.truncated());
+        assert_eq!(repeat.attempts.len(), 3, "two runs plus the error survive");
+        assert_eq!(repeat.attempts[0].attempt, 1);
+        assert_eq!(repeat.attempts[1].attempt, 2);
+        assert_eq!(repeat.attempts[2].attempt, 3);
+        assert_eq!(
+            repeat.attempts[2].outcome,
+            crate::stats::RepeatAttemptOutcome::Error
+        );
+        assert!(
+            repeat.attempts[2]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("provider exploded"))
+        );
+        assert!(
+            repeat.attempts[..2]
+                .iter()
+                .all(|attempt| attempt.input_tokens.is_some()
+                    && attempt.output_tokens.is_some()
+                    && attempt.duration_ms.is_some()
+                    && attempt.llm_calls.is_some()),
+            "completed attempt receipts retain metrics"
+        );
         assert!(
             repeat
                 .error
@@ -1146,6 +1169,10 @@ mod tests {
         assert!(
             !repeat.pass_hat_k(),
             "a truncated set must never establish pass^k"
+        );
+        assert!(
+            !repeat.establishes_pass_hat_k(),
+            "truncated evidence must never clear a baseline regression"
         );
         // Exactly 3 provider builds: two successes plus the failing one.
         assert_eq!(
@@ -1174,5 +1201,41 @@ mod tests {
             .await
             .expect_err("no evidence at all must surface as an error");
         assert!(err.to_string().contains("provider exploded immediately"));
+    }
+
+    #[tokio::test]
+    async fn suite_report_keeps_first_repeat_error_as_attempt_one() {
+        let suite = tempfile::tempdir().unwrap();
+        std::fs::write(
+            suite.path().join("first-error.json"),
+            r#"{
+                "id": "first-error",
+                "model_name": "first-error",
+                "repeat": 3,
+                "turns": [{ "user_input": "run" }],
+                "expects": {}
+            }"#,
+        )
+        .unwrap();
+        let deps = live_deps(
+            move |_| anyhow::bail!("provider exploded immediately"),
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let report = crate::runner::run_suite(suite.path(), &deps).await.unwrap();
+        let case = &report.cases[0];
+        let repeat = case.repeat.as_ref().expect("repeat metadata survives");
+        assert_eq!(repeat.completed, 0);
+        assert_eq!(repeat.attempts.len(), 1);
+        assert_eq!(repeat.attempts[0].attempt, 1);
+        assert_eq!(
+            repeat.attempts[0].outcome,
+            crate::stats::RepeatAttemptOutcome::Error
+        );
+        assert_eq!(
+            repeat.attempts[0].error.as_deref(),
+            Some("provider exploded immediately")
+        );
     }
 }

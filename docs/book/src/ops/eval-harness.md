@@ -226,8 +226,15 @@ repetitions that already completed are retained and reported (`repeat p/k (c
 completed)`) together with the error, rather than discarded -- live runs are paid
 for, and the partial evidence is what makes the aggregate disputable. Such a set
 is fail-closed: the missing repetitions never count as passes, so it cannot
-establish `pass^k`, and the case fails. Only a set with no completed repetition
-at all is reported purely as an errored case.
+establish `pass^k`, and the case fails. Baseline retries apply the same completeness
+check: a passing representative from a truncated retry never downgrades a regression.
+
+The JSON report and record dump also contain a stable, one-based `attempts` list.
+Each completed repetition records its pass/fail outcome, token and duration
+metrics, LLM-call count, and per-check verdicts. The repetition that stops a
+partial set is retained as an explicit error entry. These are deliberately
+minimal receipts: case-level provenance stays on the representative run record,
+and full transcripts are not duplicated for every repetition.
 
 ## Exit-code contract
 

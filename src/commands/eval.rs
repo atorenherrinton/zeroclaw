@@ -405,6 +405,18 @@ async fn rerun_live_regressions(
     suite_path: &Path,
     comparison: &baseline::BaselineComparison,
 ) -> Result<BTreeMap<String, bool>> {
+    let deps = build_run_deps(config, Mode::Live)?;
+    rerun_live_regressions_with_deps(suite_path, comparison, &deps).await
+}
+
+/// Dependency-injected core of [`rerun_live_regressions`]. Keeping the retry
+/// decision here lets the regression exercise the same suite loading, repeat
+/// runner, and baseline verdict used by production without calling a provider.
+async fn rerun_live_regressions_with_deps(
+    suite_path: &Path,
+    comparison: &baseline::BaselineComparison,
+    deps: &RunDeps,
+) -> Result<BTreeMap<String, bool>> {
     let regressed: Vec<&str> = comparison
         .per_case
         .iter()
@@ -416,16 +428,14 @@ async fn rerun_live_regressions(
         return Ok(out);
     }
     let traces = zeroclaw_eval::case::load_suite(suite_path)?;
-    let deps = build_run_deps(config, Mode::Live)?;
     for (_, trace) in &traces {
         let id = trace.display_id();
         if regressed.contains(&id) {
-            // `run_case_repeated` applies the case's effective repeat policy and
-            // returns a representative whose grades already encode pass^k: for
-            // k > 1 it is a failing run whenever any repetition failed.
             let passed = matches!(
-                Box::pin(zeroclaw_eval::run_case_repeated(trace, &deps)).await,
-                Ok((outcome, _)) if outcome.grades.iter().all(|g| g.passed)
+                Box::pin(zeroclaw_eval::run_case_repeated(trace, deps)).await,
+                Ok((outcome, repeat))
+                    if outcome.grades.iter().all(|g| g.passed)
+                        && repeat.as_ref().is_none_or(|stats| stats.establishes_pass_hat_k())
             );
             out.insert(id.to_string(), passed);
         }
@@ -658,6 +668,7 @@ fn write_case_dump(dir: &Path, case: &CaseReport) -> Result<PathBuf> {
         "record": case.record,
         "grades": case.grades,
         "error": case.error,
+        "repeat": case.repeat,
     });
     let json = serde_json::to_vec_pretty(&dump)?;
 
@@ -758,8 +769,58 @@ pub enum OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities,
+    };
     use zeroclaw_eval::record::{CaseProvenance, RunCompletion, SandboxStamp, ToolSurface};
     use zeroclaw_eval::{GradeCategory, GradeResult, RunRecord};
+
+    struct StaticTextProvider;
+
+    impl Attributable for StaticTextProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "eval-retry-test"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for StaticTextProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities::default()
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
 
     fn provenance(case_id: &str) -> CaseProvenance {
         CaseProvenance {
@@ -1036,11 +1097,11 @@ mod tests {
             cases: vec![case_report("flaky", false)],
         };
 
-        // A retry that did NOT clear pass^k (e.g. 4 of 5 runs passed).
         let mut cmp = BaselineComparison {
             per_case: [("flaky".to_string(), regression())].into_iter().collect(),
         };
-        let rerun: BTreeMap<String, bool> = [("flaky".to_string(), false)].into_iter().collect();
+        let rerun: BTreeMap<String, bool> =
+            [("flaky".to_string(), false)].into_iter().collect();
         let flaky =
             zeroclaw_eval::baseline::downgrade_flaky_regressions(&mut cmp, Mode::Live, &rerun);
         assert!(
@@ -1053,17 +1114,124 @@ mod tests {
             "an unexcused regression must gate"
         );
 
-        // A retry that DID clear pass^k is still excused, as designed.
         let mut cmp_ok = BaselineComparison {
             per_case: [("flaky".to_string(), regression())].into_iter().collect(),
         };
-        let rerun_ok: BTreeMap<String, bool> = [("flaky".to_string(), true)].into_iter().collect();
+        let rerun_ok: BTreeMap<String, bool> =
+            [("flaky".to_string(), true)].into_iter().collect();
         let flaky_ok = zeroclaw_eval::baseline::downgrade_flaky_regressions(
             &mut cmp_ok,
             Mode::Live,
             &rerun_ok,
         );
         assert_eq!(flaky_ok, vec!["flaky".to_string()]);
+    }
+
+    /// Drive the production baseline retry composition: two passing attempts
+    /// followed by a provider-construction error must remain a regression, even
+    /// though the representative completed run passed every grade.
+    #[tokio::test]
+    async fn truncated_baseline_retry_remains_gating() {
+        use zeroclaw_eval::baseline::{BaselineComparison, CaseComparison, SuiteKind};
+
+        let suite = tempfile::tempdir().unwrap();
+        std::fs::write(
+            suite.path().join("partial.json"),
+            r#"{
+                "id": "partial-retry",
+                "model_name": "partial-retry",
+                "repeat": 3,
+                "turns": [{ "user_input": "run" }],
+                "expects": { "response_contains": ["ok"] }
+            }"#,
+        )
+        .unwrap();
+
+        let builds = Arc::new(AtomicUsize::new(0));
+        let builds_for_factory = Arc::clone(&builds);
+        let deps = RunDeps {
+            mode: Mode::Live,
+            provider: Box::new(move |_trace| {
+                let attempt = builds_for_factory.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt == 3 {
+                    anyhow::bail!("provider failed on attempt 3");
+                }
+                Ok(zeroclaw_eval::CaseProvider::from_provider(Box::new(
+                    StaticTextProvider,
+                )))
+            }),
+            provider_ref: "test.retry:model".to_string(),
+            live_tools: Vec::new(),
+            case_timeout: Duration::from_secs(5),
+        };
+
+        let mut cmp = BaselineComparison {
+            per_case: [(
+                "partial-retry".to_string(),
+                CaseComparison::Regression {
+                    categories: Vec::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let rerun = rerun_live_regressions_with_deps(suite.path(), &cmp, &deps)
+            .await
+            .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert_eq!(rerun.get("partial-retry"), Some(&false));
+
+        let flaky =
+            zeroclaw_eval::baseline::downgrade_flaky_regressions(&mut cmp, Mode::Live, &rerun);
+        assert!(
+            flaky.is_empty(),
+            "a truncated retry must not be excused as flaky"
+        );
+
+        let report = SuiteReport {
+            cases: vec![case_report("partial-retry", false)],
+        };
+        assert_eq!(
+            report.exit_code(SuiteKind::Regression, Some(&cmp)),
+            1,
+            "the incomplete retry leaves the original regression gating"
+        );
+    }
+
+    #[test]
+    fn record_dump_contains_indexed_repeat_attempts() {
+        let sample = zeroclaw_eval::stats::RunSample {
+            passed: true,
+            input_tokens: 3,
+            output_tokens: 2,
+            duration_ms: 17,
+            llm_calls: 1,
+            checks: vec![("response_contains".to_string(), true)],
+        };
+        let mut case = case_report("partial", false);
+        case.repeat = Some(zeroclaw_eval::stats::RepeatStats::from_partial_runs(
+            3,
+            &[sample],
+            "provider timeout".to_string(),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        write_case_dump(dir.path(), &case).unwrap();
+        let dump: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("partial.json")).unwrap(),
+        )
+        .unwrap();
+        let attempts = dump["repeat"]["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0]["attempt"].as_u64(), Some(1));
+        assert_eq!(attempts[0]["outcome"].as_str(), Some("passed"));
+        assert_eq!(attempts[1]["attempt"].as_u64(), Some(2));
+        assert_eq!(attempts[1]["outcome"].as_str(), Some("error"));
+        assert_eq!(attempts[1]["error"].as_str(), Some("provider timeout"));
+        assert!(
+            attempts[0].get("history").is_none(),
+            "minimal attempt receipts must not duplicate transcripts"
+        );
     }
 
     #[test]

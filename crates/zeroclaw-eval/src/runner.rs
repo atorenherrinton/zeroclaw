@@ -191,6 +191,7 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
                 }
             }
             Err(e) => {
+                let (k, _) = crate::stats::effective_repeat(deps.mode, trace.repeat);
                 // The receipt exists for exactly this path. A provider, setup,
                 // timeout, or agent error must still produce a record carrying the
                 // case hash, mode, provider, tool surface, and sandbox stamp, or a
@@ -204,7 +205,9 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
                     record: Some(RunRecord::from_provenance(provenance)),
                     grades: vec![],
                     error: Some(e.to_string()),
-                    repeat: None,
+                    repeat: (k > 1).then(|| {
+                        crate::stats::RepeatStats::from_partial_runs(k, &[], e.to_string())
+                    }),
                     cluster: trace.cluster.clone(),
                 }
             }
@@ -266,8 +269,10 @@ pub async fn run_case_repeated(
         .iter()
         .map(|o| crate::stats::RunSample {
             passed: all_pass(o),
-            total_tokens: o.record.input_tokens + o.record.output_tokens,
+            input_tokens: o.record.input_tokens,
+            output_tokens: o.record.output_tokens,
             duration_ms: o.record.duration_ms,
+            llm_calls: o.record.llm_calls,
             checks: o
                 .grades
                 .iter()
