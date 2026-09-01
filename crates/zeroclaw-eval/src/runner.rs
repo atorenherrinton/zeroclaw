@@ -9,6 +9,7 @@ use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_memory::{Memory, create_memory};
 use zeroclaw_runtime::agent::agent::Agent;
 use zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher;
+use zeroclaw_runtime::i18n::get_required_cli_string_with_args;
 
 use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
@@ -246,7 +247,33 @@ async fn run_case_repeated_recording_provenance(
 ) -> anyhow::Result<(CaseOutcome, Option<crate::stats::RepeatStats>)> {
     let (k, warnings) = crate::stats::effective_repeat(deps.mode, trace.repeat);
     for w in &warnings {
-        eprintln!("  {} (repeat): {w}", trace.display_id());
+        let case = trace.display_id();
+        let warning = match w {
+            crate::stats::RepeatWarning::ClampedLow => {
+                zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-eval-repeat-warning-clamped-low",
+                )
+            }
+            crate::stats::RepeatWarning::ClampedHigh { requested } => {
+                let requested = requested.to_string();
+                get_required_cli_string_with_args(
+                    "cli-eval-repeat-warning-clamped-high",
+                    &[("requested", requested.as_str())],
+                )
+            }
+            crate::stats::RepeatWarning::ReplayIgnored => {
+                zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-eval-repeat-warning-replay-ignored",
+                )
+            }
+        };
+        eprintln!(
+            "{}",
+            get_required_cli_string_with_args(
+                "cli-eval-repeat-warning",
+                &[("case", case), ("warning", warning.as_str())],
+            )
+        );
     }
     if k <= 1 {
         return Ok((
@@ -268,13 +295,25 @@ async fn run_case_repeated_recording_provenance(
                     *provenance_out = attempt_provenance;
                     return Err(e);
                 }
+                let case = trace.display_id();
+                let attempt = (i + 1).to_string();
+                let total = k.to_string();
+                let completed = outcomes.len().to_string();
+                let error = e.to_string();
                 eprintln!(
-                    "  {} (repeat): repetition {}/{k} errored, reporting {} completed run(s): {e}",
-                    trace.display_id(),
-                    i + 1,
-                    outcomes.len()
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-eval-repeat-error",
+                        &[
+                            ("case", case),
+                            ("attempt", attempt.as_str()),
+                            ("total", total.as_str()),
+                            ("completed", completed.as_str()),
+                            ("error", error.as_str()),
+                        ],
+                    )
                 );
-                run_error = Some(e.to_string());
+                run_error = Some(error);
                 break;
             }
         }
