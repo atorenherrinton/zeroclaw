@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Mode;
 use crate::grader::GradeCategory;
-use crate::record::SandboxStamp;
+use crate::record::{SandboxStamp, ToolSurface};
 use crate::report::{CaseReport, SuiteReport};
 
 /// The schema tag stamped on every baseline file.
@@ -57,12 +57,13 @@ pub enum Verdict {
 
 /// One case's entry in a baseline file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BaselineEntry {
     pub case_id: String,
     pub case_hash: String,
     pub mode: Mode,
     pub provider_ref: String,
-    pub tool_surface: Vec<String>,
+    pub tool_surface: ToolSurface,
     /// The sandbox posture the baseline run executed under. Part of the
     /// comparability key: runs under different sandbox policies are not
     /// comparable.
@@ -76,12 +77,12 @@ pub struct BaselineEntry {
 
 impl BaselineEntry {
     /// The comparability key: two entries are comparable only when these agree.
-    fn key(&self) -> (&str, Mode, &str, &[String], &SandboxStamp) {
+    fn key(&self) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp) {
         (
             self.case_hash.as_str(),
             self.mode,
             self.provider_ref.as_str(),
-            self.tool_surface.as_slice(),
+            &self.tool_surface,
             &self.sandbox,
         )
     }
@@ -89,6 +90,7 @@ impl BaselineEntry {
 
 /// A baseline file: every case's entry from a prior run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Baseline {
     pub schema: String,
     pub entries: Vec<BaselineEntry>,
@@ -97,28 +99,38 @@ pub struct Baseline {
 impl Baseline {
     /// Build a baseline from a completed suite report.
     ///
-    /// Fails closed: a baseline must describe **every** case in the suite. A case
-    /// that errored before producing a `RunRecord` cannot be represented, and
-    /// silently omitting it would make the case merely `New` on a later run —
-    /// and a failing `New` case is explicitly non-gating, so an incomplete
-    /// reference permanently excuses a regression.
+    /// Fails closed: a baseline must describe **every completed, gradeable** case
+    /// in the suite. Provenance exists even for an execution error, but that does
+    /// not make the failed attempt a trustworthy reference run. Silently omitting
+    /// or recording it would weaken later Pass-to-Fail classification.
     pub fn from_report(report: &SuiteReport) -> anyhow::Result<Baseline> {
-        let mut missing: Vec<&str> = report
+        let mut incomplete: Vec<&str> = report
             .cases
             .iter()
-            .filter(|c| c.record.is_none())
+            .filter(|case| {
+                case.error.is_some()
+                    || case.score().is_none()
+                    || !case
+                        .record
+                        .as_ref()
+                        .is_some_and(crate::record::RunRecord::is_complete)
+            })
             .map(|c| c.name.as_str())
             .collect();
-        if !missing.is_empty() {
-            missing.sort_unstable();
+        if !incomplete.is_empty() {
+            incomplete.sort_unstable();
             anyhow::bail!(
-                "refusing to write a baseline: {} case(s) produced no run record ({}); \
+                "refusing to write a baseline: {} case(s) did not complete a gradeable run ({}); \
                  fix the run errors and regenerate",
-                missing.len(),
-                missing.join(", ")
+                incomplete.len(),
+                incomplete.join(", ")
             );
         }
-        let entries = report.cases.iter().filter_map(entry_from_case).collect();
+        let entries = report
+            .cases
+            .iter()
+            .map(entry_from_case)
+            .collect::<anyhow::Result<Vec<_>>>()?;
         Ok(Baseline {
             schema: BASELINE_SCHEMA.to_string(),
             entries,
@@ -126,8 +138,8 @@ impl Baseline {
     }
 
     /// Serialize as pretty JSON.
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string())
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        Ok(serde_json::to_string_pretty(self)?)
     }
 
     /// Parse and validate a baseline from JSON text. Fails closed: an
@@ -158,15 +170,24 @@ impl Baseline {
     }
 }
 
-fn entry_from_case(case: &CaseReport) -> Option<BaselineEntry> {
-    let rec = case.record.as_ref()?;
-    Some(BaselineEntry {
-        case_id: rec.case_id.clone(),
-        case_hash: rec.case_hash.clone(),
-        mode: rec.mode,
-        provider_ref: rec.provider_ref.clone(),
-        tool_surface: rec.tool_surface.clone(),
-        sandbox: rec.sandbox.clone(),
+fn entry_from_case(case: &CaseReport) -> anyhow::Result<BaselineEntry> {
+    let rec = case
+        .record
+        .as_ref()
+        .ok_or_else(|| anyhow::Error::msg(format!("case {:?} has no run record", case.name)))?;
+    let completion = rec.completion.as_ref().ok_or_else(|| {
+        anyhow::Error::msg(format!("case {:?} has no completion data", case.name))
+    })?;
+    let score = case
+        .score()
+        .ok_or_else(|| anyhow::Error::msg(format!("case {:?} produced no grades", case.name)))?;
+    Ok(BaselineEntry {
+        case_id: rec.provenance.case_id.clone(),
+        case_hash: rec.provenance.case_hash.clone(),
+        mode: rec.provenance.mode,
+        provider_ref: rec.provenance.provider_ref.clone(),
+        tool_surface: rec.provenance.tool_surface.clone(),
+        sandbox: rec.provenance.sandbox.clone(),
         verdict: if case.passed() {
             Verdict::Pass
         } else {
@@ -177,8 +198,10 @@ fn entry_from_case(case: &CaseReport) -> Option<BaselineEntry> {
             .iter()
             .map(|g| (g.check.clone(), g.passed))
             .collect(),
-        total_tokens: rec.input_tokens + rec.output_tokens,
-        score: case.score(),
+        total_tokens: completion
+            .input_tokens
+            .saturating_add(completion.output_tokens),
+        score,
     })
 }
 
@@ -189,8 +212,8 @@ pub enum CaseComparison {
     New,
     /// In the baseline, absent now (warned, never gated).
     Removed,
-    /// The current run errored before producing a record; no trustworthy
-    /// comparison exists. Always gates (a run error, not a check failure).
+    /// The current run errored; provenance may exist, but no trustworthy
+    /// completed comparison exists. Always gates (a run error, not a check failure).
     CurrentError,
     /// Comparability key changed; cannot be compared or gated.
     Unverifiable,
@@ -220,7 +243,7 @@ impl BaselineComparison {
             .count()
     }
 
-    /// Count of current cases that errored before producing a record.
+    /// Count of current cases whose run errored.
     pub fn current_errors(&self) -> usize {
         self.per_case
             .values()
@@ -298,13 +321,13 @@ impl BaselineComparison {
     }
 }
 
-fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &[String], &SandboxStamp) {
+fn current_key(rec: &crate::record::RunRecord) -> (&str, Mode, &str, &ToolSurface, &SandboxStamp) {
     (
-        rec.case_hash.as_str(),
-        rec.mode,
-        rec.provider_ref.as_str(),
-        rec.tool_surface.as_slice(),
-        &rec.sandbox,
+        rec.provenance.case_hash.as_str(),
+        rec.provenance.mode,
+        rec.provenance.provider_ref.as_str(),
+        &rec.provenance.tool_surface,
+        &rec.provenance.sandbox,
     )
 }
 
@@ -336,11 +359,12 @@ pub fn compare(current: &SuiteReport, baseline: &Baseline) -> anyhow::Result<Bas
 
     let mut cur_map: BTreeMap<&str, &CaseReport> = BTreeMap::new();
     for case in &current.cases {
-        // An errored case has no record; its report identity is its name.
+        // Provenance normally supplies the canonical id even for an errored case;
+        // the report name is a fail-closed fallback for synthetic callers.
         let id = case
             .record
             .as_ref()
-            .map(|r| r.case_id.as_str())
+            .map(|r| r.provenance.case_id.as_str())
             .unwrap_or(case.name.as_str());
         if id.is_empty() {
             anyhow::bail!("current run case with empty id cannot be compared");
@@ -377,7 +401,10 @@ pub fn compare(current: &SuiteReport, baseline: &Baseline) -> anyhow::Result<Bas
                                 },
                                 (false, true) => CaseComparison::Improvement,
                                 _ => {
-                                    let cur_total = rec.input_tokens + rec.output_tokens;
+                                    let completion = rec.completion_or_default();
+                                    let cur_total = completion
+                                        .input_tokens
+                                        .saturating_add(completion.output_tokens);
                                     let delta = token_delta_pct(base.total_tokens, cur_total);
                                     CaseComparison::Unchanged {
                                         token_delta_pct: delta,
@@ -432,28 +459,28 @@ fn token_delta_pct(base: u64, current: u64) -> Option<f64> {
 mod tests {
     use super::*;
     use crate::grader::{GradeCategory, GradeResult};
-    use crate::record::{RECORD_SCHEMA, RunRecord, SandboxStamp};
+    use crate::record::{
+        CaseProvenance, RECORD_SCHEMA, RunCompletion, RunRecord, SandboxStamp, ToolSurface,
+    };
 
     fn rec(case_id: &str, tokens: u64) -> RunRecord {
         RunRecord {
-            schema: RECORD_SCHEMA.to_string(),
-            mode: Mode::Replay,
-            case_id: case_id.to_string(),
-            case_hash: "hash".to_string(),
-            provider_ref: "scripted".to_string(),
-            tool_surface: Vec::new(),
-            sandbox: SandboxStamp {
-                autonomy: "supervised".to_string(),
-                workspace_only: false,
+            provenance: CaseProvenance {
+                schema: RECORD_SCHEMA.to_string(),
+                mode: Mode::Replay,
+                case_id: case_id.to_string(),
+                case_hash: "hash".to_string(),
+                provider_ref: "scripted".to_string(),
+                tool_surface: ToolSurface::default(),
+                sandbox: SandboxStamp {
+                    autonomy: "supervised".to_string(),
+                    workspace_only: false,
+                },
             },
-            final_response: String::new(),
-            history: Vec::new(),
-            tools_called: Vec::new(),
-            all_tools_succeeded: true,
-            input_tokens: tokens,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
+            completion: Some(RunCompletion {
+                input_tokens: tokens,
+                ..RunCompletion::default()
+            }),
         }
     }
 
@@ -492,7 +519,7 @@ mod tests {
         let baseline = baseline_of(&pass);
         // Now the case fails AND its hash changed.
         let mut failing = case("a", vec![grade("c", false, GradeCategory::Response)], 10);
-        failing.record.as_mut().unwrap().case_hash = "different".to_string();
+        failing.record.as_mut().unwrap().provenance.case_hash = "different".to_string();
         let current = SuiteReport {
             cases: vec![failing],
         };
@@ -594,9 +621,28 @@ mod tests {
     }
 
     #[test]
+    fn from_report_rejects_errored_run_with_provenance_only() {
+        // The runner now preserves provenance for execution errors. That receipt
+        // makes the failed attempt diagnosable, but it is still not a completed
+        // reference run and must not become a baseline.
+        let mut errored = case("errored", Vec::new(), 0);
+        let provenance = errored.record.take().unwrap().provenance;
+        errored.record = Some(RunRecord::from_provenance(provenance));
+        errored.error = Some("provider exploded".to_string());
+        let report = SuiteReport {
+            cases: vec![errored],
+        };
+
+        let error = Baseline::from_report(&report)
+            .expect_err("provenance-only errored runs must not become baselines");
+        assert!(error.to_string().contains("errored"));
+        assert!(error.to_string().contains("did not complete"));
+    }
+
+    #[test]
     fn from_report_accepts_a_complete_report() {
-        // Every case has a record — including a *failing* one. Only a missing record
-        // (a run error) blocks the write; an honest failure is baseline-able.
+        // Every case has completion data and grades, including a *failing* one.
+        // An execution error blocks the write; an honest check failure does not.
         let report = SuiteReport {
             cases: vec![
                 case("pass", vec![grade("c", true, GradeCategory::Response)], 10),
@@ -619,7 +665,7 @@ mod tests {
             )],
         };
         let baseline = Baseline::from_report(&report).unwrap();
-        let parsed = Baseline::from_json(&baseline.to_json()).unwrap();
+        let parsed = Baseline::from_json(&baseline.to_json().unwrap()).unwrap();
         assert_eq!(parsed.schema, BASELINE_SCHEMA);
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].case_id, "a");
@@ -641,7 +687,7 @@ mod tests {
         let baseline = baseline_of(&base_report);
         let mut current = case("a", vec![grade("c", false, GradeCategory::Response)], 10);
         // Live-mode record so the flaky rule applies.
-        current.record.as_mut().unwrap().mode = Mode::Live;
+        current.record.as_mut().unwrap().provenance.mode = Mode::Live;
         let mut base_live = baseline;
         base_live.entries[0].mode = Mode::Live;
         let current = SuiteReport {
@@ -686,17 +732,50 @@ mod tests {
             schema: "zeroclaw-eval/baseline/v999".to_string(),
             entries: Vec::new(),
         };
-        let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
+        let err = Baseline::from_json(&baseline.to_json().unwrap()).unwrap_err();
         assert!(err.to_string().contains("unsupported baseline schema"));
-        // The message must tell the operator how to recover: the `sandbox` field
-        // widened the entry schema, so pre-existing baselines need one regeneration.
+        // The message must tell the operator how to recover after the entry's
+        // capability key widened.
         assert!(
             err.to_string().contains("--write-baseline"),
             "the rejection must name the regeneration step: {err}"
         );
         // Arbitrary non-baseline schema strings are rejected too.
         baseline.schema = "not-a-baseline".to_string();
-        assert!(Baseline::from_json(&baseline.to_json()).is_err());
+        assert!(Baseline::from_json(&baseline.to_json().unwrap()).is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_unknown_fields_at_every_schema_level() {
+        let report = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = Baseline::from_report(&report).unwrap();
+        let original: serde_json::Value =
+            serde_json::from_str(&baseline.to_json().unwrap()).unwrap();
+
+        for path in ["root", "entry", "tool_surface", "sandbox"] {
+            let mut changed = original.clone();
+            let object = match path {
+                "root" => changed.as_object_mut().unwrap(),
+                "entry" => changed["entries"][0].as_object_mut().unwrap(),
+                "tool_surface" => changed["entries"][0]["tool_surface"]
+                    .as_object_mut()
+                    .unwrap(),
+                "sandbox" => changed["entries"][0]["sandbox"].as_object_mut().unwrap(),
+                _ => unreachable!(),
+            };
+            object.insert("unexpected".to_string(), serde_json::json!(true));
+            let text = serde_json::to_string(&changed).unwrap();
+            assert!(
+                Baseline::from_json(&text).is_err(),
+                "unknown field at {path} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -708,7 +787,7 @@ mod tests {
             ],
         };
         let baseline = Baseline::from_report(&report).unwrap();
-        let err = Baseline::from_json(&baseline.to_json()).unwrap_err();
+        let err = Baseline::from_json(&baseline.to_json().unwrap()).unwrap_err();
         assert!(err.to_string().contains("duplicate case_id"));
 
         let empty_report = SuiteReport {
@@ -719,7 +798,7 @@ mod tests {
             )],
         };
         let empty_baseline = Baseline::from_report(&empty_report).unwrap();
-        let err = Baseline::from_json(&empty_baseline.to_json()).unwrap_err();
+        let err = Baseline::from_json(&empty_baseline.to_json().unwrap()).unwrap_err();
         assert!(err.to_string().contains("empty case_id"));
     }
 
@@ -756,7 +835,7 @@ mod tests {
         // Same hash/mode/provider/tools, but the sandbox posture changed and
         // the case now fails: not comparable, must not be a regression.
         let mut failing = case("a", vec![grade("c", false, GradeCategory::Response)], 10);
-        failing.record.as_mut().unwrap().sandbox = SandboxStamp {
+        failing.record.as_mut().unwrap().provenance.sandbox = SandboxStamp {
             autonomy: "full".to_string(),
             workspace_only: true,
         };
@@ -766,6 +845,41 @@ mod tests {
         let cmp = compare(&current, &baseline).unwrap();
         assert_eq!(cmp.per_case["a"], CaseComparison::Unverifiable);
         assert_eq!(cmp.confirmed_regressions(), 0);
+    }
+
+    #[test]
+    fn changed_effective_or_registered_tool_surface_is_unverifiable() {
+        let pass = SuiteReport {
+            cases: vec![case(
+                "a",
+                vec![grade("c", true, GradeCategory::Response)],
+                10,
+            )],
+        };
+        let baseline = baseline_of(&pass);
+        let changed_surfaces = [
+            ToolSurface {
+                requested: Vec::new(),
+                effective: vec!["web".to_string()],
+                registered: Vec::new(),
+            },
+            ToolSurface {
+                requested: Vec::new(),
+                effective: Vec::new(),
+                registered: vec!["echo".to_string()],
+            },
+        ];
+
+        for tool_surface in changed_surfaces {
+            let mut failing = case("a", vec![grade("c", false, GradeCategory::Response)], 10);
+            failing.record.as_mut().unwrap().provenance.tool_surface = tool_surface;
+            let current = SuiteReport {
+                cases: vec![failing],
+            };
+            let cmp = compare(&current, &baseline).unwrap();
+            assert_eq!(cmp.per_case["a"], CaseComparison::Unverifiable);
+            assert_eq!(cmp.confirmed_regressions(), 0);
+        }
     }
 
     #[test]

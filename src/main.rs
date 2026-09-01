@@ -5960,7 +5960,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     opts,
                 ))
                 .await?;
-                std::process::exit(code);
+                match code {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
+                }
             }
         },
 

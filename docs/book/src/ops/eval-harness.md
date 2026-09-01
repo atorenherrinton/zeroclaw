@@ -136,8 +136,9 @@ records each case's verdict and comparability key from a prior run:
 - `--baseline <file>` compares the current run against it, per case id.
 
 Comparison is keyed by the comparability tuple `(case_hash, mode, provider_ref,
-tool_surface, sandbox)`. The sandbox posture is part of the key, so runs under
-different sandbox policies are never called comparable:
+tool_surface, sandbox)`. The tool surface records requested, effective, and
+registered tools, and the sandbox posture is part of the key, so runs with
+different actual capabilities are never called comparable:
 
 - A changed key reports `changed - refresh baseline` (Unverifiable) and is never
   compared or gated.
@@ -147,30 +148,32 @@ different sandbox policies are never called comparable:
   case only in the current run is **new**; a case only in the baseline is
   **removed** (warned). Per-case token deltas are reported as a percentage and are
   never gated.
-- A current case that errored before producing a record is reported as a
-  **run error** (`CurrentError`), never `removed`, and always gates.
+- A current case that errored is reported as a **run error** (`CurrentError`),
+  never `removed`, and always gates. Its record retains pre-run provenance but
+  has no completion data.
 
 Baseline inputs fail closed: a baseline file with an unrecognized `schema` tag,
-an empty case id, or duplicate case ids is rejected at parse time, and a current
-run with duplicate case ids is rejected at comparison time, so malformed or
-ambiguous inputs can never produce a trusted gate result.
+unknown fields, an empty case id, or duplicate case ids is rejected at parse
+time, and a current run with duplicate case ids is rejected at comparison time,
+so malformed or ambiguous inputs can never produce a trusted gate result.
 
 Baseline *writes* fail closed too. A baseline must describe every case in the
-suite, so `--write-baseline` refuses to write at all when any case errored before
-producing a run record; the error names the offending case ids. This is deliberate:
+suite, so `--write-baseline` refuses to write at all when any case errored or did
+not produce grades and completion data; the error names the offending case ids. This is deliberate:
 an omitted case would be classified merely `new` on the next run, and a failing
 `new` case never gates, so a silently shortened baseline would convert a hard
-regression into a permanently excused case. The check runs before any filesystem
-work and the write itself is atomic (temp file plus rename), so a failed run
-neither creates a new baseline nor replaces an existing one. A case that *failed
-its checks* is still recorded normally; only a missing record blocks the write.
+regression into a permanently excused case. The check runs before touching the
+baseline target and the write itself is atomic, so a failed run neither creates a
+new baseline nor replaces an existing one. A case that completed but *failed its
+checks* is still recorded normally.
 
 ### Baseline schema compatibility
 
-Baseline entries carry a `sandbox` stamp, which is part of the comparability key.
-This widens the `zeroclaw-eval/baseline/v1` entry schema, and the parser is
-strict: **baseline files written before this change are rejected and must be
-regenerated once** with `--write-baseline`. This is a one-time migration:
+Baseline entries carry a three-stage `tool_surface` and a `sandbox` stamp, both
+of which are part of the comparability key. These widen the
+`zeroclaw-eval/baseline/v1` entry schema, and the parser is strict: **baseline
+files written before this change are rejected and must be regenerated once**
+with `--write-baseline`. This is a one-time migration:
 regenerate on a known-green run so the new reference is trustworthy, and commit
 the refreshed file.
 

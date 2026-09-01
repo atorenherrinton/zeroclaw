@@ -9,8 +9,9 @@ pub struct CaseReport {
     pub name: String,
     /// The fixture file name the case came from.
     pub source: String,
-    /// The run record (receipt + transcript). `None` when the run errored before
-    /// producing a record.
+    /// The run record (receipt + transcript). Normal execution errors preserve
+    /// provenance with no completion; `None` is reserved for callers that could
+    /// not construct even the pre-run provenance.
     pub record: Option<crate::record::RunRecord>,
     /// Per-check grades.
     pub grades: Vec<GradeResult>,
@@ -352,7 +353,8 @@ mod tests {
         let suite = SuiteReport {
             cases: vec![case("err", vec![], Some("provider timed out"))],
         };
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(SuiteKind::Regression, None)).unwrap();
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(false));
         assert!(
             json["cases"][0]["score"].is_null(),

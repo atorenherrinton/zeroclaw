@@ -312,11 +312,7 @@ pub async fn finalize(
         println!("{}", report.render_table());
     }
 
-    let dump_result = write_dumps(
-        &report,
-        opts.dump_records.as_deref(),
-        &artifacts.staged,
-    );
+    let dump_result = write_dumps(&report, opts.dump_records.as_deref(), &artifacts.staged);
     let wrote_auto = match dump_result {
         Ok(wrote_auto) => wrote_auto,
         Err(error) => {
@@ -342,14 +338,14 @@ pub async fn finalize(
 
     // --write-baseline: persist the run and exit with its normal code.
     if let Some(path) = &opts.write_baseline {
-        // Fail closed BEFORE touching the filesystem: an incomplete baseline must
-        // neither be created nor replace an existing good one. The run's own exit
-        // code is carried in the error context so it is reported alongside the write
-        // failure rather than replaced by it.
+        // Fail closed before touching the baseline target: an incomplete run must
+        // neither create a baseline nor replace an existing good one. The run's own
+        // exit code is carried in the error context so it is reported alongside the
+        // write failure rather than replaced by it.
         let run_code = report.exit_code(kind, None);
         let baseline = Baseline::from_report(&report)
             .with_context(|| format!("--write-baseline aborted (run exit code {run_code})"))?;
-        write_baseline_atomically(path, &baseline.to_json())?;
+        write_baseline_atomically(path, &baseline.to_json()?)?;
         if opts.format == OutputFormat::Json {
             println!("{}", report.to_json(kind, None));
         }
@@ -721,27 +717,23 @@ pub fn write_dumps(
     Ok(any_auto)
 }
 
-/// Write `contents` to `path` via a sibling temp file plus rename, so the target is
-/// either the old file or the complete new one — never a truncated intermediate.
-/// A failure to serialize or write leaves any existing baseline untouched.
+/// Write `contents` to `path` via a unique sibling temp file plus atomic persist,
+/// so the target is either the old file or the complete new one, never a truncated
+/// intermediate. A failed write leaves any existing baseline untouched.
 fn write_baseline_atomically(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("baseline.json");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
-    // Clean up the scratch file on any failure so a botched write leaves no litter.
-    if let Err(e) = std::fs::write(&tmp, contents) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".zeroclaw-baseline-")
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -855,12 +847,19 @@ mod tests {
         assert_eq!(count, 2, "colliding ids must produce two files, not one");
     }
 
-    /// An errored case: no record, only an error string — exactly the shape
-    /// `--write-baseline` must refuse to serialize.
+    /// An errored case with provenance but no completion data: the shape the
+    /// runner now preserves and `--write-baseline` must refuse to serialize.
     fn errored_case(name: &str) -> CaseReport {
         let mut c = case_report(name, false);
-        c.record = None;
+        c.record = Some(RunRecord::from_provenance(provenance(name)));
         c
+    }
+
+    fn test_artifacts(root: &Path) -> RunArtifacts {
+        let root = root.join("eval-artifacts");
+        create_private_dir(&root).unwrap();
+        let staged = stage_run_dir(&root).unwrap();
+        RunArtifacts { root, staged }
     }
 
     fn write_baseline_opts(path: &Path) -> FinalizeOpts {
@@ -873,12 +872,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn atomic_baseline_write_replaces_existing_file_without_litter() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("baseline.json");
+        std::fs::write(&target, "old").unwrap();
+
+        write_baseline_atomically(&target, "complete-new-baseline").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "complete-new-baseline"
+        );
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("baseline.json")]);
+    }
+
     #[tokio::test]
     async fn write_baseline_does_not_create_file_on_run_error() {
-        // A case errored before producing a record. The baseline would be silently
-        // short by that case, so the write must be refused outright — no file at all.
+        // A case errored after producing provenance but before completion. The
+        // baseline would be untrustworthy, so the write must be refused outright.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("nested").join("baseline.json");
+        let artifact_dir = tempfile::tempdir().unwrap();
         let report = SuiteReport {
             cases: vec![case_report("ok", true), errored_case("boom-case")],
         };
@@ -888,6 +907,7 @@ mod tests {
             Mode::Replay,
             Path::new("evals/regression"),
             report,
+            test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )
         .await
@@ -909,6 +929,7 @@ mod tests {
         // refusal happens before the target is created, truncated, or replaced.
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("baseline.json");
+        let artifact_dir = tempfile::tempdir().unwrap();
         let good = SuiteReport {
             cases: vec![case_report("ok", true)],
         };
@@ -917,6 +938,7 @@ mod tests {
             Mode::Replay,
             Path::new("evals/regression"),
             good,
+            test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )
         .await
@@ -932,6 +954,7 @@ mod tests {
             Mode::Replay,
             Path::new("evals/regression"),
             broken,
+            test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
         )
         .await
