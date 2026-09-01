@@ -17,8 +17,8 @@ pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_grade
 pub use record::RunRecord;
 pub use report::{CaseReport, SuiteReport};
 pub use runner::{
-    CaseOutcome, CaseProvider, RunDeps, ensure_live_provider, run_case, run_case_with_graders,
-    run_case_repeated, run_suite,
+    CaseOutcome, CaseProvider, RunDeps, ensure_live_provider, run_case, run_case_repeated,
+    run_case_with_graders, run_suite,
 };
 
 use std::str::FromStr;

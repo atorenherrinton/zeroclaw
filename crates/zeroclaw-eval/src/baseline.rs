@@ -904,6 +904,8 @@ mod tests {
             record: None,
             grades: Vec::new(),
             error: Some("trace exhausted".to_string()),
+            repeat: None,
+            cluster: None,
         };
         let current = SuiteReport {
             cases: vec![errored],

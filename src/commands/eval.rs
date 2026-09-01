@@ -1100,8 +1100,7 @@ mod tests {
         let mut cmp = BaselineComparison {
             per_case: [("flaky".to_string(), regression())].into_iter().collect(),
         };
-        let rerun: BTreeMap<String, bool> =
-            [("flaky".to_string(), false)].into_iter().collect();
+        let rerun: BTreeMap<String, bool> = [("flaky".to_string(), false)].into_iter().collect();
         let flaky =
             zeroclaw_eval::baseline::downgrade_flaky_regressions(&mut cmp, Mode::Live, &rerun);
         assert!(
@@ -1117,8 +1116,7 @@ mod tests {
         let mut cmp_ok = BaselineComparison {
             per_case: [("flaky".to_string(), regression())].into_iter().collect(),
         };
-        let rerun_ok: BTreeMap<String, bool> =
-            [("flaky".to_string(), true)].into_iter().collect();
+        let rerun_ok: BTreeMap<String, bool> = [("flaky".to_string(), true)].into_iter().collect();
         let flaky_ok = zeroclaw_eval::baseline::downgrade_flaky_regressions(
             &mut cmp_ok,
             Mode::Live,

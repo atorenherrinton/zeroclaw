@@ -163,7 +163,9 @@ pub async fn run_suite(dir: &Path, deps: &RunDeps) -> anyhow::Result<SuiteReport
         // The execution path publishes provenance here as soon as it is known,
         // so an error after that point still yields a joinable receipt.
         let mut provenance = Some(case_provenance(&trace, deps, ToolSurface::default())?);
-        let report = match run_case_repeated(&trace, deps).await {
+        let report = match run_case_repeated_recording_provenance(&trace, deps, &mut provenance)
+            .await
+        {
             Ok((outcome, repeat)) => {
                 // A truncated repetition set must not pass: the representative's
                 // grades only describe the repetitions that completed, so a
@@ -234,23 +236,36 @@ pub async fn run_case_repeated(
     trace: &LlmTrace,
     deps: &RunDeps,
 ) -> anyhow::Result<(CaseOutcome, Option<crate::stats::RepeatStats>)> {
+    run_case_repeated_recording_provenance(trace, deps, &mut None).await
+}
+
+async fn run_case_repeated_recording_provenance(
+    trace: &LlmTrace,
+    deps: &RunDeps,
+    provenance_out: &mut Option<CaseProvenance>,
+) -> anyhow::Result<(CaseOutcome, Option<crate::stats::RepeatStats>)> {
     let (k, warnings) = crate::stats::effective_repeat(deps.mode, trace.repeat);
     for w in &warnings {
         eprintln!("  {} (repeat): {w}", trace.display_id());
     }
     if k <= 1 {
-        return Ok((run_case(trace, deps).await?, None));
+        return Ok((
+            run_case_recording_provenance(trace, deps, provenance_out).await?,
+            None,
+        ));
     }
     let mut outcomes = Vec::with_capacity(k as usize);
     let mut run_error: Option<String> = None;
     for i in 0..k {
-        match run_case(trace, deps).await {
+        let mut attempt_provenance = None;
+        match run_case_recording_provenance(trace, deps, &mut attempt_provenance).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(e) => {
                 // Keep the evidence from repetitions 0..i and stop; with no
                 // completed repetition there is nothing to report, so the error
                 // propagates as an errored case instead.
                 if outcomes.is_empty() {
+                    *provenance_out = attempt_provenance;
                     return Err(e);
                 }
                 eprintln!(
@@ -267,17 +282,20 @@ pub async fn run_case_repeated(
     let all_pass = |o: &CaseOutcome| o.grades.iter().all(|g| g.passed);
     let samples: Vec<crate::stats::RunSample> = outcomes
         .iter()
-        .map(|o| crate::stats::RunSample {
-            passed: all_pass(o),
-            input_tokens: o.record.input_tokens,
-            output_tokens: o.record.output_tokens,
-            duration_ms: o.record.duration_ms,
-            llm_calls: o.record.llm_calls,
-            checks: o
-                .grades
-                .iter()
-                .map(|g| (g.check.clone(), g.passed))
-                .collect(),
+        .map(|o| {
+            let completion = o.record.completion_or_default();
+            crate::stats::RunSample {
+                passed: all_pass(o),
+                input_tokens: completion.input_tokens,
+                output_tokens: completion.output_tokens,
+                duration_ms: completion.duration_ms,
+                llm_calls: completion.llm_calls,
+                checks: o
+                    .grades
+                    .iter()
+                    .map(|g| (g.check.clone(), g.passed))
+                    .collect(),
+            }
         })
         .collect();
     let stats = match run_error {

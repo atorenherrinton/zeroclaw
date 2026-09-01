@@ -1213,7 +1213,7 @@ mod tests {
                 "model_name": "first-error",
                 "repeat": 3,
                 "turns": [{ "user_input": "run" }],
-                "expects": {}
+                "expects": { "response_contains": ["ok"] }
             }"#,
         )
         .unwrap();
