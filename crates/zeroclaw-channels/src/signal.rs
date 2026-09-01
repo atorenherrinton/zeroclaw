@@ -24,6 +24,11 @@ const RECENT_TARGETS_CAPACITY: usize = 1024;
 /// a delayed echo unsafe.
 const SELF_SEND_GUARD_CAPACITY: usize = 128;
 
+/// Bound concurrent SSE envelope classification. A matching sent-sync event
+/// may wait for its in-flight RPC timestamp, but it must not stop the serial
+/// reader from admitting later unrelated events.
+const SIGNAL_ENVELOPE_TASK_CAPACITY: usize = 128;
+
 #[derive(Debug)]
 struct PendingSelfSend {
     content: String,
@@ -57,8 +62,8 @@ enum EchoDecision {
 /// task, a losing `select!` branch, a shutdown, a timeout wrapper -- would
 /// otherwise bypass every one of them and leave the token pending with no
 /// owner that will ever classify it. A later sync event with the same body
-/// then parks in `is_echo` forever, and because the SSE listener awaits
-/// `process_envelope_async` inline, the whole inbound stream stops.
+/// then leaves one envelope-classification task parked in `is_echo` forever
+/// and permanently consumes one slot from the bounded listener task set.
 ///
 /// Making the registration an RAII value turns cancellation into a
 /// resolution path: whatever happens to the future, the token is resolved
@@ -118,13 +123,17 @@ impl Drop for SelfSendTicket {
 /// arrive at the listener as an unmatched sent-sync event and be replayed as a
 /// fresh inbound turn -- exactly the self-reply loop this feature must prevent.
 ///
-/// Keying by `(http_url, account)` makes correlation canonical for the
-/// endpoint/account pair that signal-cli itself correlates on, so all handles
-/// for one account share one guard while distinct accounts stay isolated. The
-/// registry deliberately owns a strong reference for the process lifetime:
-/// rebuilding a channel must not forget an unresolved send whose late echo can
-/// still arrive on the replacement listener. Only restarting the ZeroClaw
-/// daemon clears fail-closed or capacity-exhausted correlation state.
+/// Keying by canonical `(http_url, account)` makes correlation authoritative
+/// for the endpoint/account pair that signal-cli itself correlates on, so all
+/// handles for one account share one guard while distinct accounts stay
+/// isolated. Proxy routing is deliberately excluded: aliases that name the
+/// same endpoint/account are an unsafe duplicate-listener topology even when
+/// they configure different proxies. The registry keeps non-empty guards for
+/// the process lifetime because rebuilding a channel must not forget an
+/// unresolved send whose late echo can still arrive on the replacement
+/// listener. Clean guards with no live channel handle are retired on the next
+/// lookup. Only restarting the ZeroClaw daemon clears fail-closed or
+/// capacity-exhausted correlation state.
 /// Registry of canonical self-send guards, keyed by `(http_url, account)`.
 type SelfSendGuardRegistry = SyncMutex<HashMap<(String, String), Arc<SelfSendGuard>>>;
 
@@ -147,6 +156,7 @@ impl SelfSendGuard {
     fn shared_for(http_url: &str, account: &str) -> Arc<Self> {
         let key = SignalChannel::endpoint_account_key(http_url, account);
         let mut guards = SELF_SEND_GUARDS.lock();
+        guards.retain(|_, guard| Arc::strong_count(guard) > 1 || !guard.is_pristine());
         Arc::clone(
             guards
                 .entry(key)
@@ -203,7 +213,18 @@ impl SelfSendGuard {
             .send_modify(|version| *version = version.wrapping_add(1));
     }
 
+    #[cfg(test)]
     async fn is_echo(&self, timestamp: u64, content: &str) -> bool {
+        self.is_echo_with_pending_wait(timestamp, content, true)
+            .await
+    }
+
+    async fn is_echo_with_pending_wait(
+        &self,
+        timestamp: u64,
+        content: &str,
+        wait_for_pending: bool,
+    ) -> bool {
         let mut version = self.version.subscribe();
         let mut observed_pending = HashSet::new();
 
@@ -220,13 +241,17 @@ impl SelfSendGuard {
                     state.confirmed.remove(&timestamp);
                     EchoDecision::Echo
                 } else {
-                    let matching: Vec<u64> = state
-                        .pending
-                        .iter()
-                        .filter_map(|(token, pending)| {
-                            (pending.content == content).then_some(*token)
-                        })
-                        .collect();
+                    let matching: Vec<u64> = if wait_for_pending {
+                        state
+                            .pending
+                            .iter()
+                            .filter_map(|(token, pending)| {
+                                (pending.content == content).then_some(*token)
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     observed_pending.extend(matching);
                     if observed_pending
                         .iter()
@@ -249,6 +274,19 @@ impl SelfSendGuard {
                 }
             }
         }
+    }
+
+    fn is_pristine(&self) -> bool {
+        let state = self.state.lock();
+        state.pending.is_empty() && state.confirmed.is_empty() && !state.indeterminate
+    }
+
+    fn has_pending_content(&self, content: &str) -> bool {
+        self.state
+            .lock()
+            .pending
+            .values()
+            .any(|pending| pending.content == content)
     }
 
     #[cfg(test)]
@@ -435,13 +473,19 @@ pub struct PollAnswer {
 
 impl SignalChannel {
     /// Canonical identity used both by self-send correlation and listener
-    /// topology checks. A trailing slash does not identify a different HTTP
-    /// daemon; the configured account remains signal-cli's account identity.
+    /// topology checks. URL parsing normalizes equivalent scheme/host casing,
+    /// default ports, and root spellings before trailing slashes are removed;
+    /// surrounding account whitespace is not part of signal-cli's E.164
+    /// identity. The per-alias proxy is intentionally not part of this key:
+    /// multiple listeners for one endpoint/account are rejected even when
+    /// their configured routes differ.
     pub(crate) fn endpoint_account_key(http_url: &str, account: &str) -> (String, String) {
-        (
-            http_url.trim_end_matches('/').to_string(),
-            account.to_string(),
-        )
+        let trimmed_url = http_url.trim().trim_end_matches('/');
+        let canonical_url = reqwest::Url::parse(trimmed_url).map_or_else(
+            |_| trimmed_url.to_string(),
+            |url| url.to_string().trim_end_matches('/').to_string(),
+        );
+        (canonical_url, account.trim().to_string())
     }
 
     pub fn new(
@@ -757,7 +801,17 @@ impl SignalChannel {
     /// resolvable independently. Callers that conflate the two should
     /// treat any vec from this method as "the user's reply set" and
     /// dispatch each entry through their normal inbound pipeline.
+    #[cfg(test)]
     async fn process_envelope_async(&self, envelope: &Envelope) -> Vec<ChannelMessage> {
+        self.process_envelope_with_pending_wait(envelope, true)
+            .await
+    }
+
+    async fn process_envelope_with_pending_wait(
+        &self,
+        envelope: &Envelope,
+        wait_for_pending: bool,
+    ) -> Vec<ChannelMessage> {
         // Skip story messages when configured
         if self.ignore_stories && envelope.story_message.is_some() {
             return Vec::new();
@@ -769,12 +823,74 @@ impl SignalChannel {
                 .as_ref()
                 .and_then(|s| s.sent_message.as_ref())
             {
-                return self.process_sent_sync_message(envelope, sent).await;
+                return self
+                    .process_sent_sync_message(envelope, sent, wait_for_pending)
+                    .await;
             }
             return Vec::new();
         };
 
         self.process_data_message(envelope, data_msg)
+    }
+
+    async fn dispatch_envelope(
+        &self,
+        envelope: Envelope,
+        tx: mpsc::Sender<ChannelMessage>,
+        wait_for_pending: bool,
+    ) {
+        for msg in self
+            .process_envelope_with_pending_wait(&envelope, wait_for_pending)
+            .await
+        {
+            if let Some((token, response)) = crate::util::parse_approval_reply(&msg.content) {
+                let mut map = self.pending_approvals.lock().await;
+                if let Some(sender) = map.remove(&token) {
+                    let _ = sender.send(response);
+                    continue;
+                }
+            }
+            if tx.send(msg).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn spawn_envelope_task(
+        &self,
+        tasks: &mut tokio::task::JoinSet<()>,
+        envelope: Envelope,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) {
+        let channel = self.clone();
+        let tx = tx.clone();
+        tasks.spawn(async move {
+            channel.dispatch_envelope(envelope, tx, true).await;
+        });
+    }
+
+    fn envelope_matches_pending_self_send(&self, envelope: &Envelope) -> bool {
+        envelope.data_message.is_none()
+            && envelope
+                .sync_message
+                .as_ref()
+                .and_then(|sync| sync.sent_message.as_ref())
+                .and_then(|sent| sent.message.as_deref())
+                .is_some_and(|content| self.self_send_guard.has_pending_content(content))
+    }
+
+    fn record_envelope_task_result(result: Result<(), tokio::task::JoinError>) {
+        if let Err(error) = result
+            && !error.is_cancelled()
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Signal SSE envelope task failed"
+            );
+        }
     }
 
     #[cfg(test)]
@@ -872,6 +988,7 @@ impl SignalChannel {
         &self,
         envelope: &Envelope,
         sent: &SentMessage,
+        wait_for_pending: bool,
     ) -> Vec<ChannelMessage> {
         // Group sync messages are out of scope for Note-to-Self.
         if sent.group_info.is_some() {
@@ -914,7 +1031,11 @@ impl SignalChannel {
         // spend an outbound correlation entry. The timestamp returned by the
         // send RPC is the canonical identity; an equal body alone is never a
         // completed-send match.
-        if self.self_send_guard.is_echo(timestamp, content).await {
+        if self
+            .self_send_guard
+            .is_echo_with_pending_wait(timestamp, content, wait_for_pending)
+            .await
+        {
             return Vec::new();
         }
 
@@ -1155,6 +1276,7 @@ impl Channel for SignalChannel {
 
         let mut retry_delay_secs = 2u64;
         let max_delay_secs = 60u64;
+        let mut envelope_tasks = tokio::task::JoinSet::new();
 
         loop {
             let resp = self
@@ -1202,7 +1324,20 @@ impl Channel for SignalChannel {
             let mut buffer = String::new();
             let mut current_data = String::new();
 
-            while let Some(chunk) = bytes_stream.next().await {
+            loop {
+                let chunk = tokio::select! {
+                    () = tx.closed() => return Ok(()),
+                    result = envelope_tasks.join_next(), if !envelope_tasks.is_empty() => {
+                        if let Some(result) = result {
+                            Self::record_envelope_task_result(result);
+                        }
+                        continue;
+                    }
+                    chunk = bytes_stream.next() => chunk,
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
@@ -1251,27 +1386,28 @@ impl Channel for SignalChannel {
                         if !current_data.is_empty() {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
-                                    if let Some(ref envelope) = sse.envelope {
-                                        let mut consumed_as_approval = false;
-                                        let messages = self.process_envelope_async(envelope).await;
-                                        for msg in messages {
-                                            if let Some((token, response)) =
-                                                crate::util::parse_approval_reply(&msg.content)
+                                    if let Some(envelope) = sse.envelope {
+                                        if self.envelope_matches_pending_self_send(&envelope) {
+                                            while envelope_tasks.len()
+                                                >= SIGNAL_ENVELOPE_TASK_CAPACITY
                                             {
-                                                let mut map = self.pending_approvals.lock().await;
-                                                if let Some(sender) = map.remove(&token) {
-                                                    let _ = sender.send(response);
-                                                    consumed_as_approval = true;
-                                                    continue;
+                                                if let Some(result) =
+                                                    envelope_tasks.join_next().await
+                                                {
+                                                    Self::record_envelope_task_result(result);
                                                 }
                                             }
-                                            if tx.send(msg).await.is_err() {
+                                            self.spawn_envelope_task(
+                                                &mut envelope_tasks,
+                                                envelope,
+                                                &tx,
+                                            );
+                                        } else {
+                                            self.dispatch_envelope(envelope, tx.clone(), false)
+                                                .await;
+                                            if tx.is_closed() {
                                                 return Ok(());
                                             }
-                                        }
-                                        if consumed_as_approval {
-                                            current_data.clear();
-                                            continue;
                                         }
                                     }
                                 }
@@ -1304,18 +1440,19 @@ impl Channel for SignalChannel {
             if !current_data.is_empty() {
                 match serde_json::from_str::<SseEnvelope>(&current_data) {
                     Ok(sse) => {
-                        if let Some(ref envelope) = sse.envelope {
-                            for msg in self.process_envelope_async(envelope).await {
-                                if let Some((token, response)) =
-                                    crate::util::parse_approval_reply(&msg.content)
-                                {
-                                    let mut map = self.pending_approvals.lock().await;
-                                    if let Some(sender) = map.remove(&token) {
-                                        let _ = sender.send(response);
-                                        continue;
+                        if let Some(envelope) = sse.envelope {
+                            if self.envelope_matches_pending_self_send(&envelope) {
+                                while envelope_tasks.len() >= SIGNAL_ENVELOPE_TASK_CAPACITY {
+                                    if let Some(result) = envelope_tasks.join_next().await {
+                                        Self::record_envelope_task_result(result);
                                     }
                                 }
-                                let _ = tx.send(msg).await;
+                                self.spawn_envelope_task(&mut envelope_tasks, envelope, &tx);
+                            } else {
+                                self.dispatch_envelope(envelope, tx.clone(), false).await;
+                                if tx.is_closed() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -1516,6 +1653,43 @@ mod tests {
         assert!(ch.is_sender_allowed("+1111111111"));
         assert!(!ch.ignore_attachments);
         assert!(!ch.ignore_stories);
+    }
+
+    #[test]
+    fn endpoint_identity_canonicalizes_equivalent_urls_and_account_whitespace() {
+        assert_eq!(
+            SignalChannel::endpoint_account_key(" HTTP://LOCALHOST:80/api/ ", " +15551234567 ",),
+            SignalChannel::endpoint_account_key("http://localhost/api", "+15551234567")
+        );
+    }
+
+    #[test]
+    fn clean_guard_registry_entries_retire_after_the_last_handle_drops() {
+        let endpoint = format!("http://signal-clean-{}", Uuid::new_v4());
+        let account = "+15550000998".to_string();
+        let new_handle = || {
+            SignalChannel::new(
+                endpoint.clone(),
+                account.clone(),
+                Vec::new(),
+                false,
+                "signal_test_alias",
+                Arc::new(Vec::<String>::new),
+                false,
+                false,
+            )
+        };
+
+        let first = new_handle();
+        let retired = Arc::downgrade(&first.self_send_guard);
+        drop(first);
+
+        let rebuilt = new_handle();
+        assert!(
+            retired.upgrade().is_none(),
+            "a clean registry entry with no live handle should be retired"
+        );
+        assert_eq!(rebuilt.self_send_guard.snapshot(), (0, 0, false));
     }
 
     #[test]
@@ -3146,10 +3320,13 @@ mod tests {
             .begin("unknown outcome".to_string())
             .unwrap();
         ticket.mark_indeterminate();
-        let original_guard = Arc::clone(&first.self_send_guard);
+        let original_guard = Arc::downgrade(&first.self_send_guard);
         drop(first);
 
         let rebuilt = new_handle();
+        let original_guard = original_guard
+            .upgrade()
+            .expect("a non-empty guard must remain process-scoped");
         assert!(
             Arc::ptr_eq(&original_guard, &rebuilt.self_send_guard),
             "an in-process channel rebuild must retain the canonical guard"
@@ -3170,8 +3347,8 @@ mod tests {
     /// Goes through the real `SignalChannel::send` and the real
     /// `process_envelope_async` listener entry point -- not by poking
     /// `SelfSendGuard` directly -- because the wedge only manifests through
-    /// that wiring: the SSE listener awaits `process_envelope_async` inline,
-    /// so a permanently-parked `is_echo` stops the entire inbound stream.
+    /// that wiring: an unresolved `is_echo` consumes one of the listener's
+    /// bounded envelope-classification tasks indefinitely.
     ///
     /// Aborts a send after the stub has accepted the request but before it
     /// responds, then injects (a) the matching sync event and (b) a second,
@@ -3257,7 +3434,7 @@ mod tests {
         .await
         .expect(
             "a cancelled send must not leave the matching sync event parked forever -- \
-                     the SSE listener awaits this call inline",
+                     the listener must reclaim its classification task",
         );
         assert!(
             echo_result.is_empty(),
@@ -3292,6 +3469,99 @@ mod tests {
             later_result.is_empty(),
             "indeterminate correlation fails closed for subsequent events as well"
         );
+    }
+
+    #[tokio::test]
+    async fn pending_echo_does_not_block_a_later_sse_event() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let account = "+15550000005";
+        Mock::given(method("POST"))
+            .and(path("/api/v1/rpc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(2))
+                    .set_body_json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "result": { "timestamp": 1_700_000_000_600_u64 },
+                        "id": "ignored"
+                    })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pending_echo = serde_json::json!({
+            "envelope": {
+                "sourceNumber": account,
+                "syncMessage": {"sentMessage": {
+                    "destinationNumber": account,
+                    "message": "slow self send",
+                    "timestamp": 1_700_000_000_600_u64
+                }}
+            }
+        });
+        let later_note = serde_json::json!({
+            "envelope": {
+                "sourceNumber": account,
+                "syncMessage": {"sentMessage": {
+                    "destinationNumber": account,
+                    "message": "later phone note",
+                    "timestamp": 1_700_000_000_601_u64
+                }}
+            }
+        });
+        let sse_body = format!("data: {pending_echo}\n\ndata: {later_note}\n\n");
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let channel = Arc::new(SignalChannel::new(
+            server.uri(),
+            account.to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(move || vec![account.to_string()]),
+            false,
+            false,
+        ));
+        let sender = Arc::clone(&channel);
+        let mut send_task = zeroclaw_spawn::spawn!(async move {
+            sender
+                .send(&SendMessage::new("slow self send", account))
+                .await
+        });
+        for _ in 0..200 {
+            if channel.self_send_guard.snapshot().0 == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(channel.self_send_guard.snapshot().0, 1);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let listener = Arc::clone(&channel);
+        let mut listen_task = zeroclaw_spawn::spawn!(async move { listener.listen(tx).await });
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the later event must not wait for the slow send response")
+            .expect("the listener should remain connected");
+        assert_eq!(received.content, "later phone note");
+
+        send_task.abort();
+        let _ = (&mut send_task).await;
+        listen_task.abort();
+        let _ = (&mut listen_task).await;
     }
 
     #[tokio::test]

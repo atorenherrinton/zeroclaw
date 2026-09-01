@@ -9152,6 +9152,7 @@ fn build_channel_by_id(
                     sg.ignore_attachments,
                     sg.ignore_stories,
                 )
+                .with_proxy_url(sg.proxy_url.clone())
                 .with_approval_timeout_secs(sg.approval_timeout_secs),
             ))
         }
@@ -10149,6 +10150,9 @@ fn collect_configured_channels(
     // listener. Two aliases for the same endpoint/account would therefore
     // deliver every genuine note twice, while a confirmed self-echo could be
     // consumed by only the first listener and re-enter through the second.
+    // Proxy routing intentionally does not distinguish listener identity:
+    // ZeroClaw cannot prove that two proxies select disjoint event sources, so
+    // an otherwise identical endpoint/account pair remains fail-closed.
     // Derive the unsafe aliases from live config at construction time and
     // skip every conflicting alias: choosing one HashMap entry would route
     // private traffic nondeterministically to one of the configured agents.
@@ -13097,7 +13101,8 @@ pub async fn deliver_announcement(
                 peer_resolver,
                 sg.ignore_attachments,
                 sg.ignore_stories,
-            );
+            )
+            .with_proxy_url(sg.proxy_url.clone());
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-signal"))]
@@ -29789,16 +29794,16 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn collect_configured_channels_rejects_duplicate_signal_listener_identity() {
         let mut config = Config::default();
-        for (alias, http_url) in [
-            ("primary", "http://127.0.0.1:8686"),
-            ("duplicate", "http://127.0.0.1:8686/"),
+        for (alias, http_url, account) in [
+            ("primary", "HTTP://LOCALHOST:80", " +15551234567 "),
+            ("duplicate", "http://localhost/", "+15551234567"),
         ] {
             config.channels.signal.insert(
                 alias.to_string(),
                 zeroclaw_config::schema::SignalConfig {
                     enabled: true,
                     http_url: http_url.into(),
-                    account: "+15551234567".into(),
+                    account: account.into(),
                     ..Default::default()
                 },
             );
@@ -29810,6 +29815,34 @@ This is an example JSON object for profile settings."#;
             !channels.iter().any(|entry| entry.display_name == "Signal"),
             "every alias sharing one normalized Signal endpoint/account must be rejected; \
              selecting one would route duplicate private traffic nondeterministically"
+        );
+    }
+
+    #[cfg(feature = "channel-signal")]
+    #[test]
+    fn collect_configured_channels_rejects_duplicate_signal_identity_across_proxies() {
+        let mut config = Config::default();
+        for (alias, proxy_url) in [
+            ("primary", "http://proxy-one.example:8080"),
+            ("duplicate", "socks5://proxy-two.example:1080"),
+        ] {
+            config.channels.signal.insert(
+                alias.to_string(),
+                zeroclaw_config::schema::SignalConfig {
+                    enabled: true,
+                    http_url: "http://127.0.0.1:8686".into(),
+                    account: "+15551234567".into(),
+                    proxy_url: Some(proxy_url.into()),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        assert!(
+            !channels.iter().any(|entry| entry.display_name == "Signal"),
+            "proxy routing must not make duplicate endpoint/account listeners safe"
         );
     }
 

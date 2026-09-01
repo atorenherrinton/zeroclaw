@@ -42,11 +42,20 @@ suppressed by the listener, instead of returning as a new turn.
 Configure at most one enabled Signal alias for a given endpoint and account.
 The signal-cli event stream delivers the same account event to every active
 listener, so duplicate aliases would duplicate genuine notes and let only one
-listener consume a self-echo correlation entry. ZeroClaw detects aliases with
-the same normalized endpoint/account identity at channel construction and
-skips all of the conflicting aliases rather than choosing an agent
-nondeterministically. Give each alias a distinct account or endpoint, then
-reload the configuration.
+listener consume a self-echo correlation entry. ZeroClaw parses the endpoint
+URL to normalize equivalent scheme and host casing, default ports, and root or
+trailing-slash spellings; it also trims surrounding whitespace from the E.164
+account. Per-alias proxy routing intentionally does not create a distinct
+listener identity because ZeroClaw cannot prove that two proxy routes select
+disjoint event sources. Aliases with the same normalized endpoint/account are
+therefore all skipped even if their `proxy_url` values differ, rather than
+choosing an agent nondeterministically. Give each alias a distinct account or
+endpoint, then reload the configuration.
+
+A sent-sync event can arrive before its outbound RPC response supplies the
+canonical timestamp. That classification runs in a bounded task while it
+waits, so the serial SSE reader continues dispatching later unrelated events;
+ordinary envelopes keep their serial dispatch order.
 
 A confirmed self-send is cleared when its own echo arrives on the sync
 stream. ZeroClaw tracks at most 128 unresolved self-sends and never evicts
@@ -60,6 +69,12 @@ because a late echo may still arrive on a rebuilt listener. Restart the full
 ZeroClaw daemon to clear the record and restore Note-to-Self sending. Inbound
 Signal traffic and all other outbound targets keep working throughout; only
 self-sends are refused.
+
+Empty correlation guards are retired after their last channel handle is
+dropped and another Signal handle is constructed. Guards with pending,
+confirmed, indeterminate, or capacity-exhausted state remain process-scoped so
+a channel rebuild cannot forget a late echo or weaken the fail-closed recovery
+contract.
 
 ## Prerequisites
 
