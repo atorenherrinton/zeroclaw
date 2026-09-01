@@ -1,6 +1,6 @@
 use crate::cron::store::{
-    CronClaimToken, RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
-    persist_run_result,
+    CronClaimToken, RunCompletionAction, cron_db_path, persist_manual_run_result,
+    persist_run_completion_state, persist_run_result,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
@@ -12,7 +12,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
@@ -310,6 +310,105 @@ type OwnedOperation<T> = Box<
         + Send,
 >;
 
+static OWNED_WORKER_TRACKERS: LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, tokio::sync::watch::Sender<usize>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+#[derive(Clone)]
+struct OwnedWorkerTracker {
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+impl OwnedWorkerTracker {
+    fn for_config(config: &Config) -> Self {
+        let path = cron_db_path(config);
+        let mut trackers = OWNED_WORKER_TRACKERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let active = trackers
+            .entry(path)
+            .or_insert_with(|| tokio::sync::watch::channel(0).0)
+            .clone();
+        Self { active }
+    }
+
+    fn register(&self) -> ActiveOwnedWorkerGuard {
+        self.active
+            .send_modify(|active| *active = active.saturating_add(1));
+        ActiveOwnedWorkerGuard {
+            active: self.active.clone(),
+        }
+    }
+
+    fn active_count(&self) -> usize {
+        *self.active.borrow()
+    }
+
+    async fn wait_for_drain(&self) {
+        let mut active = self.active.subscribe();
+        while *active.borrow_and_update() != 0 {
+            if active.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+struct ActiveOwnedWorkerGuard {
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+impl Drop for ActiveOwnedWorkerGuard {
+    fn drop(&mut self) {
+        self.active
+            .send_modify(|active| *active = active.saturating_sub(1));
+    }
+}
+
+struct CancelOwnedWorkerOnDrop(CancellationToken);
+
+impl Drop for CancelOwnedWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn run_blocked_owned_worker_for_test(
+    config: &Config,
+    started: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    cancellation_seen: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let _ = supervise_owned(
+        Duration::from_secs(30),
+        OwnedWorkerTracker::for_config(config),
+        Box::new(move |cancellation| {
+            Box::pin(async move {
+                let _ = started.send(());
+                let _ = release.recv();
+                if cancellation.is_cancelled() {
+                    cancellation_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                }
+            })
+        }),
+    )
+    .await;
+}
+
+#[cfg(test)]
+pub(crate) fn active_owned_worker_count_for_test(config: &Config) -> usize {
+    OwnedWorkerTracker::for_config(config).active_count()
+}
+
+#[cfg(test)]
+pub(crate) async fn wait_for_owned_workers_for_test(config: &Config) {
+    OwnedWorkerTracker::for_config(config)
+        .wait_for_drain()
+        .await;
+}
+
 /// Observe a deadline independently without releasing ownership of live work.
 ///
 /// The private runtime keeps a synchronously blocking poll from starving the
@@ -319,20 +418,26 @@ type OwnedOperation<T> = Box<
 /// returning `DeadlineExceeded`. If a poll cannot yield, the durable caller
 /// must keep its claim: Rust cannot safely preempt that thread, and reporting a
 /// terminal timeout while it can still perform tools or delivery would create
-/// two owners for the same work.
+/// two owners for the same work. Dropping this supervising future (for example,
+/// when daemon shutdown exhausts its grace period) also requests cancellation;
+/// the process-local tracker remains active until the worker thread exits.
 async fn supervise_owned<T>(
     deadline: Duration,
+    tracker: OwnedWorkerTracker,
     operation: OwnedOperation<T>,
 ) -> Result<T, OwnedSupervisionError>
 where
     T: Send + 'static,
 {
     let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOwnedWorkerOnDrop(cancellation.clone());
     let worker_cancellation = cancellation.clone();
+    let active_worker = tracker.register();
     let (tx, mut rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("cron-owned".into())
         .spawn(move || {
+            let _active_worker = active_worker;
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -527,6 +632,7 @@ pub async fn deliver_and_classify_run_result(
         let deadline = delivery_timeout();
         match supervise_owned(
             deadline,
+            OwnedWorkerTracker::for_config(config),
             Box::new(move |cancellation| {
                 Box::pin(async move {
                     deliver_if_configured_with_cancellation(
@@ -690,6 +796,21 @@ pub async fn run(
     event_tx: EventBroadcast,
     cancel: CancellationToken,
 ) -> Result<()> {
+    let owned_workers = OwnedWorkerTracker::for_config(&config);
+    let active_workers = owned_workers.active_count();
+    if active_workers != 0 {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"active_workers": active_workers})),
+            "Cron scheduler waiting for workers owned by the prior in-process generation"
+        );
+    }
+    tokio::select! {
+        () = owned_workers.wait_for_drain() => {}
+        () = cancel.cancelled() => return Ok(()),
+    }
+
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -1499,6 +1620,7 @@ async fn run_agent_job_with_timeout(
             let run_allowed_tools = job.allowed_tools.clone();
             let supervised = supervise_owned(
                 timeout,
+                OwnedWorkerTracker::for_config(config),
                 Box::new(move |cancellation| {
                     Box::pin(
                         async move {
@@ -3954,8 +4076,11 @@ mod tests {
 
     #[tokio::test]
     async fn supervise_owned_rejects_completion_after_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
         let outcome = supervise_owned(
             Duration::from_millis(50),
+            OwnedWorkerTracker::for_config(&config),
             Box::new(|_cancellation| {
                 Box::pin(async {
                     // One non-yielding poll crosses the deadline and then
@@ -3972,6 +4097,51 @@ mod tests {
         assert!(
             matches!(outcome, Err(OwnedSupervisionError::DeadlineExceeded)),
             "a completion observed after cancellation must remain a deadline: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervise_owned_cancels_dropped_callers_and_tracks_worker_until_exit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let worker_config = config.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cancellation_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancellation_seen = Arc::clone(&cancellation_seen);
+
+        let mut supervisor = zeroclaw_spawn::spawn!(async move {
+            run_blocked_owned_worker_for_test(
+                &worker_config,
+                started_tx,
+                release_rx,
+                worker_cancellation_seen,
+            )
+            .await;
+        });
+        started_rx.await.expect("owned worker should start");
+        assert_eq!(active_owned_worker_count_for_test(&config), 1);
+
+        supervisor.abort();
+        (&mut supervisor)
+            .await
+            .expect_err("aborted supervisor should report cancellation");
+        assert_eq!(
+            active_owned_worker_count_for_test(&config),
+            1,
+            "dropping the caller must not make its non-yielding worker look finished"
+        );
+
+        release_tx.send(()).expect("release blocked worker");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_owned_workers_for_test(&config),
+        )
+        .await
+        .expect("owned worker should drain after its blocking poll returns");
+        assert!(
+            cancellation_seen.load(std::sync::atomic::Ordering::SeqCst),
+            "dropping the supervisor must request cancellation from its worker"
         );
     }
 

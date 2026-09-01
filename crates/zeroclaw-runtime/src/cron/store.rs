@@ -1710,7 +1710,7 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     }
 }
 
-fn cron_db_path(config: &Config) -> std::path::PathBuf {
+pub(crate) fn cron_db_path(config: &Config) -> std::path::PathBuf {
     config.data_dir.join("cron").join("jobs.db")
 }
 

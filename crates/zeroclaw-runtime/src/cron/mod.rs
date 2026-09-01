@@ -13,6 +13,8 @@ pub mod scheduler;
 pub use schedule::{
     next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
 };
+#[cfg(test)]
+pub(crate) use store::current_claim_for_test;
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, all_overdue_jobs, clear_stale_locks, due_jobs, get_job, get_job_for_agent,
