@@ -9,6 +9,7 @@ Suites of agent evaluation cases for `zeroclaw eval run` (crate: `crates/zerocla
 ## Authoring rules
 
 - Source cases from real failures (bug tracker, support reports). Start small; 20–50 good cases beat 500 vague ones.
+- A tracker-attributed regression case must reach the boundary where that bug occurred. A replay fixture that only asserts text supplied by its own scripted provider is not evidence for provider serialization, streaming, policy, history, or UI behavior; keep the case generic or test the real boundary elsewhere.
 - Every case states its class: a **positive** case (behavior must happen) or a **negative** case (behavior must NOT happen — e.g. `tools_not_used`, `response_not_contains`, `max_tool_calls: 0`). Keep the suite balanced; one-sided evals create one-sided optimization.
 - The two-experts test: two people reading the case must independently reach the same pass/fail verdict from the case text alone. If they wouldn't, the case is ambiguous — tighten it.
 - A replay case's scripted steps double as its reference solution: they prove the task is solvable.
