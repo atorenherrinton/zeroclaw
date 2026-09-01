@@ -676,7 +676,6 @@ pub(crate) mod tests {
             ),
             model: "m".to_string(),
             judge_ref: "judge.m:x".to_string(),
-            gates: false,
         });
 
         let outcome = run_case(&trace, &deps).await.unwrap();

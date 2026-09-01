@@ -528,9 +528,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 .as_ref()
                 .is_some_and(|item| item.judge_ref.split(':').next() == Some(provider_ref.as_str()))
             {
-                println!(
-                    "  warning: judge and live provider are the same provider reference (self-judging bias)"
-                );
+                println!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
             }
             let cfg = config.clone();
             RunDeps {
@@ -556,45 +554,47 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
     Ok(deps)
 }
 
-/// Convert a model-inclusive judge reference into a safe calibration filename.
-fn calibration_stem(judge_ref: &str) -> String {
-    judge_ref
-        .chars()
-        .map(|character| match character {
-            '/' | '.' | ':' => '_',
-            other => other,
-        })
-        .collect()
+fn fixed_identity_judge_config(config: &Config, provider_ref: &str) -> Result<Config> {
+    let (family, alias) = provider_ref.split_once('.').ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "model_provider reference `{provider_ref}` must be `<type>.<alias>`"
+        ))
+    })?;
+    let mut judge_config = config.clone();
+    judge_config.model_routes.clear();
+    let profile = judge_config
+        .providers
+        .models
+        .iter_entries_mut()
+        .find(|(entry_family, entry_alias, _)| *entry_family == family && *entry_alias == alias)
+        .map(|(_, _, profile)| profile)
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("unknown model_provider reference `{provider_ref}`"))
+        })?;
+    profile.fallback.clear();
+    profile.fallback_models.clear();
+    Ok(judge_config)
 }
 
-/// Resolve optional judge dependencies. Judge grades become authoritative only
-/// when gating is requested and the corresponding calibration artifact exists.
+/// Resolve optional diagnostic judge dependencies. Fallback models, aliases,
+/// and routes are disabled on a per-run config clone so `judge_ref` names the
+/// model actually queried rather than only the first candidate in a resilient
+/// chain.
 fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::JudgeDeps>> {
     let provider_ref = config.eval.judge_provider.as_str().trim().to_string();
     if provider_ref.is_empty() {
         return Ok(None);
     }
 
+    let judge_config = fixed_identity_judge_config(config, &provider_ref)?;
     let (provider, _provider_type, model) =
-        build_session_model_provider(config, &provider_ref, None)?;
+        build_session_model_provider(&judge_config, &provider_ref, None)?;
     let judge_ref = format!("{provider_ref}:{model}");
-    let path = PathBuf::from(format!(
-        "evals/calibration/{}.json",
-        calibration_stem(&judge_ref)
-    ));
-    let calibrated = path.exists();
-    let gates = config.eval.judge_gate && calibrated;
-    if config.eval.judge_gate && !calibrated {
-        println!(
-            "  warning: [eval].judge_gate is set but no calibration file for {judge_ref}; judge grades stay diagnostic"
-        );
-    }
 
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
-        gates,
     }))
 }
 
@@ -928,18 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn calibration_stem_includes_model_identity() {
-        assert_eq!(
-            calibration_stem("anthropic.sonnet:claude-x"),
-            "anthropic_sonnet_claude-x"
-        );
-        assert_ne!(
-            calibration_stem("anthropic.sonnet:model-a"),
-            calibration_stem("anthropic.sonnet:model-b")
-        );
-    }
-
-    #[test]
     fn atomic_baseline_write_replaces_existing_file_without_litter() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("baseline.json");
@@ -956,6 +944,38 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("baseline.json")]);
+    }
+
+    #[test]
+    fn fixed_identity_judge_config_removes_every_alternate_dispatch_path() {
+        let config: Config = toml::from_str(
+            r#"
+                [providers.models.custom.judge]
+                model = "primary"
+                fallback_models = ["backup-model"]
+                fallback = ["custom.backup"]
+
+                [providers.models.custom.backup]
+                model = "other"
+
+                [[model_routes]]
+                hint = "primary"
+                model_provider = "custom.backup"
+                model = "routed"
+            "#,
+        )
+        .unwrap();
+
+        let isolated = fixed_identity_judge_config(&config, "custom.judge").unwrap();
+        let profile = isolated.providers.models.find("custom", "judge").unwrap();
+        assert!(profile.fallback.is_empty());
+        assert!(profile.fallback_models.is_empty());
+        assert!(isolated.model_routes.is_empty());
+
+        let original = config.providers.models.find("custom", "judge").unwrap();
+        assert_eq!(original.fallback_models, ["backup-model"]);
+        assert_eq!(original.fallback[0].as_str(), "custom.backup");
+        assert_eq!(config.model_routes.len(), 1);
     }
 
     #[tokio::test]
