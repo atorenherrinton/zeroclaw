@@ -7,13 +7,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zeroclaw_config::schema::Config;
 use zeroclaw_eval::baseline::{self, Baseline, CaseComparison, SuiteKind};
-use zeroclaw_eval::calibration::{JudgeRunRecord, append_judge_records};
+use zeroclaw_eval::calibration::{
+    CalibrationRejection, JudgeRunRecord, append_judge_records, calibration_stem, load_calibration,
+};
 use zeroclaw_eval::{CaseProvider, CaseReport, LlmTrace, Mode, RunDeps, SuiteReport};
 use zeroclaw_runtime::agent::agent::build_session_model_provider;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
-
-#[cfg(test)]
-use zeroclaw_eval::calibration::calibration_stem;
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -563,7 +562,7 @@ fn build_run_deps(config: &Config, mode: Mode) -> Result<RunDeps> {
                 .as_ref()
                 .is_some_and(|item| item.judge_ref.split(':').next() == Some(provider_ref.as_str()))
             {
-                println!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
+                eprintln!("{}", get_required_cli_string("cli-eval-self-judge-warning"));
             }
             let cfg = config.clone();
             RunDeps {
@@ -625,11 +624,49 @@ fn build_judge_deps(config: &Config) -> Result<Option<zeroclaw_eval::grader::Jud
     let (provider, _provider_type, model) =
         build_session_model_provider(&judge_config, &provider_ref, None)?;
     let judge_ref = format!("{provider_ref}:{model}");
+    let prompt_hash = zeroclaw_eval::grader::judge_prompt_contract_hash();
+    let calibration_path = PathBuf::from("evals")
+        .join("calibration")
+        .join(format!("{}.json", calibration_stem(&judge_ref)));
+    let calibration = if config.eval.judge_gate {
+        match load_calibration(&calibration_path, &judge_ref, &prompt_hash) {
+            Ok(calibration) => Some(std::sync::Arc::new(calibration)),
+            Err(CalibrationRejection::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                eprintln!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-eval-calibrate-gate-missing",
+                        &[("judge_ref", judge_ref.as_str())],
+                    )
+                );
+                None
+            }
+            Err(rejection) => {
+                let reason = super::eval_calibrate::localized_calibration_rejection(&rejection);
+                eprintln!(
+                    "{}",
+                    get_required_cli_string_with_args(
+                        "cli-eval-calibrate-gate-rejected",
+                        &[
+                            ("judge_ref", judge_ref.as_str()),
+                            ("reason", reason.as_str()),
+                        ],
+                    )
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     Ok(Some(zeroclaw_eval::grader::JudgeDeps {
         provider: std::sync::Arc::from(provider),
         model,
         judge_ref,
+        calibration,
         records_sink: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
     }))
 }
@@ -856,6 +893,7 @@ pub enum OutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use zeroclaw_eval::record::{CaseProvenance, RunCompletion, SandboxStamp, ToolSurface};
     use zeroclaw_eval::{GradeCategory, GradeResult, RunRecord};
 
@@ -911,12 +949,21 @@ mod tests {
     fn judge_record(case_id: &str, score: f64) -> JudgeRunRecord {
         JudgeRunRecord::new(zeroclaw_eval::calibration::JudgeRunRecordInput {
             judge_ref: "judge.provider:model".to_string(),
+            prompt_hash: zeroclaw_eval::grader::judge_prompt_contract_hash(),
             case_id: case_id.to_string(),
-            case_hash: format!("hash-{case_id}"),
+            case_hash: format!("{:x}", Sha256::digest(case_id.as_bytes())),
             rubric_name: "helpfulness".to_string(),
             rubric_text: "Be helpful".to_string(),
+            rubric_hash: zeroclaw_eval::calibration::rubric_hash(
+                "helpfulness",
+                "Be helpful",
+                0.7,
+                false,
+            ),
             threshold: 0.7,
+            include_transcript: false,
             task_turns: vec!["Help me".to_string()],
+            transcript: None,
             final_response: "Done".to_string(),
             score,
             reason: format!("reason-{case_id}"),
@@ -946,15 +993,21 @@ mod tests {
     fn calibration_stem_keys_on_model_inclusive_judge_ref() {
         // The stem is derived from judge_ref (provider:model), not the bare
         // provider, so calibration is model-specific and matches the docs.
-        assert_eq!(
-            calibration_stem("anthropic.sonnet:claude-x"),
-            "anthropic_sonnet_claude-x"
+        assert!(
+            calibration_stem("anthropic.sonnet:claude-x").starts_with("anthropic_sonnet_claude-x-")
         );
         // A model swap under the same provider produces a different stem.
         assert_ne!(
             calibration_stem("anthropic.sonnet:model-a"),
             calibration_stem("anthropic.sonnet:model-b")
         );
+    }
+
+    #[test]
+    fn judge_gate_config_defaults_off_and_parses_explicit_opt_in() {
+        assert!(!Config::default().eval.judge_gate);
+        let config: Config = toml::from_str("[eval]\njudge_gate = true\n").unwrap();
+        assert!(config.eval.judge_gate);
     }
 
     #[tokio::test]

@@ -51,8 +51,42 @@ pub fn run(
         .into_iter()
         .filter(|record| record.judge_ref == judge_ref)
         .collect::<Vec<_>>();
-    let labels_path = labels.unwrap_or_else(|| default_labels_path(&judge_ref));
-    let completed_ids = load_completed_ids(&labels_path)?;
+    let expected_prompt_hash = zeroclaw_eval::grader::judge_prompt_contract_hash();
+    let found_prompt_hashes = records
+        .iter()
+        .map(|record| record.prompt_hash.as_str())
+        .collect::<BTreeSet<_>>();
+    if !found_prompt_hashes.contains(expected_prompt_hash.as_str()) {
+        let found = found_prompt_hashes
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(tr_args(
+            "cli-eval-calibrate-label-stale-prompt-records",
+            &[("expected", &expected_prompt_hash), ("found", &found)],
+        ));
+    }
+    let stale_records = records
+        .iter()
+        .filter(|record| record.prompt_hash != expected_prompt_hash)
+        .count();
+    if stale_records > 0 {
+        let count = stale_records.to_string();
+        println!(
+            "{}",
+            tr_args(
+                "cli-eval-calibrate-label-skipped-stale-records",
+                &[("count", &count)],
+            )
+        );
+    }
+    let records = records
+        .into_iter()
+        .filter(|record| record.prompt_hash == expected_prompt_hash)
+        .collect::<Vec<_>>();
+    let labels_path =
+        labels.unwrap_or_else(|| default_labels_path(&judge_ref, &expected_prompt_hash));
+    let completed_ids = load_completed_ids(&labels_path, &judge_ref, &expected_prompt_hash)?;
     let completed = records
         .iter()
         .filter(|record| completed_ids.contains(&record.id))
@@ -188,22 +222,38 @@ fn select_judge_ref(
         })
 }
 
-fn default_labels_path(judge_ref: &str) -> PathBuf {
+fn default_labels_path(judge_ref: &str, prompt_hash: &str) -> PathBuf {
     Path::new("evals")
         .join("calibration")
         .join("labels")
-        .join(format!("{}.jsonl", calibration_stem(judge_ref)))
+        .join(format!(
+            "{}-{}.jsonl",
+            calibration_stem(judge_ref),
+            &prompt_hash[..12]
+        ))
 }
 
-fn load_completed_ids(labels_path: &Path) -> Result<HashSet<String>> {
+fn load_completed_ids(
+    labels_path: &Path,
+    judge_ref: &str,
+    prompt_hash: &str,
+) -> Result<HashSet<String>> {
     if !labels_path.exists() {
         return Ok(HashSet::new());
     }
-    Ok(load_judge_labels(labels_path)
-        .map_err(|error| localized_jsonl_error(labels_path, &error))?
-        .into_iter()
-        .map(|label| label.record_id)
-        .collect())
+    let labels = load_judge_labels(labels_path)
+        .map_err(|error| localized_jsonl_error(labels_path, &error))?;
+    let mismatched = labels
+        .iter()
+        .any(|label| label.judge_ref != judge_ref || label.prompt_hash != prompt_hash);
+    if mismatched {
+        let path = labels_path.display().to_string();
+        bail!(tr_args(
+            "cli-eval-calibrate-label-existing-labels-mismatch",
+            &[("path", &path), ("judge_ref", judge_ref)],
+        ));
+    }
+    Ok(labels.into_iter().map(|label| label.record_id).collect())
 }
 
 fn resolve_labeler(explicit: Option<String>) -> Result<String> {
@@ -283,7 +333,9 @@ where
                         schema: JUDGE_LABEL_SCHEMA.to_string(),
                         record_id: record.id.clone(),
                         judge_ref: record.judge_ref.clone(),
+                        prompt_hash: record.prompt_hash.clone(),
                         rubric_name: record.rubric_name.clone(),
+                        rubric_hash: record.rubric_hash.clone(),
                         human_pass,
                         judge_pass: record.judge_pass,
                         score: record.score,
@@ -415,6 +467,14 @@ fn write_transcript(output: &mut impl Write, record: &JudgeRunRecord) -> Result<
             )
         )?;
     }
+    if let Some(transcript) = &record.transcript {
+        writeln!(
+            output,
+            "{}",
+            tr("cli-eval-calibrate-label-agent-transcript")
+        )?;
+        writeln!(output, "{transcript}")?;
+    }
     Ok(())
 }
 
@@ -464,24 +524,35 @@ fn write_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::io::Cursor;
 
     fn record(id: &str, judge_ref: &str, score: f64, judge_pass: bool) -> JudgeRunRecord {
-        JudgeRunRecord {
-            schema: zeroclaw_eval::calibration::JUDGE_RECORD_SCHEMA.to_string(),
-            id: id.to_string(),
+        let rubric_name = "quality";
+        let rubric_text = "The response is correct and complete.";
+        let record = JudgeRunRecord::new(zeroclaw_eval::calibration::JudgeRunRecordInput {
             judge_ref: judge_ref.to_string(),
+            prompt_hash: zeroclaw_eval::calibration::judge_prompt_hash("system", "contract"),
             case_id: format!("case-{id}"),
-            case_hash: format!("hash-{id}"),
-            rubric_name: "quality".to_string(),
-            rubric_text: "The response is correct and complete.".to_string(),
+            case_hash: format!("{:x}", Sha256::digest(id.as_bytes())),
+            rubric_name: rubric_name.to_string(),
+            rubric_text: rubric_text.to_string(),
+            rubric_hash: zeroclaw_eval::calibration::rubric_hash(
+                rubric_name,
+                rubric_text,
+                0.5,
+                false,
+            ),
             threshold: 0.5,
+            include_transcript: false,
             task_turns: vec!["system turn".to_string(), "user turn".to_string()],
+            transcript: None,
             final_response: format!("candidate response {id}"),
             score,
-            judge_pass,
             reason: "HIDDEN_REASON_TOKEN".to_string(),
-        }
+        });
+        assert_eq!(record.judge_pass, judge_pass);
+        record
     }
 
     fn drive(
@@ -530,11 +601,30 @@ mod tests {
         assert_eq!(labels.len(), 2);
         assert!(labels[0].human_pass);
         assert!(!labels[1].human_pass);
-        assert_eq!(labels[0].record_id, "pass");
-        assert_eq!(labels[1].record_id, "fail");
+        assert_eq!(labels[0].record_id, records[0].id);
+        assert_eq!(labels[1].record_id, records[1].id);
         assert_eq!(output.matches("Judge verdict:").count(), 2);
         assert!(output.contains("score 0.91"));
         assert!(output.contains("score 0.12"));
+    }
+
+    #[test]
+    fn transcript_evidence_is_visible_before_the_blind_verdict() {
+        let mut item = record("transcript", "provider:model", 0.91, true);
+        item.include_transcript = true;
+        item.transcript = Some(
+            r#"[{"type":"Chat","data":{"role":"user","content":"agent evidence"}}]"#.to_string(),
+        );
+        let (outcome, labels, output) = drive(&[item], &HashSet::new(), "p\n");
+
+        assert_eq!(outcome.written, 1);
+        assert_eq!(labels.len(), 1);
+        assert!(output.contains("Agent conversation transcript:"));
+        assert!(output.contains("agent evidence"));
+        assert!(
+            output.find("agent evidence").unwrap() < output.find("Judge verdict:").unwrap(),
+            "transcript must be shown before the judge result is revealed"
+        );
     }
 
     #[test]
@@ -583,12 +673,12 @@ mod tests {
             record("done", "provider:model", 0.91, true),
             record("pending", "provider:model", 0.12, false),
         ];
-        let completed = HashSet::from(["done".to_string()]);
+        let completed = HashSet::from([records[0].id.clone()]);
         let (outcome, labels, output) = drive(&records, &completed, "p\n");
 
         assert_eq!(outcome.written, 1);
         assert_eq!(outcome.pending, 0);
-        assert_eq!(labels[0].record_id, "pending");
+        assert_eq!(labels[0].record_id, records[1].id);
         assert!(!output.contains("candidate response done"));
         assert!(output.contains("candidate response pending"));
     }
@@ -663,9 +753,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let records_path = directory.path().join(JUDGE_RUNS_FILENAME);
         let first = record("duplicate", "provider:model", 0.9, true);
-        let mut replacement = record("duplicate", "provider:model", 0.1, false);
-        replacement.final_response = "replacement response".to_string();
-        append_records_for_test(&records_path, &[first, replacement]);
+        append_records_for_test(&records_path, &[first.clone(), first]);
 
         let (resolved_from_directory, from_directory) = load_records(directory.path()).unwrap();
         let (resolved_from_file, from_file) = load_records(&records_path).unwrap();
@@ -673,7 +761,10 @@ mod tests {
         assert_eq!(resolved_from_file, records_path);
         assert_eq!(from_directory, from_file);
         assert_eq!(from_directory.len(), 1);
-        assert_eq!(from_directory[0].final_response, "replacement response");
+        assert_eq!(
+            from_directory[0].final_response,
+            "candidate response duplicate"
+        );
     }
 
     fn append_records_for_test(path: &Path, records: &[JudgeRunRecord]) {
@@ -683,8 +774,45 @@ mod tests {
     #[test]
     fn default_path_uses_canonical_calibration_stem() {
         assert_eq!(
-            default_labels_path("provider.example/model:v1"),
-            PathBuf::from("evals/calibration/labels/provider_example_model_v1.jsonl")
+            default_labels_path("provider.example/model:v1", &"a".repeat(64)),
+            PathBuf::from("evals/calibration/labels").join(format!(
+                "{}-aaaaaaaaaaaa.jsonl",
+                calibration_stem("provider.example/model:v1")
+            ))
+        );
+    }
+
+    #[test]
+    fn resume_rejects_labels_from_another_prompt_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("labels.jsonl");
+        let source = record("source", "provider:model", 0.9, true);
+        let label = JudgeLabel {
+            schema: JUDGE_LABEL_SCHEMA.to_string(),
+            record_id: source.id.clone(),
+            judge_ref: source.judge_ref.clone(),
+            prompt_hash: source.prompt_hash.clone(),
+            rubric_name: source.rubric_name.clone(),
+            rubric_hash: source.rubric_hash.clone(),
+            human_pass: true,
+            judge_pass: source.judge_pass,
+            score: source.score,
+            labeler: "tester".to_string(),
+            date: "2026-07-21".to_string(),
+        };
+        append_judge_labels(&path, &[label]).unwrap();
+
+        assert!(load_completed_ids(&path, "provider:model", &source.prompt_hash).is_ok());
+        let error = load_completed_ids(
+            &path,
+            "provider:model",
+            &zeroclaw_eval::calibration::judge_prompt_hash("changed", "contract"),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("different judge or prompt contract")
         );
     }
 }

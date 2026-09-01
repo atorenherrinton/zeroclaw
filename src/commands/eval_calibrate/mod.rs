@@ -52,6 +52,17 @@ pub(super) fn localized_jsonl_error(path: &Path, error: &JsonlError) -> anyhow::
                 ],
             )
         }
+        JsonlError::InvalidData { line, reason } => {
+            let line = line.to_string();
+            get_required_cli_string_with_args(
+                "cli-eval-calibrate-jsonl-invalid-data",
+                &[
+                    ("path", path.as_str()),
+                    ("line", line.as_str()),
+                    ("reason", reason.as_str()),
+                ],
+            )
+        }
     };
     anyhow::Error::msg(message)
 }
@@ -84,6 +95,12 @@ pub(super) fn localized_calibration_rejection(error: &CalibrationRejection) -> S
                 &[("found", found.as_str()), ("expected", expected.as_str())],
             )
         }
+        CalibrationRejection::WrongPromptHash { expected, found } => {
+            get_required_cli_string_with_args(
+                "cli-eval-calibrate-calibration-wrong-prompt-hash",
+                &[("found", found.as_str()), ("expected", expected.as_str())],
+            )
+        }
         CalibrationRejection::InsufficientRecords { found, minimum } => {
             let found = found.to_string();
             let minimum = minimum.to_string();
@@ -92,6 +109,25 @@ pub(super) fn localized_calibration_rejection(error: &CalibrationRejection) -> S
                 &[("found", found.as_str()), ("minimum", minimum.as_str())],
             )
         }
+        CalibrationRejection::InvalidAgreement { found } => {
+            let found = found.to_string();
+            get_required_cli_string_with_args(
+                "cli-eval-calibrate-calibration-invalid-agreement",
+                &[("found", found.as_str())],
+            )
+        }
+        CalibrationRejection::LowAgreement { found, minimum } => {
+            let found = format!("{:.2}", found * 100.0);
+            let minimum = format!("{:.2}", minimum * 100.0);
+            get_required_cli_string_with_args(
+                "cli-eval-calibrate-calibration-low-agreement",
+                &[("found", found.as_str()), ("minimum", minimum.as_str())],
+            )
+        }
+        CalibrationRejection::InvalidEvidence { reason } => get_required_cli_string_with_args(
+            "cli-eval-calibrate-calibration-invalid-evidence",
+            &[("reason", reason.as_str())],
+        ),
     }
 }
 

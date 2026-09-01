@@ -226,13 +226,16 @@ judge-only.
 
 **Judge grades are diagnostic by default:** they are stripped from the pass/fail
 gate unless `[eval].judge_gate` is true and the model-specific calibration file
-at `evals/calibration/<judge_ref>.json` is accepted. Here, `judge_ref` is the
-model-inclusive `<type>.<alias>:<model>` with `/`, `.`, and `:` replaced by `_`,
-matching the comparability key. The consumer parses the file and requires the
-`zeroclaw-eval/calibration/v1` schema, an exact `judge_ref` match, and at least 50
-labeled records. A missing or rejected file produces a concrete warning and
-keeps judge grades diagnostic; merely placing a file at the expected path no
-longer enables gating.
+under `evals/calibration/` is accepted. Its collision-safe filename combines a
+readable, sanitized model-inclusive `judge_ref` with a short hash; the CLI prints
+the exact path. The consumer requires schema `zeroclaw-eval/calibration/v1`, an
+exact `judge_ref`, the current judge prompt/scoring-contract hash, at least 50
+labeled records, and overall agreement of at least 0.85. Each individual grade
+also requires an entry for its exact rubric text, name, threshold, and transcript
+setting, with per-rubric agreement of at least 0.85. Changing the judge prompt or
+rubric therefore requires recalibration. A missing or rejected file produces a
+concrete warning and keeps judge grades diagnostic; a missing or low-agreement
+rubric entry keeps that rubric diagnostic.
 
 ### Calibration workflow
 
@@ -249,26 +252,30 @@ zeroclaw eval calibrate label \
 
 # Summarize agreement and emit the validated calibration artifact.
 zeroclaw eval calibrate finalize \
-  --labels evals/calibration/labels/<judge_ref>.jsonl
+  --labels evals/calibration/labels/<judge-and-prompt-stem>.jsonl
 ```
 
 `--dump-records` appends one entry per successful, parseable judge call to
 `judge-runs.jsonl`; repeated suite runs therefore accumulate toward the 50-label
 minimum. The label command deduplicates records by stable id and resumes an
-append-only labels file, so interrupted sessions are safe to restart.
+append-only labels file keyed by both judge reference and prompt contract, so
+interrupted sessions are safe to restart and older records cannot mix with a
+new prompt's calibration.
 
 Labeling is blind: before each pass/fail answer, the terminal shows the task,
 rubric, and response but withholds the judge's score, verdict, and reason. This
 prevents the judge's own conclusion from anchoring the human assessment. The
-judge result is revealed only after the human answers. Press `t` to toggle the
-task transcript, `p` or `f` to label, `u` to leave the record pending, or `q` to
-quit.
+judge result is revealed only after the human answers. For rubrics that included
+the agent conversation in judge evidence, the record preserves and displays it
+too. Press `t` to toggle transcript evidence, `p` or `f` to label, `u` to leave
+the record pending, or `q` to quit.
 
 Finalization refuses fewer than 50 labels, prints agreement, per-rubric results,
-and Cohen's kappa, and writes only the compact calibration artifact. Agreement
-below 0.85 warns but still emits by default; pass `--min-agreement` to make a
-chosen floor mandatory. Commit the emitted `evals/calibration/<judge_ref>.json`
-file, then set `[eval].judge_gate = true`.
+and Cohen's kappa, and retains the prompt hash, per-rubric contract hashes,
+counts, agreement, and kappa in the compact artifact. Agreement below 0.85 warns
+but still emits so the evidence remains inspectable; such an artifact is rejected
+for gating. Pass `--min-agreement` to refuse emission below a stricter chosen
+floor. Commit the emitted calibration file, then set `[eval].judge_gate = true`.
 
 ## Exit-code contract
 

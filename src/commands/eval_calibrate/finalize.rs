@@ -7,12 +7,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use zeroclaw_eval::calibration::{
-    CALIBRATION_SCHEMA, CalibrationFile, JudgeLabel, MIN_CALIBRATION_RECORDS, agreement,
-    calibration_stem, cohens_kappa, load_judge_labels,
+    AGREEMENT_FLOOR, CALIBRATION_SCHEMA, CalibrationFile, JudgeLabel, MIN_CALIBRATION_RECORDS,
+    RubricCalibration, agreement, calibration_stem, cohens_kappa, load_judge_labels,
 };
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
-const RECOMMENDED_AGREEMENT: f64 = 0.85;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
+const RECOMMENDED_AGREEMENT: f64 = AGREEMENT_FLOOR;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct AgreementCount {
@@ -24,12 +27,57 @@ fn per_rubric_agreement(labels: &[JudgeLabel]) -> BTreeMap<String, AgreementCoun
     let mut breakdown = BTreeMap::new();
     for label in labels {
         let count = breakdown
-            .entry(label.rubric_name.clone())
+            .entry(format!(
+                "{} ({})",
+                label.rubric_name,
+                &label.rubric_hash[..12]
+            ))
             .or_insert_with(AgreementCount::default);
         count.total += 1;
         count.agreed += usize::from(label.human_pass == label.judge_pass);
     }
     breakdown
+}
+
+fn rubric_calibrations(labels: &[JudgeLabel]) -> Result<BTreeMap<String, RubricCalibration>> {
+    let mut grouped: BTreeMap<String, Vec<JudgeLabel>> = BTreeMap::new();
+    for label in labels {
+        grouped
+            .entry(label.rubric_hash.clone())
+            .or_default()
+            .push(label.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(hash, labels)| {
+            let names = labels
+                .iter()
+                .map(|label| label.rubric_name.as_str())
+                .collect::<BTreeSet<_>>();
+            if names.len() != 1 {
+                bail!(get_required_cli_string_with_args(
+                    "cli-eval-calibrate-finalize-rubric-hash-conflict",
+                    &[
+                        ("hash", hash.as_str()),
+                        (
+                            "names",
+                            names.into_iter().collect::<Vec<_>>().join(", ").as_str()
+                        ),
+                    ],
+                ));
+            }
+            let rubric_name = labels[0].rubric_name.clone();
+            Ok((
+                hash,
+                RubricCalibration {
+                    rubric_name,
+                    labeled_records: labels.len(),
+                    agreement: agreement(&labels),
+                    kappa: cohens_kappa(&labels),
+                },
+            ))
+        })
+        .collect()
 }
 
 fn percent(value: f64) -> String {
@@ -38,6 +86,26 @@ fn percent(value: f64) -> String {
 
 fn default_output_path(judge_ref: &str) -> PathBuf {
     PathBuf::from("evals/calibration").join(format!("{}.json", calibration_stem(judge_ref)))
+}
+
+fn write_calibration_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut staged = tempfile::Builder::new()
+        .prefix(".zeroclaw-calibration-")
+        .suffix(".partial")
+        .tempfile_in(parent)?;
+    #[cfg(unix)]
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    staged.write_all(contents)?;
+    staged.as_file().sync_all()?;
+    staged.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 fn run_with_writer(
@@ -84,6 +152,19 @@ fn run_with_writer(
         ));
     }
     let judge_ref = first_label.judge_ref.as_str();
+
+    let prompt_hashes: BTreeSet<&str> = labels
+        .iter()
+        .map(|label| label.prompt_hash.as_str())
+        .collect();
+    if prompt_hashes.len() != 1 {
+        let hashes = prompt_hashes.into_iter().collect::<Vec<_>>().join(", ");
+        bail!(get_required_cli_string_with_args(
+            "cli-eval-calibrate-finalize-multiple-prompt-hashes",
+            &[("hashes", hashes.as_str())],
+        ));
+    }
+    let prompt_hash = first_label.prompt_hash.as_str();
 
     if labels.len() < MIN_CALIBRATION_RECORDS {
         let count = labels.len().to_string();
@@ -181,7 +262,10 @@ fn run_with_writer(
     }
 
     let output_labeler = match labeler {
-        Some(labeler) => labeler.to_string(),
+        Some(labeler) if !labeler.trim().is_empty() => labeler.trim().to_string(),
+        Some(_) => bail!(get_required_cli_string(
+            "cli-eval-calibrate-finalize-empty-labeler"
+        )),
         None => labels
             .iter()
             .map(|label| label.labeler.as_str())
@@ -193,22 +277,20 @@ fn run_with_writer(
     let calibration = CalibrationFile {
         schema: CALIBRATION_SCHEMA.to_string(),
         judge_ref: judge_ref.to_string(),
+        prompt_hash: prompt_hash.to_string(),
         labeled_records: labels.len(),
         agreement: overall_agreement,
+        kappa: cohens_kappa(&labels),
+        rubrics: rubric_calibrations(&labels)?,
         labeler: output_labeler,
         date: date.to_string(),
     };
     let output_path = out
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_output_path(judge_ref));
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
-    }
     let mut contents = serde_json::to_vec_pretty(&calibration)?;
     contents.push(b'\n');
-    std::fs::write(&output_path, contents)?;
+    write_calibration_atomically(&output_path, &contents)?;
 
     let output_path_text = output_path.display().to_string();
     writeln!(
@@ -270,9 +352,16 @@ mod tests {
     ) -> JudgeLabel {
         JudgeLabel {
             schema: JUDGE_LABEL_SCHEMA.to_string(),
-            record_id: format!("record-{index}"),
+            record_id: format!("{index:064x}"),
             judge_ref: judge_ref.to_string(),
+            prompt_hash: zeroclaw_eval::calibration::judge_prompt_hash("system", "contract"),
             rubric_name: rubric_name.to_string(),
+            rubric_hash: zeroclaw_eval::calibration::rubric_hash(
+                rubric_name,
+                "rubric text",
+                0.7,
+                false,
+            ),
             human_pass,
             judge_pass,
             score: if judge_pass { 0.9 } else { 0.1 },
@@ -306,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn emitted_calibration_has_exact_six_key_schema() {
+    fn emitted_calibration_retains_prompt_rubric_and_kappa_evidence() {
         let temp = tempdir().expect("temporary directory should be created");
         let labels_path = temp.path().join("labels.jsonl");
         let output_path = temp.path().join("calibration.json");
@@ -338,8 +427,11 @@ mod tests {
                 "agreement",
                 "date",
                 "judge_ref",
+                "kappa",
                 "labeled_records",
                 "labeler",
+                "prompt_hash",
+                "rubrics",
                 "schema",
             ])
         );
@@ -347,8 +439,17 @@ mod tests {
         assert_eq!(value["labeled_records"], 50);
         assert_eq!(value["labeler"], "Override");
         assert_eq!(value["date"], "2026-07-21");
-        assert!(value.get("kappa").is_none());
-        assert!(value.get("rubrics").is_none());
+        assert!(
+            value["prompt_hash"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64)
+        );
+        assert!(value["kappa"].is_number());
+        let rubrics = value["rubrics"].as_object().expect("rubric evidence map");
+        assert_eq!(rubrics.len(), 1);
+        let rubric = rubrics.values().next().expect("one rubric");
+        assert_eq!(rubric["labeled_records"], 50);
+        assert_eq!(rubric["agreement"], 0.8);
     }
 
     #[test]
@@ -532,11 +633,19 @@ mod tests {
 
         let terminal = String::from_utf8(terminal).expect("output should be UTF-8");
         assert!(terminal.contains("Overall agreement: 70.00% (35/50)"));
+        let alpha_line = format!(
+            "alpha ({}): 80.00% (20/25)",
+            &zeroclaw_eval::calibration::rubric_hash("alpha", "rubric text", 0.7, false)[..12]
+        );
+        let beta_line = format!(
+            "beta ({}): 60.00% (15/25)",
+            &zeroclaw_eval::calibration::rubric_hash("beta", "rubric text", 0.7, false)[..12]
+        );
         let alpha = terminal
-            .find("alpha: 80.00% (20/25)")
+            .find(&alpha_line)
             .expect("alpha breakdown should be reported");
         let beta = terminal
-            .find("beta: 60.00% (15/25)")
+            .find(&beta_line)
             .expect("beta breakdown should be reported");
         assert!(alpha < beta, "rubrics should be sorted by name");
         assert!(terminal.contains("Cohen's kappa:"));
