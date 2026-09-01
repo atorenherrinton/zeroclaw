@@ -116,6 +116,7 @@ pub struct TraceExpects {
 /// (0-based, counted across calls to the named tool in dispatch order), which is
 /// how a fixture asserts ordering — e.g. call 0 carried `alpha`, call 1 `beta`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolPayloadExpect {
     /// Tool name whose payload is inspected.
     pub tool: String,
@@ -141,6 +142,10 @@ impl TraceExpects {
             && self.max_tool_calls.is_none()
             && self.all_tools_succeeded.is_none()
             && self.response_matches.is_empty()
+            && self.min_tool_calls.is_none()
+            && self.exact_tool_calls.is_none()
+            && self.tool_arguments_contain.is_empty()
+            && self.tool_results_contain.is_empty()
     }
 
     /// The name of the first string-backed family holding a zero-length entry.
@@ -165,6 +170,62 @@ impl TraceExpects {
         .find(|(_, values)| values.iter().any(|value| value.is_empty()))
         .map(|(name, _)| name)
     }
+
+    /// The first empty tool/payload field in a dispatch-boundary expectation.
+    fn empty_payload_field(&self) -> Option<&'static str> {
+        [
+            ("tool_arguments_contain", &self.tool_arguments_contain),
+            ("tool_results_contain", &self.tool_results_contain),
+        ]
+        .into_iter()
+        .find_map(|(family, entries)| {
+            entries.iter().find_map(|entry| {
+                if entry.tool.is_empty() {
+                    Some(match family {
+                        "tool_arguments_contain" => "tool_arguments_contain.tool",
+                        _ => "tool_results_contain.tool",
+                    })
+                } else if entry.needle.is_empty() {
+                    Some(match family {
+                        "tool_arguments_contain" => "tool_arguments_contain.needle",
+                        _ => "tool_results_contain.needle",
+                    })
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
+    fn invalid_tool_call_bounds(&self) -> Option<String> {
+        if self.min_tool_calls == Some(0) {
+            return Some("`min_tool_calls` must be at least 1".to_string());
+        }
+        if let (Some(min), Some(max)) = (self.min_tool_calls, self.max_tool_calls)
+            && min > max
+        {
+            return Some(format!(
+                "`min_tool_calls` ({min}) exceeds `max_tool_calls` ({max})"
+            ));
+        }
+        if let Some(exact) = self.exact_tool_calls {
+            if let Some(min) = self.min_tool_calls
+                && exact < min
+            {
+                return Some(format!(
+                    "`exact_tool_calls` ({exact}) is below `min_tool_calls` ({min})"
+                ));
+            }
+            if let Some(max) = self.max_tool_calls
+                && exact > max
+            {
+                return Some(format!(
+                    "`exact_tool_calls` ({exact}) exceeds `max_tool_calls` ({max})"
+                ));
+            }
+        }
+        None
+    }
 }
 
 impl LlmTrace {
@@ -187,6 +248,21 @@ impl LlmTrace {
                  nothing and cannot certify the required regression gate",
                 path.display(),
                 family
+            );
+        }
+        if let Some(field) = trace.expects.empty_payload_field() {
+            anyhow::bail!(
+                "trace fixture {} declares an empty `{}` value; an empty tool or needle cannot \
+                 certify the required regression gate",
+                path.display(),
+                field
+            );
+        }
+        if let Some(reason) = trace.expects.invalid_tool_call_bounds() {
+            anyhow::bail!(
+                "trace fixture {} declares invalid tool-call bounds: {}",
+                path.display(),
+                reason
             );
         }
         Ok(trace)
@@ -382,6 +458,10 @@ mod tests {
             r#"{"max_tool_calls":0}"#,
             r#"{"all_tools_succeeded":false}"#,
             r#"{"response_matches":["^a"]}"#,
+            r#"{"min_tool_calls":1}"#,
+            r#"{"exact_tool_calls":0}"#,
+            r#"{"tool_arguments_contain":[{"tool":"echo","needle":"alpha"}]}"#,
+            r#"{"tool_results_contain":[{"tool":"echo","needle":"alpha"}]}"#,
         ];
         for raw in cases {
             let expects: TraceExpects = serde_json::from_str(raw).unwrap();
@@ -441,6 +521,87 @@ mod tests {
         )
         .unwrap();
         assert!(expects.empty_entry_family().is_none());
+    }
+
+    #[test]
+    fn from_file_rejects_empty_dispatch_payload_fields() {
+        let cases = [
+            (
+                "tool_arguments_contain.tool",
+                r#"{"tool_arguments_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_arguments_contain.needle",
+                r#"{"tool_arguments_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+            (
+                "tool_results_contain.tool",
+                r#"{"tool_results_contain":[{"tool":"","needle":"alpha"}]}"#,
+            ),
+            (
+                "tool_results_contain.needle",
+                r#"{"tool_results_contain":[{"tool":"echo","needle":""}]}"#,
+            ),
+        ];
+
+        for (field, expects) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "zeroclaw_eval_case_empty_payload_{}_test.json",
+                field.replace('.', "_")
+            ));
+            std::fs::write(
+                &path,
+                format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .unwrap();
+            let err = LlmTrace::from_file(&path).expect_err("empty payload fields must fail");
+            assert!(
+                format!("{err:#}").contains(field),
+                "error must name {field}: {err:#}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_unknown_dispatch_expectation_fields() {
+        let path = std::env::temp_dir().join("zeroclaw_eval_case_payload_typo_test.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"demo","turns":[],"expects":{"tool_arguments_contain":[{"tool":"echo","nedle":"alpha"}]}}"#,
+        )
+        .unwrap();
+        let err = LlmTrace::from_file(&path).expect_err("nested expectation typos must fail");
+        assert!(format!("{err:#}").contains("nedle"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn from_file_rejects_vacuous_or_contradictory_tool_call_bounds() {
+        let cases = [
+            ("min_tool_calls", r#"{"min_tool_calls":0}"#),
+            ("exceeds", r#"{"min_tool_calls":2,"max_tool_calls":1}"#),
+            ("below", r#"{"min_tool_calls":2,"exact_tool_calls":1}"#),
+            ("exceeds", r#"{"max_tool_calls":1,"exact_tool_calls":2}"#),
+        ];
+
+        for (reason, expects) in cases {
+            let path = std::env::temp_dir().join(format!(
+                "zeroclaw_eval_case_invalid_bounds_{}_test.json",
+                reason
+            ));
+            std::fs::write(
+                &path,
+                format!(r#"{{"model_name":"demo","turns":[],"expects":{expects}}}"#),
+            )
+            .unwrap();
+            let err = LlmTrace::from_file(&path).expect_err("invalid bounds must fail");
+            assert!(
+                format!("{err:#}").contains(reason),
+                "error must explain {reason}: {err:#}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

@@ -65,3 +65,6 @@ documented in `crates/zeroclaw-eval/README.md`. Reach for them whenever a case
 claims that a value round-tripped through a tool or that a specific number of
 tool calls happened; expectations over the final response alone cannot show
 either, because the replay provider scripts that response itself.
+The recorded-call list is the canonical dispatch fact. Tool names and aggregate
+success are derived from it at grading time, so richer boundary evidence does
+not create a second independently mutable tool-call summary.

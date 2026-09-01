@@ -127,8 +127,6 @@ pub async fn run_case(trace: &LlmTrace) -> anyhow::Result<RunRecord> {
     Ok(RunRecord {
         final_response,
         history: agent.history().to_vec(),
-        tools_called: tool_calls.iter().map(|c| c.name.clone()).collect(),
-        all_tools_succeeded: observer.all_tools_succeeded(),
         tool_calls,
         input_tokens,
         output_tokens,
@@ -165,7 +163,7 @@ mod tests {
         let trace: LlmTrace = serde_json::from_str(SMOKE).unwrap();
         let record = run_case(&trace).await.unwrap();
         assert!(record.final_response.contains("Hello"));
-        assert!(record.tools_called.is_empty());
+        assert!(record.tool_calls.is_empty());
         let grades = evaluate_expects(&trace.expects, &record);
         assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
     }
@@ -174,8 +172,8 @@ mod tests {
     async fn replays_tool_call_trace() {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
         let record = run_case(&trace).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo".to_string()]);
-        assert!(record.all_tools_succeeded);
+        assert_eq!(record.tool_names(), vec!["echo"]);
+        assert!(record.all_tools_succeeded());
         let grades = evaluate_expects(&trace.expects, &record);
         assert!(grades.iter().all(|g| g.passed), "grades: {grades:?}");
     }

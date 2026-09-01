@@ -117,7 +117,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
                     false,
                     format!(
                         "{tool:?} was never called; tools called: {:?}",
-                        run.tools_called
+                        run.tool_names()
                     ),
                 )
             } else {
@@ -140,6 +140,7 @@ fn grade_payload(expect: &ToolPayloadExpect, run: &RunRecord, kind: PayloadKind)
 pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeResult> {
     let mut out = Vec::new();
     let resp = run.final_response.as_str();
+    let tool_names = run.tool_names();
 
     for needle in &expects.response_contains {
         let passed = resp.contains(needle);
@@ -168,20 +169,20 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     for tool in &expects.tools_used {
-        let passed = run.tools_called.iter().any(|t| t == tool);
+        let passed = tool_names.iter().any(|name| *name == tool);
         out.push(GradeResult::new(
             format!("tools_used({tool:?})"),
             passed,
             if passed {
                 "called".to_string()
             } else {
-                format!("not called; tools called: {:?}", run.tools_called)
+                format!("not called; tools called: {tool_names:?}")
             },
         ));
     }
 
     for tool in &expects.tools_not_used {
-        let passed = !run.tools_called.iter().any(|t| t == tool);
+        let passed = !tool_names.iter().any(|name| *name == tool);
         out.push(GradeResult::new(
             format!("tools_not_used({tool:?})"),
             passed,
@@ -194,7 +195,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(max) = expects.max_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         let passed = actual <= max;
         out.push(GradeResult::new(
             format!("max_tool_calls({max})"),
@@ -204,7 +205,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(min) = expects.min_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         let passed = actual >= min;
         out.push(GradeResult::new(
             format!("min_tool_calls({min})"),
@@ -214,12 +215,12 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(exact) = expects.exact_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         let passed = actual == exact;
         out.push(GradeResult::new(
             format!("exact_tool_calls({exact})"),
             passed,
-            format!("{actual} tool call(s): {:?}", run.tools_called),
+            format!("{actual} tool call(s): {tool_names:?}"),
         ));
     }
 
@@ -232,11 +233,12 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(expected) = expects.all_tools_succeeded {
-        let passed = run.all_tools_succeeded == expected;
+        let actual = run.all_tools_succeeded();
+        let passed = actual == expected;
         out.push(GradeResult::new(
             format!("all_tools_succeeded({expected})"),
             passed,
-            format!("actual all_tools_succeeded = {}", run.all_tools_succeeded),
+            format!("actual all_tools_succeeded = {actual}"),
         ));
     }
 
@@ -276,7 +278,6 @@ mod tests {
         RunRecord {
             final_response: resp.to_string(),
             history: Vec::new(),
-            tools_called: tools.iter().map(|s| s.to_string()).collect(),
             tool_calls: tools
                 .iter()
                 .map(|s| RecordedCall {
@@ -286,7 +287,6 @@ mod tests {
                     success: all_ok,
                 })
                 .collect(),
-            all_tools_succeeded: all_ok,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -297,8 +297,6 @@ mod tests {
         RunRecord {
             final_response: resp.to_string(),
             history: Vec::new(),
-            tools_called: calls.iter().map(|c| c.name.clone()).collect(),
-            all_tools_succeeded: calls.iter().all(|c| c.success),
             tool_calls: calls,
             input_tokens: 0,
             output_tokens: 0,
@@ -375,13 +373,13 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate_expects(&want_true, &run("", &[], true))[0].passed);
-        assert!(!evaluate_expects(&want_true, &run("", &[], false))[0].passed);
+        assert!(!evaluate_expects(&want_true, &run("", &["echo"], false))[0].passed);
 
         let want_false = TraceExpects {
             all_tools_succeeded: Some(false),
             ..Default::default()
         };
-        assert!(evaluate_expects(&want_false, &run("", &[], false))[0].passed);
+        assert!(evaluate_expects(&want_false, &run("", &["echo"], false))[0].passed);
     }
 
     #[test]
