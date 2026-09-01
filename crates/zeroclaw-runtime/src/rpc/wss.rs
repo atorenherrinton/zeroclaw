@@ -1202,7 +1202,11 @@ pub async fn run_wss_listener(
                         conn_cancel.clone(),
                     )
                     .with_peer_cert_fingerprint(Some(peer_cert_fp));
-                    dispatcher.run_connection(&mut transport).await;
+                    // The concrete dispatcher future carries the full request
+                    // state machine. Keep that state heap-backed so an active
+                    // WSS request does not depend on the executor worker's
+                    // thread-stack size.
+                    Box::pin(dispatcher.run_connection(&mut transport)).await;
 
                     // Epoch-checked: a relay flap can leave this session draining
                     // long after the client has reconnected and re-adopted the
