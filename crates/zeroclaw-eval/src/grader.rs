@@ -1,8 +1,7 @@
 //! Grading: non-panicking checks over a [`RunRecord`].
 
 use crate::case::{
-    BudgetExpects, ToolPayloadExpect, TraceExpects, WorkspaceExpects,
-    validate_workspace_rel_path,
+    BudgetExpects, ToolPayloadExpect, TraceExpects, WorkspaceExpects, validate_workspace_rel_path,
 };
 use crate::record::RunRecord;
 use serde::{Deserialize, Serialize};
@@ -156,15 +155,15 @@ fn grade_payload(
         },
         None if matching.is_empty() => (
             false,
-            format!("{tool:?} was never called; tools called: {:?}", run.tools_called),
+            format!(
+                "{tool:?} was never called; tools called: {:?}",
+                run.tool_names()
+            ),
         ),
         None if matching.iter().any(|payload| payload.contains(needle)) => {
             (true, "found".to_string())
         }
-        None => (
-            false,
-            format!("not found; observed payloads: {matching:?}"),
-        ),
+        None => (false, format!("not found; observed payloads: {matching:?}")),
     };
     GradeResult::new(check, passed, detail, GradeCategory::Tool)
 }
@@ -575,6 +574,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     let run = run.completion_or_default();
     let mut out = Vec::new();
     let resp = run.final_response.as_str();
+    let tool_names = run.tool_names();
 
     for needle in &expects.response_contains {
         let passed = resp.contains(needle);
@@ -605,21 +605,21 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     for tool in &expects.tools_used {
-        let passed = run.tools_called.iter().any(|t| t == tool);
+        let passed = tool_names.iter().any(|name| *name == tool);
         out.push(GradeResult::new(
             format!("tools_used({tool:?})"),
             passed,
             if passed {
                 "called".to_string()
             } else {
-                format!("not called; tools called: {:?}", run.tools_called)
+                format!("not called; tools called: {tool_names:?}")
             },
             GradeCategory::Tool,
         ));
     }
 
     for tool in &expects.tools_not_used {
-        let passed = !run.tools_called.iter().any(|t| t == tool);
+        let passed = !tool_names.iter().any(|name| *name == tool);
         out.push(GradeResult::new(
             format!("tools_not_used({tool:?})"),
             passed,
@@ -633,7 +633,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(max) = expects.max_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         let passed = actual <= max;
         out.push(GradeResult::new(
             format!("max_tool_calls({max})"),
@@ -644,7 +644,7 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(minimum) = expects.min_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         out.push(GradeResult::new(
             format!("min_tool_calls({minimum})"),
             actual >= minimum,
@@ -654,11 +654,11 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(exact) = expects.exact_tool_calls {
-        let actual = run.tools_called.len();
+        let actual = run.tool_calls.len();
         out.push(GradeResult::new(
             format!("exact_tool_calls({exact})"),
             actual == exact,
-            format!("{actual} tool call(s): {:?}", run.tools_called),
+            format!("{actual} tool call(s): {tool_names:?}"),
             GradeCategory::Tool,
         ));
     }
@@ -671,11 +671,12 @@ pub fn evaluate_expects(expects: &TraceExpects, run: &RunRecord) -> Vec<GradeRes
     }
 
     if let Some(expected) = expects.all_tools_succeeded {
-        let passed = run.all_tools_succeeded == expected;
+        let actual = run.all_tools_succeeded();
+        let passed = actual == expected;
         out.push(GradeResult::new(
             format!("all_tools_succeeded({expected})"),
             passed,
-            format!("actual all_tools_succeeded = {}", run.all_tools_succeeded),
+            format!("actual all_tools_succeeded = {actual}"),
             GradeCategory::Tool,
         ));
     }
@@ -856,8 +857,15 @@ mod tests {
             },
             completion: Some(crate::record::RunCompletion {
                 final_response: resp.to_string(),
-                tools_called: tools.iter().map(|s| s.to_string()).collect(),
-                all_tools_succeeded: all_ok,
+                tool_calls: tools
+                    .iter()
+                    .map(|name| crate::observer::RecordedCall {
+                        name: (*name).to_string(),
+                        arguments: String::new(),
+                        result: String::new(),
+                        success: all_ok,
+                    })
+                    .collect(),
                 ..crate::record::RunCompletion::default()
             }),
         }
@@ -943,13 +951,13 @@ mod tests {
             ..Default::default()
         };
         assert!(evaluate_expects(&want_true, &run("", &[], true))[0].passed);
-        assert!(!evaluate_expects(&want_true, &run("", &[], false))[0].passed);
+        assert!(!evaluate_expects(&want_true, &run("", &["echo"], false))[0].passed);
 
         let want_false = TraceExpects {
             all_tools_succeeded: Some(false),
             ..Default::default()
         };
-        assert!(evaluate_expects(&want_false, &run("", &[], false))[0].passed);
+        assert!(evaluate_expects(&want_false, &run("", &["echo"], false))[0].passed);
     }
 
     #[test]

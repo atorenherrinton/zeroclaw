@@ -90,6 +90,8 @@ order; omit it to accept a match on any call to that tool. Prefer
 `exact_tool_calls` over `tools_used` + `max_tool_calls` when the fixture claims a
 specific number of dispatches: `tools_used` is existential and `max_tool_calls`
 is only an upper bound, so together they still pass when a dispatch is missing.
+Fixture loading rejects unknown nested fields, empty tool names or needles,
+`min_tool_calls: 0`, and contradictory min/max/exact bounds before execution.
 
 Replay fixtures may only call tools the harness registers; Phase 0 ships a
 side-effect-free `echo` tool (see `tools::default_tools`). Live evals assemble
@@ -102,7 +104,9 @@ filter it to the effective allowlist; `shell` remains unavailable.
 - `replay::TraceLlmProvider` — a `ModelProvider` that replays trace steps in FIFO order.
 - `tools` — deterministic built-in tools the replay agent can dispatch.
 - `observer::RecordingObserver` — captures each dispatched tool call
-  (`RecordedCall`: name, arguments, result, success) and token usage.
+  (`RecordedCall`: name, arguments, result, success) and token usage. The
+  recorded-call list is the canonical dispatch fact; tool names and aggregate
+  success are derived from it rather than stored again.
 - `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
   extension point for side-effect/budget/LLM-judge graders in later phases).
 - `runner` — builds an isolated agent per case, drives it, grades it.

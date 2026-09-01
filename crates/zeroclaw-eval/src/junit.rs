@@ -189,6 +189,8 @@ mod tests {
             record: None,
             grades,
             error: error.map(str::to_string),
+            repeat: None,
+            cluster: None,
         }
     }
 

@@ -259,6 +259,43 @@ impl TraceExpects {
 
     /// Reject nested expectation declarations that would produce no useful grade.
     pub fn validate(&self) -> anyhow::Result<()> {
+        for (family, entries) in [
+            ("tool_arguments_contain", &self.tool_arguments_contain),
+            ("tool_results_contain", &self.tool_results_contain),
+        ] {
+            for (index, entry) in entries.iter().enumerate() {
+                if entry.tool.trim().is_empty() {
+                    anyhow::bail!("expects.{family}[{index}].tool must not be empty");
+                }
+                if entry.needle.is_empty() {
+                    anyhow::bail!("expects.{family}[{index}].needle must not be empty");
+                }
+            }
+        }
+        if self.min_tool_calls == Some(0) {
+            anyhow::bail!("expects.min_tool_calls must be at least 1");
+        }
+        if let (Some(minimum), Some(maximum)) = (self.min_tool_calls, self.max_tool_calls)
+            && minimum > maximum
+        {
+            anyhow::bail!("expects.min_tool_calls ({minimum}) exceeds max_tool_calls ({maximum})");
+        }
+        if let Some(exact) = self.exact_tool_calls {
+            if let Some(minimum) = self.min_tool_calls
+                && exact < minimum
+            {
+                anyhow::bail!(
+                    "expects.exact_tool_calls ({exact}) is below min_tool_calls ({minimum})"
+                );
+            }
+            if let Some(maximum) = self.max_tool_calls
+                && exact > maximum
+            {
+                anyhow::bail!(
+                    "expects.exact_tool_calls ({exact}) exceeds max_tool_calls ({maximum})"
+                );
+            }
+        }
         if let Some(workspace) = &self.workspace {
             if workspace.is_empty() {
                 anyhow::bail!(

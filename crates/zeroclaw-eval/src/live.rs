@@ -363,8 +363,7 @@ pub(crate) async fn run_live_case_with_graders_recording_provenance(
         completion: Some(RunCompletion {
             final_response,
             history: agent.history().to_vec(),
-            tools_called: observer.tool_names(),
-            all_tools_succeeded: observer.all_tools_succeeded(),
+            tool_calls: observer.calls(),
             input_tokens,
             output_tokens,
             duration_ms,
@@ -489,10 +488,10 @@ mod tests {
         let record = run_live_case(&trace, &deps).await.unwrap().record;
         let completion = record.completion_or_default();
         assert!(
-            !completion.tools_called.contains(&"shell".to_string()),
+            !completion.tool_names().contains(&"shell"),
             "shell must be auto-denied before it ever reaches tool \
              dispatch, so it must not appear as a dispatched tool call: {:?}",
-            completion.tools_called
+            completion.tool_names()
         );
         let denied = completion.history.iter().any(|msg| {
             matches!(
@@ -539,8 +538,8 @@ mod tests {
 
         let outcome = run_live_case(&trace, &deps).await.unwrap();
         let completion = outcome.record.completion_or_default();
-        assert_eq!(completion.tools_called, vec!["echo"]);
-        assert!(completion.all_tools_succeeded);
+        assert_eq!(completion.tool_names(), vec!["echo"]);
+        assert!(completion.all_tools_succeeded());
     }
 
     #[test]
@@ -735,7 +734,7 @@ mod tests {
             canary_parent.display()
         );
         assert!(
-            !outcome.record.completion_or_default().all_tools_succeeded,
+            !outcome.record.completion_or_default().all_tools_succeeded(),
             "the out-of-workspace file_write must not report success"
         );
     }

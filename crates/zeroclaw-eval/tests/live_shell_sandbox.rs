@@ -155,18 +155,17 @@ async fn live_shell_cannot_write_outside_workspace_because_it_never_runs() {
         canary.display()
     );
     assert!(
-        !completion.tools_called.contains(&"shell".to_string()),
+        !completion.tool_names().contains(&"shell"),
         "shell must be auto-denied before it ever reaches tool dispatch, so \
          it must not appear as a dispatched tool call: {:?}",
-        completion.tools_called
+        completion.tool_names()
     );
     // Anti-vacuity: the in-workspace `file_write` step (writing the escape
     // script `shell` would have run) did dispatch and succeed, so the
     // absence of the shell call above isn't just the whole case failing to
     // run anything.
     assert!(
-        completion.tools_called.contains(&"file_write".to_string())
-            && completion.all_tools_succeeded,
+        completion.tool_names().contains(&"file_write") && completion.all_tools_succeeded(),
         "the in-workspace file_write step must still dispatch and succeed: {:?}",
         record
     );
@@ -211,14 +210,13 @@ async fn live_shell_cannot_reach_external_network_because_it_never_runs() {
     let record = run_live_case(&trace, &deps).await.unwrap().record;
     let completion = record.completion_or_default();
     assert!(
-        !completion.tools_called.contains(&"shell".to_string()),
+        !completion.tool_names().contains(&"shell"),
         "shell must be auto-denied before it ever reaches tool dispatch, so \
          it must not appear as a dispatched tool call: {:?}",
-        completion.tools_called
+        completion.tool_names()
     );
     assert!(
-        completion.tools_called.contains(&"file_write".to_string())
-            && completion.all_tools_succeeded,
+        completion.tool_names().contains(&"file_write") && completion.all_tools_succeeded(),
         "the in-workspace file_write step must still dispatch and succeed: {:?}",
         record
     );

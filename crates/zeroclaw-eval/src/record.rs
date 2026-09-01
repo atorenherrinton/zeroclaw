@@ -95,12 +95,10 @@ pub struct RunCompletion {
     pub final_response: String,
     /// The full conversation trajectory (messages + tool calls + tool results).
     pub history: Vec<ConversationMessage>,
-    /// Names of tools that were dispatched, in call order.
-    pub tools_called: Vec<String>,
     /// Every dispatched tool call with its arguments and result, in order.
+    /// This is the canonical dispatch fact; names and aggregate success are
+    /// derived from it rather than copied into parallel fields.
     pub tool_calls: Vec<RecordedCall>,
-    /// Whether every dispatched tool call succeeded.
-    pub all_tools_succeeded: bool,
     /// Accumulated input tokens reported by the provider.
     pub input_tokens: u64,
     /// Accumulated output tokens reported by the provider.
@@ -116,14 +114,27 @@ impl Default for RunCompletion {
         Self {
             final_response: String::new(),
             history: Vec::new(),
-            tools_called: Vec::new(),
             tool_calls: Vec::new(),
-            all_tools_succeeded: true,
             input_tokens: 0,
             output_tokens: 0,
             duration_ms: 0,
             llm_calls: 0,
         }
+    }
+}
+
+impl RunCompletion {
+    /// Names of tools actually dispatched, in order.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tool_calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect()
+    }
+
+    /// Whether every dispatched tool call succeeded (vacuously true if none).
+    pub fn all_tools_succeeded(&self) -> bool {
+        self.tool_calls.iter().all(|call| call.success)
     }
 }
 
@@ -232,7 +243,8 @@ mod tests {
         let record = RunRecord::from_provenance(provenance());
         let c = record.completion_or_default();
         assert_eq!(c.llm_calls, 0);
-        assert!(c.tools_called.is_empty());
+        assert!(c.tool_calls.is_empty());
+        assert!(c.all_tools_succeeded());
         assert!(c.final_response.is_empty());
     }
 }

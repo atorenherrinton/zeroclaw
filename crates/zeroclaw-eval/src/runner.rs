@@ -503,9 +503,7 @@ async fn run_replay_case(
         completion: Some(RunCompletion {
             final_response,
             history: agent.history().to_vec(),
-            tools_called: tool_calls.iter().map(|call| call.name.clone()).collect(),
             tool_calls,
-            all_tools_succeeded: observer.all_tools_succeeded(),
             input_tokens,
             output_tokens,
             duration_ms,
@@ -669,13 +667,7 @@ pub(crate) mod tests {
                 .final_response
                 .contains("Hello")
         );
-        assert!(
-            outcome
-                .record
-                .completion_or_default()
-                .tools_called
-                .is_empty()
-        );
+        assert!(outcome.record.completion_or_default().tool_calls.is_empty());
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
@@ -688,10 +680,10 @@ pub(crate) mod tests {
         let trace: LlmTrace = serde_json::from_str(ECHO).unwrap();
         let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
         assert_eq!(
-            outcome.record.completion_or_default().tools_called,
-            vec!["echo".to_string()]
+            outcome.record.completion_or_default().tool_names(),
+            ["echo"]
         );
-        assert!(outcome.record.completion_or_default().all_tools_succeeded);
+        assert!(outcome.record.completion_or_default().all_tools_succeeded());
         assert!(
             outcome.grades.iter().all(|g| g.passed),
             "grades: {:?}",
