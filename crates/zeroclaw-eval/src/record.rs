@@ -22,3 +22,20 @@ pub struct RunRecord {
     /// Number of LLM responses observed during the run.
     pub llm_calls: u32,
 }
+
+/// Convert elapsed wall time to the report's millisecond representation.
+/// Extremely long durations saturate instead of truncating through an integer cast.
+pub fn duration_millis_saturating(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::duration_millis_saturating;
+    use std::time::Duration;
+
+    #[test]
+    fn duration_millis_saturates_at_u64_max() {
+        assert_eq!(duration_millis_saturating(Duration::MAX), u64::MAX);
+    }
+}

@@ -48,7 +48,7 @@ impl RecordingObserver {
 
     /// Number of LLM responses observed during the run.
     pub fn llm_calls(&self) -> u32 {
-        *self.llm_calls.lock().unwrap()
+        *lock_recover(&self.llm_calls)
     }
 }
 
@@ -63,12 +63,15 @@ impl Observer for RecordingObserver {
                 output_tokens,
                 ..
             } => {
-                *self.llm_calls.lock().unwrap() += 1;
+                let mut llm_calls = lock_recover(&self.llm_calls);
+                *llm_calls = llm_calls.saturating_add(1);
                 if let Some(i) = input_tokens {
-                    *lock_recover(&self.input_tokens) += i;
+                    let mut total = lock_recover(&self.input_tokens);
+                    *total = total.saturating_add(*i);
                 }
                 if let Some(o) = output_tokens {
-                    *lock_recover(&self.output_tokens) += o;
+                    let mut total = lock_recover(&self.output_tokens);
+                    *total = total.saturating_add(*o);
                 }
             }
             _ => {}
@@ -157,6 +160,14 @@ mod tests {
         obs.record_event(&llm_event(100, 50));
         obs.record_event(&llm_event(200, 80));
         assert_eq!(obs.tokens(), (300, 130));
+    }
+
+    #[test]
+    fn token_totals_saturate_on_provider_overflow() {
+        let obs = RecordingObserver::new();
+        obs.record_event(&llm_event(u64::MAX, u64::MAX));
+        obs.record_event(&llm_event(1, 1));
+        assert_eq!(obs.tokens(), (u64::MAX, u64::MAX));
     }
 
     #[test]

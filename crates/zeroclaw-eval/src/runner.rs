@@ -14,7 +14,7 @@ use crate::Mode;
 use crate::case::{LlmTrace, load_suite};
 use crate::grader::{GradeResult, Grader, default_graders, grade_with};
 use crate::observer::RecordingObserver;
-use crate::record::RunRecord;
+use crate::record::{RunRecord, duration_millis_saturating};
 use crate::report::{CaseReport, SuiteReport};
 use crate::tools::default_tools;
 
@@ -250,7 +250,7 @@ async fn run_replay_case(
             finish(turn_index)?;
         }
     }
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = duration_millis_saturating(start.elapsed());
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {

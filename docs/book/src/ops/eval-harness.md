@@ -161,8 +161,10 @@ that same grade-before-teardown path instead of calling a grader directly.
 
 `expects` collects declarative checks. Every field is optional; each declared
 check becomes one graded result, tagged with a category (`response`, `tool`,
-`side_effect`, `budget`, `judge`) surfaced in the JSON report along with a
-per-case `score` and `category_totals`.
+`side_effect`, `budget`, `judge`, or `config`) surfaced in the JSON report along
+with a per-case `score` and `category_totals`. The harness emits a failing
+`config` grade only as a runtime backstop when an in-process case bypasses the
+fixture loader and declares no effective checks.
 
 Response checks (category `response`):
 

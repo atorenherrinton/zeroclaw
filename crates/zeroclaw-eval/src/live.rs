@@ -17,7 +17,7 @@ use zeroclaw_runtime::security::Sandbox;
 
 use crate::case::{CaseSetup, LlmTrace, validate_workspace_rel_path};
 use crate::observer::RecordingObserver;
-use crate::record::RunRecord;
+use crate::record::{RunRecord, duration_millis_saturating};
 use crate::runner::{CaseProvider, RunDeps};
 
 /// The model name `Agent::builder()` falls back to when no `model_name` is set.
@@ -327,7 +327,7 @@ pub async fn run_live_case_with_graders(
             }
         }
     }
-    let duration_ms = start.elapsed().as_millis() as u64;
+    let duration_ms = duration_millis_saturating(start.elapsed());
 
     let (input_tokens, output_tokens) = observer.tokens();
     let record = RunRecord {

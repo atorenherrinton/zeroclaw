@@ -224,7 +224,7 @@ impl Grader for BudgetGrader {
             out.push(check(
                 "max_total_tokens",
                 max,
-                run.input_tokens + run.output_tokens,
+                run.input_tokens.saturating_add(run.output_tokens),
             ));
         }
         if let Some(max) = self.expects.max_duration_ms {
@@ -730,6 +730,24 @@ mod tests {
         .await;
         assert!(!below[0].passed, "limit-1 < actual must fail");
         assert!(at_limit[0].category == GradeCategory::Budget);
+    }
+
+    #[tokio::test]
+    async fn budget_total_saturates_instead_of_wrapping() {
+        let mut record = run("", &[], true);
+        record.input_tokens = u64::MAX;
+        record.output_tokens = 1;
+        let grades = BudgetGrader {
+            expects: BudgetExpects {
+                max_total_tokens: Some(u64::MAX - 1),
+                ..BudgetExpects::default()
+            },
+        }
+        .grade(&record, &dummy_ctx())
+        .await;
+        assert_eq!(grades.len(), 1);
+        assert!(!grades[0].passed);
+        assert_eq!(grades[0].detail, format!("actual {}", u64::MAX));
     }
 
     #[tokio::test]
