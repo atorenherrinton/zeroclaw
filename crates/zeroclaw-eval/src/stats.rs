@@ -4,21 +4,32 @@
 use crate::Mode;
 use serde::Serialize;
 
+/// A repeat-policy adjustment that the CLI should explain to the operator.
+///
+/// This stays structured so localization happens at the user-facing boundary
+/// instead of baking English into the statistics layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepeatWarning {
+    ClampedLow,
+    ClampedHigh { requested: u32 },
+    ReplayIgnored,
+}
+
 /// Clamp a requested repeat count to 1..=50 and resolve it for the mode. Returns
 /// the effective count and any warnings (clamping, replay-ignore). Replay is
 /// deterministic, so `repeat > 1` runs once.
-pub fn effective_repeat(mode: Mode, requested: u32) -> (u32, Vec<String>) {
+pub fn effective_repeat(mode: Mode, requested: u32) -> (u32, Vec<RepeatWarning>) {
     let mut warnings = Vec::new();
     let mut k = requested;
     if k < 1 {
         k = 1;
-        warnings.push("repeat < 1 clamped to 1".to_string());
+        warnings.push(RepeatWarning::ClampedLow);
     } else if k > 50 {
         k = 50;
-        warnings.push(format!("repeat {requested} clamped to 50"));
+        warnings.push(RepeatWarning::ClampedHigh { requested });
     }
     if mode == Mode::Replay && k > 1 {
-        warnings.push("replay is deterministic; repeat ignored".to_string());
+        warnings.push(RepeatWarning::ReplayIgnored);
         k = 1;
     }
     (k, warnings)
@@ -93,7 +104,7 @@ pub fn cluster_means(items: &[(Option<String>, f64)]) -> Vec<f64> {
 /// Two-sided 95% Student-t multiplier for `df` degrees of freedom (t_{0.975}).
 /// Small-n suites collapse to only a few units, where the normal z=1.96 badly
 /// understates the interval; this returns the correct larger multiplier and
-/// converges to ~1.96 for large df.
+/// converges to ~1.96 for large df without treating any finite df as infinite.
 pub fn t95_multiplier(df: usize) -> f64 {
     // t_{0.975} table; values between listed df use the next-lower df (conservative).
     const TABLE: &[(usize, f64)] = &[
@@ -117,7 +128,16 @@ pub fn t95_multiplier(df: usize) -> f64 {
         return f64::INFINITY;
     }
     if df > 30 {
-        return 1.96;
+        // Cornish-Fisher expansion of the 97.5th percentile around the normal
+        // quantile. At df >= 31 this is accurate to well below the precision we
+        // display, stays above 1.96 for every finite df, and converges smoothly.
+        let z = 1.959_963_984_540_054_f64;
+        let v = df as f64;
+        return z
+            + (z.powi(3) + z) / (4.0 * v)
+            + (5.0 * z.powi(5) + 16.0 * z.powi(3) + 3.0 * z) / (96.0 * v.powi(2))
+            + (3.0 * z.powi(7) + 19.0 * z.powi(5) + 17.0 * z.powi(3) - 15.0 * z)
+                / (384.0 * v.powi(3));
     }
     // Use the largest listed df not exceeding `df` (next-lower table row, whose
     // multiplier is >= the true value): conservative for unlisted df.
@@ -137,7 +157,7 @@ pub fn suspect_note(passes: u32, k: u32) -> Option<String> {
     }
     if k >= 20 {
         Some(format!(
-            "suspect: broken task (0% across {k} trials usually means the task, not the agent)"
+            "suspect: 0/{k} passes; inspect both task validity and agent behavior"
         ))
     } else if k >= 5 {
         Some(format!(
@@ -406,8 +426,11 @@ mod tests {
         // Small df need a much larger multiplier than the normal z=1.96.
         assert!(t95_multiplier(1) > 12.0);
         assert!(t95_multiplier(2) > 4.0);
-        // Large df converges to the normal approximation.
-        assert!((t95_multiplier(100) - 1.96).abs() < 1e-9);
+        // Every finite df stays above the infinite-df normal quantile and
+        // converges toward it without a discontinuity at 30/31.
+        assert!(t95_multiplier(31) > 1.96);
+        assert!(t95_multiplier(100) > 1.96);
+        assert!(t95_multiplier(100) < t95_multiplier(31));
         // Monotonic-ish: smaller df => larger (or equal) multiplier.
         assert!(t95_multiplier(2) >= t95_multiplier(10));
     }
@@ -416,17 +439,17 @@ mod tests {
     fn repeat_clamped_and_warned() {
         let (k, w) = effective_repeat(Mode::Live, 200);
         assert_eq!(k, 50);
-        assert!(w.iter().any(|m| m.contains("clamped to 50")));
+        assert_eq!(w, vec![RepeatWarning::ClampedHigh { requested: 200 }]);
         let (k0, w0) = effective_repeat(Mode::Live, 0);
         assert_eq!(k0, 1);
-        assert!(w0.iter().any(|m| m.contains("clamped to 1")));
+        assert_eq!(w0, vec![RepeatWarning::ClampedLow]);
     }
 
     #[test]
     fn replay_repeat_ignored_with_warning() {
         let (k, w) = effective_repeat(Mode::Replay, 10);
         assert_eq!(k, 1);
-        assert!(w.iter().any(|m| m.contains("replay is deterministic")));
+        assert_eq!(w, vec![RepeatWarning::ReplayIgnored]);
     }
 
     #[test]
@@ -434,10 +457,6 @@ mod tests {
         assert!(suspect_note(1, 20).is_none());
         assert!(suspect_note(0, 3).is_none());
         assert!(suspect_note(0, 5).unwrap().contains("low signal"));
-        assert!(
-            suspect_note(0, 20)
-                .unwrap()
-                .contains("suspect: broken task")
-        );
+        assert!(suspect_note(0, 20).unwrap().contains("inspect both"));
     }
 }

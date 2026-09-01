@@ -267,26 +267,29 @@ iff `pass^k` (the consistency standard).
 
 At the suite level, each case's success proportion `p_i = passes_i / k_i` is
 collapsed first (one value per case), so correlated resamples do not fake
-precision; the report prints `repeated-case pass rate p̄ +/-t·SEM (95% CI, n of N
-cases repeated)`, using the Student-t multiplier on n-1 degrees of freedom (the
-normal z=1.96 understates the interval for the few-unit suites repeated runs
-typically produce).
+precision; the report prints the repeated-case pass rate with a bounded 95%
+interval and the `n of N cases have complete repeat statistics` population. The
+displayed bounds are clamped to `[0%, 100%]`. The implementation uses a
+Student-t multiplier on n-1 degrees of freedom, including a finite-df
+approximation above the embedded small-sample table; it never substitutes the
+infinite-df normal value for a finite sample.
 
 That statistic is deliberately restricted to cases that actually repeated
 (effective `k > 1`). Effective `k = 1` cases and cases whose run errored have no
 within-case success proportion, so including them would give a single-shot case
 the same weight as a 20-run case. It is therefore **not** the suite pass rate --
 the suite's own `passed/total` line is reported separately, and the two can
-legitimately differ. The printed population (`n of N cases repeated`) makes the
-exclusion explicit.
+legitimately differ. The printed population (`n of N cases have complete repeat
+statistics`) makes the exclusion explicit.
 
 An optional per-case `cluster` label averages correlated case families together
 before the error bar; omitting it asserts independence. With fewer than two
 independent units, the report shows the observed rate and marks the 95% CI
 unavailable.
 
-A case with `0/k` passes at `k >= 5` is flagged low-signal, and at `k >= 20` as a
-suspect (broken) task.
+A case with `0/k` passes at `k >= 5` is flagged low-signal, and at `k >= 20` is
+flagged for inspection. The count alone does not assign the cause to either the
+task or the agent.
 
 **Partial repetition sets.** If a repetition errors partway through, the
 repetitions that already completed are retained and reported (`repeat p/k (c
@@ -352,6 +355,13 @@ carries `suite_kind` and the `exit_code` the process exits with. When
 `token_delta_pct` when comparable). A failing CI artifact therefore always
 states why the gate failed; the exit code never encodes information missing
 from the document.
+
+When completed repeated cases are present, `repeat_ci` is a structured object
+with the `[0, 1]` `pass_rate`, bounded `lower` and `upper` confidence limits,
+the repeated-case and suite populations, and the effective independent-unit
+count after cluster collapsing. `lower` and `upper` are `null` when fewer than
+two independent units make the interval unavailable. This JSON surface remains
+locale-independent; only the human-readable table is localized.
 
 ## Run receipts and record dumps
 

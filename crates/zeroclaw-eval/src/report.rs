@@ -1,6 +1,7 @@
 //! Pass/fail aggregation and rendering.
 
 use crate::grader::GradeResult;
+use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 /// A case's comparison id: the record's `case_id` when present, else its name.
 /// The single canonical case-identity derivation (baseline skip-matching and the
@@ -108,6 +109,22 @@ pub struct CapabilityStats {
     pub saturated: bool,
 }
 
+/// Machine-readable confidence summary derived from completed repeated cases.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct RepeatCi {
+    /// Mean success proportion across independent units, in `[0, 1]`.
+    pub pass_rate: f64,
+    /// Bounded lower 95% confidence limit, absent when fewer than two
+    /// independent units are available.
+    pub lower: Option<f64>,
+    /// Bounded upper 95% confidence limit, absent when fewer than two
+    /// independent units are available.
+    pub upper: Option<f64>,
+    pub repeated_cases: usize,
+    pub total_cases: usize,
+    pub independent_units: usize,
+}
+
 impl SuiteReport {
     pub fn passed_count(&self) -> usize {
         self.cases.iter().filter(|c| c.passed()).count()
@@ -190,8 +207,7 @@ impl SuiteReport {
         }
     }
 
-    /// Error bar over *repeated* cases only: `repeated-case pass rate p̄ ±t·SEM
-    /// (95% CI)`, annotated with how many of the suite's cases that covers.
+    /// Machine-readable error bar over completed repeated cases only.
     ///
     /// The population is deliberately restricted to cases that actually
     /// repeated (effective `k > 1`) and produced statistics. Effective `k = 1`
@@ -207,7 +223,7 @@ impl SuiteReport {
     /// precision. `None` when no case repeated. Fewer than two independent
     /// units report the observed rate without an interval because SEM is not
     /// estimable.
-    pub fn repeat_ci_line(&self) -> Option<String> {
+    pub fn repeat_ci(&self) -> Option<RepeatCi> {
         let items: Vec<(Option<String>, f64)> = self
             .cases
             .iter()
@@ -221,25 +237,54 @@ impl SuiteReport {
         if items.is_empty() {
             return None;
         }
-        // Names the population so the restricted rate can never be read as the
-        // suite pass rate printed directly above it.
-        let scope = format!("{} of {} cases repeated", items.len(), self.cases.len());
         let values = crate::stats::cluster_means(&items);
         let mean = crate::stats::mean(&values);
-        if values.len() < 2 {
-            return Some(format!(
-                "repeated-case pass rate {:.0}% ({scope}; 95% CI unavailable: insufficient independent units)",
-                mean * 100.0
+        let bounds = (values.len() >= 2).then(|| {
+            let df = values.len() - 1;
+            let margin = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
+            (
+                (mean - margin).clamp(0.0, 1.0),
+                (mean + margin).clamp(0.0, 1.0),
+            )
+        });
+        Some(RepeatCi {
+            pass_rate: mean,
+            lower: bounds.map(|(lower, _)| lower),
+            upper: bounds.map(|(_, upper)| upper),
+            repeated_cases: items.len(),
+            total_cases: self.cases.len(),
+            independent_units: values.len(),
+        })
+    }
+
+    /// Localized human-readable rendering of [`Self::repeat_ci`].
+    pub fn repeat_ci_line(&self) -> Option<String> {
+        let ci = self.repeat_ci()?;
+        // Names the population so the restricted rate can never be read as the
+        // suite pass rate printed directly above it.
+        let repeated = ci.repeated_cases.to_string();
+        let total = ci.total_cases.to_string();
+        let scope = get_required_cli_string_with_args(
+            "cli-eval-repeat-scope",
+            &[("repeated", repeated.as_str()), ("total", total.as_str())],
+        );
+        let rate = format!("{:.0}", ci.pass_rate * 100.0);
+        let (Some(lower), Some(upper)) = (ci.lower, ci.upper) else {
+            return Some(get_required_cli_string_with_args(
+                "cli-eval-repeat-ci-unavailable",
+                &[("rate", rate.as_str()), ("scope", scope.as_str())],
             ));
-        }
-        // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
-        // interval for the few-unit suites repeated runs typically produce.
-        let df = values.len() - 1;
-        let ci = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
-        Some(format!(
-            "repeated-case pass rate {:.0}% +/-{:.0}% (95% CI, {scope})",
-            mean * 100.0,
-            ci * 100.0
+        };
+        let lower = format!("{:.0}", lower * 100.0);
+        let upper = format!("{:.0}", upper * 100.0);
+        Some(get_required_cli_string_with_args(
+            "cli-eval-repeat-ci",
+            &[
+                ("rate", rate.as_str()),
+                ("lower", lower.as_str()),
+                ("upper", upper.as_str()),
+                ("scope", scope.as_str()),
+            ],
         ))
     }
 
@@ -272,14 +317,38 @@ impl SuiteReport {
             // in JSON: passes/k plus the consistency verdict are this feature's
             // primary output.
             if let Some(r) = &case.repeat {
-                s.push_str(&format!("      repeat {}/{}", r.passes, r.k));
+                let passes = r.passes.to_string();
+                let total = r.k.to_string();
+                s.push_str("      ");
+                s.push_str(&get_required_cli_string_with_args(
+                    "cli-eval-repeat-case",
+                    &[("passes", passes.as_str()), ("total", total.as_str())],
+                ));
                 if r.truncated() {
-                    s.push_str(&format!(" ({} completed)", r.completed));
+                    let completed = r.completed.to_string();
+                    s.push(' ');
+                    s.push_str(&get_required_cli_string_with_args(
+                        "cli-eval-repeat-completed",
+                        &[("completed", completed.as_str())],
+                    ));
                 }
-                s.push_str(&format!(
-                    "  pass@k {}  pass^k {}",
-                    if r.pass_at_k() { "yes" } else { "no" },
-                    if r.pass_hat_k() { "yes" } else { "no" }
+                let pass_at = get_required_cli_string(if r.pass_at_k() {
+                    "cli-status-word-yes"
+                } else {
+                    "cli-status-word-no"
+                });
+                let pass_hat = get_required_cli_string(if r.pass_hat_k() {
+                    "cli-status-word-yes"
+                } else {
+                    "cli-status-word-no"
+                });
+                s.push_str("  ");
+                s.push_str(&get_required_cli_string_with_args(
+                    "cli-eval-repeat-verdicts",
+                    &[
+                        ("pass_at", pass_at.as_str()),
+                        ("pass_hat", pass_hat.as_str()),
+                    ],
                 ));
                 if !r.check_flips.is_empty() {
                     let flips: Vec<String> = r
@@ -287,10 +356,24 @@ impl SuiteReport {
                         .iter()
                         .map(|(name, n)| format!("{name}×{n}"))
                         .collect();
-                    s.push_str(&format!("  flips: {}", flips.join(", ")));
+                    let flips = flips.join(", ");
+                    s.push_str("  ");
+                    s.push_str(&get_required_cli_string_with_args(
+                        "cli-eval-repeat-flips",
+                        &[("flips", flips.as_str())],
+                    ));
                 }
                 s.push('\n');
-                if let Some(note) = r.suspect_note() {
+                let note_key = if r.passes == 0 && r.k >= 20 {
+                    Some("cli-eval-repeat-suspect")
+                } else if r.passes == 0 && r.k >= 5 {
+                    Some("cli-eval-repeat-low-signal")
+                } else {
+                    None
+                };
+                if let Some(key) = note_key {
+                    let total = r.k.to_string();
+                    let note = get_required_cli_string_with_args(key, &[("total", total.as_str())]);
                     s.push_str(&format!("      {note}\n"));
                 }
             }
@@ -404,7 +487,7 @@ impl SuiteReport {
             "all_passed": self.all_passed(),
             "suite_kind": kind.as_str(),
             "exit_code": self.exit_code(kind, comparison),
-            "repeat_ci": self.repeat_ci_line(),
+            "repeat_ci": self.repeat_ci(),
             "cases": cases,
         });
         if let (Some(cmp), Some(map)) = (comparison, value.as_object_mut()) {
@@ -527,7 +610,7 @@ mod tests {
             "restricted estimand must be named: {line}"
         );
         assert!(
-            line.contains("1 of 2 cases repeated"),
+            line.contains("1 of 2 cases have complete repeat statistics"),
             "population must be disclosed: {line}"
         );
 
@@ -559,9 +642,30 @@ mod tests {
 
         let line = suite.repeat_ci_line().expect("repeated cases present");
         assert!(
-            line.contains("2 of 4 cases repeated"),
+            line.contains("2 of 4 cases have complete repeat statistics"),
             "denominator must be the whole suite: {line}"
         );
+    }
+
+    #[test]
+    fn repeat_confidence_interval_is_bounded_to_probability_range() {
+        let suite = SuiteReport {
+            cases: vec![
+                repeated_case("always", 2, 2, None),
+                repeated_case("never", 0, 2, None),
+            ],
+        };
+
+        let line = suite.repeat_ci_line().expect("repeated cases present");
+        assert!(line.contains("95% CI 0%–100%"), "got: {line}");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&suite.to_json(crate::baseline::SuiteKind::Regression, None))
+                .unwrap();
+        assert_eq!(json["repeat_ci"]["pass_rate"].as_f64(), Some(0.5));
+        assert_eq!(json["repeat_ci"]["lower"].as_f64(), Some(0.0));
+        assert_eq!(json["repeat_ci"]["upper"].as_f64(), Some(1.0));
+        assert_eq!(json["repeat_ci"]["independent_units"].as_u64(), Some(2));
     }
 
     /// The per-case repeat verdict is the feature's primary diagnostic and must
