@@ -1,7 +1,8 @@
 //! Grading: non-panicking checks over a [`RunRecord`].
 
 use crate::case::{
-    BudgetExpects, MemoryExpects, TraceExpects, WorkspaceExpects, validate_workspace_rel_path,
+    BudgetExpects, MemoryExpects, TraceExpects, WorkspaceExpects, validate_memory_key,
+    validate_workspace_rel_path,
 };
 use crate::record::RunRecord;
 use serde::{Deserialize, Serialize};
@@ -211,11 +212,11 @@ impl Grader for MemoryGrader {
 
         for key in &self.expects.present {
             let check = format!("memory_present({key:?})");
-            if validate_workspace_rel_path(key).is_err() {
+            if let Err(error) = validate_memory_key(key) {
                 out.push(GradeResult::new(
                     check,
                     false,
-                    "key escapes workspace",
+                    format!("invalid memory key: {error}"),
                     GradeCategory::SideEffect,
                 ));
                 continue;
@@ -250,11 +251,11 @@ impl Grader for MemoryGrader {
 
         for key in &self.expects.absent {
             let check = format!("memory_absent({key:?})");
-            if validate_workspace_rel_path(key).is_err() {
+            if let Err(error) = validate_memory_key(key) {
                 out.push(GradeResult::new(
                     check,
                     false,
-                    "key escapes workspace",
+                    format!("invalid memory key: {error}"),
                     GradeCategory::SideEffect,
                 ));
                 continue;
@@ -292,12 +293,13 @@ impl Grader for MemoryGrader {
         }
 
         for (key, needles) in &self.expects.contains {
-            if validate_workspace_rel_path(key).is_err() {
+            if let Err(error) = validate_memory_key(key) {
+                let detail = format!("invalid memory key: {error}");
                 if needles.is_empty() {
                     out.push(GradeResult::new(
                         format!("memory_contains({key:?})"),
                         false,
-                        "key escapes workspace",
+                        detail.clone(),
                         GradeCategory::SideEffect,
                     ));
                 }
@@ -305,7 +307,7 @@ impl Grader for MemoryGrader {
                     out.push(GradeResult::new(
                         format!("memory_contains({key:?}, {needle:?})"),
                         false,
-                        "key escapes workspace",
+                        detail.clone(),
                         GradeCategory::SideEffect,
                     ));
                 }
@@ -1067,7 +1069,7 @@ mod tests {
         let memory = PanicGetMemory;
         let expects = MemoryExpects {
             present: vec!["../escape".into()],
-            absent: vec!["/absolute".into()],
+            absent: vec!["project status".into()],
             contains: BTreeMap::from([
                 ("nested/../../escape".into(), vec!["x".into()]),
                 ("../empty".into(), Vec::new()),
@@ -1088,17 +1090,19 @@ mod tests {
         assert!(
             grades
                 .iter()
-                .all(|grade| grade.detail == "key escapes workspace")
+                .all(|grade| grade.detail.starts_with("invalid memory key:"))
         );
         assert_eq!(grades[0].check, r#"memory_present("../escape")"#);
-        assert_eq!(grades[1].check, r#"memory_absent("/absolute")"#);
-        assert_eq!(
-            find(&grades, r#"memory_contains("nested/../../escape", "x")"#).detail,
-            "key escapes workspace"
+        assert_eq!(grades[1].check, r#"memory_absent("project status")"#);
+        assert!(
+            find(&grades, r#"memory_contains("nested/../../escape", "x")"#)
+                .detail
+                .starts_with("invalid memory key:")
         );
-        assert_eq!(
-            find(&grades, r#"memory_contains("../empty")"#).detail,
-            "key escapes workspace"
+        assert!(
+            find(&grades, r#"memory_contains("../empty")"#)
+                .detail
+                .starts_with("invalid memory key:")
         );
     }
 

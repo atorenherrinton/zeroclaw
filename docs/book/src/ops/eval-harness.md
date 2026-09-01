@@ -54,8 +54,10 @@ A live case omits scripted `steps` (the provider produces the responses) and may
 declare `tools` it needs. Its `setup` can seed workspace files with
 `workspace_files` and long-term memory with a `memory` map of key to content. The
 harness stores each seed as an unscoped Core memory entry before the first turn.
-Memory keys follow the same rules as workspace expectation paths: they must be
-non-empty, relative, and cannot contain `..`.
+Memory keys must be non-empty relative paths without `..`, and every character
+must match the provider-safe `[A-Za-z0-9._/-]` grammar. Unlike values, raw keys
+can appear in provider-visible context, so whitespace, control characters, and
+other punctuation are rejected before provider construction.
 
 Seeds pass through the production memory content scanner before persistence.
 Flagged secret-like content or unsafe instructions fail the case before the live
@@ -265,8 +267,9 @@ Memory checks (category `side_effect`), under `memory`:
   a failed malformed expectation rather than a vacuous pass.
 
 Memory checks query the case's isolated memory backend by exact key rather than
-using ranked recall. Each key is validated before the backend is queried; an
-empty, absolute, or `..`-containing key is a failed check, never a memory access.
+using ranked recall. Each key must satisfy the same `[A-Za-z0-9._/-]` grammar as
+seed keys and is validated before the backend is queried; an invalid key is a
+failed check, never a memory access.
 Memory expectations are live-mode only; replay rejects their declaration and
 names `--mode live` in the error.
 

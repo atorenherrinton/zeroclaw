@@ -244,7 +244,13 @@ impl TraceExpects {
                      remove the block or add present / absent / contains entries"
                 );
             }
+            for key in memory.present.iter().chain(&memory.absent) {
+                validate_memory_key(key)
+                    .with_context(|| format!("validating memory expectation key {key:?}"))?;
+            }
             for (key, needles) in &memory.contains {
+                validate_memory_key(key)
+                    .with_context(|| format!("validating memory expectation key {key:?}"))?;
                 if needles.is_empty() {
                     anyhow::bail!(
                         "expects.memory.contains[{key:?}] is an empty list; \
@@ -337,6 +343,12 @@ impl LlmTrace {
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        if let Some(setup) = &trace.setup {
+            for key in setup.memory.keys() {
+                validate_memory_key(key)
+                    .with_context(|| format!("validating setup memory key {key:?}"))?;
+            }
+        }
         trace
             .expects
             .validate()
