@@ -322,7 +322,7 @@ async fn run_case_repeated_recording_provenance(
             }
         }
     }
-    let all_pass = |o: &CaseOutcome| o.grades.iter().all(|g| g.passed);
+    let all_pass = |o: &CaseOutcome| crate::grader::gating_grades_pass(&o.grades);
     let samples: Vec<crate::stats::RunSample> = outcomes
         .iter()
         .map(|o| {
@@ -336,7 +336,7 @@ async fn run_case_repeated_recording_provenance(
                 checks: o
                     .grades
                     .iter()
-                    .map(|g| (g.check.clone(), g.passed))
+                    .map(|g| (g.check.clone(), g.passed, g.diagnostic))
                     .collect(),
             }
         })

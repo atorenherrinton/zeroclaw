@@ -42,12 +42,7 @@ impl CaseReport {
     /// boundary also fails closed so a caller cannot manufacture a green
     /// report from an empty grade vector.
     pub fn passed(&self) -> bool {
-        self.error.is_none()
-            && !self.grades.is_empty()
-            && self
-                .grades
-                .iter()
-                .all(|grade| grade.passed || grade.diagnostic)
+        self.error.is_none() && crate::grader::gating_grades_pass(&self.grades)
     }
 
     fn checks_passed(&self) -> usize {
@@ -531,7 +526,7 @@ mod tests {
                 output_tokens: 1,
                 duration_ms: 10 + index as u64,
                 llm_calls: 1,
-                checks: vec![("response".to_string(), index < passes)],
+                checks: vec![("response".to_string(), index < passes, false)],
             })
             .collect();
         CaseReport {
@@ -703,7 +698,7 @@ mod tests {
                 output_tokens: 1,
                 duration_ms: 10,
                 llm_calls: 1,
-                checks: vec![("response".to_string(), true)],
+                checks: vec![("response".to_string(), true, false)],
             },
             crate::stats::RunSample {
                 passed: true,
@@ -711,7 +706,7 @@ mod tests {
                 output_tokens: 1,
                 duration_ms: 11,
                 llm_calls: 1,
-                checks: vec![("response".to_string(), true)],
+                checks: vec![("response".to_string(), true, false)],
             },
         ];
         c.repeat = Some(crate::stats::RepeatStats::from_partial_runs(
@@ -778,6 +773,12 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
+        let mut diagnostic = grade("judge", false, "advisory");
+        diagnostic.diagnostic = true;
+        assert!(
+            case("a", vec![grade("c1", true, ""), diagnostic], None).passed(),
+            "a diagnostic failure must not become a gating case failure"
+        );
         // No checks cannot certify a passing case.
         assert!(!case("a", vec![], None).passed());
     }

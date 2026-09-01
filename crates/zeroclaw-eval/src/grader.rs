@@ -77,6 +77,15 @@ impl GradeResult {
     }
 }
 
+/// Whether a non-empty grade set satisfies every gating check.
+///
+/// This is the single aggregation rule used by both one-shot case reports and
+/// repeated-run sampling, so advisory judge failures cannot silently become a
+/// repeat failure.
+pub(crate) fn gating_grades_pass(grades: &[GradeResult]) -> bool {
+    !grades.is_empty() && grades.iter().all(|grade| grade.passed || grade.diagnostic)
+}
+
 /// Context available to graders while the case's workspace still exists.
 pub struct GradeContext<'a> {
     pub workspace: &'a std::path::Path,

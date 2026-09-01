@@ -552,13 +552,9 @@ fn write_run_history_with(
 ) -> Option<PathBuf> {
     let dir = resolved_history_dir(override_dir, &config.eval.history_dir)?;
     if path_is_under_target(&dir) {
-        let display = dir.display().to_string();
         eprintln!(
             "{}",
-            get_required_cli_string_with_args(
-                "cli-eval-history-target-warning",
-                &[("dir", display.as_str())],
-            )
+            get_required_cli_string("cli-eval-history-target-warning")
         );
     }
 
@@ -566,14 +562,13 @@ fn write_run_history_with(
         .and_then(|receipt| writer(&dir, &receipt))
     {
         Ok(path) => Some(path),
-        Err(error) => {
-            let error = error.to_string();
+        Err(_) => {
+            // History is best effort and its destination can contain host identity.
+            // Keep retained CI stderr useful without echoing the configured path or
+            // the path-rich anyhow chain from the writer.
             eprintln!(
                 "{}",
-                get_required_cli_string_with_args(
-                    "cli-eval-history-write-warning",
-                    &[("error", error.as_str())],
-                )
+                get_required_cli_string("cli-eval-history-write-warning")
             );
             None
         }
@@ -1195,6 +1190,7 @@ mod tests {
             baseline: None,
             write_baseline: Some(path.to_path_buf()),
             suite_kind: None,
+            history_dir: None,
         }
     }
 
@@ -1264,6 +1260,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
+            "scripted",
             report,
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
@@ -1295,6 +1292,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
+            "scripted",
             good,
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
@@ -1311,6 +1309,7 @@ mod tests {
             &Config::default(),
             Mode::Replay,
             Path::new("evals/regression"),
+            "scripted",
             broken,
             test_artifacts(artifact_dir.path()),
             write_baseline_opts(&target),
@@ -1447,6 +1446,7 @@ mod tests {
             provider_ref: "test.retry:model".to_string(),
             live_tools: Vec::new(),
             case_timeout: Duration::from_secs(5),
+            judge: None,
         };
 
         let mut cmp = BaselineComparison {
@@ -1490,7 +1490,7 @@ mod tests {
             output_tokens: 2,
             duration_ms: 17,
             llm_calls: 1,
-            checks: vec![("response_contains".to_string(), true)],
+            checks: vec![("response_contains".to_string(), true, false)],
         };
         let mut case = case_report("partial", false);
         case.repeat = Some(zeroclaw_eval::stats::RepeatStats::from_partial_runs(

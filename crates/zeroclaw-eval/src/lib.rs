@@ -17,7 +17,8 @@ pub mod tools;
 pub use case::{CaseSetup, LlmTrace, ToolPayloadExpect, TraceExpects};
 pub use grader::{GradeCategory, GradeContext, GradeResult, Grader, default_graders};
 pub use history::{
-    HISTORY_SCHEMA, HistoryCase, HistoryReceipt, HistoryRepeatCi, HistoryRun, write_history_receipt,
+    HISTORY_SCHEMA, HistoryCase, HistoryCheck, HistoryReceipt, HistoryRepeatAttempt,
+    HistoryRepeatCheck, HistoryRepeatCi, HistoryRepeatStats, HistoryRun, write_history_receipt,
 };
 pub use observer::RecordedCall;
 pub use record::RunRecord;

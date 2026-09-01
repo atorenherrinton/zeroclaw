@@ -399,22 +399,26 @@ Run history is an opt-in, append-only record for longitudinal analysis. Set
 `<history_dir>/<suite>/` with a UTC timestamp and short git SHA in each filename;
 collisions receive an `_N` suffix instead of overwriting an earlier run. Avoid
 placing the directory under `target/`, because other tooling may clear that tree.
+Receipts publish atomically; on a filesystem without atomic hard-link support,
+the best-effort history write fails without changing the eval result.
 
 Each receipt records the UTC time, git SHA and dirty flag when available,
 ZeroClaw version, suite identity and kind, mode, provider reference, pass counts,
 the report's suite-level repeat confidence interval, and transcript-free per-case
-results. Case results include comparability keys, verdict and score, per-check
-booleans under privacy-safe approved check-kind/ordinal identifiers, token and duration
-metrics, repeat statistics, and the baseline comparison class when `--baseline`
-was used. Absolute suite paths are reduced to a process-relative logical path
-when possible, or otherwise to the final suite component, so receipts do not
-retain host workspace paths.
+results. Case results include comparability keys, verdict and optional score,
+per-check pass and diagnostic/gating status under privacy-safe approved
+check-kind/ordinal identifiers, optional token and duration metrics, repeat
+statistics, and the baseline comparison class when `--baseline` was used.
+Absolute suite paths are reduced to a process-relative logical path when
+possible, or otherwise to the final suite component, so receipts do not retain
+host workspace paths.
 
 History receipts never contain `final_response`, conversation `history`, grade
 details, provider error payloads, or workspace content. They are designed for
-retention and private CI artifact upload. This differs deliberately from
-`--dump-records` and `target/eval-last-run/`: those debugging artifacts retain
-full transcripts, are overwritten or managed per run, and must never be
+retained CI use; best-effort write warnings likewise omit configured paths and
+underlying error details. This differs deliberately from
+`--dump-records` and `<install>/eval-artifacts/last-run`: those debugging artifacts
+retain full transcripts, are overwritten or managed per run, and must never be
 committed. `/evals/history/` is gitignored as instance/CI data; the canonical
 git-versioned eval artifacts remain `evals/baselines/*.json`.
 

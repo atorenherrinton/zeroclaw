@@ -175,13 +175,14 @@ pub struct RunSample {
     pub output_tokens: u64,
     pub duration_ms: u64,
     pub llm_calls: u32,
-    /// Per-check `(name, passed)` for flip counting across runs.
-    pub checks: Vec<(String, bool)>,
+    /// Per-check `(name, passed, diagnostic)` for flip counting and retained
+    /// gating semantics across runs.
+    pub checks: Vec<(String, bool, bool)>,
 }
 
 /// Outcome recorded for one attempted repetition. Execution errors are kept
 /// distinct from completed runs whose grades failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepeatAttemptOutcome {
     Passed,
@@ -212,6 +213,7 @@ pub struct RepeatAttemptReceipt {
 pub struct RepeatCheckReceipt {
     pub check: String,
     pub passed: bool,
+    pub diagnostic: bool,
 }
 
 impl RepeatAttemptReceipt {
@@ -230,9 +232,10 @@ impl RepeatAttemptReceipt {
             checks: run
                 .checks
                 .iter()
-                .map(|(check, passed)| RepeatCheckReceipt {
+                .map(|(check, passed, diagnostic)| RepeatCheckReceipt {
                     check: check.clone(),
                     passed: *passed,
+                    diagnostic: *diagnostic,
                 })
                 .collect(),
             error: None,
@@ -254,7 +257,7 @@ impl RepeatAttemptReceipt {
 }
 
 /// Aggregated statistics over k isolated runs of one case.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RepeatStats {
     /// Repetitions requested by the effective repeat policy.
@@ -299,7 +302,7 @@ impl RepeatStats {
         let mut per_check: std::collections::BTreeMap<String, Vec<bool>> =
             std::collections::BTreeMap::new();
         for run in runs {
-            for (name, passed) in &run.checks {
+            for (name, passed, _) in &run.checks {
                 per_check.entry(name.clone()).or_default().push(*passed);
             }
         }

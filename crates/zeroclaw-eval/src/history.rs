@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::Mode;
 use crate::baseline::{BaselineComparison, CaseComparison, SuiteKind, Verdict};
+use crate::record::ToolSurface;
 use crate::report::{CaseReport, RepeatCi, SuiteReport};
-use crate::stats::RepeatStats;
+use crate::stats::RepeatAttemptOutcome;
 
 /// The schema tag stamped on every run-history receipt.
 pub const HISTORY_SCHEMA: &str = "zeroclaw-eval/history/v1";
@@ -48,22 +49,64 @@ pub struct HistoryCase {
     pub case_id: String,
     pub case_hash: String,
     pub provider_ref: String,
-    pub tool_surface: Vec<String>,
+    pub tool_surface: ToolSurface,
     pub judge_ref: Option<String>,
     pub verdict: Verdict,
     pub error: bool,
-    pub score: f64,
+    pub score: Option<f64>,
     /// Per-check results keyed by privacy-safe approved check-kind/ordinal identifiers.
     /// Raw grader labels are deliberately excluded because expectation labels
     /// can contain response needles, regexes, or workspace-relative paths.
-    pub checks: BTreeMap<String, bool>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub duration_ms: u64,
-    pub llm_calls: u32,
-    pub repeat: Option<RepeatStats>,
+    pub checks: BTreeMap<String, HistoryCheck>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub llm_calls: Option<u32>,
+    pub repeat: Option<HistoryRepeatStats>,
     pub baseline_comparison: Option<String>,
     pub regression_categories: Vec<String>,
+}
+
+/// One privacy-safe grade result with its effect on the case verdict retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCheck {
+    pub passed: bool,
+    /// `true` means the result was advisory and did not gate the case verdict.
+    pub diagnostic: bool,
+}
+
+/// Transcript- and error-payload-free repeat evidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryRepeatStats {
+    pub k: u32,
+    pub passes: u32,
+    pub completed: u32,
+    pub attempts: Vec<HistoryRepeatAttempt>,
+    pub token_mean: f64,
+    pub token_stddev: f64,
+    pub duration_mean: f64,
+    pub duration_stddev: f64,
+    pub check_flips: BTreeMap<String, u32>,
+}
+
+/// One transcript-free attempted repetition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryRepeatAttempt {
+    pub attempt: u32,
+    pub outcome: RepeatAttemptOutcome,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub llm_calls: Option<u32>,
+    pub checks: Vec<HistoryRepeatCheck>,
+}
+
+/// One privacy-safe repeat-attempt check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryRepeatCheck {
+    pub check: String,
+    pub passed: bool,
+    pub diagnostic: bool,
 }
 
 /// Suite-level repeated-run confidence interval, copied from the report's
@@ -71,7 +114,10 @@ pub struct HistoryCase {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HistoryRepeatCi {
     pub pass_rate: f64,
-    pub ci_half_width: Option<f64>,
+    pub lower: Option<f64>,
+    pub upper: Option<f64>,
+    pub repeated_cases: usize,
+    pub total_cases: usize,
     pub independent_units: usize,
 }
 
@@ -79,7 +125,10 @@ impl From<RepeatCi> for HistoryRepeatCi {
     fn from(value: RepeatCi) -> Self {
         Self {
             pass_rate: value.pass_rate,
-            ci_half_width: value.ci_half_width,
+            lower: value.lower,
+            upper: value.upper,
+            repeated_cases: value.repeated_cases,
+            total_cases: value.total_cases,
             independent_units: value.independent_units,
         }
     }
@@ -142,51 +191,53 @@ fn history_case(
     run_provider_ref: &str,
     comparison: Option<&BaselineComparison>,
 ) -> HistoryCase {
-    let classification = case.record.as_ref().and_then(|record| {
-        comparison.and_then(|value| value.per_case.get(record.case_id.as_str()))
-    });
+    let classification =
+        comparison.and_then(|value| value.per_case.get(crate::report::case_id(case)));
     let (baseline_comparison, regression_categories) = comparison_fields(classification);
 
     let (checks, repeat) = history_check_fields(case);
 
     match &case.record {
-        Some(record) => HistoryCase {
-            case_id: record.case_id.clone(),
-            case_hash: record.case_hash.clone(),
-            provider_ref: record.provider_ref.clone(),
-            tool_surface: record.tool_surface.clone(),
-            judge_ref: record.judge_ref.clone(),
-            verdict: if case.passed() {
-                Verdict::Pass
-            } else {
-                Verdict::Fail
-            },
-            error: false,
-            score: case.score(),
-            checks,
-            input_tokens: record.input_tokens,
-            output_tokens: record.output_tokens,
-            duration_ms: record.duration_ms,
-            llm_calls: record.llm_calls,
-            repeat,
-            baseline_comparison,
-            regression_categories,
-        },
+        Some(record) => {
+            let completion = record.completion.as_ref();
+            HistoryCase {
+                case_id: record.provenance.case_id.clone(),
+                case_hash: record.provenance.case_hash.clone(),
+                provider_ref: record.provenance.provider_ref.clone(),
+                tool_surface: record.provenance.tool_surface.clone(),
+                judge_ref: record.provenance.judge_ref.clone(),
+                verdict: if case.passed() {
+                    Verdict::Pass
+                } else {
+                    Verdict::Fail
+                },
+                error: case.error.is_some() || completion.is_none(),
+                score: case.score(),
+                checks,
+                input_tokens: completion.map(|value| value.input_tokens),
+                output_tokens: completion.map(|value| value.output_tokens),
+                duration_ms: completion.map(|value| value.duration_ms),
+                llm_calls: completion.map(|value| value.llm_calls),
+                repeat,
+                baseline_comparison,
+                regression_categories,
+            }
+        }
         None => HistoryCase {
             case_id: case.name.clone(),
             case_hash: String::new(),
             provider_ref: run_provider_ref.to_string(),
-            tool_surface: Vec::new(),
+            tool_surface: ToolSurface::default(),
             judge_ref: None,
             verdict: Verdict::Fail,
             error: true,
-            score: 0.0,
+            score: None,
             checks: BTreeMap::new(),
-            input_tokens: 0,
-            output_tokens: 0,
-            duration_ms: 0,
-            llm_calls: 0,
-            repeat: None,
+            input_tokens: None,
+            output_tokens: None,
+            duration_ms: None,
+            llm_calls: None,
+            repeat,
             baseline_comparison,
             regression_categories,
         },
@@ -199,7 +250,9 @@ fn history_case(
 /// embed fixture arguments such as response needles or expected file content.
 /// The approved kind and deterministic position carry the longitudinal identity
 /// we need within an unchanged case hash without retaining those arguments.
-fn history_check_fields(case: &CaseReport) -> (BTreeMap<String, bool>, Option<RepeatStats>) {
+fn history_check_fields(
+    case: &CaseReport,
+) -> (BTreeMap<String, HistoryCheck>, Option<HistoryRepeatStats>) {
     let mut kind_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut identities: BTreeMap<String, String> = BTreeMap::new();
     let mut checks = BTreeMap::new();
@@ -212,13 +265,18 @@ fn history_check_fields(case: &CaseReport) -> (BTreeMap<String, bool>, Option<Re
         identities
             .entry(grade.check.clone())
             .or_insert_with(|| identity.clone());
-        checks.insert(identity, grade.passed);
+        checks.insert(
+            identity,
+            HistoryCheck {
+                passed: grade.passed,
+                diagnostic: grade.diagnostic,
+            },
+        );
     }
 
     let repeat = case.repeat.as_ref().map(|value| {
-        let mut safe = value.clone();
         let mut fallback_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
-        safe.check_flips = value
+        let check_flips = value
             .check_flips
             .iter()
             .map(|(raw, flips)| {
@@ -231,7 +289,47 @@ fn history_check_fields(case: &CaseReport) -> (BTreeMap<String, bool>, Option<Re
                 (identity, *flips)
             })
             .collect();
-        safe
+        let attempts = value
+            .attempts
+            .iter()
+            .map(|attempt| {
+                let mut attempt_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+                let checks = attempt
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        let kind = safe_check_kind(&check.check, "check");
+                        let ordinal = attempt_counts.entry(kind).or_default();
+                        *ordinal += 1;
+                        HistoryRepeatCheck {
+                            check: format!("{kind}:{ordinal}"),
+                            passed: check.passed,
+                            diagnostic: check.diagnostic,
+                        }
+                    })
+                    .collect();
+                HistoryRepeatAttempt {
+                    attempt: attempt.attempt,
+                    outcome: attempt.outcome,
+                    input_tokens: attempt.input_tokens,
+                    output_tokens: attempt.output_tokens,
+                    duration_ms: attempt.duration_ms,
+                    llm_calls: attempt.llm_calls,
+                    checks,
+                }
+            })
+            .collect();
+        HistoryRepeatStats {
+            k: value.k,
+            passes: value.passes,
+            completed: value.completed,
+            attempts,
+            token_mean: value.token_mean,
+            token_stddev: value.token_stddev,
+            duration_mean: value.duration_mean,
+            duration_stddev: value.duration_stddev,
+            check_flips,
+        }
     });
 
     (checks, repeat)
@@ -287,6 +385,7 @@ fn comparison_fields(classification: Option<&CaseComparison>) -> (Option<String>
         }
         Some(CaseComparison::Improvement) => (Some("improvement".to_string()), Vec::new()),
         Some(CaseComparison::Unchanged { .. }) => (Some("unchanged".to_string()), Vec::new()),
+        Some(CaseComparison::CurrentError) => (Some("current_error".to_string()), Vec::new()),
         // Removed cases do not have a current case receipt.
         Some(CaseComparison::Removed) | None => (None, Vec::new()),
     }
@@ -350,9 +449,10 @@ fn write_history_receipt_with(
     let mut json = serde_json::to_vec_pretty(receipt)?;
     json.push(b'\n');
 
-    // Write and sync a hidden sibling first. Where the filesystem permits it,
-    // a hard link publishes the complete file atomically without overwriting.
-    // Other filesystems use the create-new compatibility path below.
+    // Write and sync a hidden sibling first. A hard link publishes the complete
+    // file atomically without overwriting; filesystems that cannot provide that
+    // primitive fail the best-effort history write instead of exposing a partial
+    // receipt.
     let mut temp_suffix = 0_u32;
     let (temp_path, mut temp_file) = loop {
         let temp_name = if temp_suffix == 0 {
@@ -412,15 +512,9 @@ fn write_history_receipt_with(
                 };
                 suffix = next_suffix;
             }
-            Err(link_error) => {
-                let result = write_history_receipt_without_hard_links(&suite_dir, &stem, &json)
-                    .with_context(|| {
-                        format!(
-                            "hard-link publication failed ({link_error}); create-new fallback also failed"
-                        )
-                    });
+            Err(error) => {
                 let _ = std::fs::remove_file(&temp_path);
-                return result;
+                return Err(error).context("atomic history receipt publication failed");
             }
         }
     }
@@ -430,50 +524,6 @@ fn path_has_parent(path: &Path, expected_parent: &Path) -> Result<bool> {
     let canonical = std::fs::canonicalize(path)
         .with_context(|| format!("failed to revalidate {}", path.display()))?;
     Ok(canonical.parent() == Some(expected_parent))
-}
-
-/// Compatibility path for writable filesystems without hard-link support.
-/// `create_new` still prevents overwrite and partial files are removed on
-/// returned write errors, though such filesystems cannot provide atomic publish
-/// with the Rust standard library alone.
-fn write_history_receipt_without_hard_links(
-    suite_dir: &Path,
-    stem: &str,
-    json: &[u8],
-) -> Result<PathBuf> {
-    let mut path = suite_dir.join(format!("{stem}.json"));
-    let mut suffix = 1_u32;
-    loop {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(json).and_then(|()| file.sync_all()) {
-                    drop(file);
-                    let _ = std::fs::remove_file(&path);
-                    return Err(error)
-                        .with_context(|| format!("failed to write {}", path.display()));
-                }
-                drop(file);
-                if !path_has_parent(&path, suite_dir)? {
-                    let _ = std::fs::remove_file(&path);
-                    anyhow::bail!("history suite directory changed while publishing receipt");
-                }
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                path = suite_dir.join(format!("{stem}_{suffix}.json"));
-                suffix = suffix
-                    .checked_add(1)
-                    .context("history receipt collision suffix overflowed")?;
-            }
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to create {}", path.display()));
-            }
-        }
-    }
 }
 
 fn git_stamp() -> (Option<String>, Option<bool>) {
@@ -518,32 +568,39 @@ mod tests {
     use crate::baseline::{Baseline, compare};
     use crate::case::LlmTrace;
     use crate::grader::{GradeCategory, GradeResult};
-    use crate::record::{RECORD_SCHEMA, RunRecord, SandboxStamp};
+    use crate::record::{
+        CaseProvenance, RECORD_SCHEMA, RunCompletion, RunRecord, SandboxStamp, ToolSurface,
+    };
     use crate::report::CaseReport;
     use crate::stats::{RepeatStats, RunSample};
 
     fn record(case_id: &str) -> RunRecord {
         RunRecord {
-            schema: RECORD_SCHEMA.to_string(),
-            mode: Mode::Replay,
-            case_id: case_id.to_string(),
-            case_hash: "case-hash".to_string(),
-            provider_ref: "scripted".to_string(),
-            tool_surface: vec!["echo".to_string()],
-            sandbox: SandboxStamp {
-                autonomy: "supervised".to_string(),
-                workspace_only: true,
+            provenance: CaseProvenance {
+                schema: RECORD_SCHEMA.to_string(),
+                mode: Mode::Replay,
+                case_id: case_id.to_string(),
+                case_hash: "case-hash".to_string(),
+                provider_ref: "scripted".to_string(),
+                tool_surface: ToolSurface::new(
+                    vec!["echo".to_string()],
+                    vec!["echo".to_string()],
+                    vec!["echo".to_string()],
+                ),
+                sandbox: SandboxStamp {
+                    autonomy: "supervised".to_string(),
+                    workspace_only: true,
+                },
+                judge_ref: None,
             },
-            final_response: "private transcript sentinel".to_string(),
-            history: Vec::new(),
-            tools_called: vec!["echo".to_string()],
-            all_tools_succeeded: true,
-            input_tokens: 12,
-            output_tokens: 4,
-            duration_ms: 8,
-            llm_calls: 1,
-            judge_ref: None,
-            judge_usage: None,
+            completion: Some(RunCompletion {
+                final_response: "private transcript sentinel".to_string(),
+                input_tokens: 12,
+                output_tokens: 4,
+                duration_ms: 8,
+                llm_calls: 1,
+                ..RunCompletion::default()
+            }),
         }
     }
 
@@ -620,30 +677,21 @@ mod tests {
             category: GradeCategory::Response,
             diagnostic: false,
         });
-        let repeat = RepeatStats::from_runs(
+        let repeat = RepeatStats::from_partial_runs(
             2,
-            &[
-                RunSample {
-                    passed: true,
-                    total_tokens: 10,
-                    duration_ms: 20,
-                    checks: vec![(
-                        "file_contains(\"private/path\", \"private workspace sentinel\")"
-                            .to_string(),
-                        true,
-                    )],
-                },
-                RunSample {
-                    passed: false,
-                    total_tokens: 12,
-                    duration_ms: 24,
-                    checks: vec![(
-                        "file_contains(\"private/path\", \"private workspace sentinel\")"
-                            .to_string(),
-                        false,
-                    )],
-                },
-            ],
+            &[RunSample {
+                passed: true,
+                input_tokens: 6,
+                output_tokens: 4,
+                duration_ms: 20,
+                llm_calls: 1,
+                checks: vec![(
+                    "file_contains(\"private/path\", \"private workspace sentinel\")".to_string(),
+                    true,
+                    false,
+                )],
+            }],
+            "private provider repeat error sentinel".to_string(),
         );
         let report = SuiteReport {
             cases: vec![CaseReport {
@@ -664,6 +712,7 @@ mod tests {
         assert!(!text.contains("private workspace sentinel"));
         assert!(!text.contains("private/path"));
         assert!(!text.contains("private grade detail sentinel"));
+        assert!(!text.contains("private provider repeat error sentinel"));
     }
 
     #[test]
@@ -679,6 +728,35 @@ mod tests {
         assert_eq!(parsed.suite, "regression");
         assert_eq!(parsed.passed, 1);
         assert_eq!(parsed.cases[0].case_id, "case-a");
+    }
+
+    #[test]
+    fn history_check_retains_diagnostic_status() {
+        let mut diagnostic = grade(false);
+        diagnostic.check = "judge:quality".to_string();
+        diagnostic.category = GradeCategory::Judge;
+        diagnostic.diagnostic = true;
+        let report = SuiteReport {
+            cases: vec![CaseReport {
+                name: "diagnostic".to_string(),
+                source: "case.json".to_string(),
+                record: Some(record("diagnostic")),
+                grades: vec![diagnostic],
+                error: None,
+                repeat: None,
+                cluster: None,
+            }],
+        };
+
+        let receipt = build_receipt(&report);
+        assert_eq!(receipt.cases[0].verdict, Verdict::Pass);
+        assert_eq!(
+            receipt.cases[0].checks["judge:1"],
+            HistoryCheck {
+                passed: false,
+                diagnostic: true,
+            }
+        );
     }
 
     #[test]
@@ -782,36 +860,6 @@ mod tests {
     }
 
     #[test]
-    fn history_create_new_fallback_preserves_collisions() {
-        let dir = tempfile::tempdir().expect("history root");
-        let suite_dir = dir.path().join("regression");
-        std::fs::create_dir(&suite_dir).expect("suite dir");
-        let suite_dir = std::fs::canonicalize(suite_dir).expect("suite dir resolves");
-        let receipt = build_receipt(&SuiteReport {
-            cases: vec![case("case-a", true)],
-        });
-        let mut json = serde_json::to_vec_pretty(&receipt).expect("receipt serializes");
-        json.push(b'\n');
-        let first = write_history_receipt_without_hard_links(&suite_dir, "fallback", &json)
-            .expect("first fallback write");
-        let second = write_history_receipt_without_hard_links(&suite_dir, "fallback", &json)
-            .expect("second fallback write");
-        assert_eq!(
-            first.file_name().and_then(|name| name.to_str()),
-            Some("fallback.json")
-        );
-        assert_eq!(
-            second.file_name().and_then(|name| name.to_str()),
-            Some("fallback_1.json")
-        );
-        for path in [first, second] {
-            let text = std::fs::read_to_string(path).expect("fallback receipt is readable");
-            serde_json::from_str::<HistoryReceipt>(&text)
-                .expect("fallback receipt is complete JSON");
-        }
-    }
-
-    #[test]
     fn errored_case_recorded_with_error_flag() {
         let report = SuiteReport {
             cases: vec![CaseReport {
@@ -840,8 +888,53 @@ mod tests {
         assert_eq!(case.verdict, Verdict::Fail);
         assert!(case.error);
         assert_eq!(case.provider_ref, "anthropic.eval:model-x");
-        assert_eq!(case.score, 0.0);
+        assert_eq!(case.score, None);
         assert!(case.checks.is_empty());
+        assert!(
+            !serde_json::to_string(&receipt)
+                .expect("receipt serializes")
+                .contains("private provider payload")
+        );
+    }
+
+    #[test]
+    fn errored_case_keeps_provenance_and_current_error_classification() {
+        let baseline_report = SuiteReport {
+            cases: vec![case("errored-case", true)],
+        };
+        let baseline = Baseline::from_report(&baseline_report).expect("baseline builds");
+        let current = SuiteReport {
+            cases: vec![CaseReport {
+                name: "errored-case".to_string(),
+                source: "error.json".to_string(),
+                record: Some(RunRecord::from_provenance(
+                    record("errored-case").provenance,
+                )),
+                grades: Vec::new(),
+                error: Some("private provider payload".to_string()),
+                repeat: None,
+                cluster: None,
+            }],
+        };
+        let comparison = compare(&current, &baseline).expect("comparison builds");
+        let receipt = HistoryReceipt::from_report(
+            &current,
+            HistoryRun {
+                recorded_at: Utc::now(),
+                suite_dir: "evals/regression".to_string(),
+                suite_kind: SuiteKind::Regression,
+                mode: Mode::Replay,
+                provider_ref: "scripted".to_string(),
+            },
+            Some(&comparison),
+        )
+        .expect("receipt builds");
+
+        let case = &receipt.cases[0];
+        assert!(case.error);
+        assert_eq!(case.case_hash, "case-hash");
+        assert_eq!(case.baseline_comparison.as_deref(), Some("current_error"));
+        assert_eq!(case.input_tokens, None);
         assert!(
             !serde_json::to_string(&receipt)
                 .expect("receipt serializes")
@@ -854,11 +947,11 @@ mod tests {
         let baseline_report = SuiteReport {
             cases: vec![case("case-a", true)],
         };
-        let baseline = Baseline::from_report(&baseline_report);
+        let baseline = Baseline::from_report(&baseline_report).expect("baseline builds");
         let current = SuiteReport {
             cases: vec![case("case-a", false)],
         };
-        let comparison = compare(&current, &baseline);
+        let comparison = compare(&current, &baseline).expect("comparison builds");
         let receipt = HistoryReceipt::from_report(
             &current,
             HistoryRun {
@@ -886,15 +979,19 @@ mod tests {
             &[
                 RunSample {
                     passed: true,
-                    total_tokens: 10,
+                    input_tokens: 6,
+                    output_tokens: 4,
                     duration_ms: 20,
-                    checks: vec![("response_contains".to_string(), true)],
+                    llm_calls: 1,
+                    checks: vec![("response_contains".to_string(), true, false)],
                 },
                 RunSample {
-                    passed: false,
-                    total_tokens: 14,
+                    passed: true,
+                    input_tokens: 8,
+                    output_tokens: 6,
                     duration_ms: 24,
-                    checks: vec![("response_contains".to_string(), false)],
+                    llm_calls: 1,
+                    checks: vec![("response_contains".to_string(), false, true)],
                 },
             ],
         ));
@@ -905,8 +1002,9 @@ mod tests {
         let parsed: HistoryReceipt = serde_json::from_str(&json).expect("receipt deserializes");
         let repeat = parsed.cases[0].repeat.as_ref().expect("repeat is present");
         assert_eq!(repeat.k, 2);
-        assert_eq!(repeat.passes, 1);
+        assert_eq!(repeat.passes, 2);
         assert_eq!(repeat.check_flips["response_contains:1"], 1);
+        assert!(repeat.attempts[1].checks[0].diagnostic);
     }
 
     #[test]
