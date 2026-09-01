@@ -44,7 +44,7 @@ use std::io::{BufRead, ErrorKind, Read, Write};
 
 #[cfg(feature = "agent-runtime")]
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -338,6 +338,7 @@ trait QuickstartSelectorTerminal {
     fn size_checked(&mut self) -> Option<(u16, u16)>;
     fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
     fn clear_screen(&mut self) -> std::io::Result<()>;
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()>;
     fn hide_cursor(&mut self) -> std::io::Result<()>;
     fn show_cursor(&mut self) -> std::io::Result<()>;
     fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
@@ -387,6 +388,10 @@ impl QuickstartSelectorTerminal for CrosstermQuickstartTerminal {
 
     fn clear_screen(&mut self) -> std::io::Result<()> {
         execute!(self.stderr.lock(), Clear(ClearType::All))
+    }
+
+    fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+        execute!(self.stderr.lock(), MoveTo(0, 0))
     }
 
     fn hide_cursor(&mut self) -> std::io::Result<()> {
@@ -465,6 +470,7 @@ impl<'a, T: QuickstartSelectorTerminal> QuickstartSelectorScreen<'a, T> {
         };
         screen.term.enter_alternate_screen()?;
         screen.term.clear_screen()?;
+        screen.term.move_cursor_to_origin()?;
         screen.term.hide_cursor()?;
         screen.term.flush()?;
         Ok(screen)
@@ -540,12 +546,14 @@ fn interact_quickstart_selector<T: QuickstartSelectorTerminal>(
                     selected = (selected + 1) % labels.len();
                     frame = quickstart_selector_frame_lines(labels, prompt, selected);
                     screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
                     render_quickstart_selector(screen.term, &frame)?;
                 }
                 QuickstartSelectorKey::Up => {
                     selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
                     frame = quickstart_selector_frame_lines(labels, prompt, selected);
                     screen.term.clear_screen()?;
+                    screen.term.move_cursor_to_origin()?;
                     render_quickstart_selector(screen.term, &frame)?;
                 }
                 QuickstartSelectorKey::Select => {
@@ -9378,6 +9386,10 @@ mod tests {
             self.perform("clear_screen")
         }
 
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            self.perform("move_cursor_to_origin")
+        }
+
         fn hide_cursor(&mut self) -> std::io::Result<()> {
             self.perform("hide_cursor")
         }
@@ -9407,6 +9419,197 @@ mod tests {
                 ))
             })
         }
+    }
+
+    /// A real PTY-backed terminal writer with deterministic injected input.
+    ///
+    /// The production crossterm adapter and this test adapter emit the same
+    /// commands. Keeping input injected lets the regression exercise repeated
+    /// navigation without racing a process-global terminal event reader.
+    #[cfg(all(feature = "agent-runtime", unix))]
+    struct PtyWriter(std::fs::File);
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    impl std::io::Write for PtyWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buffer)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    struct PtySelectorTestTerminal {
+        slave: PtyWriter,
+        keys: std::collections::VecDeque<std::io::Result<QuickstartSelectorKey>>,
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    impl QuickstartSelectorTerminal for PtySelectorTestTerminal {
+        fn size_checked(&mut self) -> Option<(u16, u16)> {
+            use std::os::fd::AsRawFd;
+
+            let mut size = std::mem::MaybeUninit::<libc::winsize>::uninit();
+            // SAFETY: `size` points to writable `winsize` storage and `slave`
+            // owns a live PTY descriptor for the duration of this call.
+            let result = unsafe {
+                libc::ioctl(
+                    self.slave.0.as_raw_fd(),
+                    libc::TIOCGWINSZ,
+                    size.as_mut_ptr(),
+                )
+            };
+            (result == 0).then(|| {
+                // SAFETY: a successful `TIOCGWINSZ` initialized `size`.
+                let size = unsafe { size.assume_init() };
+                (size.ws_row, size.ws_col)
+            })
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, EnterAlternateScreen)
+        }
+
+        fn clear_screen(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, Clear(ClearType::All))
+        }
+
+        fn move_cursor_to_origin(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, MoveTo(0, 0))
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, Hide)
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, Show)
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            execute!(self.slave, LeaveAlternateScreen)
+        }
+
+        fn write_line(&mut self, line: &str) -> std::io::Result<()> {
+            write!(self.slave, "{line}\r\n")
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.slave.flush()
+        }
+
+        fn read_key(&mut self) -> std::io::Result<QuickstartSelectorKey> {
+            self.keys.pop_front().unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "no injected selector key",
+                ))
+            })
+        }
+    }
+
+    #[cfg(all(feature = "agent-runtime", unix))]
+    #[test]
+    fn quickstart_selector_repeated_navigation_redraws_at_pty_origin() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let mut dimensions = libc::winsize {
+            ws_row: 20,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: both descriptor pointers refer to live `c_int` storage. The
+        // optional name and termios inputs are null, and `dimensions` remains
+        // live for the duration of the call.
+        let openpty_result = unsafe {
+            libc::openpty(
+                &raw mut master_fd,
+                &raw mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &raw mut dimensions,
+            )
+        };
+        assert_eq!(openpty_result, 0, "openpty failed");
+
+        // SAFETY: `openpty` returned two distinct, live descriptors. Each is
+        // transferred to exactly one `File`, which closes it exactly once.
+        let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+        let mut term = PtySelectorTestTerminal {
+            slave: PtyWriter(slave),
+            keys: [
+                Ok(QuickstartSelectorKey::Down),
+                Ok(QuickstartSelectorKey::Down),
+                Ok(QuickstartSelectorKey::Up),
+                Ok(QuickstartSelectorKey::Cancel),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let outcome = interact_quickstart_selector(
+            &mut term,
+            &["first".to_string(), "second".to_string()],
+            "Choose",
+            (20, 80),
+        )
+        .expect("repeated PTY navigation should succeed");
+        assert_eq!(outcome, QuickstartSelectorOutcome::Pick(None));
+
+        // SAFETY: the PTY master descriptor is live; preserving its current
+        // flags and adding O_NONBLOCK prevents a spurious poll wakeup from
+        // hanging the test.
+        let master_flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+        assert!(master_flags >= 0, "reading PTY master flags failed");
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    master.as_raw_fd(),
+                    libc::F_SETFL,
+                    master_flags | libc::O_NONBLOCK,
+                )
+            },
+            0,
+            "setting PTY master nonblocking mode failed"
+        );
+
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 4096];
+        loop {
+            let mut poll_fd = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll_fd` points to one initialized poll descriptor.
+            let ready = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
+            assert!(ready >= 0, "polling PTY output failed");
+            if ready == 0 || poll_fd.revents & libc::POLLIN == 0 {
+                break;
+            }
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("failed to read PTY output: {error}"),
+            }
+        }
+        drop(term);
+
+        let output = String::from_utf8(output).expect("selector output should be UTF-8");
+        let clear_and_home = "\u{1b}[2J\u{1b}[1;1H";
+        assert_eq!(
+            output.matches(clear_and_home).count(),
+            4,
+            "the initial frame and all three navigation redraws must begin at the PTY origin; \
+             output: {output:?}"
+        );
     }
 
     #[cfg(feature = "agent-runtime")]

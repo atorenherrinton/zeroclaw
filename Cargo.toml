@@ -413,6 +413,7 @@ panic = "abort"
 # registry. dev-dependency only: resolver v2 keeps `test-util` out of the shipped
 # binary build, so the assemble()-only seal holds in production.
 zeroclaw-runtime = { workspace = true, features = ["test-util"] }
+libc = "0.2"
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
