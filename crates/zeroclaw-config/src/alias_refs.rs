@@ -533,6 +533,22 @@ pub fn is_reserved_agent_alias(alias: &str) -> bool {
     alias.trim() == RESERVED_DEFAULT_AGENT
 }
 
+/// Validate an agent alias before it is used outside the configured map.
+///
+/// Normal map mutations validate keys while editing the config. Committed
+/// lifecycle recovery also accepts aliases whose config entries are already
+/// gone, so callers must use this guard before deriving filesystem paths or
+/// probing owned state from request input.
+pub fn validate_agent_alias(alias: &str) -> Result<(), String> {
+    crate::helpers::validate_alias_key(alias)?;
+    if is_reserved_agent_alias(alias) {
+        return Err(format!(
+            "alias `{RESERVED_DEFAULT_AGENT}` is reserved and cannot be used for agent lifecycle operations"
+        ));
+    }
+    Ok(())
+}
+
 /// Why a [`create_map_key_checked`] did not create the key.
 #[derive(Debug)]
 pub enum CreateError {
@@ -2605,6 +2621,17 @@ mod tests {
         assert!(!is_reserved_agent_alias("default2"));
         assert!(!is_reserved_agent_alias("cronos"));
         assert!(!is_reserved_agent_alias(""));
+    }
+
+    #[test]
+    fn lifecycle_agent_alias_validation_rejects_unsafe_and_reserved_names() {
+        for alias in ["/tmp/outside", "../outside", "agent/name", "default"] {
+            assert!(
+                validate_agent_alias(alias).is_err(),
+                "lifecycle alias `{alias}` must be rejected"
+            );
+        }
+        assert!(validate_agent_alias("safe_agent").is_ok());
     }
 
     #[test]

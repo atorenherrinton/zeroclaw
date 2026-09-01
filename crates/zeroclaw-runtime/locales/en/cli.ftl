@@ -1049,6 +1049,7 @@ cli-alias-renamed = renamed {$section}.{$from} → {$section}.{$to} (rewrote {$c
 cli-alias-rename-invalid = invalid new alias: {$message}
 cli-alias-rename-reserved = alias `{$alias}` is reserved and cannot be renamed
 cli-alias-rename-postcondition = rename cascade post-condition failed: {$message}
+cli-alias-agent-invalid = invalid agent alias: {$message}
 cli-alias-unknown-provider-category = unknown provider category `{$category}` (expected models | tts | transcription)
 cli-alias-no-such-section = no such config section: {$section}
 cli-alias-live-acp-sessions = {$count} live ACP session(s) for `{$alias}` — end them first

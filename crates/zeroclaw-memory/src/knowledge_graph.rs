@@ -642,20 +642,6 @@ impl KnowledgeGraph {
         tags: &[String],
         source_project: Option<&str>,
     ) -> anyhow::Result<String> {
-        let conn = self.conn.lock();
-
-        // The cap is a global disk budget shared by every agent on the
-        // one store, so it deliberately counts all rows, not just the
-        // scope-visible ones.
-        let count: usize = conn.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
-        if count >= self.max_nodes {
-            anyhow::bail!(
-                "knowledge graph node limit reached ({}/{})",
-                count,
-                self.max_nodes
-            );
-        }
-
         // Reject tags containing commas since comma is the separator in storage.
         for tag in tags {
             if tag.contains(',') {
@@ -670,7 +656,23 @@ impl KnowledgeGraph {
         let now = Utc::now().to_rfc3339();
         let tags_str = tags.join(",");
 
-        conn.execute(
+        let mut conn = self.conn.lock();
+        // The cap is a global disk budget shared by every agent connection to
+        // the one store. BEGIN IMMEDIATE serializes the count with the insert,
+        // preventing two connections from both admitting the last slot.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("failed to begin atomic knowledge node admission")?;
+        let count: usize = tx.query_row("SELECT COUNT(*) FROM nodes", [], |r| r.get(0))?;
+        if count >= self.max_nodes {
+            anyhow::bail!(
+                "knowledge graph node limit reached ({}/{})",
+                count,
+                self.max_nodes
+            );
+        }
+
+        tx.execute(
             "INSERT INTO nodes (id, node_type, title, content, tags, created_at, updated_at, source_project, owner_agent)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -685,8 +687,23 @@ impl KnowledgeGraph {
                 scope.write_owner(),
             ],
         )?;
+        tx.commit()
+            .context("failed to commit knowledge node admission")?;
 
         Ok(id)
+    }
+
+    fn node_is_visible(
+        conn: &Connection,
+        scope: &KnowledgeScope,
+        node_id: &str,
+    ) -> anyhow::Result<bool> {
+        let (visibility, owners) = scope.visibility_sql("owner_agent", 2);
+        let sql = format!("SELECT COUNT(*) FROM nodes WHERE id = ?1 AND {visibility}");
+        let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&node_id];
+        sql_params.extend(owners.iter().map(|owner| owner as &dyn rusqlite::ToSql));
+        let count: usize = conn.query_row(&sql, &sql_params[..], |row| row.get(0))?;
+        Ok(count > 0)
     }
 
     /// Add a directed edge between two nodes the scope can see. The edge
@@ -706,19 +723,10 @@ impl KnowledgeGraph {
         // Both endpoints must exist and be visible to the caller. An
         // invisible node is reported exactly like a missing one so the
         // error is not an existence oracle for foreign rows.
-        let (vis_node, vis_params) = scope.visibility_sql("owner_agent", 2);
-        let visible = |id: &str| -> anyhow::Result<bool> {
-            let sql = format!("SELECT COUNT(*) FROM nodes WHERE id = ?1 AND {vis_node}");
-            let mut sql_params: Vec<&dyn rusqlite::ToSql> = vec![&id];
-            sql_params.extend(vis_params.iter().map(|owner| owner as &dyn rusqlite::ToSql));
-            let c: usize = conn.query_row(&sql, &sql_params[..], |r| r.get(0))?;
-            Ok(c > 0)
-        };
-
-        if !visible(from_id)? {
+        if !Self::node_is_visible(&conn, scope, from_id)? {
             anyhow::bail!("source node not found: {from_id}");
         }
-        if !visible(to_id)? {
+        if !Self::node_is_visible(&conn, scope, to_id)? {
             anyhow::bail!("target node not found: {to_id}");
         }
 
@@ -858,6 +866,9 @@ impl KnowledgeGraph {
         node_id: &str,
     ) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
         let conn = self.conn.lock();
+        if !Self::node_is_visible(&conn, scope, node_id)? {
+            return Ok(Vec::new());
+        }
         let (vis_edge, vis_params) = scope.visibility_sql("e.owner_agent", 2);
         let (vis_node, _) = scope.visibility_sql("n.owner_agent", 2);
         let sql = format!(
@@ -918,6 +929,9 @@ impl KnowledgeGraph {
         direction: Direction,
     ) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
         let conn = self.conn.lock();
+        if !Self::node_is_visible(&conn, scope, node_id)? {
+            return Ok(Vec::new());
+        }
         let limit = sql_limit(limit)?;
         let (anchor, joined) = match direction {
             Direction::Outbound => ("e.from_id", "e.to_id"),
@@ -1027,6 +1041,9 @@ impl KnowledgeGraph {
         direction: Direction,
     ) -> anyhow::Result<Vec<KnowledgeNode>> {
         let conn = self.conn.lock();
+        if !Self::node_is_visible(&conn, scope, node_id)? {
+            return Ok(Vec::new());
+        }
         let limit = sql_limit(limit)?;
         let (anchor, joined) = match direction {
             Direction::Outbound => ("e.from_id", "e.to_id"),
@@ -1605,6 +1622,52 @@ mod tests {
     }
 
     #[test]
+    fn max_nodes_limit_is_atomic_across_connections() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("knowledge.db");
+        // Create the schema before the workers contend on the admission path.
+        drop(KnowledgeGraph::new(&db_path, 1).unwrap());
+
+        let worker_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(worker_count));
+        let handles: Vec<_> = (0..worker_count)
+            .map(|worker| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let db_path = db_path.clone();
+                std::thread::spawn(move || {
+                    let graph = KnowledgeGraph::new(&db_path, 1).unwrap();
+                    barrier.wait();
+                    graph
+                        .add_node(
+                            &agent(&format!("agent_{worker}")),
+                            NodeType::Lesson,
+                            &format!("worker {worker}"),
+                            "concurrent admission",
+                            &[],
+                            None,
+                        )
+                        .is_ok()
+                })
+            })
+            .collect();
+
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 1, "only the one global slot may be admitted");
+        let graph = KnowledgeGraph::new(&db_path, 1).unwrap();
+        assert_eq!(
+            graph
+                .stats(&KnowledgeScope::unrestricted())
+                .unwrap()
+                .total_nodes,
+            1
+        );
+    }
+
+    #[test]
     fn stats_reports_correct_counts() {
         let (_tmp, graph, scope) = test_graph();
         graph
@@ -2074,7 +2137,7 @@ mod tests {
     }
 
     #[test]
-    fn subgraph_requires_a_scope_visible_seed_after_grant_revocation() {
+    fn anchor_queries_require_a_scope_visible_seed_after_grant_revocation() {
         let (_tmp, graph, _unused) = test_graph();
         let agent_a = agent("agent_a");
         let agent_b = agent("agent_b");
@@ -2108,6 +2171,57 @@ mod tests {
                 Relation::Uses,
             )
             .unwrap();
+        graph
+            .add_edge(
+                &agent_a_reading_b,
+                &visible_node,
+                &private_root,
+                Relation::AppliesTo,
+            )
+            .unwrap();
+
+        assert!(
+            graph
+                .find_related(&agent_a, &private_root)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            graph
+                .find_outbound(&agent_a, &private_root, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            graph
+                .find_inbound(&agent_a, &private_root, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            graph
+                .find_outbound_by_relation_and_type(
+                    &agent_a,
+                    &private_root,
+                    Relation::Uses,
+                    NodeType::Technology,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            graph
+                .find_inbound_by_relation_and_type(
+                    &agent_a,
+                    &private_root,
+                    Relation::AppliesTo,
+                    NodeType::Technology,
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
 
         let (nodes, edges) = graph.get_subgraph(&agent_a, &private_root, 1).unwrap();
         assert!(nodes.is_empty());

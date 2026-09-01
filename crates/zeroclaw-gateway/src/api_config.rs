@@ -1108,6 +1108,13 @@ async fn delete_agent_cascade(
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind, CascadePolicy};
 
+    if let Err(message) = alias_refs::validate_agent_alias(alias) {
+        return error_response(
+            ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+                .with_path(format!("agents.{alias}")),
+        );
+    }
+
     if !working.agents.contains_key(alias) {
         // The config entry is gone, but a prior delete may have committed that
         // removal and then failed its owned-state cascade (the cascade refuses
@@ -1761,6 +1768,15 @@ async fn rename_agent_cascade(
 ) -> Response {
     use zeroclaw_config::alias_refs::{self, AliasKind};
     let (from, to) = (&body.from, &body.to);
+
+    for alias in [from, to] {
+        if let Err(message) = alias_refs::validate_agent_alias(alias) {
+            return error_response(
+                ConfigApiError::new(ConfigApiCode::ValidationFailed, message)
+                    .with_path(format!("{}.{alias}", body.path)),
+            );
+        }
+    }
 
     // Capture the OLD workspace path while the entry still lives under `from`
     // (custom paths are read off the entry, which is about to move).
@@ -2641,6 +2657,55 @@ mod tests {
             data_dir,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_recovery_rejects_unsafe_aliases_before_filesystem_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.agents.insert(
+            "target".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let absolute_root = tmp.path().join("absolute_escape");
+        let traversal_root = tmp.path().join("traversal_escape");
+        let reserved_root = config.data_dir.join("agents/default");
+        let cases = [
+            (absolute_root.to_string_lossy().into_owned(), absolute_root),
+            ("../../traversal_escape".to_string(), traversal_root),
+            ("default".to_string(), reserved_root),
+        ];
+        let state = test_state(config);
+
+        for (alias, outside_root) in cases {
+            let marker = outside_root.join("workspace/marker.txt");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "must remain untouched").unwrap();
+
+            let working = state.config.read().clone();
+            let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+            let delete = delete_agent_cascade(&state, working, &alias, guard).await;
+            assert_eq!(delete.status(), StatusCode::BAD_REQUEST, "alias: {alias}");
+            assert!(marker.exists(), "delete touched unsafe path for `{alias}`");
+
+            let working = state.config.read().clone();
+            let guard = Arc::clone(&state.config_write_lock).lock_owned().await;
+            let rename = rename_agent_cascade(
+                &state,
+                working,
+                &RenameMapKeyBody {
+                    path: "agents".to_string(),
+                    from: alias.clone(),
+                    to: "target".to_string(),
+                },
+                guard,
+            )
+            .await;
+            assert_eq!(rename.status(), StatusCode::BAD_REQUEST, "alias: {alias}");
+            assert!(marker.exists(), "rename touched unsafe path for `{alias}`");
+        }
+
+        assert!(state.config.read().agents.contains_key("target"));
     }
 
     fn test_state(config: zeroclaw_config::schema::Config) -> AppState {

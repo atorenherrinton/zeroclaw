@@ -458,8 +458,18 @@ async fn move_renamed_agent_workspace(
     old_workspace: &std::path::Path,
     new_workspace: &std::path::Path,
 ) -> Option<String> {
-    if old_workspace == new_workspace || !old_workspace.exists() {
+    if old_workspace == new_workspace {
         return None;
+    }
+    match tokio::fs::try_exists(old_workspace).await {
+        Ok(false) => return None,
+        Err(err) => {
+            return Some(format!(
+                "workspace inspection failed for {}: {err}",
+                old_workspace.display()
+            ));
+        }
+        Ok(true) => {}
     }
     if let Some(parent) = new_workspace.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
@@ -3312,6 +3322,10 @@ impl RpcDispatcher {
     ) -> RpcResult {
         use zeroclaw_config::alias_refs::{AliasKind, CascadePolicy};
 
+        zeroclaw_config::alias_refs::validate_agent_alias(&req.key).map_err(|error| {
+            rpc_err(INVALID_PARAMS, format!("{}.{}: {error}", req.path, req.key))
+        })?;
+
         let active = self
             .ctx
             .sessions
@@ -3484,6 +3498,11 @@ impl RpcDispatcher {
         Box::pin(async move {
             let is_agent = matches!(kind, zeroclaw_config::alias_refs::AliasKind::Agent);
             if is_agent {
+                for alias in [&req.from, &req.to] {
+                    zeroclaw_config::alias_refs::validate_agent_alias(alias).map_err(|error| {
+                        rpc_err(INVALID_PARAMS, format!("{}.{alias}: {error}", req.path))
+                    })?;
+                }
                 // Live RPC sessions hold the selected agent alias in memory; refuse
                 // rather than letting them recreate old-alias state after the rename.
                 let active = self
@@ -7926,6 +7945,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_lifecycle_recovery_rejects_unsafe_aliases_before_filesystem_access() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let absolute_root = tmp.path().join("absolute_escape");
+        let traversal_root = tmp.path().join("traversal_escape");
+        let reserved_root = config.data_dir.join("agents/default");
+        let cases = [
+            (absolute_root.to_string_lossy().into_owned(), absolute_root),
+            ("../../traversal_escape".to_string(), traversal_root),
+            ("default".to_string(), reserved_root),
+        ];
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+
+        for (alias, outside_root) in cases {
+            let marker = outside_root.join("workspace/marker.txt");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "must remain untouched").unwrap();
+
+            let delete = dispatcher
+                .handle_config_map_key_delete(&json!({
+                    "path": "agents",
+                    "key": alias,
+                }))
+                .await;
+            assert!(delete.is_err(), "delete accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "delete touched unsafe path for `{alias}`");
+
+            let rename = dispatcher
+                .handle_config_map_key_rename(&json!({
+                    "path": "agents",
+                    "from": alias,
+                    "to": "target",
+                }))
+                .await;
+            assert!(rename.is_err(), "rename accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "rename touched unsafe path for `{alias}`");
+        }
+
+        assert!(dispatcher.ctx.config.read().agents.contains_key("target"));
+    }
+
+    #[tokio::test]
     async fn seed_trim_event_is_forwarded_exactly_once() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -8219,6 +8288,85 @@ mod tests {
         .unwrap();
         assert_eq!(graph.count_owner("alpha").unwrap(), 0);
         assert_eq!(graph.count_owner("beta").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn config_map_key_rename_retries_unreadable_workspace_before_alias_reuse() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_agent_rename_test_config(&tmp);
+        config.memory.backend = "none".to_string();
+        config.gateway.session_persistence = false;
+        config.channels.session_persistence = false;
+
+        let old_workspace = config.agent_workspace_dir("alpha");
+        std::fs::create_dir_all(&old_workspace).unwrap();
+        std::fs::write(
+            old_workspace.join("retired-marker.txt"),
+            "prior incarnation",
+        )
+        .unwrap();
+        zeroclaw_config::alias_refs::rename_with_cascade(
+            &mut config,
+            &zeroclaw_config::alias_refs::AliasKind::Agent,
+            "alpha",
+            "beta",
+        )
+        .expect("seed config rename committed before workspace move");
+        let new_workspace = config.agent_workspace_dir("beta");
+
+        let workspace_root = old_workspace
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let saved_workspace_root = workspace_root.with_extension("saved");
+        std::fs::rename(&workspace_root, &saved_workspace_root).unwrap();
+        std::fs::write(&workspace_root, "blocks child metadata").unwrap();
+        assert!(old_workspace.try_exists().is_err());
+
+        let dispatcher = make_owned_state_recovery_test_dispatcher(config, None, None);
+        let blocked_retry = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta",
+            }))
+            .await
+            .expect("metadata failure must remain retryable");
+        assert_eq!(blocked_retry["renamed"], true);
+        assert!(
+            blocked_retry["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("workspace inspection failed"))),
+            "the retry must surface unreadable workspace residue: {blocked_retry:?}"
+        );
+
+        std::fs::remove_file(&workspace_root).unwrap();
+        std::fs::rename(&saved_workspace_root, &workspace_root).unwrap();
+        assert!(old_workspace.join("retired-marker.txt").exists());
+
+        let repaired_retry = dispatcher
+            .handle_config_map_key_rename(&json!({
+                "path": "agents",
+                "from": "alpha",
+                "to": "beta",
+            }))
+            .await
+            .expect("restored workspace must converge on retry");
+        assert_eq!(repaired_retry["renamed"], true);
+        assert!(new_workspace.join("retired-marker.txt").exists());
+        assert!(!old_workspace.exists());
+
+        std::fs::create_dir_all(&old_workspace).unwrap();
+        assert!(
+            !old_workspace.join("retired-marker.txt").exists(),
+            "reusing the old alias must not expose the retired workspace"
+        );
     }
 
     #[tokio::test]
@@ -8791,25 +8939,27 @@ mod tests {
     #[tokio::test]
     async fn config_map_key_rename_refuses_active_agent_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let config = make_acp_test_config(&tmp);
+        let mut config = make_acp_test_config(&tmp);
+        let agent = config.agents.remove("test-agent").unwrap();
+        config.agents.insert("test_agent".to_string(), agent);
         let data_dir = config.data_dir.clone();
         let (dispatcher, sessions, _chat_backend, _acp_store) =
             make_persistence_test_dispatcher(config, &data_dir);
 
         dispatcher
             .handle_session_new_for_test(&json!({
-                "agent_alias": "test-agent",
+                "agent_alias": "test_agent",
                 "session_id": "live-agent-session"
             }))
             .await
             .expect("session/new should succeed");
-        assert_eq!(sessions.count_by_agent().await.get("test-agent"), Some(&1));
+        assert_eq!(sessions.count_by_agent().await.get("test_agent"), Some(&1));
 
         let err = dispatcher
             .handle_config_map_key_rename(&json!({
                 "path": "agents",
-                "from": "test-agent",
-                "to": "renamed-agent"
+                "from": "test_agent",
+                "to": "renamed_agent"
             }))
             .await
             .expect_err("agent rename must refuse active sessions");

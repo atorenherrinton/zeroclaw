@@ -363,6 +363,28 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
             save(config).await
         }
         AgentsCommands::Rename { from, to } => {
+            for alias in [&from, &to] {
+                if alias_refs::is_reserved_agent_alias(alias) {
+                    bail!(
+                        "{}",
+                        mta(
+                            "cli-alias-rename-reserved",
+                            &[("alias", alias)],
+                            "alias `{$alias}` is reserved and cannot be renamed"
+                        )
+                    );
+                }
+                if let Err(message) = alias_refs::validate_agent_alias(alias) {
+                    bail!(
+                        "{}",
+                        mta(
+                            "cli-alias-agent-invalid",
+                            &[("message", &message)],
+                            "invalid agent alias: {$message}"
+                        )
+                    );
+                }
+            }
             // Capture the workspace path while the `from` entry still exists
             // (custom paths are read off the entry, which the rename moves).
             let old_ws = config.agent_workspace_dir(&from);
@@ -384,6 +406,16 @@ pub async fn handle_agents(cmd: AgentsCommands, config: &mut Config) -> Result<(
                     mt(
                         "cli-alias-delete-reserved-default",
                         "the `default` agent is reserved and cannot be deleted"
+                    )
+                );
+            }
+            if let Err(message) = alias_refs::validate_agent_alias(&alias) {
+                bail!(
+                    "{}",
+                    mta(
+                        "cli-alias-agent-invalid",
+                        &[("message", &message)],
+                        "invalid agent alias: {$message}"
                     )
                 );
             }
@@ -863,6 +895,59 @@ mod tests {
             }),
             "channels.discord"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_recovery_rejects_unsafe_aliases_before_filesystem_access() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        config.agents.insert(
+            "target".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let absolute_root = tmp.path().join("absolute_escape");
+        let traversal_root = tmp.path().join("traversal_escape");
+        let reserved_root = config.data_dir.join("agents/default");
+        let cases = [
+            (absolute_root.to_string_lossy().into_owned(), absolute_root),
+            ("../../traversal_escape".to_string(), traversal_root),
+            ("default".to_string(), reserved_root),
+        ];
+
+        for (alias, outside_root) in cases {
+            let marker = outside_root.join("workspace/marker.txt");
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            std::fs::write(&marker, "must remain untouched").unwrap();
+
+            let delete = handle_agents(
+                AgentsCommands::Delete {
+                    alias: alias.clone(),
+                    dry_run: false,
+                    yes: true,
+                },
+                &mut config,
+            )
+            .await;
+            assert!(delete.is_err(), "delete accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "delete touched unsafe path for `{alias}`");
+
+            let rename = handle_agents(
+                AgentsCommands::Rename {
+                    from: alias.clone(),
+                    to: "target".to_string(),
+                },
+                &mut config,
+            )
+            .await;
+            assert!(rename.is_err(), "rename accepted unsafe alias `{alias}`");
+            assert!(marker.exists(), "rename touched unsafe path for `{alias}`");
+        }
+
+        assert!(config.agents.contains_key("target"));
     }
 
     /// Committed-delete recovery, CLI surface. `zeroclaw agents delete` persists
