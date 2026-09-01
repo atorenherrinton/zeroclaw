@@ -11278,6 +11278,16 @@ mod tests {
         sid: &str,
         provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
     ) -> String {
+        install_state_test_session_with_owner(sessions, chat_backend, sid, provider, None).await
+    }
+
+    async fn install_state_test_session_with_owner(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+        owner_tui_id: Option<&str>,
+    ) -> String {
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(provider))
             .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
@@ -11296,7 +11306,8 @@ mod tests {
             "test-agent",
             std::env::temp_dir().to_str().unwrap(),
             crate::rpc::types::ChatMode::Chat,
-        );
+        )
+        .with_owner(owner_tui_id.map(str::to_string));
         sessions.insert(sid.to_string(), rpc_session).await.unwrap();
 
         let session_key = format!("rpc_{sid}");
@@ -11304,6 +11315,91 @@ mod tests {
             .set_session_agent_alias(&session_key, "test-agent")
             .unwrap();
         session_key
+    }
+
+    #[tokio::test]
+    async fn owner_cancelled_rpc_prompt_returns_durable_chat_state_to_idle() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let sid = "rpc-state-owner-cancel";
+        let owner = "cancel-owner";
+        let session_key = install_state_test_session_with_owner(
+            &sessions,
+            &chat_backend,
+            sid,
+            GatedProvider {
+                started: started_tx,
+                release: tokio::sync::Mutex::new(Some(release_rx)),
+            },
+            Some(owner),
+        )
+        .await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-owner-cancel:pid=1".into());
+        dispatcher.set_tui_id_for_test(Some(owner.to_string()));
+
+        let prompt_handle = dispatcher.spawn_handle();
+        let prompt_task = zeroclaw_spawn::spawn!(async move {
+            prompt_handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid,
+                    "prompt": "wait for owner cancellation",
+                }))
+                .await
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("the real Chat prompt must reach its gated provider");
+
+        let running = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the admitted Chat turn must have durable state");
+        assert_eq!(running.state, "running");
+        assert!(running.turn_id.is_some());
+
+        let cancelled = dispatcher
+            .handle_session_cancel(&json!({"session_id": sid}))
+            .await
+            .expect("the owning dispatcher must be allowed to cancel its turn");
+        assert_eq!(cancelled["cancelled"], true);
+
+        let prompt_result = tokio::time::timeout(std::time::Duration::from_secs(2), prompt_task)
+            .await
+            .expect("owner cancellation must release the blocked prompt")
+            .expect("prompt task must not panic")
+            .expect("cancelled prompt must settle normally");
+        assert_eq!(prompt_result["stop_reason"], "cancelled");
+        assert!(
+            release_tx.send(()).is_err(),
+            "cancellation must drop the gated provider future"
+        );
+
+        let idle = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the cancelled Chat turn must retain its durable row");
+        assert_eq!(idle.state, "idle");
+        assert!(
+            idle.turn_id.is_none(),
+            "a cancelled terminal turn must clear its durable turn id"
+        );
     }
 
     #[tokio::test]
