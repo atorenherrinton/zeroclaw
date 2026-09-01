@@ -455,7 +455,7 @@ mod tests {
             name: name.to_string(),
             source: "fixture.json".to_string(),
             record: None,
-            grades: Vec::new(),
+            grades: vec![grade("response", passes == k, "repeat representative")],
             error: None,
             repeat: Some(crate::stats::RepeatStats::from_runs(k, &runs)),
             cluster: cluster.map(str::to_string),
@@ -476,7 +476,11 @@ mod tests {
         );
         assert!(!line.contains("NaN"), "got: {line}");
         assert!(!suite.render_table().contains("NaN"));
-        assert!(!suite.to_json().contains("NaN"));
+        assert!(
+            !suite
+                .to_json(crate::baseline::SuiteKind::Regression, None)
+                .contains("NaN")
+        );
     }
 
     #[test]
@@ -637,8 +641,9 @@ mod tests {
             table.contains("provider timeout"),
             "the truncating error must be reported: {table}"
         );
-        assert!(suite.to_json().contains("\"truncated\": true"));
-        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        let report_json = suite.to_json(crate::baseline::SuiteKind::Regression, None);
+        assert!(report_json.contains("\"truncated\": true"));
+        let json: serde_json::Value = serde_json::from_str(&report_json).unwrap();
         let attempts = json["cases"][0]["repeat"]["attempts"]
             .as_array()
             .expect("repeat attempts are serialized");
