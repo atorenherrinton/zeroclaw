@@ -175,10 +175,23 @@ impl SuiteReport {
         }
     }
 
-    /// Suite pass-rate error bar for repeated (live) runs: `pass rate p̄ ±1.96·SEM
-    /// (95% CI)`. Per-case success proportions are collapsed first (one value per
-    /// case), then cluster-averaged, so correlated resamples do not fake precision.
-    /// `None` when no case repeated.
+    /// Error bar over *repeated* cases only: `repeated-case pass rate p̄ ±t·SEM
+    /// (95% CI)`, annotated with how many of the suite's cases that covers.
+    ///
+    /// The population is deliberately restricted to cases that actually
+    /// repeated (effective `k > 1`) and produced statistics. Effective `k = 1`
+    /// cases contribute no within-case success proportion, so folding them in
+    /// would give a single-shot case the same weight as a 20-run case and
+    /// misrepresent the interval's precision. The label therefore names the
+    /// restricted estimand rather than presenting it as the suite pass rate —
+    /// the suite's own `passed/total` line is reported separately by
+    /// [`Self::render_table`].
+    ///
+    /// Per-case success proportions are collapsed by cluster first (one value
+    /// per cluster), then averaged, so correlated resamples do not fake
+    /// precision. `None` when no case repeated. Fewer than two independent
+    /// units report the observed rate without an interval because SEM is not
+    /// estimable.
     pub fn repeat_ci_line(&self) -> Option<String> {
         let items: Vec<(Option<String>, f64)> = self
             .cases
@@ -192,14 +205,23 @@ impl SuiteReport {
         if items.is_empty() {
             return None;
         }
+        // Names the population so the restricted rate can never be read as the
+        // suite pass rate printed directly above it.
+        let scope = format!("{} of {} cases repeated", items.len(), self.cases.len());
         let values = crate::stats::cluster_means(&items);
         let mean = crate::stats::mean(&values);
+        if values.len() < 2 {
+            return Some(format!(
+                "repeated-case pass rate {:.0}% ({scope}; 95% CI unavailable: insufficient independent units)",
+                mean * 100.0
+            ));
+        }
         // Student-t multiplier on (n-1) df: the normal z=1.96 understates the
         // interval for the few-unit suites repeated runs typically produce.
-        let df = values.len().saturating_sub(1);
+        let df = values.len() - 1;
         let ci = crate::stats::t95_multiplier(df) * crate::stats::sem(&values);
         Some(format!(
-            "pass rate {:.0}% +/-{:.0}% (95% CI)",
+            "repeated-case pass rate {:.0}% +/-{:.0}% (95% CI, {scope})",
             mean * 100.0,
             ci * 100.0
         ))
@@ -216,15 +238,46 @@ impl SuiteReport {
                     "  {icon} {} ({})  —  run error: {err}\n",
                     case.name, case.source
                 ));
-                continue;
+                // A truncated repeat set reports an error *and* carries partial
+                // statistics; fall through so that evidence is still shown.
+                if case.repeat.is_none() {
+                    continue;
+                }
+            } else {
+                s.push_str(&format!(
+                    "  {icon} {} ({})  {}/{} checks\n",
+                    case.name,
+                    case.source,
+                    case.checks_passed(),
+                    case.grades.len()
+                ));
             }
-            s.push_str(&format!(
-                "  {icon} {} ({})  {}/{} checks\n",
-                case.name,
-                case.source,
-                case.checks_passed(),
-                case.grades.len()
-            ));
+            // Per-case repeat diagnostics belong in the default report, not only
+            // in JSON: passes/k plus the consistency verdict are this feature's
+            // primary output.
+            if let Some(r) = &case.repeat {
+                s.push_str(&format!("      repeat {}/{}", r.passes, r.k));
+                if r.truncated() {
+                    s.push_str(&format!(" ({} completed)", r.completed));
+                }
+                s.push_str(&format!(
+                    "  pass@k {}  pass^k {}",
+                    if r.pass_at_k() { "yes" } else { "no" },
+                    if r.pass_hat_k() { "yes" } else { "no" }
+                ));
+                if !r.check_flips.is_empty() {
+                    let flips: Vec<String> = r
+                        .check_flips
+                        .iter()
+                        .map(|(name, n)| format!("{name}×{n}"))
+                        .collect();
+                    s.push_str(&format!("  flips: {}", flips.join(", ")));
+                }
+                s.push('\n');
+                if let Some(note) = r.suspect_note() {
+                    s.push_str(&format!("      {note}\n"));
+                }
+            }
             for g in case.grades.iter().filter(|g| !g.passed) {
                 s.push_str(&format!("      ✗ {}: {}\n", g.check, g.detail));
             }
@@ -306,6 +359,9 @@ impl SuiteReport {
                         serde_json::json!({
                             "k": r.k,
                             "passes": r.passes,
+                            "completed": r.completed,
+                            "truncated": r.truncated(),
+                            "error": r.error,
                             "pass_at_k": r.pass_at_k(),
                             "pass_hat_k": r.pass_hat_k(),
                             "token_mean": r.token_mean,
@@ -361,6 +417,186 @@ mod tests {
             repeat: None,
             cluster: None,
         }
+    }
+
+    fn repeated_case(name: &str, passes: u32, k: u32, cluster: Option<&str>) -> CaseReport {
+        CaseReport {
+            name: name.to_string(),
+            source: "fixture.json".to_string(),
+            record: None,
+            grades: Vec::new(),
+            error: None,
+            repeat: Some(crate::stats::RepeatStats {
+                k,
+                passes,
+                completed: k,
+                error: None,
+                token_mean: 0.0,
+                token_stddev: 0.0,
+                duration_mean: 0.0,
+                duration_stddev: 0.0,
+                check_flips: std::collections::BTreeMap::new(),
+            }),
+            cluster: cluster.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn repeated_single_case_reports_insufficient_units_without_nan() {
+        let suite = SuiteReport {
+            cases: vec![repeated_case("only", 1, 2, None)],
+        };
+
+        let line = suite.repeat_ci_line().expect("repeated case has a summary");
+        assert!(line.contains("pass rate 50%"), "got: {line}");
+        assert!(
+            line.contains("insufficient independent units"),
+            "got: {line}"
+        );
+        assert!(!line.contains("NaN"), "got: {line}");
+        assert!(!suite.render_table().contains("NaN"));
+        assert!(!suite.to_json().contains("NaN"));
+    }
+
+    #[test]
+    fn repeated_single_effective_cluster_reports_insufficient_units() {
+        let suite = SuiteReport {
+            cases: vec![
+                repeated_case("cluster-a", 2, 2, Some("family")),
+                repeated_case("cluster-b", 0, 2, Some("family")),
+            ],
+        };
+
+        let line = suite
+            .repeat_ci_line()
+            .expect("repeated cases have a summary");
+        assert!(line.contains("pass rate 50%"), "got: {line}");
+        assert!(
+            line.contains("insufficient independent units"),
+            "got: {line}"
+        );
+        assert!(!line.contains("NaN"), "got: {line}");
+    }
+
+    /// The exact misleading pairing from review: a suite that prints
+    /// `1/2 cases passed` must not also present an unqualified `pass rate 100%`.
+    #[test]
+    fn mixed_suite_never_labels_the_restricted_rate_as_the_suite_pass_rate() {
+        let suite = SuiteReport {
+            cases: vec![
+                // Repeated and fully passing -> the restricted population.
+                repeated_case("repeated-ok", 2, 2, None),
+                // Effective k=1: no repeat stats, and it fails the suite.
+                case("single-fail", vec![grade("c", false, "")], None),
+            ],
+        };
+
+        assert_eq!(suite.passed_count(), 1);
+        assert_eq!(suite.cases.len(), 2);
+
+        let line = suite.repeat_ci_line().expect("one case repeated");
+        // The restricted population is 100%, and that is legitimate — but it
+        // must be named, and must not claim to be the suite pass rate.
+        assert!(
+            line.contains("repeated-case pass rate 100%"),
+            "restricted estimand must be named: {line}"
+        );
+        assert!(
+            line.contains("1 of 2 cases repeated"),
+            "population must be disclosed: {line}"
+        );
+
+        let table = suite.render_table();
+        assert!(table.contains("1/2 cases passed"), "got: {table}");
+        // Guard the regression directly: no bare "pass rate" label may appear,
+        // only the qualified one.
+        assert!(
+            !table.contains(" pass rate") || table.contains("repeated-case pass rate"),
+            "unqualified pass rate leaked into the table: {table}"
+        );
+    }
+
+    /// Errored and effective-k=1 cases are excluded from the restricted
+    /// population by design; the disclosed denominator must still be the whole
+    /// suite so the exclusion is visible.
+    #[test]
+    fn repeat_population_discloses_errored_and_single_run_cases() {
+        let suite = SuiteReport {
+            cases: vec![
+                repeated_case("rep-a", 2, 2, None),
+                repeated_case("rep-b", 1, 2, None),
+                case("single", vec![grade("c", true, "")], None),
+                case("errored", vec![], Some("provider exploded")),
+            ],
+        };
+
+        let line = suite.repeat_ci_line().expect("repeated cases present");
+        assert!(
+            line.contains("2 of 4 cases repeated"),
+            "denominator must be the whole suite: {line}"
+        );
+    }
+
+    /// The per-case repeat verdict is the feature's primary diagnostic and must
+    /// be in the default table, not only in JSON.
+    #[test]
+    fn default_table_exposes_per_case_repeat_verdict() {
+        let suite = SuiteReport {
+            cases: vec![repeated_case("flaky-case", 3, 5, None)],
+        };
+
+        let table = suite.render_table();
+        assert!(
+            table.contains("repeat 3/5"),
+            "passes/k must be in the table: {table}"
+        );
+        assert!(
+            table.contains("pass@k yes"),
+            "pass@k verdict must be in the table: {table}"
+        );
+        assert!(
+            table.contains("pass^k no"),
+            "pass^k verdict must be in the table: {table}"
+        );
+    }
+
+    /// A truncated repeat set must fail and must still show its partial
+    /// evidence: the completed repetitions were paid for.
+    #[test]
+    fn truncated_repeat_set_fails_and_retains_partial_evidence() {
+        let mut c = repeated_case("truncated", 2, 5, None);
+        {
+            let r = c.repeat.as_mut().expect("repeat stats");
+            r.completed = 2;
+            r.error = Some("provider timeout".to_string());
+        }
+        // Mirrors what the runner records for a truncated set.
+        c.error = Some(
+            "repeat 2/5 runs completed (pass^k not established): provider timeout".to_string(),
+        );
+
+        assert!(
+            !c.passed(),
+            "a truncated set must not pass: only 2 of 5 runs completed"
+        );
+        let r = c.repeat.as_ref().unwrap();
+        assert!(r.truncated());
+        assert!(
+            !r.pass_hat_k(),
+            "pass^k must stay fail-closed on truncation"
+        );
+
+        let suite = SuiteReport { cases: vec![c] };
+        let table = suite.render_table();
+        assert!(
+            table.contains("repeat 2/5") || table.contains("(2 completed)"),
+            "partial evidence must survive into the table: {table}"
+        );
+        assert!(
+            table.contains("provider timeout"),
+            "the truncating error must be reported: {table}"
+        );
+        assert!(suite.to_json().contains("\"truncated\": true"));
     }
 
     #[test]
