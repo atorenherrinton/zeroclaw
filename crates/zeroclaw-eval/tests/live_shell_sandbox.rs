@@ -7,8 +7,8 @@
 //!
 //! This file previously proved that `shell`'s subprocesses were confined by
 //! a real OS sandbox backend (Landlock/Firejail/`sandbox-exec`) when `shell`
-//! was allowlisted. The reviewer found that every accepted backend still
-//! permits host *reads* a real-provider live run must not leak back into the
+//! was allowlisted. Every accepted backend still permits host *reads* that a
+//! real-provider live run must not leak back into the
 //! conversation (Seatbelt allows user dotfile reads; Firejail's
 //! `--private=home` adds no workspace whitelist; Landlock leaves the whole
 //! `/tmp` tree readable and network unrestricted) - wrapping `shell` in the

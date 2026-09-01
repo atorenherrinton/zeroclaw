@@ -57,11 +57,10 @@ const UNCONFIGURED_MODEL: &str = "<unconfigured>";
 /// the live agent then sends to the real provider on the next turn -
 /// confidentiality leakage no amount of sandboxing-the-writes fixes.
 ///
-/// This is the ship-safe interim posture: the reviewer's two accepted
-/// options were "either keep `shell` unavailable in live mode or provide an
-/// eval-specific sandbox contract that denies sensitive host reads as well
-/// as outside writes on every accepted backend." The read-confinement
-/// contract is the deliberate, harder follow-up; `live_shell_sandbox` /
+/// Keep `shell` unavailable in live mode until an eval-specific sandbox
+/// contract denies sensitive host reads as well as outside writes on every
+/// accepted backend. That read-confinement contract is the deliberate,
+/// harder follow-up; `live_shell_sandbox` /
 /// `ensure_real_sandbox` and `live_tool_registry`'s sandboxed-shell
 /// construction below are left in place as building blocks for it, even
 /// though this denylist means `run_live_case` can no longer reach that
