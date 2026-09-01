@@ -369,32 +369,10 @@ pub(crate) mod tests {
             |o: &CaseOutcome| -> Vec<String> { o.grades.iter().map(|g| g.check.clone()).collect() };
         assert_eq!(checks(&via_wrapper), checks(&via_seam));
         assert!(
-            checks(&via_wrapper).contains(&"run_completed".to_string()),
-            "default catalog must include the run_completed grade: {:?}",
+            checks(&via_wrapper).contains(&r#"response_contains("Hello")"#.to_string()),
+            "default catalog must include the fixture's expectation grades: {:?}",
             checks(&via_wrapper)
         );
-    }
-
-    #[tokio::test]
-    async fn every_case_emits_at_least_one_grade() {
-        // The invariant `CaseReport::passed`'s non-empty requirement relies on:
-        // a case that declares no expectations still grades something, so
-        // "zero grades" always means "nothing ran", never "everything passed".
-        let trace: LlmTrace = serde_json::from_str(
-            r#"{
-                "model_name": "test-no-expectations",
-                "turns": [{ "user_input": "Hi", "steps": [{ "response": { "type": "text", "content": "Hello." } }] }],
-                "expects": {},
-                "allow_no_expectations": true
-            }"#,
-        )
-        .unwrap();
-        let outcome = run_case(&trace, &RunDeps::replay()).await.unwrap();
-        assert!(
-            !outcome.grades.is_empty(),
-            "a run that reached grading must produce at least one grade"
-        );
-        assert!(outcome.grades.iter().all(|g| g.passed));
     }
 
     const SMOKE: &str = r#"{

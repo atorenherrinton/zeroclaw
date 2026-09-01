@@ -63,8 +63,9 @@ Supported expectations: `response_contains`, `response_not_contains`,
 `all_tools_succeeded`.
 
 Replay fixtures may only call tools the harness registers; Phase 0 ships a
-side-effect-free `echo` tool (see `tools::default_tools`). Wiring the real
-sandboxed tool registry for live evals is a later phase.
+side-effect-free `echo` tool (see `tools::default_tools`). Live evals assemble
+the runtime tool registry under the case's workspace-only security policy and
+filter it to the effective allowlist; `shell` remains unavailable.
 
 ## Library shape
 
