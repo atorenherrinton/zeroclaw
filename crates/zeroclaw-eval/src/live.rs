@@ -228,18 +228,21 @@ pub async fn run_live_case(trace: &LlmTrace, deps: &RunDeps) -> anyhow::Result<R
         ..SecurityPolicy::default()
     });
 
-    // Deny-by-default approvals. Allowlisted tools are auto-approved (deterministic
-    // pass-through); anything else that reaches the gate resolves Prompt -> auto-deny.
-    // The backchannel variant closes the non-interactive shell-exemption hole.
+    let tools = live_tool_registry(&effective, policy.clone()).await?;
+    // The assembled registry is the source of truth for what live mode can
+    // execute. Auto-approve exactly that surface so the harmless echo-only
+    // closed-default registry remains usable, while anything absent from the
+    // registry still resolves Prompt -> auto-deny through the non-interactive
+    // backchannel.
+    let approval_tools = tools.iter().map(|tool| tool.name().to_string()).collect();
     let risk = RiskProfileConfig {
         level: AutonomyLevel::Supervised,
-        auto_approve: effective.clone(),
+        auto_approve: approval_tools,
         always_ask: Vec::new(),
         ..RiskProfileConfig::default()
     };
     let approvals = Arc::new(ApprovalManager::for_non_interactive_backchannel(&risk));
 
-    let tools = live_tool_registry(&effective, policy.clone()).await?;
     // The policy is the source of truth for both assembly and the agent's
     // defense-in-depth gate. `None` keeps the echo-only empty-allowlist
     // registry usable; a non-empty allowlist narrows both boundaries equally.
@@ -460,6 +463,27 @@ mod tests {
         let registry = live_tool_registry(&[], policy).await.unwrap();
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name(), "echo");
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_echo_tool_executes() {
+        let trace: LlmTrace = serde_json::from_str(
+            r#"{ "model_name": "echo-only", "turns": [{ "user_input": "echo" }] }"#,
+        )
+        .unwrap();
+        let driver = r#"{"model_name":"driver","turns":[{"user_input":"","steps":[
+            {"response":{"type":"tool_calls","tool_calls":[{"id":"1","name":"echo","arguments":{"message":"hello"}}]}},
+            {"response":{"type":"text","content":"done"}}
+        ]}]}"#;
+        let deps = live_deps(
+            move |_| Ok(driver_provider(driver)),
+            Vec::new(),
+            Duration::from_secs(5),
+        );
+
+        let record = run_live_case(&trace, &deps).await.unwrap();
+        assert_eq!(record.tools_called, vec!["echo"]);
+        assert!(record.all_tools_succeeded);
     }
 
     #[test]

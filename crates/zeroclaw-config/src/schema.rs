@@ -21210,6 +21210,13 @@ impl Config {
                 ),
             }
         }
+        if self.eval.case_timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "eval.case_timeout_secs",
+                "eval.case_timeout_secs must be greater than 0",
+            );
+        }
 
         // Reply-pacing bounds — both `reply_min_interval_secs` and
         // `reply_queue_depth_max` walk through one entry list so adding
@@ -40758,6 +40765,22 @@ allowed_users = []
         let cfg = eval_live_provider_config("");
         cfg.validate()
             .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_zero_eval_case_timeout() {
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 0;
+
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("a zero-second live timeout must fail validation")
+        );
+        assert!(
+            msg.contains("eval.case_timeout_secs") && msg.contains("greater than 0"),
+            "expected InvalidNumericRange for eval.case_timeout_secs, got: {msg}"
+        );
     }
 
     // effective_summary_provider precedence — agent → profile → None.
