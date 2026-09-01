@@ -499,9 +499,9 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let record = run_live_case(&trace, &deps).await.unwrap();
-        assert_eq!(record.tools_called, vec!["echo"]);
-        assert!(record.all_tools_succeeded);
+        let outcome = run_live_case(&trace, &deps).await.unwrap();
+        assert_eq!(outcome.record.tools_called, vec!["echo"]);
+        assert!(outcome.record.all_tools_succeeded);
     }
 
     #[test]
