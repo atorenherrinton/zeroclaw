@@ -12,6 +12,7 @@ use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
 const MEMORY_API_CONTENT_MAX_CHARS: usize = 4096;
+const MEMORY_API_KEY_MAX_BYTES: usize = 1024;
 
 fn integration_entry_json(
     entry: &zeroclaw_runtime::integrations::IntegrationEntry,
@@ -71,6 +72,9 @@ pub(crate) fn require_auth(
 
 #[derive(Deserialize)]
 pub struct MemoryQuery {
+    /// Exact, untruncated lookup through the selected memory handle. Cannot be
+    /// combined with fuzzy search or time filters; keys are not normalized.
+    pub key: Option<String>,
     pub query: Option<String>,
     pub category: Option<String>,
     /// Filter memories created at or after (RFC 3339 / ISO 8601)
@@ -974,7 +978,7 @@ async fn resolve_memory_handle(
         })
 }
 
-/// GET /api/memory — list or search memory entries
+/// GET /api/memory — exact lookup, list, or search memory entries
 pub async fn handle_api_memory_list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -984,10 +988,52 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
+    if let Some(key) = params.key.as_deref() {
+        if key.trim().is_empty() || key.len() > MEMORY_API_KEY_MAX_BYTES {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Memory key must be nonblank and at most 1024 UTF-8 bytes"})),
+            )
+                .into_response();
+        }
+        if params.query.is_some() || params.since.is_some() || params.until.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Exact memory key cannot be combined with query, since, or until"})),
+            )
+                .into_response();
+        }
+    }
+
     let mem = match resolve_memory_handle(&state, params.agent.as_deref()).await {
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
+
+    if let Some(key) = params.key.as_deref() {
+        // The factory-owned handle enforces agent/peer scope. Exact reads must
+        // preserve content so callers can reconcile writes without mistaking a
+        // dashboard preview for the stored value. No list/recall fallback.
+        return match mem.get(key).await {
+            Ok(entry) => {
+                let entries: Vec<_> = entry
+                    .filter(|entry| {
+                        params
+                            .category
+                            .as_deref()
+                            .is_none_or(|category| entry.category.to_string() == category)
+                    })
+                    .into_iter()
+                    .collect();
+                Json(serde_json::json!({"entries": entries})).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Memory get failed: {e}")})),
+            )
+                .into_response(),
+        };
+    }
 
     // Use recall when query or time range is provided
     if params.query.is_some() || params.since.is_some() || params.until.is_some() {
@@ -2164,8 +2210,8 @@ pub(crate) mod tests {
             Ok(self.entries.clone())
         }
 
-        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
-            Ok(None)
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(self.entries.iter().find(|entry| entry.key == key).cloned())
         }
 
         async fn list(
@@ -2456,6 +2502,195 @@ pub(crate) mod tests {
             .expect("string content")
     }
 
+    async fn memory_http_get(
+        state: AppState,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+
+        let app = axum::Router::new()
+            .route("/api/memory", axum::routing::get(handle_api_memory_list))
+            .with_state(state);
+        let mut request = axum::http::Request::builder().uri(uri);
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn require_test_memory_auth(state: &mut AppState) {
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &["synthetic-memory-token".to_string()],
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_exact_key_returns_one_full_entry_not_history() {
+        let content = "火".repeat(MEMORY_API_CONTENT_MAX_CHARS + 1000);
+        let mut target = memory_entry_with_content(content.clone());
+        target.key = "call/target".into();
+        let mut entries = vec![target];
+        // A category/list response would greatly exceed the worker's body cap.
+        for index in 0..100 {
+            let mut other = memory_entry_with_content("x".repeat(4096));
+            other.key = format!("call/other-{index}");
+            entries.push(other);
+        }
+        let mut state = test_state_with_memory(Default::default(), entries);
+        require_test_memory_auth(&mut state);
+        let response = memory_http_get(
+            state,
+            "/api/memory?key=call%2Ftarget",
+            Some("synthetic-memory-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["key"], "call/target");
+        assert_eq!(memory_content_from_response(&body), content);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_exact_key_missing_and_category_mismatch_are_empty() {
+        let state = test_state_with_memory(
+            Default::default(),
+            vec![memory_entry_with_content("stored".into())],
+        );
+        for uri in [
+            "/api/memory?key=missing",
+            "/api/memory?key=huge-memory&category=core",
+        ] {
+            let response = memory_http_get(state.clone(), uri, None).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                serde_json::json!({"entries": []})
+            );
+        }
+        let response = memory_http_get(
+            state,
+            "/api/memory?key=huge-memory&category=conversation",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            memory_content_from_response(&response_json(response).await),
+            "stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_exact_key_auth_precedes_validation_and_resolution() {
+        let mut state = test_state(Default::default());
+        require_test_memory_auth(&mut state);
+        for token in [None, Some("wrong-synthetic-token")] {
+            for uri in [
+                "/api/memory?key=private",
+                "/api/memory?key=&agent=not-configured",
+            ] {
+                let response = memory_http_get(state.clone(), uri, token).await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_exact_key_rejects_invalid_or_ambiguous_filters() {
+        let state = test_state(Default::default());
+        let mut invalid = vec![
+            "/api/memory?key=".to_string(),
+            "/api/memory?key=++".to_string(),
+            "/api/memory?key=k&query=".to_string(),
+            "/api/memory?key=k&since=2026-01-01".to_string(),
+            "/api/memory?key=k&until=2026-01-01".to_string(),
+            "/api/memory?key=k&key=other".to_string(),
+        ];
+        invalid.push(format!(
+            "/api/memory?key={}",
+            "x".repeat(MEMORY_API_KEY_MAX_BYTES + 1)
+        ));
+        // The length limit is bytes, not Unicode scalar count.
+        invalid.push(format!("/api/memory?key={}", "%E7%81%AB".repeat(342)));
+        for uri in invalid {
+            let response = memory_http_get(state.clone(), &uri, None).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = memory_http_get(
+            state,
+            &format!("/api/memory?key={}", "x".repeat(MEMORY_API_KEY_MAX_BYTES)),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn handle_api_memory_exact_key_preserves_sqlite_agent_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: temp.path().join("data"),
+            config_path: temp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "sqlite".into();
+        config.memory.embedding_provider = "none".into();
+        for alias in ["alpha", "beta"] {
+            config.agents.insert(
+                alias.into(),
+                zeroclaw_config::schema::AliasedAgentConfig::default(),
+            );
+        }
+        let alpha = zeroclaw_memory::create_memory_for_agent(&config, "alpha", None)
+            .await
+            .unwrap();
+        alpha
+            .store(
+                "call/target",
+                "alpha private summary",
+                MemoryCategory::Custom("call_screening".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut state = test_state(config);
+        require_test_memory_auth(&mut state);
+        let response = memory_http_get(
+            state.clone(),
+            "/api/memory?agent=beta&key=call%2Ftarget",
+            Some("synthetic-memory-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({"entries": []})
+        );
+        let response = memory_http_get(
+            state.clone(),
+            "/api/memory?agent=alpha&key=call%2Ftarget",
+            Some("synthetic-memory-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(body["entries"][0]["agent_alias"], "alpha");
+        assert_eq!(memory_content_from_response(&body), "alpha private summary");
+        let response = memory_http_get(
+            state,
+            "/api/memory?agent=unknown&key=call%2Ftarget",
+            Some("synthetic-memory-token"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn truncate_memory_api_content_caps_total_chars_with_ellipsis() {
         let exact = "x".repeat(MEMORY_API_CONTENT_MAX_CHARS);
@@ -2482,6 +2717,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Query(MemoryQuery {
+                key: None,
                 query: None,
                 category: None,
                 since: None,
@@ -2513,6 +2749,7 @@ pub(crate) mod tests {
             State(state),
             HeaderMap::new(),
             Query(MemoryQuery {
+                key: None,
                 query: Some("huge".into()),
                 category: Some("conversation".into()),
                 since: None,
@@ -4754,6 +4991,7 @@ pub(crate) mod tests {
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,

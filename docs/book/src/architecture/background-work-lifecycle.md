@@ -23,6 +23,10 @@ The scheduler polls for due, enabled, unclaimed rows. Claiming a row prevents du
 
 Startup behavior is explicit. With catch-up enabled, overdue jobs are considered for execution. Otherwise an overdue one-shot is disabled with a skipped result, while a recurring job advances to its next future occurrence without recording a run result. The scheduler checks its cancellation token between polling iterations, so shutdown waits for the current due-job batch to finish before the loop exits. Cancelling the scheduler is not a promise that an already-dispatched external side effect can be rolled back.
 
+Declarative agent jobs may set `cron.<alias>.timeout_secs` to an integer from 1 through 86400. Each agent attempt resolves this optional deadline from the current config declaration; the cron database does not own a copy. Omission preserves the existing behavior without a scheduler agent deadline. Imperative jobs, including rows whose IDs collide with a config alias, do not inherit it. Shell jobs retain their existing independent timeout.
+
+The deadline drops the agent-run future and follows normal failure handling, including isolated-session memory cleanup, result persistence, and claim release. It is a per-attempt limit: `reliability.scheduler_retries` still controls retries, and setting it to `0` avoids repeated attempts for workflows with ambiguous external writes. Async cancellation cannot preempt code that never yields, roll back a completed request, or guarantee termination of an already-launched child process or detached task. Such tools need their own process/request bounds and idempotency or uncertain-write handling. Config edits apply through the existing scheduler reload boundary; deadlines are not copied into persistent jobs or a new live cache.
+
 ## SOP runs
 
 SOP definitions live under the configured `sops` directory. `SopEngine` owns run progression, approval waits, checkpoints, terminal transitions, and the in-process status surface. `SopRunStore` is the concurrency source of truth when it admits and claims a run.

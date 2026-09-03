@@ -337,6 +337,7 @@ pub async fn render_memory_context(
     let mut context = String::new();
     let mut included = 0usize;
     let mut used_chars = 0usize;
+    let mut exposed = Vec::new();
 
     for entry in entries.iter().filter(|e| match e.score {
         Some(score) => score >= cfg.min_relevance_score,
@@ -370,11 +371,21 @@ pub async fn render_memory_context(
             context.push('\n');
         }
         context.push_str(&line);
+        if entry.content.chars().count() <= cfg.entry_max_chars {
+            exposed.push(entry.clone());
+        }
         used_chars += line_chars;
         included += 1;
     }
 
     if included > 0 {
+        if mem.record_recall_evidence(None, &exposed).await.is_err() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "memory injection recall evidence unavailable"
+            );
+        }
         context.push_str(MEMORY_CONTEXT_CLOSE);
         context.push_str("\n\n");
     }
@@ -424,6 +435,7 @@ mod tests {
         fail: bool,
         recalls: std::sync::atomic::AtomicUsize,
         recorded_limits: Mutex<Vec<usize>>,
+        exposed_keys: Mutex<Vec<String>>,
     }
 
     impl FixtureMemory {
@@ -439,6 +451,7 @@ mod tests {
                 fail: false,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
+                exposed_keys: Mutex::new(Vec::new()),
             }
         }
 
@@ -448,12 +461,23 @@ mod tests {
                 fail: true,
                 recalls: std::sync::atomic::AtomicUsize::new(0),
                 recorded_limits: Mutex::new(Vec::new()),
+                exposed_keys: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl Memory for FixtureMemory {
+        async fn record_recall_evidence(
+            &self,
+            _agent_id: Option<&str>,
+            entries: &[MemoryEntry],
+        ) -> anyhow::Result<()> {
+            self.exposed_keys
+                .lock()
+                .extend(entries.iter().map(|entry| entry.key.clone()));
+            Ok(())
+        }
         async fn store(
             &self,
             _key: &str,
@@ -552,6 +576,86 @@ mod tests {
         fn alias(&self) -> &str {
             "FixtureMemory"
         }
+    }
+
+    #[tokio::test]
+    async fn promotion_evidence_only_after_filter_and_complete_render() {
+        let mem = FixtureMemory::with(vec![
+            entry("low", "low relevance", MemoryCategory::Daily, Some(0.1)),
+            entry(
+                "raw_history",
+                "history blob",
+                MemoryCategory::Daily,
+                Some(1.0),
+            ),
+            entry(
+                "tool",
+                "<tool_result>external data",
+                MemoryCategory::Daily,
+                Some(1.0),
+            ),
+            entry("valid", "short note", MemoryCategory::Daily, Some(1.0)),
+            entry(
+                "long",
+                "a long note with a qualifier that must not be omitted",
+                MemoryCategory::Daily,
+                Some(1.0),
+            ),
+            entry(
+                "chat",
+                "chat context",
+                MemoryCategory::Conversation,
+                Some(1.0),
+            ),
+        ]);
+        let cfg = MemoryInjectConfig {
+            max_entries: 10,
+            entry_max_chars: 12,
+            max_total_chars: 200,
+            min_relevance_score: 0.5,
+            ..Default::default()
+        };
+        let text = render_memory_context(
+            &mem,
+            &RecordingObserver::default(),
+            "query",
+            &[],
+            &cfg,
+            true,
+            TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: Some("owner"),
+                turn_id: "turn",
+                channel_name: "test",
+            },
+        )
+        .await;
+        assert!(text.contains("short note"));
+        assert_eq!(*mem.exposed_keys.lock(), vec!["valid"]);
+        mem.exposed_keys.lock().clear();
+        let cfg = MemoryInjectConfig {
+            max_total_chars: 0,
+            ..cfg
+        };
+        assert!(
+            render_memory_context(
+                &mem,
+                &RecordingObserver::default(),
+                "query",
+                &[],
+                &cfg,
+                true,
+                TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: Some("owner"),
+                    turn_id: "turn2",
+                    channel_name: "test"
+                }
+            )
+            .await
+            .is_empty()
+        );
+        assert!(mem.exposed_keys.lock().is_empty());
     }
 
     /// Records MemoryRecall events: (num_entries, success).

@@ -121,6 +121,28 @@ impl Tool for MemoryRecallTool {
                         entry.category, entry.key, entry.content
                     );
                 }
+                let fully_exposed = zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
+                    .try_with(|ctx| {
+                        ctx.as_ref()
+                            .is_some_and(|ctx| output.len() <= ctx.tool_output_limit)
+                    })
+                    .unwrap_or(false);
+                // If the outer collector will truncate this result, do not
+                // count unseen entries. Time-only browse is not a query signal.
+                if fully_exposed
+                    && !zeroclaw_memory::is_recent_recall_query(query)
+                    && self
+                        .memory
+                        .record_recall_evidence(None, &entries)
+                        .await
+                        .is_err()
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "memory recall evidence unavailable"
+                    );
+                }
                 Ok(ToolResult {
                     success: true,
                     output: output.into(),
@@ -142,6 +164,107 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use zeroclaw_memory::{MemoryCategory, MemoryEntry, SqliteMemory, is_recent_recall_query};
+
+    #[tokio::test]
+    async fn promotion_real_store_recall_factory_path_and_result_budget() {
+        use zeroclaw_api::ingress::TurnOrigin;
+        use zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT;
+        use zeroclaw_config::policy::SecurityPolicy;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        cfg.memory.embedding_provider = "none".into();
+        cfg.memory.promotion.enabled = true;
+        cfg.memory.promotion.agent_aliases = vec!["owner".into()];
+        cfg.agents
+            .insert("owner".into(), AliasedAgentConfig::default());
+        let memory = zeroclaw_memory::create_memory_for_agent(&cfg, "owner", None)
+            .await
+            .unwrap();
+        let writer = crate::memory_store::MemoryStoreTool::new(
+            memory.clone(),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let recall = MemoryRecallTool::new(memory);
+        let context = |input: &str, turn: &str, budget: usize| {
+            let mut ctx = zeroclaw_memory::promotion::owner_context(
+                &cfg.memory.promotion,
+                Some("owner"),
+                TurnOrigin::Interactive,
+                "cli",
+                turn,
+                Some(input),
+            )
+            .unwrap();
+            ctx.tool_output_limit = budget;
+            Some(ctx)
+        };
+        let note = "I prefer Rust, SQLite, privacy, local tools and short notes.";
+        let stored = OWNER_RECALL_CONTEXT
+            .scope(
+                context(note, "write", 10_000),
+                writer.execute(json!({"key":"preference","content":note,"category":"daily"})),
+            )
+            .await
+            .unwrap();
+        assert!(stored.success);
+        let raw = SqliteMemory::new("sqlite", &cfg.data_dir)
+            .unwrap()
+            .with_promotion_config(&cfg.memory.promotion, &cfg.memory.policy)
+            .unwrap();
+        for (n, query) in ["Rust", "SQLite", "privacy", "local", "short"]
+            .iter()
+            .enumerate()
+        {
+            // Real recall succeeds, but outer collector would truncate all of
+            // the payload: no evidence is allowed to accumulate.
+            assert!(
+                OWNER_RECALL_CONTEXT
+                    .scope(
+                        context(query, &format!("small{n}"), 1),
+                        recall.execute(json!({"query":query}))
+                    )
+                    .await
+                    .unwrap()
+                    .success
+            );
+        }
+        assert_eq!(
+            raw.promote_for_alias("owner", true).await.unwrap().eligible,
+            0
+        );
+        for (n, query) in ["Rust", "SQLite", "privacy", "local", "short"]
+            .iter()
+            .enumerate()
+        {
+            let result = OWNER_RECALL_CONTEXT
+                .scope(
+                    context(query, &format!("full{n}"), 10_000),
+                    recall.execute(json!({"query":query})),
+                )
+                .await
+                .unwrap();
+            assert!(result.success && result.output.contains(note));
+        }
+        assert_eq!(
+            raw.promote_for_alias("owner", false)
+                .await
+                .unwrap()
+                .promoted,
+            1
+        );
+        assert_eq!(
+            raw.promote_for_alias("owner", false)
+                .await
+                .unwrap()
+                .promoted,
+            0
+        );
+    }
 
     fn seeded_mem() -> (TempDir, Arc<dyn Memory>) {
         let tmp = TempDir::new().unwrap();

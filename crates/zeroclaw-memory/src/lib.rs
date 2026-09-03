@@ -32,6 +32,7 @@ pub mod policy;
 pub mod policy_gate;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
+pub mod promotion;
 pub mod qdrant;
 pub mod redact;
 pub mod rerank;
@@ -658,7 +659,8 @@ pub fn create_memory_with_storage_and_routes(
             config.embedding_cache_size,
             sqlite_open_timeout_secs,
             config.search_mode.clone(),
-        )?;
+        )?
+        .with_promotion_config(&config.promotion, &config.policy)?;
 
         if has_embedder {
             reconcile_embedding_identity(
@@ -993,6 +995,18 @@ pub async fn create_memory_for_agent(
         .get(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
+    if config.memory.promotion.enabled
+        && config
+            .memory
+            .promotion
+            .agent_aliases
+            .iter()
+            .any(|alias| alias == agent_alias)
+        && (!matches!(backend_kind, ConfigBackend::Sqlite)
+            || backend_kind_from_dotted(&config.memory.backend) != "sqlite")
+    {
+        anyhow::bail!("memory promotion requires the SQLite backend for its admitted agent");
+    }
 
     // Typed-memory producers are SQLite-only. Config::validate already
     // rejects this combination on every save path, but boot is

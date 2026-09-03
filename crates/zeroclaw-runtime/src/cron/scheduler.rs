@@ -296,6 +296,7 @@ pub async fn run(
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
@@ -594,6 +595,45 @@ fn cron_agent_session_path(target: &SessionTarget, run_session_id: &str) -> std:
     }
 }
 
+fn cron_agent_timeout(config: &Config, job: &CronJob) -> Result<Option<Duration>> {
+    // A same-ID imperative row must not borrow a declarative job's policy.
+    if job.source != "declarative" || job.job_type != JobType::Agent {
+        return Ok(None);
+    }
+    config
+        .cron
+        .get(&job.id)
+        .map(CronJobDecl::validated_timeout_secs)
+        .transpose()
+        .map(|seconds| seconds.flatten().map(Duration::from_secs))
+}
+
+async fn await_cron_agent_run<F>(config: &Config, job: &CronJob, run: F) -> Result<String>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    match cron_agent_timeout(config, job)? {
+        Some(limit) => time::timeout(limit, run).await.map_err(|_| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error_key": "cron.agent_attempt_timeout",
+                        "job_id": job.id,
+                        "timeout_secs": limit.as_secs(),
+                    })),
+                "Cron agent attempt timed out"
+            );
+            anyhow::Error::msg(crate::i18n::get_required_cli_string_with_args(
+                "cli-cron-agent-attempt-timeout",
+                &[("seconds", &limit.as_secs().to_string())],
+            ))
+        })?,
+        None => run.await,
+    }
+}
+
 async fn execute_job_with_retry(
     config: &Config,
     security: &SecurityPolicy,
@@ -864,29 +904,43 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
-                )
-                .instrument(subagent_span),
+            await_cron_agent_run(
+                config,
+                job,
+                Box::pin(
+                    crate::agent::run(
+                        cron_config,
+                        agent_alias,
+                        Some(prefixed_prompt),
+                        None,
+                        model_override,
+                        config
+                            .model_provider_for_agent(agent_alias)
+                            .and_then(|e| e.temperature),
+                        vec![],
+                        false,
+                        Some(session_path.clone()),
+                        job.allowed_tools.clone(),
+                        zeroclaw_api::ingress::TurnOrigin::Cron,
+                        run_overrides,
+                    )
+                    .instrument(subagent_span),
+                ) as futures_util::future::BoxFuture<'_, Result<String>>,
             )
             .await
         }
     };
 
+    finish_cron_agent_run(config, agent_alias, job, &session_path, run_result).await
+}
+
+async fn finish_cron_agent_run(
+    config: &Config,
+    agent_alias: &str,
+    job: &CronJob,
+    session_path: &std::path::Path,
+    run_result: Result<String>,
+) -> (bool, String) {
     match run_result {
         Ok(response) => (
             true,
@@ -1561,6 +1615,152 @@ mod tests {
             schedule,
             ..test_job("echo test")
         }
+    }
+
+    fn declarative_agent_deadline(config: &mut Config, seconds: Option<u64>) -> CronJob {
+        let mut job = agent_job_with_schedule(Schedule::Every { every_ms: 60000 });
+        job.source = "declarative".into();
+        config.cron.insert(
+            job.id.clone(),
+            CronJobDecl {
+                job_type: "agent".into(),
+                prompt: Some("Synthetic scheduled task".into()),
+                timeout_secs: seconds,
+                ..Default::default()
+            },
+        );
+        job
+    }
+
+    #[tokio::test]
+    async fn cron_agent_deadline_uses_current_config_not_job_snapshot() {
+        let mut config = Config::default();
+        let job = declarative_agent_deadline(&mut config, Some(300));
+        assert_eq!(
+            cron_agent_timeout(&config, &job).unwrap(),
+            Some(Duration::from_secs(300))
+        );
+        config.cron.get_mut(&job.id).unwrap().timeout_secs = Some(900);
+        assert_eq!(
+            cron_agent_timeout(&config, &job).unwrap(),
+            Some(Duration::from_secs(900))
+        );
+        config.cron.get_mut(&job.id).unwrap().timeout_secs = Some(600);
+        assert_eq!(
+            cron_agent_timeout(&config, &job).unwrap(),
+            Some(Duration::from_secs(600))
+        );
+        config.cron.get_mut(&job.id).unwrap().timeout_secs = Some(0);
+        assert!(
+            await_cron_agent_run(&config, &job, async { Ok("must not run".into()) })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_agent_deadline_none_and_imperative_collision_remain_unbounded() {
+        let mut config = Config::default();
+        let mut job = declarative_agent_deadline(&mut config, None);
+        assert_eq!(cron_agent_timeout(&config, &job).unwrap(), None);
+        assert!(
+            time::timeout(
+                Duration::from_millis(10),
+                await_cron_agent_run(&config, &job, std::future::pending())
+            )
+            .await
+            .is_err()
+        );
+        config.cron.get_mut(&job.id).unwrap().timeout_secs = Some(1);
+        job.source = "imperative".into();
+        assert_eq!(cron_agent_timeout(&config, &job).unwrap(), None);
+        assert_eq!(
+            await_cron_agent_run(&config, &job, async { Ok("imperative completed".into()) })
+                .await
+                .unwrap(),
+            "imperative completed"
+        );
+        job.source = "declarative".into();
+        job.job_type = JobType::Shell;
+        assert_eq!(cron_agent_timeout(&config, &job).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cron_agent_deadline_success_keeps_existing_completion_result() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = declarative_agent_deadline(&mut config, Some(1));
+        let result = await_cron_agent_run(&config, &job, async {
+            Ok("synthetic completed result".into())
+        })
+        .await;
+        let (success, output) = finish_cron_agent_run(
+            &config,
+            TEST_AGENT,
+            &job,
+            std::path::Path::new("cron-fixture"),
+            result,
+        )
+        .await;
+        assert!(success);
+        assert_eq!(output, "synthetic completed result");
+    }
+
+    #[tokio::test]
+    async fn cron_agent_deadline_drops_pending_run_and_uses_failure_memory_cleanup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = declarative_agent_deadline(&mut config, Some(1));
+        let session_path = std::path::Path::new("cron-timeout-fixture");
+        let key = zeroclaw_api::session_keys::sanitize_session_key("cli:cron-timeout-fixture");
+        let mem = zeroclaw_memory::create_memory_for_agent(&config, TEST_AGENT, None)
+            .await
+            .unwrap();
+        mem.store(
+            "timeout-fixture",
+            "Synthetic failed-run memory",
+            zeroclaw_memory::MemoryCategory::Conversation,
+            Some(&key),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "unrelated-fixture",
+            "Synthetic other-run memory",
+            zeroclaw_memory::MemoryCategory::Conversation,
+            Some("other-session"),
+        )
+        .await
+        .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let result = await_cron_agent_run(&config, &job, async move {
+            let _guard = guard;
+            std::future::pending::<Result<String>>().await
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "deadline must drop the actual agent future"
+        );
+        let (success, output) =
+            finish_cron_agent_run(&config, TEST_AGENT, &job, session_path, result).await;
+        assert!(
+            !success,
+            "a deadline must not become a successful empty completion"
+        );
+        assert!(output.starts_with("agent job failed:"));
+        assert!(output.contains("timed out"));
+        assert!(mem.get("timeout-fixture").await.unwrap().is_none());
+        assert!(mem.get("unrelated-fixture").await.unwrap().is_some());
     }
 
     #[test]

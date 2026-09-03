@@ -238,6 +238,26 @@ impl<M: Memory> AuditedMemory<M> {
 
 #[async_trait]
 impl<M: Memory> Memory for AuditedMemory<M> {
+    async fn attest_explicit_note(
+        &self,
+        agent_id: Option<&str>,
+        key: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .attest_explicit_note(agent_id, key, content)
+            .await
+    }
+
+    async fn record_recall_evidence(
+        &self,
+        agent_id: Option<&str>,
+        entries: &[MemoryEntry],
+    ) -> anyhow::Result<()> {
+        // This evidence path intentionally does not write raw-query audit text.
+        self.inner.record_recall_evidence(agent_id, entries).await
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

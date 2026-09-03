@@ -40,6 +40,21 @@ CORS preflight requests (those carrying `Access-Control-Request-Method`) get
 the standard preflight response and short-circuit before the schema body is
 returned.
 
+## Memory reads
+
+`GET /api/memory?agent=<alias>&key=<exact-key>` uses the same bearer
+authentication and per-agent memory handle as other memory operations. It
+returns `{"entries": [...]}` with zero or one entry, preserving its complete
+content rather than a dashboard preview. Agent peer-memory grants still apply.
+An unknown agent is rejected; a missing key returns an empty array.
+
+The decoded `key` must be nonblank and at most 1024 UTF-8 bytes. It is matched
+exactly, without trimming or normalization, and cannot be combined with
+`query`, `since`, or `until`. Optional `category` further filters that exact
+entry. Omit `category` when checking for collisions across categories.
+Without `key`, existing list/search behavior and preview truncation are unchanged.
+This is a read capability, not an atomic create-if-absent or compare-and-swap API.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |
@@ -121,6 +136,34 @@ If the Scalar bundle can't load from the CDN (offline / air-gapped install),
 the page degrades gracefully and points you at the raw spec at
 `/api/openapi.json` so you can use any compatible viewer
 (Insomnia, Postman, Swagger UI, etc.).
+
+## Fixed native-companion OAuth readiness
+
+The local migration extension adds an empty `POST` to
+`/api/auth/openai-codex/zeroclaw-native/ensure-fresh`. It accepts no body, query,
+profile, model or endpoint override. Pairing must be enabled and the request
+must have a valid paired bearer token and an actual loopback peer; forwarded
+headers do not establish locality. It runs only in a daemon with the reviewed
+encrypted native `openai.sol` OAuth Responses configuration.
+
+The response is one credential-free JSON field with `Cache-Control: no-store`:
+`200 {"status":"ready"}`, `202 {"status":"pending"}`,
+`409 {"status":"reauth_required"}`, a 400/401/403 `unavailable`, or
+`503 {"status":"deferred"}`. Ready requires the exact
+`openai-codex:zeroclaw-native` OAuth profile with known expiry strictly more
+than 240 seconds away. No model inference is requested or credential returned.
+
+The daemon owns renewal under the same process-local refresh mutex used by its
+normal provider. A process-wide single-flight slot rejects overlapping work
+with pending, without queuing another refresh. The handler waits four seconds;
+accepted work retains the slot after timeout or client disconnect. Lock waiting
+is bounded at ten seconds and the HTTP phase at 65 seconds, with twenty seconds
+per attempt; the native transient retry policy is retained. Persistence of an
+accepted rotation is deliberately outside cancellation deadlines, so this is
+not a whole-operation time bound. Companions must reread actual profile metadata
+before model work and must never treat pending/ready as credentials. They must
+not start an independent refresher or overwrite the current store after timeout.
+Manual credential replacement and clock discontinuities require coordination.
 
 ## Event stream contract
 

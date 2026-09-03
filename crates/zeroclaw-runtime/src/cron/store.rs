@@ -1480,6 +1480,7 @@ pub fn sync_declarative_jobs(
 
 /// Validate a declarative cron job definition.
 fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Result<()> {
+    decl.validated_timeout_secs()?;
     if id.trim().is_empty() {
         anyhow::bail!("Declarative cron job has empty id");
     }
@@ -2876,6 +2877,7 @@ mod tests {
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -3008,6 +3010,7 @@ mod tests {
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -3215,6 +3218,7 @@ mod tests {
                 model: None,
                 allowed_tools: None,
                 uses_memory: true,
+                timeout_secs: None,
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
@@ -3242,6 +3246,7 @@ mod tests {
                 model: None,
                 allowed_tools: None,
                 uses_memory: true,
+                timeout_secs: None,
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
@@ -3523,6 +3528,7 @@ mod tests {
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: Default::default(),
@@ -3868,6 +3874,7 @@ schedule = { kind = "every", every_ms = 300000 }
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -3922,6 +3929,7 @@ schedule = { kind = "every", every_ms = 300000 }
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -4050,6 +4058,7 @@ schedule = { kind = "every", every_ms = 300000 }
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4098,6 +4107,7 @@ schedule = { kind = "every", every_ms = 300000 }
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4206,6 +4216,7 @@ schedule = { kind = "every", every_ms = 300000 }
             model: None,
             allowed_tools: None,
             uses_memory: true,
+            timeout_secs: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,

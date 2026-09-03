@@ -1,5 +1,8 @@
 # Memory and payload lifecycle
 
+For the opt-in deterministic, agent-owned recall-evidence promotion pass, see
+[Native recall-weighted memory promotion](./weighted-memory-promotion.md).
+
 ZeroClaw carries several kinds of "remembered" information during a turn. They
 do not all have the same owner, durability, privacy boundary, or review risk.
 

@@ -246,6 +246,31 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
 
+    /// Record an explicit Daily note's authoring provenance. This is not an
+    /// assertion that a model-written note is true. Supporting backends require
+    /// an owner-input excerpt in the current native turn scope and re-check the
+    /// exact stored content version. Unscoped and unsupported calls do nothing.
+    async fn attest_explicit_note(
+        &self,
+        _agent_id: Option<&str>,
+        _key: &str,
+        _content: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Record only results actually exposed by a recall consumer, never the
+    /// backend's over-fetched candidate set. Supporting backends persist hashes,
+    /// counts and scores, not query text; repeated exposures in one native turn
+    /// count once. The per-agent wrapper supplies the authoritative owner id.
+    async fn record_recall_evidence(
+        &self,
+        _agent_id: Option<&str>,
+        _entries: &[MemoryEntry],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Store a memory entry, optionally scoped to a session
     async fn store(
         &self,

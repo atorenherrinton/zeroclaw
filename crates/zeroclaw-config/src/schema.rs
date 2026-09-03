@@ -11817,6 +11817,11 @@ pub struct MemoryConfig {
     #[serde(default)]
     #[nested]
     pub types: MemoryTypesConfig,
+    /// Native, deterministic recall-weighted promotion. Off unless an operator
+    /// explicitly admits agents and single-owner channel names.
+    #[serde(default)]
+    #[nested]
+    pub promotion: MemoryPromotionConfig,
     // Backend-specific config fields (sqlite_open_timeout_secs, qdrant.*,
     // postgres.*) live on `[storage.<backend>.<alias>]`. The `backend` field
     // carries a dotted alias reference and the runtime looks up the typed
@@ -11836,6 +11841,25 @@ pub struct MemoryTypesConfig {
     /// Assign a first-class MemoryKind to new consolidation writes.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Recall-weighted promotion (`[memory.promotion]`). Policy limits are fixed:
+/// ten per pass, score >= .75, three recalls and distinct owner queries, a
+/// fourteen-day half-life and at most thirty days since the latest qualifying
+/// recall. Lifetime version-scoped recall counts otherwise remain. SQLite only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "memory.promotion"]
+pub struct MemoryPromotionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit aliases whose own notes may qualify; peers never qualify.
+    #[serde(default)]
+    pub agent_aliases: Vec<String>,
+    /// Exact runtime channel names, admitted only after verifying single-owner
+    /// pairing. Empty admits local Interactive turns only, not WS/embedded API.
+    #[serde(default)]
+    pub owner_channels: Vec<String>,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -12269,6 +12293,7 @@ impl Default for MemoryConfig {
             audit_retention_days: default_audit_retention_days(),
             policy: MemoryPolicyConfig::default(),
             types: MemoryTypesConfig::default(),
+            promotion: MemoryPromotionConfig::default(),
         }
     }
 }
@@ -13728,6 +13753,16 @@ pub struct CronJobDecl {
     /// Model override for agent jobs.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional wall-clock limit for each declarative agent attempt, in seconds
+    /// (1..=86400). Omission preserves the existing unbounded agent-run behavior.
+    /// Resolved from this declaration at execution, never copied into the job DB.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_cron_timeout_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[cfg_attr(feature = "schema-export", schemars(range(min = 1, max = 86400)))]
+    pub timeout_secs: Option<u64>,
     /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
     /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
@@ -13766,6 +13801,7 @@ impl Default for CronJobDecl {
             prompt: None,
             enabled: true,
             model: None,
+            timeout_secs: None,
             allowed_tools: None,
             uses_memory: true,
             session_target: None,
@@ -13773,6 +13809,74 @@ impl Default for CronJobDecl {
             shell_output_format: CronShellOutputFormat::default(),
         }
     }
+}
+
+impl CronJobDecl {
+    /// Validate the canonical deadline even for programmatically built config.
+    pub fn validated_timeout_secs(&self) -> Result<Option<u64>> {
+        validate_cron_timeout_secs(self.timeout_secs)
+    }
+}
+
+#[cfg(test)]
+mod cron_timeout_tests {
+    use super::*;
+
+    #[test]
+    fn cron_timeout_optional_bounds_and_serde_round_trip() {
+        let absent: CronJobDecl = toml::from_str("").unwrap();
+        assert_eq!(absent.timeout_secs, None);
+        assert_eq!(absent.validated_timeout_secs().unwrap(), None);
+        for seconds in [1, 300, 600, 900, 86400] {
+            let declaration: CronJobDecl =
+                toml::from_str(&format!("timeout_secs = {seconds}")).unwrap();
+            assert_eq!(declaration.validated_timeout_secs().unwrap(), Some(seconds));
+            let round_trip: CronJobDecl =
+                toml::from_str(&toml::to_string(&declaration).unwrap()).unwrap();
+            assert_eq!(round_trip.timeout_secs, Some(seconds));
+        }
+        for value in ["0", "86401", "-1", "1.5", "\"900\""] {
+            assert!(toml::from_str::<CronJobDecl>(&format!("timeout_secs = {value}")).is_err());
+        }
+    }
+
+    #[test]
+    fn cron_timeout_programmatic_config_is_validated() {
+        for seconds in [0, 86401, u64::MAX] {
+            let declaration = CronJobDecl {
+                timeout_secs: Some(seconds),
+                ..Default::default()
+            };
+            assert!(declaration.validated_timeout_secs().is_err());
+            let mut config = Config::default();
+            config.cron.insert("fixture".into(), declaration);
+            let error = config.validate().unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<crate::api_error::ConfigApiError>()
+                    .unwrap()
+                    .code,
+                crate::api_error::ConfigApiCode::InvalidNumericRange
+            );
+        }
+    }
+}
+
+fn validate_cron_timeout_secs(value: Option<u64>) -> Result<Option<u64>> {
+    if value.is_some_and(|seconds| !(1..=86400).contains(&seconds)) {
+        validation_bail!(
+            InvalidNumericRange,
+            "cron.timeout_secs",
+            "cron timeout_secs must be between 1 and 86400 seconds"
+        );
+    }
+    Ok(value)
+}
+
+fn deserialize_cron_timeout_secs<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    validate_cron_timeout_secs(Option::<u64>::deserialize(deserializer)?).map_err(de::Error::custom)
 }
 
 /// Output format for shell cron job stdout.
@@ -21340,6 +21444,9 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        for declaration in self.cron.values() {
+            declaration.validated_timeout_secs()?;
+        }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {

@@ -25,11 +25,55 @@ const GEMINI_PROVIDER: &str = "gemini";
 const XAI_PROVIDER: &str = "xai";
 const DEFAULT_PROFILE_NAME: &str = "default";
 const OPENAI_REFRESH_SKEW_SECS: u64 = 90;
+pub const NATIVE_OPENAI_PROFILE_NAME: &str = "zeroclaw-native";
+const NATIVE_OPENAI_FRESH_SECS: i64 = 240;
 const OPENAI_REFRESH_FAILURE_BACKOFF_SECS: u64 = 10;
 const OAUTH_REFRESH_MAX_ATTEMPTS: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(3).expect("OAuth refresh attempt count must be nonzero");
 const OAUTH_REFRESH_RETRY_BASE_DELAY_MS: u64 = 350;
 static REFRESH_BACKOFFS: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+/// Credential-free outcome for the daemon's fixed companion refresh boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeOpenAiFreshness {
+    Ready,
+    ReauthRequired,
+    Deferred,
+}
+
+#[derive(Clone, Copy)]
+enum OpenAiRefreshPolicy {
+    Provider,
+    NativeCompanion,
+}
+
+impl OpenAiRefreshPolicy {
+    fn accepts_profile(self, profile: &AuthProfile) -> bool {
+        match self {
+            Self::Provider => true,
+            Self::NativeCompanion => {
+                profile.id == profile_id(OPENAI_CODEX_PROVIDER, NATIVE_OPENAI_PROFILE_NAME)
+                    && profile.model_provider == OPENAI_CODEX_PROVIDER
+                    && profile.profile_name == NATIVE_OPENAI_PROFILE_NAME
+                    && profile.kind == AuthProfileKind::OAuth
+            }
+        }
+    }
+
+    fn tokens_ready(self, tokens: &TokenSet, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match self {
+            Self::Provider => {
+                !tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS))
+            }
+            Self::NativeCompanion => {
+                !tokens.access_token.trim().is_empty()
+                    && tokens.expires_at.is_some_and(|expiry| {
+                        expiry > now + chrono::Duration::seconds(NATIVE_OPENAI_FRESH_SECS)
+                    })
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -202,6 +246,50 @@ impl AuthService {
         &self,
         profile_override: Option<&str>,
     ) -> Result<Option<String>> {
+        self.openai_access_token_with_policy(profile_override, OpenAiRefreshPolicy::Provider, |token| async move {
+            refresh_openai_access_token_with_retries(&self.client, &token).await
+        }).await
+    }
+
+    /// Ensure the explicitly named native OAuth profile has a known TTL greater
+    /// than the companion budget. Never selects another active/default profile,
+    /// exports credentials, or invokes inference. Call from daemon-owned work:
+    /// cancellation after a token rotation must not interrupt persistence.
+    pub async fn ensure_native_openai_fresh(&self) -> NativeOpenAiFreshness {
+        // This new maintenance boundary is bounded and cannot inherit endpoint,
+        // redirect, or proxy overrides. The normal provider's client is unchanged.
+        let client = match reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return NativeOpenAiFreshness::Deferred,
+        };
+        match self.openai_access_token_with_policy(
+            Some(NATIVE_OPENAI_PROFILE_NAME),
+            OpenAiRefreshPolicy::NativeCompanion,
+            |token| async move { refresh_openai_access_token_with_retries(&client, &token).await },
+        ).await {
+            Ok(Some(_)) => NativeOpenAiFreshness::Ready,
+            Ok(None) => NativeOpenAiFreshness::ReauthRequired,
+            Err(error) if error.downcast_ref::<openai_oauth::TokenRequestRejected>()
+                .is_some_and(|rejected| rejected.reauth_required) => NativeOpenAiFreshness::ReauthRequired,
+            Err(_) => NativeOpenAiFreshness::Deferred,
+        }
+    }
+
+    async fn openai_access_token_with_policy<F, Fut>(
+        &self,
+        profile_override: Option<&str>,
+        policy: OpenAiRefreshPolicy,
+        refresh: F,
+    ) -> Result<Option<String>>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<TokenSet>>,
+    {
         let data = self.store.load().await?;
         let Some(profile_id) = select_profile_id(&data, OPENAI_CODEX_PROVIDER, profile_override)
         else {
@@ -212,36 +300,79 @@ impl AuthService {
             return Ok(None);
         };
 
+        if !policy.accepts_profile(profile) {
+            return Ok(None);
+        }
+
         let Some(token_set) = profile.token_set.as_ref() else {
+            if matches!(policy, OpenAiRefreshPolicy::NativeCompanion) {
+                return Ok(None);
+            }
             anyhow::bail!("OpenAI Codex auth profile is not OAuth-based: {profile_id}");
         };
 
-        if !token_set.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+        if policy.tokens_ready(token_set, chrono::Utc::now()) {
             return Ok(Some(token_set.access_token.clone()));
         }
 
         let Some(refresh_token) = token_set.refresh_token.clone() else {
-            return Ok(Some(token_set.access_token.clone()));
+            return Ok(matches!(policy, OpenAiRefreshPolicy::Provider)
+                .then(|| token_set.access_token.clone()));
         };
+        if matches!(policy, OpenAiRefreshPolicy::NativeCompanion) && refresh_token.trim().is_empty()
+        {
+            return Ok(None);
+        }
 
         let refresh_lock = refresh_lock_for_profile(&profile_id);
-        let _guard = refresh_lock.lock().await;
+        let _guard = match policy {
+            OpenAiRefreshPolicy::Provider => refresh_lock.lock().await,
+            OpenAiRefreshPolicy::NativeCompanion => {
+                tokio::time::timeout(Duration::from_secs(10), refresh_lock.lock())
+                    .await
+                    .map_err(|_| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Native OAuth refresh lock deferred"
+                        );
+                        anyhow::Error::msg("Native OAuth refresh lock deferred")
+                    })?
+            }
+        };
 
         // Re-load after waiting for lock to avoid duplicate refreshes.
         let data = self.store.load().await?;
         let Some(latest_profile) = data.profiles.get(&profile_id) else {
             return Ok(None);
         };
+        if !policy.accepts_profile(latest_profile) {
+            return Ok(None);
+        }
 
         let Some(latest_tokens) = latest_profile.token_set.as_ref() else {
+            if matches!(policy, OpenAiRefreshPolicy::NativeCompanion) {
+                return Ok(None);
+            }
             anyhow::bail!("OpenAI Codex auth profile is missing token set: {profile_id}");
         };
 
-        if !latest_tokens.is_expiring_within(Duration::from_secs(OPENAI_REFRESH_SKEW_SECS)) {
+        if policy.tokens_ready(latest_tokens, chrono::Utc::now()) {
             return Ok(Some(latest_tokens.access_token.clone()));
         }
 
-        let refresh_token = latest_tokens.refresh_token.clone().unwrap_or(refresh_token);
+        let refresh_token = match policy {
+            OpenAiRefreshPolicy::Provider => {
+                latest_tokens.refresh_token.clone().unwrap_or(refresh_token)
+            }
+            OpenAiRefreshPolicy::NativeCompanion => match latest_tokens.refresh_token.as_ref() {
+                Some(token) if !token.trim().is_empty() => token.clone(),
+                _ => return Ok(None),
+            },
+        };
 
         if let Some(remaining) = refresh_backoff_remaining(&profile_id) {
             anyhow::bail!(
@@ -249,32 +380,67 @@ impl AuthService {
             );
         }
 
-        let mut refreshed =
-            match refresh_openai_access_token_with_retries(&self.client, &refresh_token).await {
-                Ok(tokens) => {
-                    clear_refresh_backoff(&profile_id);
-                    tokens
-                }
-                Err(err) => {
-                    set_refresh_backoff(
-                        &profile_id,
-                        Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
-                    );
-                    return Err(err);
-                }
-            };
+        let refresh_result = match policy {
+            OpenAiRefreshPolicy::Provider => refresh(refresh_token).await,
+            OpenAiRefreshPolicy::NativeCompanion => {
+                tokio::time::timeout(Duration::from_secs(65), refresh(refresh_token))
+                    .await
+                    .unwrap_or_else(|_| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "Native OAuth refresh deadline exceeded"
+                        );
+                        Err(anyhow::Error::msg("Native OAuth refresh deadline exceeded"))
+                    })
+            }
+        };
+        let mut refreshed = match refresh_result {
+            Ok(tokens) => {
+                clear_refresh_backoff(&profile_id);
+                tokens
+            }
+            Err(err) => {
+                set_refresh_backoff(
+                    &profile_id,
+                    Duration::from_secs(OPENAI_REFRESH_FAILURE_BACKOFF_SECS),
+                );
+                return Err(err);
+            }
+        };
         if refreshed.refresh_token.is_none() {
             refreshed
                 .refresh_token
                 .clone_from(&latest_tokens.refresh_token);
         }
 
-        let account_id = openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
-            .or_else(|| latest_profile.account_id.clone());
+        let account_id = match policy {
+            OpenAiRefreshPolicy::Provider => {
+                openai_oauth::extract_account_id_from_jwt(&refreshed.access_token)
+                    .or_else(|| latest_profile.account_id.clone())
+            }
+            OpenAiRefreshPolicy::NativeCompanion => latest_profile.account_id.clone(),
+        };
 
         let updated = self
             .store
             .update_profile(&profile_id, |profile| {
+                // A concurrent local login/logout must not be overwritten with
+                // a response obtained for the earlier account's credentials.
+                if matches!(policy, OpenAiRefreshPolicy::NativeCompanion)
+                    && (!policy.accepts_profile(profile)
+                        || profile.updated_at != latest_profile.updated_at
+                        || profile
+                            .token_set
+                            .as_ref()
+                            .and_then(|t| t.refresh_token.as_ref())
+                            != latest_tokens.refresh_token.as_ref())
+                {
+                    anyhow::bail!("Native OAuth profile changed during refresh");
+                }
                 profile.kind = AuthProfileKind::OAuth;
                 profile.token_set = Some(refreshed.clone());
                 profile.account_id.clone_from(&account_id);
@@ -282,7 +448,11 @@ impl AuthService {
             })
             .await?;
 
-        Ok(updated.token_set.map(|t| t.access_token))
+        Ok(updated.token_set.and_then(|t| {
+            (matches!(policy, OpenAiRefreshPolicy::Provider)
+                || policy.tokens_ready(&t, chrono::Utc::now()))
+            .then_some(t.access_token)
+        }))
     }
 
     pub async fn get_valid_gemini_access_token(
@@ -709,7 +879,8 @@ async fn refresh_openai_access_token_with_retries(
     refresh_oauth_access_token_with_retries(
         || refresh_access_token(client, refresh_token),
         |failure| {
-            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "error": format!("{}", failure.error)})), "OpenAI token refresh failed");
+            // OAuth error bodies are untrusted and may echo credentials.
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"attempt": failure.attempt, "max_attempts": failure.max_attempts, "retry": failure.should_retry, "non_retryable": failure.non_retryable})), "OpenAI token refresh failed");
         },
     )
     .await
@@ -1888,6 +2059,261 @@ mod tests {
     use axum::routing::post;
     use axum::{Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn native_test_tokens(ttl: Option<i64>) -> TokenSet {
+        TokenSet {
+            access_token: "synthetic-access-token".into(),
+            refresh_token: Some("synthetic-refresh-token".into()),
+            id_token: None,
+            expires_at: ttl.map(|seconds| chrono::Utc::now() + chrono::Duration::seconds(seconds)),
+            token_type: Some("Bearer".into()),
+            scope: None,
+        }
+    }
+
+    async fn native_test_service(ttl: Option<i64>) -> (tempfile::TempDir, AuthService) {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AuthService::new(dir.path(), true);
+        service
+            .store_openai_tokens(
+                NATIVE_OPENAI_PROFILE_NAME,
+                native_test_tokens(ttl),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        (dir, service)
+    }
+
+    #[test]
+    fn native_openai_requires_strict_known_ttl_and_exact_oauth_identity() {
+        let now = chrono::Utc::now();
+        let policy = OpenAiRefreshPolicy::NativeCompanion;
+        for seconds in [-1, 0, 90, 190, 210, 240, 241, 3600] {
+            let mut tokens = native_test_tokens(None);
+            tokens.expires_at = Some(now + chrono::Duration::seconds(seconds));
+            assert_eq!(policy.tokens_ready(&tokens, now), seconds > 240);
+        }
+        assert!(!policy.tokens_ready(&native_test_tokens(None), now));
+        let mut profile = AuthProfile::new_oauth(
+            OPENAI_CODEX_PROVIDER,
+            NATIVE_OPENAI_PROFILE_NAME,
+            native_test_tokens(Some(3600)),
+        );
+        assert!(policy.accepts_profile(&profile));
+        profile.kind = AuthProfileKind::Token;
+        assert!(!policy.accepts_profile(&profile));
+        profile.kind = AuthProfileKind::OAuth;
+        profile.model_provider = "other-provider".into();
+        assert!(!policy.accepts_profile(&profile));
+        profile.model_provider = OPENAI_CODEX_PROVIDER.into();
+        profile.profile_name = "default".into();
+        assert!(!policy.accepts_profile(&profile));
+    }
+
+    #[tokio::test]
+    async fn native_openai_provider_keeps_90_second_behavior_while_companion_refreshes() {
+        let (_dir, service) = native_test_service(Some(180)).await;
+        let legacy = service
+            .openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::Provider,
+                |_| async { panic!("provider must retain its 90-second window") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.as_deref(), Some("synthetic-access-token"));
+        let result = service
+            .openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::NativeCompanion,
+                |_| async {
+                    let mut tokens = native_test_tokens(Some(3600));
+                    tokens.access_token = "synthetic-rotated-access".into();
+                    tokens.refresh_token = None;
+                    Ok(tokens)
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.as_deref(), Some("synthetic-rotated-access"));
+        let profile = service
+            .get_profile(OPENAI_CODEX_PROVIDER, Some(NATIVE_OPENAI_PROFILE_NAME))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.token_set.unwrap().refresh_token.as_deref(),
+            Some("synthetic-refresh-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_openai_missing_exact_profile_never_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = AuthService::new(dir.path(), true);
+        service
+            .store_openai_tokens("default", native_test_tokens(Some(3600)), None, true)
+            .await
+            .unwrap();
+        let result = service
+            .openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::NativeCompanion,
+                |_| async { panic!("missing exact profile must not refresh") },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn native_openai_wrong_profile_and_missing_refresh_fail_closed() {
+        let (_dir, service) = native_test_service(Some(30)).await;
+        let mut profile = service
+            .get_profile(OPENAI_CODEX_PROVIDER, Some(NATIVE_OPENAI_PROFILE_NAME))
+            .await
+            .unwrap()
+            .unwrap();
+        profile.model_provider = "other-provider".into();
+        service
+            .store
+            .upsert_profile(profile.clone(), false)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .openai_access_token_with_policy(
+                    Some(NATIVE_OPENAI_PROFILE_NAME),
+                    OpenAiRefreshPolicy::NativeCompanion,
+                    |_| async { panic!("wrong provider must not refresh") }
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        profile.model_provider = OPENAI_CODEX_PROVIDER.into();
+        profile.token_set.as_mut().unwrap().refresh_token = None;
+        service.store.upsert_profile(profile, false).await.unwrap();
+        assert!(
+            service
+                .openai_access_token_with_policy(
+                    Some(NATIVE_OPENAI_PROFILE_NAME),
+                    OpenAiRefreshPolicy::NativeCompanion,
+                    |_| async { panic!("missing refresh credential must not refresh") }
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_openai_unknown_expiry_refreshes_but_legacy_behavior_is_unchanged() {
+        let (_dir, service) = native_test_service(None).await;
+        assert!(
+            service
+                .openai_access_token_with_policy(
+                    Some(NATIVE_OPENAI_PROFILE_NAME),
+                    OpenAiRefreshPolicy::Provider,
+                    |_| async { panic!("legacy unknown-expiry behavior changed") }
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            service
+                .openai_access_token_with_policy(
+                    Some(NATIVE_OPENAI_PROFILE_NAME),
+                    OpenAiRefreshPolicy::NativeCompanion,
+                    |_| async { Ok(native_test_tokens(Some(3600))) }
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_openai_concurrent_ensures_share_provider_refresh_lock() {
+        let (_dir, service) = native_test_service(Some(30)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let run = || {
+            let calls = calls.clone();
+            service.openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::NativeCompanion,
+                move |_| async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(native_test_tokens(Some(3600)))
+                },
+            )
+        };
+        let (a, b) = tokio::join!(run(), run());
+        assert!(a.unwrap().is_some());
+        assert!(b.unwrap().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn native_openai_short_refresh_is_persisted_but_not_reported_ready() {
+        let (_dir, service) = native_test_service(Some(30)).await;
+        let result = service
+            .openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::NativeCompanion,
+                |_| async {
+                    let mut tokens = native_test_tokens(Some(200));
+                    tokens.refresh_token = Some("rotated-short-refresh".into());
+                    Ok(tokens)
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        let profile = service
+            .get_profile(OPENAI_CODEX_PROVIDER, Some(NATIVE_OPENAI_PROFILE_NAME))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.token_set.unwrap().refresh_token.as_deref(),
+            Some("rotated-short-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn native_openai_concurrent_login_is_not_overwritten() {
+        let (_dir, service) = native_test_service(Some(30)).await;
+        let result = service
+            .openai_access_token_with_policy(
+                Some(NATIVE_OPENAI_PROFILE_NAME),
+                OpenAiRefreshPolicy::NativeCompanion,
+                |_| async {
+                    let mut tokens = native_test_tokens(Some(3600));
+                    tokens.refresh_token = Some("separate-login-refresh".into());
+                    service
+                        .store_openai_tokens(NATIVE_OPENAI_PROFILE_NAME, tokens, None, false)
+                        .await
+                        .unwrap();
+                    Ok(native_test_tokens(Some(3600)))
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        let profile = service
+            .get_profile(OPENAI_CODEX_PROVIDER, Some(NATIVE_OPENAI_PROFILE_NAME))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            profile.token_set.unwrap().refresh_token.as_deref(),
+            Some("separate-login-refresh")
+        );
+    }
 
     #[test]
     fn normalize_provider_aliases() {
