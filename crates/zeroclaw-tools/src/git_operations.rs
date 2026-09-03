@@ -67,18 +67,24 @@ impl GitOperationsTool {
         )
     }
 
-    /// Resolve a user-provided path to an absolute path within the workspace.
+    /// Resolve a user-provided path through the canonical filesystem policy.
     /// Returns the workspace_dir if no path is provided.
     /// Rejects paths that escape the workspace via traversal.
     fn resolve_working_dir(&self, path: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
         let base = match path {
             Some(p) if !p.is_empty() => {
+                if !self.security.is_path_allowed(p) {
+                    anyhow::bail!(
+                        "Path '{}' resolves outside the workspace or allowed roots",
+                        p
+                    );
+                }
                 let candidate = if std::path::Path::new(p).is_absolute() {
                     std::path::PathBuf::from(p)
                 } else {
                     self.workspace_dir.join(p)
                 };
-                let resolved = candidate.canonicalize().map_err(|e| {
+                candidate.canonicalize().map_err(|e| {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -90,18 +96,16 @@ impl GitOperationsTool {
                         "git_operations: cannot resolve path"
                     );
                     anyhow::Error::msg(format!("Cannot resolve path '{}': {}", p, e))
-                })?;
-                let workspace_canonical = self
-                    .workspace_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| self.workspace_dir.clone());
-                if !resolved.starts_with(&workspace_canonical) {
-                    anyhow::bail!("Path '{}' resolves outside the workspace directory", p);
-                }
-                resolved
+                })?
             }
             _ => self.workspace_dir.clone(),
         };
+        if !self.security.is_resolved_path_readable(&base) {
+            anyhow::bail!(
+                "Path '{}' resolves outside the workspace or allowed roots",
+                base.display()
+            );
+        }
         Ok(base)
     }
 
@@ -209,6 +213,8 @@ impl GitOperationsTool {
             .args(args)
             .current_dir(working_dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            // Read-only operations must not refresh an index in a read-only grant.
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .stdin(std::process::Stdio::null())
             .output()
             .await?;
@@ -923,7 +929,7 @@ impl Tool for GitOperationsTool {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional subdirectory path within the workspace to run git operations in. Defaults to workspace root."
+                    "description": "Optional repository path within the workspace or configured allowed roots. Defaults to workspace root."
                 }
             },
             "required": ["operation"]
@@ -986,6 +992,15 @@ impl Tool for GitOperationsTool {
 
         // Check autonomy level for write operations
         if self.requires_write_access(operation) {
+            if !self.security.is_resolved_path_allowed(&working_dir) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(
+                        "Action blocked: repository path does not grant write access".into(),
+                    ),
+                });
+            }
             if !self.security.can_act() {
                 return Ok(ToolResult {
                     success: false,
@@ -1283,6 +1298,7 @@ mod tests {
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
@@ -1309,11 +1325,13 @@ mod tests {
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
         let result = tool.execute(json!({"operation": "branch"})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
         // Branch listing must not be blocked by read-only autonomy
         let error_msg = result.error.as_deref().unwrap_or("");
         assert!(
@@ -1327,6 +1345,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
@@ -1492,6 +1511,91 @@ mod tests {
             result.error
         );
         assert!(result.output.contains("branch"));
+    }
+
+    #[tokio::test]
+    async fn git_operations_honor_extra_root_access_modes() {
+        let workspace = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        git_init_no_sign(repo.path(), &[]);
+        std::fs::write(repo.path().join("example.txt"), "fixture").unwrap();
+        let path = repo.path().to_str().unwrap();
+        let rw_tool = test_tool_with_allowed_root(workspace.path(), repo.path().to_path_buf());
+        let status = rw_tool
+            .execute(json!({"operation":"status", "path":path}))
+            .await
+            .unwrap();
+        assert!(status.success, "status failed: {:?}", status.error);
+        let add = rw_tool
+            .execute(json!({"operation":"add", "path":path, "paths":"example.txt"}))
+            .await
+            .unwrap();
+        assert!(add.success, "add failed: {:?}", add.error);
+        let commit = rw_tool
+            .execute(
+                json!({"operation":"commit", "path":path, "message":"test: verify allowed root"}),
+            )
+            .await
+            .unwrap();
+        assert!(commit.success, "commit failed: {:?}", commit.error);
+
+        let ro_policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_read_only: vec![repo.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+        let ro_tool = GitOperationsTool::new(Arc::new(ro_policy), workspace.path().to_path_buf());
+        let status = ro_tool
+            .execute(json!({"operation":"status", "path":path}))
+            .await
+            .unwrap();
+        assert!(
+            status.success,
+            "read-only status failed: {:?}",
+            status.error
+        );
+        let add = ro_tool
+            .execute(json!({"operation":"add", "path":path, "paths":"example.txt"}))
+            .await
+            .unwrap();
+        assert!(!add.success);
+        assert!(add.error.unwrap().contains("does not grant write access"));
+
+        let wo_policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots_write_only: vec![repo.path().to_path_buf()],
+            ..SecurityPolicy::default()
+        };
+        let wo_tool = GitOperationsTool::new(Arc::new(wo_policy), workspace.path().to_path_buf());
+        assert!(wo_tool.resolve_working_dir(Some(path)).is_err());
+        assert!(
+            test_tool(workspace.path())
+                .resolve_working_dir(Some(path))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn git_extra_roots_still_enforce_forbidden_subtrees_and_symlinks() {
+        let workspace = TempDir::new().unwrap();
+        let allowed = TempDir::new().unwrap();
+        let blocked = allowed.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_roots: vec![allowed.path().to_path_buf()],
+            forbidden_paths: vec![blocked.to_string_lossy().into_owned()],
+            ..SecurityPolicy::default()
+        };
+        let tool = GitOperationsTool::new(Arc::new(policy), workspace.path().to_path_buf());
+        assert!(tool.resolve_working_dir(blocked.to_str()).is_err());
+        #[cfg(unix)]
+        {
+            let outside = TempDir::new().unwrap();
+            let link = allowed.path().join("escape");
+            std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+            assert!(tool.resolve_working_dir(link.to_str()).is_err());
+        }
     }
 
     #[tokio::test]

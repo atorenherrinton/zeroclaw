@@ -188,16 +188,17 @@ impl ApprovalManager {
             return ApprovalRequirement::Prompt;
         }
 
+        // An explicit operator grant must carry approval into the shell's
+        // medium-risk gate, even on non-interactive channel turns.
+        if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
+            return ApprovalRequirement::Approved;
+        }
+
         if self.non_interactive
             && tool_name == "shell"
             && !self.non_interactive_shell_requires_approval
         {
             return ApprovalRequirement::NotRequired;
-        }
-
-        // auto_approve skips the prompt.
-        if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
-            return ApprovalRequirement::Approved;
         }
 
         // Session allowlist (from prior "Always" responses).
@@ -735,6 +736,29 @@ mod tests {
     fn non_interactive_shell_skips_outer_approval_by_default() {
         let mgr = ApprovalManager::for_non_interactive(&RiskProfileConfig::default());
         assert!(!mgr.needs_approval("shell"));
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[test]
+    fn non_interactive_shell_honors_explicit_auto_approval_but_not_over_always_ask() {
+        let mut config = RiskProfileConfig {
+            auto_approve: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        };
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::Approved
+        );
+        config.always_ask.push("shell".into());
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::Prompt
+        );
     }
 
     #[test]
