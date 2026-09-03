@@ -267,7 +267,7 @@ pub fn ingress_kind(source: SopTriggerSource) -> SopIngressKind {
 // ── Action helpers ──────────────────────────────────────────────
 
 /// Extract the `run_id` from any `SopRunAction` variant.
-fn extract_run_id_from_action(action: &SopRunAction) -> &str {
+pub(crate) fn extract_run_id_from_action(action: &SopRunAction) -> &str {
     match action {
         SopRunAction::ExecuteStep { run_id, .. }
         | SopRunAction::WaitApproval { run_id, .. }

@@ -2998,6 +2998,64 @@ impl SopEngine {
         }
     }
 
+    /// Settle a run whose driver was refused because the generation that owned
+    /// it had already drained.
+    ///
+    /// Deliberately not [`Self::cancel_run_idempotent`]. That path is
+    /// cooperative: a `Running` run becomes `CancelRequested` and stays active
+    /// and claimed until a driver reaches its next boundary. This is the one
+    /// case where no driver exists and none ever will, so waiting for a
+    /// boundary is precisely the stall this prevents. The run therefore goes
+    /// terminal immediately, through the same persistence path a normal
+    /// cancellation uses — which is what releases the execution claim and stops
+    /// a later engine rebuild from restoring it as `Running` and renewing the
+    /// claim forever.
+    ///
+    /// `Cancelled` rather than `Failed`: the work was withdrawn before it ran,
+    /// not attempted and failed. The reason travels on the durable
+    /// `run_generation_drained` event rather than `failure_reason`, which the
+    /// terminal path stamps only for genuine failures.
+    ///
+    /// Returns the status the run held before it was settled, or `None` when no
+    /// active run carries this id — already terminal, or never started.
+    pub fn settle_run_for_drained_generation(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<SopRunStatus>> {
+        let Some((prior, current_step)) = self
+            .active_runs
+            .get(run_id)
+            .map(|run| (run.status, run.current_step))
+        else {
+            return Ok(None);
+        };
+        let reason = "the daemon generation that started this run drained before its driver \
+                      was admitted, so no driver exists to advance it"
+            .to_string();
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_generation_drained".to_string(),
+            actor: None,
+            reason: Some(reason.clone()),
+            payload: ::serde_json::json!({
+                "step": current_step,
+                "prior_status": prior.to_string(),
+            }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, Some(reason), &event)?;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "Settled a SOP run as cancelled: its generation drained before the driver was \
+             admitted, so nothing would have advanced it"
+        );
+        Ok(Some(prior))
+    }
+
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
         self.resume_checkpoint(run_id, None)
     }

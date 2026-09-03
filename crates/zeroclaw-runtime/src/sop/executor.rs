@@ -416,9 +416,51 @@ pub fn spawn_and_register_sop_driver(
     audit: Option<Arc<SopAuditLogger>>,
     first_action: SopRunAction,
 ) -> bool {
-    admit_sop_driver(handles, move || {
+    // Captured before the closure consumes the action, because a refusal has to
+    // name the run it is abandoning.
+    let run_id = crate::sop::dispatch::extract_run_id_from_action(&first_action).to_string();
+    let engine_for_refusal = Arc::clone(&engine);
+    let admitted = admit_sop_driver(handles, move || {
         spawn_headless_run_driver(config, engine, audit, first_action)
-    })
+    });
+    if !admitted {
+        settle_refused_run(&engine_for_refusal, &run_id);
+    }
+    admitted
+}
+
+/// Take the run a refused driver would have advanced to a terminal state.
+///
+/// Refusing the driver is only half the boundary. The producers reach here with
+/// the run already started and persisted — an approval resume, for instance,
+/// writes the resumed run as `Running` before it asks for a driver — so
+/// declining to start one leaves a durable `Running` row that nothing will ever
+/// advance. A later engine rebuild restores it and renews its execution claim,
+/// and maintenance keeps renewing, so expiry never recovers it: the run holds
+/// concurrency capacity for as long as the daemon lives.
+///
+/// Settling it here, at the single point every generation-owned producer funnels
+/// through, is what keeps that from depending on each caller remembering to.
+/// The engine lock is taken only after `admit_sop_driver` has released the
+/// registry lock, and no producer holds the engine lock across this call.
+fn settle_refused_run(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    let mut guard = match engine.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Err(e) = guard.settle_run_for_drained_generation(run_id) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "Could not settle a SOP run whose driver was refused; it stays active and will be \
+             retried by the next terminal write rather than silently dropped"
+        );
+    }
 }
 
 /// Drive a broker-approved run from a headless approval surface.
@@ -935,6 +977,109 @@ mod tests {
             SopRunAction::ExecuteStep { run_id, .. } => run_id.clone(),
             other => panic!("expected ExecuteStep, got {other:?}"),
         }
+    }
+
+    /// Refusing a driver is only half the boundary: the run it would have
+    /// advanced is already started and persisted.
+    ///
+    /// An approval can resolve on a connection task that outlived its listener,
+    /// so the generation may already have drained. By then
+    /// `resolve_via_broker` has written the resumed run as `Running` and it
+    /// holds an execution claim. If the refusal only declines to start a driver,
+    /// that durable row survives — an engine rebuild restores it as active and
+    /// renews the claim, and maintenance keeps renewing, so expiry never
+    /// recovers it. The run would hold an admission slot for as long as the
+    /// daemon lives with nothing able to advance it.
+    ///
+    /// This drives the real approval producer against a closed generation and
+    /// then rebuilds the engine from the same store, because removing only the
+    /// in-memory run would leave the persisted row restorable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_driver_settles_the_run_it_would_have_advanced() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop_name = "approval-gate";
+        let mut gated = test_sop(sop_name);
+        gated.steps[0].requires_confirmation = true;
+
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        engine.set_sops_for_test(vec![gated]);
+        let parked = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = match &parked {
+            SopRunAction::WaitApproval { run_id, .. } => run_id.clone(),
+            other => panic!("the gated step must park for approval, got {other:?}"),
+        };
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                crate::sop::approval::ApprovalDecision::Approve,
+                crate::sop::approval::ApprovalPrincipal::agent("tester"),
+            )
+            .expect("the approval resolves");
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Running,
+            "the resumed run is persisted as Running before a driver is ever requested"
+        );
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            1,
+            "and it holds an execution claim"
+        );
+
+        // The generation drains between the approval resolving and the driver
+        // being scheduled - the race this whole path exists for.
+        let handles = SopDriverHandles::default();
+        handles.lock().unwrap().close_and_take();
+        assert!(handles.lock().unwrap().is_closed());
+
+        let engine = Arc::new(Mutex::new(engine));
+        drive_resumed_broker_action(
+            &zeroclaw_config::schema::Config::default(),
+            Arc::clone(&engine),
+            None,
+            Some(&handles),
+            &outcome,
+        );
+
+        {
+            let guard = engine.lock().unwrap();
+            assert!(
+                !guard.active_runs().contains_key(&run_id),
+                "a run whose driver was refused must not stay active"
+            );
+            assert_eq!(
+                guard.get_run(&run_id).unwrap().status,
+                SopRunStatus::Cancelled,
+                "it must be settled through the terminal path, not merely dropped"
+            );
+        }
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "the terminal write releases the execution claim in the same boundary"
+        );
+
+        // The half that in-memory cleanup alone would not survive.
+        let mut rebuilt = SopEngine::new(SopConfig::default()).with_store(store.clone());
+        rebuilt.set_sops_for_test(vec![test_sop(sop_name)]);
+        rebuilt.restore_runs();
+        assert!(
+            !rebuilt.active_runs().contains_key(&run_id),
+            "the rebuilt engine must not restore a settled run as active"
+        );
+        assert_eq!(
+            rebuilt.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "the durable row is terminal, so a restore cannot resurrect it"
+        );
+
+        rebuilt.run_maintenance_tick();
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap().0,
+            0,
+            "maintenance must not renew a claim for a run nothing will advance"
+        );
     }
 
     #[tokio::test]
