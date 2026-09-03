@@ -426,6 +426,7 @@ syn = { version = "2", features = ["full", "visit"] }
 # test-only: moved out of [dependencies] — no `src/` usage
 base64 = "0.22"
 hmac = "0.12"
+ring = "0.17"
 parking_lot = "0.12"
 regex = "1.10"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
