@@ -94,11 +94,27 @@ impl Tool for MemoryStoreTool {
         }
 
         match self.memory.store(key, content, category, None).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Stored memory: {key}").into(),
-                error: None,
-            }),
+            Ok(()) => {
+                // Best-effort evidence only: storage succeeded independently.
+                // Backend re-checks version and current owner-input provenance.
+                if self
+                    .memory
+                    .attest_explicit_note(None, key, content)
+                    .await
+                    .is_err()
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "memory promotion source evidence unavailable"
+                    );
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Stored memory: {key}").into(),
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

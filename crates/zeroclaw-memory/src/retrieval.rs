@@ -304,6 +304,25 @@ impl RetrievalPipeline {
 
 #[async_trait]
 impl Memory for RetrievalPipeline {
+    async fn attest_explicit_note(
+        &self,
+        agent_id: Option<&str>,
+        key: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        self.memory
+            .attest_explicit_note(agent_id, key, content)
+            .await
+    }
+
+    async fn record_recall_evidence(
+        &self,
+        agent_id: Option<&str>,
+        entries: &[MemoryEntry],
+    ) -> anyhow::Result<()> {
+        self.memory.record_recall_evidence(agent_id, entries).await
+    }
+
     fn name(&self) -> &str {
         self.memory.name()
     }

@@ -300,6 +300,25 @@ impl<M: Memory> ScannedMemory<M> {
 
 #[async_trait]
 impl<M: Memory> Memory for ScannedMemory<M> {
+    async fn attest_explicit_note(
+        &self,
+        agent_id: Option<&str>,
+        key: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .attest_explicit_note(agent_id, key, content)
+            .await
+    }
+
+    async fn record_recall_evidence(
+        &self,
+        agent_id: Option<&str>,
+        entries: &[MemoryEntry],
+    ) -> anyhow::Result<()> {
+        self.inner.record_recall_evidence(agent_id, entries).await
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

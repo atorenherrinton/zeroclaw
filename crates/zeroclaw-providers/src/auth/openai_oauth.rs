@@ -68,6 +68,35 @@ struct OAuthErrorResponse {
     error_description: Option<String>,
 }
 
+/// HTTP rejection metadata only; remote error descriptions are never retained
+/// in an error chain where a caller or logger could reveal credentials.
+#[derive(Debug, thiserror::Error)]
+#[error("OpenAI OAuth token request rejected (HTTP {status})")]
+pub(super) struct TokenRequestRejected {
+    status: reqwest::StatusCode,
+    pub(super) reauth_required: bool,
+}
+
+fn token_rejection(status: reqwest::StatusCode, body: &[u8]) -> TokenRequestRejected {
+    let code = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let reauth_required = matches!(status.as_u16(), 401 | 403)
+        || matches!(
+            code.as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.as_str()),
+            Some(
+                "invalid_grant"
+                    | "invalid_token"
+                    | "refresh_token_reused"
+                    | "refresh_token_expired"
+            )
+        );
+    TokenRequestRejected {
+        status,
+        reauth_required,
+    }
+}
+
 pub fn build_authorize_url(pkce: &PkceState) -> String {
     let mut params = BTreeMap::new();
     params.insert("response_type", "code");
@@ -418,11 +447,17 @@ pub fn extract_expiry_from_jwt(token: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::<Utc>::from_timestamp(exp, 0)
 }
 
-async fn parse_token_response(response: reqwest::Response) -> Result<TokenSet> {
+async fn parse_token_response(mut response: reqwest::Response) -> Result<TokenSet> {
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("OpenAI OAuth token request failed ({status}): {body}");
+        let mut body = Vec::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if body.len() + chunk.len() > 8192 {
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        return Err(token_rejection(status, &body).into());
     }
 
     let token: TokenResponse = response
@@ -536,6 +571,42 @@ async fn import_codex_auth_profile_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_openai_rejection_is_typed_and_never_retains_remote_description() {
+        for (status, body, expected) in [
+            (401, r#"{"error_description":"synthetic-secret"}"#, true),
+            (403, "synthetic-secret", true),
+            (
+                400,
+                r#"{"error":"invalid_grant","error_description":"synthetic-secret"}"#,
+                true,
+            ),
+            (
+                400,
+                r#"{"error":"invalid_request","error_description":"synthetic-secret"}"#,
+                false,
+            ),
+            (429, r#"{"error":"rate_limit_exceeded"}"#, false),
+            (500, r#"{"error":"server_error"}"#, false),
+        ] {
+            let error = super::token_rejection(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                body.as_bytes(),
+            );
+            assert_eq!(error.reauth_required, expected);
+            assert!(!error.to_string().contains("synthetic-secret"));
+            assert!(!format!("{error:?}").contains("synthetic-secret"));
+            let wrapped: anyhow::Error = error.into();
+            assert_eq!(
+                wrapped
+                    .downcast_ref::<super::TokenRequestRejected>()
+                    .unwrap()
+                    .reauth_required,
+                expected
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

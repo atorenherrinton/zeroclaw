@@ -9,6 +9,7 @@ pub mod a2a;
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
+mod api_auth;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -1622,6 +1623,7 @@ pub async fn run_gateway(
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
         // ── Web Dashboard API routes ──
         .route("/api/status", get(api::handle_api_status))
+        .route(api_auth::ENSURE_FRESH_PATH, post(api_auth::handle_ensure_fresh))
         .route("/api/version/check", get(version::handle_version_check))
         .route("/api/version/upgrade", post(version::handle_version_upgrade))
         .route(

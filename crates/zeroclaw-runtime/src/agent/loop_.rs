@@ -6286,6 +6286,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn promotion_actual_engine_owner_scope_store_and_recall() {
+        use zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.memory.embedding_provider = "none".into();
+        config.memory.promotion.enabled = true;
+        config.memory.promotion.agent_aliases = vec!["owner".into()];
+        config
+            .agents
+            .insert("owner".into(), AliasedAgentConfig::default());
+        let memory = zeroclaw_memory::create_memory_for_agent(&config, "owner", None)
+            .await
+            .unwrap();
+        let raw = zeroclaw_memory::SqliteMemory::new("sqlite", &config.data_dir)
+            .unwrap()
+            .with_promotion_config(&config.memory.promotion, &config.memory.policy)
+            .unwrap();
+        let note = "I prefer Rust, SQLite, privacy, local tools and short notes.";
+
+        async fn run_case(
+            config: &Config,
+            memory: &dyn zeroclaw_memory::Memory,
+            tools: &crate::tools::scoped::ScopedToolRegistry,
+            provider: &ScriptedModelProvider,
+            input: &str,
+            origin: TurnOrigin,
+            turn_id: &str,
+        ) {
+            let mut history = vec![ChatMessage::user(input)];
+            let result = run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: provider,
+                        provider_name: "scripted",
+                        model: "scripted",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: tools,
+                    observer: &NoopObserver,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &config.multimodal,
+                    config: Some(config),
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &config.pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 8_000,
+                    context_token_budget: 0,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                channel_name: "cli",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: None,
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: Some(crate::agent::memory_inject::TurnMemory {
+                    handle: memory,
+                    query: input.to_owned(),
+                    sessions: vec![],
+                    suppress: false,
+                    cfg: crate::agent::memory_inject::MemoryInjectConfig::default(),
+                }),
+                ingress: IngressContext::from_origin(origin),
+                agent_alias: Some("owner"),
+                turn_id,
+            })
+            .await
+            .unwrap();
+            assert_eq!(result, "done");
+        }
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            zeroclaw_tools::memory_store::MemoryStoreTool::new(
+                memory.clone(),
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            ),
+        )]);
+        let empty_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let arguments =
+            serde_json::json!({"key":"preference","content":note,"category":"daily"}).to_string();
+        let provider = ScriptedModelProvider::from_native_tool_calls(
+            vec![("store", "memory_store", &arguments)],
+            "done",
+        );
+        run_case(
+            &config,
+            memory.as_ref(),
+            &tools,
+            &provider,
+            note,
+            TurnOrigin::Interactive,
+            "write",
+        )
+        .await;
+        for (n, query) in ["Rust", "SQLite", "privacy", "local", "short"]
+            .iter()
+            .enumerate()
+        {
+            let inherited = zeroclaw_memory::promotion::owner_context(
+                &config.memory.promotion,
+                Some("owner"),
+                TurnOrigin::Interactive,
+                "cli",
+                "parent",
+                Some(query),
+            );
+            OWNER_RECALL_CONTEXT
+                .scope(
+                    inherited,
+                    run_case(
+                        &config,
+                        memory.as_ref(),
+                        &empty_tools,
+                        &ScriptedModelProvider::from_text_responses(vec!["done"]),
+                        query,
+                        TurnOrigin::SubTurn,
+                        &format!("sub{n}"),
+                    ),
+                )
+                .await;
+            run_case(
+                &config,
+                memory.as_ref(),
+                &empty_tools,
+                &ScriptedModelProvider::from_text_responses(vec!["done"]),
+                query,
+                TurnOrigin::Cron,
+                &format!("cron{n}"),
+            )
+            .await;
+        }
+        assert_eq!(
+            raw.promote_for_alias("owner", true).await.unwrap().eligible,
+            0
+        );
+        for (n, query) in ["Rust", "SQLite", "privacy", "local", "short"]
+            .iter()
+            .enumerate()
+        {
+            run_case(
+                &config,
+                memory.as_ref(),
+                &empty_tools,
+                &ScriptedModelProvider::from_text_responses(vec!["done"]),
+                query,
+                TurnOrigin::Interactive,
+                &format!("owner{n}"),
+            )
+            .await;
+        }
+        assert_eq!(
+            raw.promote_for_alias("owner", false)
+                .await
+                .unwrap()
+                .promoted,
+            1
+        );
+        assert_eq!(
+            raw.promote_for_alias("owner", false)
+                .await
+                .unwrap()
+                .promoted,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let calls = Arc::new(AtomicUsize::new(0));

@@ -39,6 +39,8 @@ pub struct SqliteMemory {
     keyword_weight: f32,
     cache_max: usize,
     search_mode: SearchMode,
+    promotion_config: zeroclaw_config::schema::MemoryPromotionConfig,
+    promotion_memory_policy: zeroclaw_config::schema::MemoryPolicyConfig,
 }
 
 impl SqliteMemory {
@@ -67,6 +69,8 @@ impl SqliteMemory {
             keyword_weight: 0.3,
             cache_max: 10_000,
             search_mode: SearchMode::default(),
+            promotion_config: Default::default(),
+            promotion_memory_policy: Default::default(),
         })
     }
 
@@ -91,6 +95,8 @@ impl SqliteMemory {
             keyword_weight,
             cache_max,
             search_mode,
+            promotion_config: Default::default(),
+            promotion_memory_policy: Default::default(),
         })
     }
 
@@ -122,6 +128,47 @@ impl SqliteMemory {
         zeroclaw_config::schema::v2::migrate_sqlite_memory_to_v3(db_path, &conn)?;
         Self::init_schema(&conn)?;
         Ok(conn)
+    }
+
+    /// Additive native evidence tables are created only when explicitly enabled.
+    pub fn with_promotion_config(
+        mut self,
+        config: &zeroclaw_config::schema::MemoryPromotionConfig,
+        policy: &zeroclaw_config::schema::MemoryPolicyConfig,
+    ) -> anyhow::Result<Self> {
+        if config.enabled {
+            anyhow::ensure!(
+                !config.agent_aliases.is_empty(),
+                "memory promotion requires explicit agent aliases"
+            );
+            super::promotion::init_schema(&self.conn.lock())?;
+        }
+        self.promotion_config = config.clone();
+        self.promotion_memory_policy = policy.clone();
+        Ok(self)
+    }
+
+    /// Deterministic owner maintenance entrypoint. No embedder/model/network use.
+    pub async fn promote_for_alias(
+        &self,
+        alias: &str,
+        dry_run: bool,
+    ) -> anyhow::Result<super::promotion::PromotionReport> {
+        let conn = self.conn.clone();
+        let alias = alias.to_owned();
+        let policy = self.promotion_config.clone();
+        let memory_policy = self.promotion_memory_policy.clone();
+        tokio::task::spawn_blocking(move || {
+            super::promotion::promote(
+                &mut conn.lock(),
+                &alias,
+                &policy,
+                &memory_policy,
+                chrono::Utc::now(),
+                dry_run,
+            )
+        })
+        .await?
     }
 
     /// Open SQLite connection, optionally with a timeout (for locked/slow storage).
@@ -1446,6 +1493,63 @@ impl SqliteMemory {
 
 #[async_trait]
 impl Memory for SqliteMemory {
+    async fn attest_explicit_note(
+        &self,
+        agent_id: Option<&str>,
+        key: &str,
+        content: &str,
+    ) -> anyhow::Result<()> {
+        if !self.promotion_config.enabled {
+            return Ok(());
+        }
+        let (Some(agent_id), Some(ctx)) = (agent_id, super::promotion::current_context()) else {
+            return Ok(());
+        };
+        let (agent_id, key, content) = (agent_id.to_owned(), key.to_owned(), content.to_owned());
+        let conn = self.conn.clone();
+        let policy = self.promotion_config.clone();
+        tokio::task::spawn_blocking(move || {
+            super::promotion::attest(
+                &mut conn.lock(),
+                &agent_id,
+                &key,
+                &content,
+                &ctx,
+                &policy,
+                chrono::Utc::now(),
+            )
+        })
+        .await?
+    }
+
+    async fn record_recall_evidence(
+        &self,
+        agent_id: Option<&str>,
+        entries: &[MemoryEntry],
+    ) -> anyhow::Result<()> {
+        if !self.promotion_config.enabled {
+            return Ok(());
+        }
+        let (Some(agent_id), Some(ctx)) = (agent_id, super::promotion::current_context()) else {
+            return Ok(());
+        };
+        let agent_id = agent_id.to_owned();
+        let entries = entries.to_vec();
+        let conn = self.conn.clone();
+        let policy = self.promotion_config.clone();
+        tokio::task::spawn_blocking(move || {
+            super::promotion::record(
+                &mut conn.lock(),
+                &agent_id,
+                &entries,
+                &ctx,
+                &policy,
+                chrono::Utc::now(),
+            )
+        })
+        .await?
+    }
+
     fn name(&self) -> &str {
         "sqlite"
     }

@@ -378,7 +378,38 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
+pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+    // Narrow wiring only: the decomposed memory crate owns promotion policy.
+    // Every nested call installs its own fail-closed scope, never inheriting a
+    // parent's owner authority. Parallel tools use join_all in the same task.
+    let channel_identity = p
+        .channel
+        .map(|channel| format!("{}.{}", p.channel_name, channel.alias()));
+    let mut context = p.exec.config.and_then(|config| {
+        zeroclaw_memory::promotion::owner_context(
+            &config.memory.promotion,
+            p.agent_alias,
+            p.ingress.origin,
+            channel_identity.as_deref().unwrap_or(p.channel_name),
+            p.turn_id,
+            p.memory.as_ref().map(|memory| memory.query.as_str()),
+        )
+    });
+    if let Some(context) = &mut context {
+        context.tool_output_limit = if p.exec.max_tool_result_chars == 0 {
+            usize::MAX
+        } else {
+            p.exec.max_tool_result_chars
+        };
+    }
+    zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
+        // Keep the task-local wrapper from embedding the turn engine's large
+        // state machine in another stack-resident future.
+        .scope(context, Box::pin(run_tool_call_loop_inner(p)))
+        .await
+}
+
+async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback

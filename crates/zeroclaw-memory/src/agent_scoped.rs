@@ -49,6 +49,40 @@ impl AgentScopedMemory {
 
 #[async_trait]
 impl Memory for AgentScopedMemory {
+    async fn attest_explicit_note(
+        &self,
+        requested: Option<&str>,
+        key: &str,
+        content: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            requested.is_none_or(|id| id == self.agent_id),
+            "foreign promotion agent refused"
+        );
+        self.inner
+            .attest_explicit_note(Some(&self.agent_id), key, content)
+            .await
+    }
+
+    async fn record_recall_evidence(
+        &self,
+        requested: Option<&str>,
+        entries: &[MemoryEntry],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            requested.is_none_or(|id| id == self.agent_id),
+            "foreign promotion agent refused"
+        );
+        let own: Vec<_> = entries
+            .iter()
+            .filter(|e| e.agent_id.as_deref() == Some(&self.agent_id))
+            .cloned()
+            .collect();
+        self.inner
+            .record_recall_evidence(Some(&self.agent_id), &own)
+            .await
+    }
+
     fn name(&self) -> &str {
         // Kept identical to the inner backend so existing log lines
         // and dashboards keep working; the wrapper's existence is

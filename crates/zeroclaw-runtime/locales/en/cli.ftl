@@ -12,6 +12,7 @@ cli-doctor-about = Run diagnostics for daemon/scheduler/channel freshness
 cli-status-about = Show system status (full details)
 cli-estop-about = Engage, inspect, and resume emergency-stop states
 cli-cron-about = Configure and manage scheduled tasks
+cli-cron-agent-attempt-timeout = Agent attempt timed out after {$seconds} seconds
 cli-models-about = Manage provider model catalogs
 cli-providers-about = List supported AI providers
 cli-channel-about = Manage communication channels
