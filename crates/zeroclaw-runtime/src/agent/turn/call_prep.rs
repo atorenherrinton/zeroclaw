@@ -489,6 +489,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_preserves_explicit_channel_shell_auto_approval() {
+        use crate::approval::ApprovalManager;
+        use zeroclaw_config::schema::RiskProfileConfig;
+        let config = RiskProfileConfig {
+            auto_approve: vec!["shell".into()],
+            allowed_commands: vec!["git".into()],
+            ..RiskProfileConfig::default()
+        };
+        let workspace = tempfile::Builder::new()
+            .prefix("zc-approval-test-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let policy = Arc::new(crate::security::SecurityPolicy::from_risk_profile(
+            &config,
+            workspace.path(),
+        ));
+        let shell = crate::tools::shell_tool_for_runtime(
+            policy,
+            Arc::new(crate::platform::NativeRuntime::new()),
+            &config,
+            &zeroclaw_config::schema::Config::default(),
+        );
+        let manager = ApprovalManager::for_non_interactive(&config);
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, _rx) = mpsc::channel(4);
+        let mut ctx = test_ctx(&observer, &pacing, &tx);
+        ctx.approval = Some(&manager);
+        ctx.channel_name = "telegram";
+        let calls = [ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command":"git init", "approved":false}),
+            tool_call_id: Some("auto-approved-shell".into()),
+        }];
+        let prepared = prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut HashSet::new(),
+            &mut HashSet::new(),
+            0,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.executable_calls.len(), 1);
+        assert_eq!(prepared.executable_calls[0].arguments["approved"], true);
+        let result = shell
+            .execute(prepared.executable_calls[0].arguments.clone())
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(workspace.path().join(".git").is_dir());
+    }
+
+    #[tokio::test]
     async fn prepare_keeps_native_targets_wrapped_by_skills_as_extensions() {
         let target: Arc<dyn Tool> = Arc::new(AttributedTool {
             name: "browser".to_string(),

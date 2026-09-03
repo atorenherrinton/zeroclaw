@@ -472,9 +472,12 @@ fn create_selected_sandbox(
         SelectedSandboxBackend::SandboxExec => {
             #[cfg(target_os = "macos")]
             {
-                super::seatbelt::SeatbeltSandbox::with_workspace(workspace_dir)
-                    .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
-                    .ok()
+                super::seatbelt::SeatbeltSandbox::with_workspace_and_roots(
+                    workspace_dir,
+                    extra_roots,
+                )
+                .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
+                .ok()
             }
             #[cfg(not(target_os = "macos"))]
             {

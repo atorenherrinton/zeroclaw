@@ -173,6 +173,14 @@ Pros: strong isolation, works on any OS. Cons: per-invocation container startup 
 
 Native macOS sandbox (`sandbox-exec`). Profiles are SBPL: ZeroClaw bundles one for tool runs. Works on macOS 10.11+.
 
+The runtime forwards resolved extra filesystem roots to Seatbelt with their
+read/write access modes. Ancestors receive metadata-only access for `getcwd`
+and path lookup; this does not permit listing sibling directories. These grants
+do not change the command allowlist, approval policy, or network rules.
+Git's user configuration (`~/.gitconfig` and `~/.config/git`) is readable but
+not writable through these support rules; the surrounding home directories
+are not granted content access.
+
 Limitation: some CLI tools (older `git`, some Homebrew-linked binaries) don't cooperate with Seatbelt's file-access rules. If you see "Operation not permitted" errors from the agent's shell calls on macOS, the tool needs broader filesystem access: consider switching to Docker.
 
 ### `none`
