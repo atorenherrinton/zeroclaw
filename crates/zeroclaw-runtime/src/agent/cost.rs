@@ -231,6 +231,23 @@ fn merge_config_and_live_rates(
     )
 }
 
+fn fill_catalog_rate_gaps(rates: ModelRates, catalog: Option<(f64, f64, f64)>) -> ModelRates {
+    rates.or(
+        catalog.map_or_else(ModelRates::default, |(input, output, cached)| ModelRates {
+            input_per_mtok: Some(input),
+            output_per_mtok: Some(output),
+            cached_input_per_mtok: Some(cached),
+        }),
+    )
+}
+
+fn rates_cover_usage(rates: ModelRates, input: u64, cached: u64, output: u64) -> bool {
+    let cached = cached.min(input);
+    (input == cached || rates.input_per_mtok.is_some())
+        && (cached == 0 || rates.cached_input_per_mtok.is_some() || rates.input_per_mtok.is_some())
+        && (output == 0 || rates.output_per_mtok.is_some())
+}
+
 /// Record usage from a rejected provider attempt without replacing the accepted
 /// response's context-window fill.
 pub fn record_rejected_tool_loop_cost_usage(
@@ -332,29 +349,16 @@ fn record_tool_loop_cost_usage_inner(
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    // `mut` so the global-catalog fallback below can still fill rates config and
-    // the live snapshot both left unset.
-    let (mut input_rate, mut output_rate, mut cached_rate) =
-        merge_config_and_live_rates(config_rates, live);
+    // Preserve presence until every fallback has run. A configured zero is an
+    // explicit free/subscription rate, not evidence that pricing is missing.
+    let resolved_rates = config_rates.or(live.unwrap_or_default());
+    let catalog = (!resolved_rates.is_complete())
+        .then(|| crate::agent::pricing_catalog::global_pricing_rates(model))
+        .flatten();
+    let effective_rates = fill_catalog_rate_gaps(resolved_rates, catalog);
+    let (input_rate, output_rate, cached_rate) = merge_config_and_live_rates(effective_rates, None);
 
-    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
-        if let Some((cat_in, cat_out, cat_cached)) =
-            crate::agent::pricing_catalog::global_pricing_rates(model)
-        {
-            input_rate = cat_in;
-            output_rate = cat_out;
-            if cached_rate == 0.0 {
-                cached_rate = cat_cached;
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
-
-    let cost_usage = CostTokenUsage::new_with_cache(
+    let mut cost_usage = CostTokenUsage::new_with_cache(
         model,
         input_tokens,
         cached_input_tokens,
@@ -364,7 +368,13 @@ fn record_tool_loop_cost_usage_inner(
         output_rate,
     );
 
-    if ctx.tracker.is_some() && !priced_from_catalog && input_rate == 0.0 && output_rate == 0.0 {
+    cost_usage.pricing_available = rates_cover_usage(
+        effective_rates,
+        input_tokens,
+        cached_input_tokens,
+        output_tokens,
+    );
+    if ctx.tracker.is_some() && !cost_usage.pricing_available {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
@@ -633,6 +643,34 @@ mod tests {
             cached_input_per_mtok: Some(1.5),
         });
         assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
+    }
+
+    #[test]
+    fn catalog_fallback_preserves_zero_subscription_rates_and_fills_only_missing_dimensions() {
+        let free = ModelRates {
+            input_per_mtok: Some(0.0),
+            output_per_mtok: Some(0.0),
+            cached_input_per_mtok: Some(0.0),
+        };
+        assert_eq!(fill_catalog_rate_gaps(free, Some((2.5, 15.0, 0.25))), free);
+        let partial = ModelRates {
+            input_per_mtok: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_config_and_live_rates(
+                fill_catalog_rate_gaps(partial, Some((2.5, 15.0, 0.25))),
+                None
+            ),
+            (0.0, 15.0, 0.25),
+        );
+        assert!(!fill_catalog_rate_gaps(free, None).is_empty());
+        assert!(fill_catalog_rate_gaps(ModelRates::default(), None).is_empty());
+        assert!(rates_cover_usage(free, 100, 50, 20));
+        assert!(!rates_cover_usage(ModelRates::default(), 100, 0, 20));
+        assert!(!rates_cover_usage(partial, 100, 0, 20));
+        assert!(rates_cover_usage(partial, 100, 0, 0));
+        assert!(rates_cover_usage(partial, 100, 100, 0));
     }
 
     #[test]
