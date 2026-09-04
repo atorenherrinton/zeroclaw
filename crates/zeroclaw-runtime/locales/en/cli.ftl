@@ -960,6 +960,20 @@ history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor}
 # (phase 1); becomes live when non-`Loop` policy is configured (phase 3).
 turn-ingress-dropped = This request was not processed: { $reason }
 turn-tool-interrupted-before-result = [interrupted by user before this tool produced a result]
+# Repair-only Codex recovery. The Rust runtime supplies only typed, sanitized
+# ZeroClaw failure metadata; no original task or user content enters this path.
+turn-codex-recovery-failure-repeated-tool = repeated tool failure
+turn-codex-recovery-failure-security-policy = security-policy denial
+turn-codex-recovery-failure-circuit-breaker = circuit breaker
+turn-codex-recovery-triggered = ⚠️ ZeroClaw is stuck: { $failure } in `{ $tool }`.
+turn-codex-recovery-repairing = 🔧 Codex is diagnosing and repairing ZeroClaw source, configuration handling, or runtime behavior. The original task remains owned by ZeroClaw.
+turn-codex-recovery-unavailable = Codex recovery is unavailable under this turn's configured tool policy.
+turn-codex-recovery-applied = ✅ Codex reported that the ZeroClaw repair was applied.
+turn-codex-recovery-restart-required = ⚠️ Codex reported that the ZeroClaw repair requires a restart. ZeroClaw will report that requirement without delegating the original task.
+turn-codex-recovery-not-applied = Codex completed diagnosis but did not report an applied ZeroClaw repair.
+turn-codex-recovery-failed = Codex recovery failed under the existing runtime policy.
+turn-codex-recovery-will-retry = ZeroClaw will retry or continue the original task.
+turn-codex-recovery-will-stop = ZeroClaw will report the stop without delegating the original task.
 # Safe reply delivered when the model repeatedly emits malformed internal
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
