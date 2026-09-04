@@ -19,9 +19,10 @@ announcement-like results are screened out. Completed outbound transcripts are
 summarized separately and privately delivered to the configured owner.
 Interactive answers use a server-enforced two-phase close: the first close
 request produces an audible recap and final check, then the bridge requires a
-remote reply (or eight seconds of post-playback silence) and an audible goodbye
-before honoring a later close request. Detected voicemail keeps the one-step
-close, but only after all message playback marks are acknowledged.
+remote reply (or eight seconds of post-playback silence) before honoring a later
+close request. That authorization remains active across separate speech and tool
+responses, while all queued audio still has to finish playback. Detected voicemail
+keeps the one-step close after all message playback marks are acknowledged.
 
 The MCP server advertises only `place_call` and `call_status`. Its tool contract
 forbids calls derived from third-party content, emergencies, unsolicited
