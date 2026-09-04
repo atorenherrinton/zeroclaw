@@ -463,6 +463,13 @@ enum EstopLevelArg {
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version)]
+#[command(long_version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ", env!("ZEROCLAW_BUILD_GIT_SHA"),
+    "\nsource: ", env!("ZEROCLAW_BUILD_GIT_STATE"),
+    "\nfeatures: ", env!("ZEROCLAW_BUILD_FEATURES"),
+    "\ncompiler: ", env!("ZEROCLAW_BUILD_RUSTC"),
+))]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
