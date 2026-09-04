@@ -212,6 +212,7 @@ fn generate_policy(workspace: &Path) -> String {
     (subpath "/Library")
     (subpath "/System")
     (subpath "/private/var")
+    (subpath "/private/etc")
     (subpath "/dev")
     (subpath "/etc")
     (subpath "/Applications")
@@ -358,6 +359,7 @@ mod tests {
         assert!(policy.contains("(subpath \"/usr\")"));
         assert!(policy.contains("(subpath \"/bin\")"));
         assert!(policy.contains("(subpath \"/System\")"));
+        assert!(policy.contains("(subpath \"/private/etc\")"));
     }
 
     #[test]
