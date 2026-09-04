@@ -236,8 +236,14 @@ impl LoopDetector {
         }
     }
 
-    /// Pattern 2: Two tools alternating (A->B->A->B) for 4+ full cycles
-    /// (i.e. 8 consecutive entries following the pattern).
+    /// Pattern 2: Two identical calls alternating (A->B->A->B) for 4+ full
+    /// cycles (i.e. 8 consecutive entries following the pattern).
+    ///
+    /// Tool-name alternation alone is not evidence of a loop. Stateful tools
+    /// commonly alternate an observation with an action (for example browser
+    /// browse/interact calls), and changing arguments or results are evidence
+    /// that such a workflow may still be making progress. Require each lane's
+    /// full call/result fingerprint to repeat before escalating.
     fn detect_ping_pong(&self) -> Option<LoopDetectionResult> {
         const MIN_CYCLES: usize = 4;
         let needed = MIN_CYCLES * 2; // each cycle = 2 calls
@@ -255,12 +261,19 @@ impl LoopDetector {
             return None;
         }
 
+        let a_args_hash = tail[0].args_hash;
+        let a_result_hash = tail[0].result_hash;
+        let b_args_hash = tail[1].args_hash;
+        let b_result_hash = tail[1].result_hash;
         let is_ping_pong = tail.iter().enumerate().all(|(i, r)| {
-            if i % 2 == 0 {
-                &r.name == a_name
+            let (expected_name, expected_args_hash, expected_result_hash) = if i % 2 == 0 {
+                (a_name, a_args_hash, a_result_hash)
             } else {
-                &r.name == b_name
-            }
+                (b_name, b_args_hash, b_result_hash)
+            };
+            &r.name == expected_name
+                && r.args_hash == expected_args_hash
+                && r.result_hash == expected_result_hash
         });
 
         if !is_ping_pong {
@@ -273,7 +286,11 @@ impl LoopDetector {
         for extra_pair in extended.chunks(2).skip(MIN_CYCLES) {
             if extra_pair.len() == 2
                 && &extra_pair[0].name == a_name
+                && extra_pair[0].args_hash == a_args_hash
+                && extra_pair[0].result_hash == a_result_hash
                 && &extra_pair[1].name == b_name
+                && extra_pair[1].args_hash == b_args_hash
+                && extra_pair[1].result_hash == b_result_hash
             {
                 cycles += 1;
             } else {
@@ -457,7 +474,12 @@ mod tests {
         // 4 full cycles = 8 calls: A B A B A B A B
         for i in 0..8 {
             let name = if i % 2 == 0 { "read" } else { "write" };
-            let result = det.record(name, &args, &format!("r{i}"));
+            let output = if i % 2 == 0 {
+                "same read result"
+            } else {
+                "same write result"
+            };
+            let result = det.record(name, &args, output);
             if i < 7 {
                 assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
             } else {
@@ -481,10 +503,15 @@ mod tests {
         // 5 cycles = 10 calls.  The 10th call (completing cycle 5) triggers Block.
         for i in 0..10 {
             let name = if i % 2 == 0 { "fetch" } else { "parse" };
-            det.record(name, &args, &format!("r{i}"));
+            let output = if i % 2 == 0 {
+                "same fetch result"
+            } else {
+                "same parse result"
+            };
+            det.record(name, &args, output);
         }
         // 11th call extends to 5.5 cycles; detector still counts 5 full -> Block.
-        let r = det.record("fetch", &args, "r10");
+        let r = det.record("fetch", &args, "same fetch result");
         match r {
             LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("fetch"));
@@ -663,27 +690,28 @@ mod tests {
     // ── Ping-pong with varying args ─────────────────────────────
 
     #[test]
-    fn ping_pong_detects_alternation_with_varying_args() {
+    fn ping_pong_ignores_productive_alternation_with_varying_args_and_results() {
         let mut det = LoopDetector::new(default_config());
 
-        // A->B->A->B with different args each time — ping-pong cares only
-        // about tool names, not argument equality.
-        for i in 0..8 {
+        // Browse/action workflows naturally alternate tool names. Different
+        // arguments and results show progress and must not trip the detector.
+        for i in 0..12 {
             let name = if i % 2 == 0 { "read" } else { "write" };
             let args = json!({"attempt": i});
             let result = det.record(name, &args, &format!("r{i}"));
-            if i < 7 {
-                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
-            } else {
-                match result {
-                    LoopDetectionResult::Warning(msg) => {
-                        assert!(msg.contains("read"));
-                        assert!(msg.contains("write"));
-                        assert!(msg.contains("4 cycles"));
-                    }
-                    other => panic!("expected Warning at cycle 4, got {other:?}"),
-                }
-            }
+            assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
+        }
+    }
+
+    #[test]
+    fn ping_pong_ignores_alternation_when_only_results_change() {
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({});
+
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "browse" } else { "interact" };
+            let result = det.record(name, &args, &format!("page state {i}"));
+            assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
         }
     }
 

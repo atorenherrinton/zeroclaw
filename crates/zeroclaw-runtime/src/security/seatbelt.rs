@@ -1,5 +1,6 @@
 //! macOS sandbox-exec (Seatbelt) sandbox backend.
 
+use crate::security::SandboxExtraRoots;
 use crate::security::traits::Sandbox;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,6 +27,14 @@ impl SeatbeltSandbox {
     /// If no workspace is provided, falls back to the process current
     /// directory for compatibility with direct construction.
     pub fn with_workspace(workspace: Option<&Path>) -> std::io::Result<Self> {
+        Self::with_workspace_and_roots(workspace, &SandboxExtraRoots::default())
+    }
+
+    /// Materialize the filesystem grants resolved by the runtime's security policy.
+    pub fn with_workspace_and_roots(
+        workspace: Option<&Path>,
+        extra_roots: &SandboxExtraRoots,
+    ) -> std::io::Result<Self> {
         if !Self::is_installed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -42,7 +51,8 @@ impl SeatbeltSandbox {
         let workspace = workspace
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp")));
-        let policy = generate_policy(&workspace);
+        let workspace = workspace.canonicalize().unwrap_or(workspace);
+        let policy = generate_policy_with_roots(&workspace, extra_roots);
         std::fs::write(&policy_path, &policy)?;
 
         Ok(Self {
@@ -133,6 +143,52 @@ fn seatbelt_string_literal(value: &str) -> String {
     escaped
 }
 
+fn generate_policy_with_roots(workspace: &Path, extra_roots: &SandboxExtraRoots) -> String {
+    let mut policy = generate_policy(workspace);
+    // Git consults these even for status/init. Do not grant the surrounding
+    // home or .config directories just to make Git's configuration readable.
+    if let Some(home) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        let config = home.join(".gitconfig");
+        let config = config.canonicalize().unwrap_or(config);
+        let escaped = seatbelt_string_literal(&config.to_string_lossy());
+        policy.push_str(&format!("\n(allow file-read* (literal \"{escaped}\"))\n"));
+        append_root_rules(&mut policy, &config, false, false);
+        append_root_rules(&mut policy, &home.join(".config/git"), true, false);
+    }
+    // getcwd/stat need ancestor metadata, not permission to list or read siblings.
+    append_root_rules(&mut policy, workspace, false, false);
+    for (roots, read, write) in [
+        (&extra_roots.read_write, true, true),
+        (&extra_roots.read_only, true, false),
+        (&extra_roots.write_only, false, true),
+    ] {
+        for root in roots {
+            append_root_rules(&mut policy, root, read, write);
+        }
+    }
+    policy
+}
+
+fn append_root_rules(policy: &mut String, root: &Path, read: bool, write: bool) {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let escaped = seatbelt_string_literal(&root.to_string_lossy());
+    if read {
+        policy.push_str(&format!("\n(allow file-read* (subpath \"{escaped}\"))\n"));
+    }
+    if write {
+        policy.push_str(&format!("\n(allow file-write* (subpath \"{escaped}\"))\n"));
+    }
+    for ancestor in root.ancestors().skip(1) {
+        let escaped = seatbelt_string_literal(&ancestor.to_string_lossy());
+        policy.push_str(&format!(
+            "(allow file-read-metadata (literal \"{escaped}\"))\n"
+        ));
+    }
+}
+
 fn generate_policy(workspace: &Path) -> String {
     let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
     format!(
@@ -156,6 +212,7 @@ fn generate_policy(workspace: &Path) -> String {
     (subpath "/Library")
     (subpath "/System")
     (subpath "/private/var")
+    (subpath "/private/etc")
     (subpath "/dev")
     (subpath "/etc")
     (subpath "/Applications")
@@ -302,6 +359,7 @@ mod tests {
         assert!(policy.contains("(subpath \"/usr\")"));
         assert!(policy.contains("(subpath \"/bin\")"));
         assert!(policy.contains("(subpath \"/System\")"));
+        assert!(policy.contains("(subpath \"/private/etc\")"));
     }
 
     #[test]
@@ -462,6 +520,115 @@ mod tests {
         assert!(
             !policy_path.exists(),
             "policy file should be cleaned up on drop"
+        );
+    }
+
+    #[test]
+    fn seatbelt_factory_enforces_extra_root_modes_at_process_boundary() {
+        use crate::security::create_sandbox;
+        use zeroclaw_config::schema::{RiskProfileConfig, RuntimeKind};
+
+        // System temp directories are already permitted by the base policy;
+        // use a private fixture outside them so negative probes are meaningful.
+        let fixture = tempfile::Builder::new()
+            .prefix("zc-seatbelt-test-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let fixture = fixture.path().canonicalize().unwrap();
+        let workspace = fixture.join("workspace");
+        let rw = fixture.join("read-write-\"quoted");
+        let ro = fixture.join("read-only");
+        let wo = fixture.join("write-only");
+        let denied = fixture.join("denied");
+        for root in [&workspace, &rw, &ro, &wo, &denied] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("fixture.txt"), "fixture").unwrap();
+        }
+        let roots = SandboxExtraRoots {
+            read_write: vec![rw.clone()],
+            read_only: vec![ro.clone()],
+            write_only: vec![wo.clone()],
+        };
+        let sandbox = create_sandbox(
+            &RiskProfileConfig::default().sandbox_config(),
+            RuntimeKind::Native,
+            Some(&workspace),
+            &roots,
+        );
+        assert_eq!(sandbox.name(), "sandbox-exec");
+        let run = |program: &str, args: &[&str]| {
+            let mut command = Command::new(program);
+            command.args(args).current_dir(&workspace);
+            sandbox.wrap_command(&mut command).unwrap();
+            command.output().unwrap()
+        };
+        let pwd = run("/bin/sh", &["-c", "pwd"]);
+        assert!(
+            pwd.status.success(),
+            "{}",
+            String::from_utf8_lossy(&pwd.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&pwd.stdout).trim(),
+            workspace.to_str().unwrap()
+        );
+        for root in [&workspace, &rw, &ro] {
+            let read = run("/bin/cat", &[root.join("fixture.txt").to_str().unwrap()]);
+            assert!(
+                read.status.success(),
+                "{}: {}",
+                root.display(),
+                String::from_utf8_lossy(&read.stderr)
+            );
+        }
+        for root in [&workspace, &rw, &wo] {
+            let write = run(
+                "/bin/sh",
+                &[
+                    "-c",
+                    "printf changed > \"$1\"",
+                    "probe",
+                    root.join("fixture.txt").to_str().unwrap(),
+                ],
+            );
+            assert!(
+                write.status.success(),
+                "{}: {}",
+                root.display(),
+                String::from_utf8_lossy(&write.stderr)
+            );
+        }
+        for root in [&wo, &denied] {
+            assert!(
+                !run("/bin/cat", &[root.join("fixture.txt").to_str().unwrap()])
+                    .status
+                    .success()
+            );
+        }
+        for root in [&ro, &denied] {
+            assert!(
+                !run(
+                    "/bin/sh",
+                    &[
+                        "-c",
+                        "printf forbidden > \"$1\"",
+                        "probe",
+                        root.join("fixture.txt").to_str().unwrap()
+                    ]
+                )
+                .status
+                .success()
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("fixture.txt")).unwrap(),
+                "fixture"
+            );
+        }
+        // Ancestors have metadata-only permission, not directory enumeration.
+        assert!(
+            !run("/bin/ls", &[fixture.to_str().unwrap()])
+                .status
+                .success()
         );
     }
 
