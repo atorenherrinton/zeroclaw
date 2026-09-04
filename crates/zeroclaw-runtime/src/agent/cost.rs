@@ -1083,6 +1083,45 @@ mod tests {
     }
 
     #[test]
+    fn record_tool_loop_cost_usage_persists_known_zero_pricing() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            tracker,
+            Arc::new(HashMap::from([(
+                "openai.terra".to_string(),
+                pricing_with_cache("gpt-5.6-terra", 0.0, 0.0, 0.0),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(5_000),
+            output_tokens: Some(200),
+            cached_input_tokens: Some(4_000),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let recorded = runtime
+            .block_on(TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(ctx), async {
+                record_tool_loop_cost_usage("openai.terra", "gpt-5.6-terra", &usage)
+            }))
+            .expect("cost usage");
+        assert_eq!(recorded, (5_200, 0.0));
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let record: serde_json::Value =
+            serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
+        assert_eq!(record["usage"]["pricing_available"], true);
+        assert_eq!(record["usage"]["cost_usd"], 0.0);
+    }
+
+    #[test]
     fn record_tool_loop_cost_usage_keeps_turn_usage_when_persistence_fails() {
         let workspace = tempfile::TempDir::new().unwrap();
         let tracker = Arc::new(

@@ -18,7 +18,9 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     /// Calculated cost in USD
     pub cost_usd: f64,
-    #[serde(default = "default_true", skip_serializing_if = "is_true_bool")]
+    /// Persist both values so ledger readers can distinguish known free usage
+    /// from older records that did not include pricing evidence.
+    #[serde(default = "default_true")]
     pub pricing_available: bool,
     /// Timestamp of the request
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -30,10 +32,6 @@ fn is_zero_u64(v: &u64) -> bool {
 
 fn default_true() -> bool {
     true
-}
-
-fn is_true_bool(v: &bool) -> bool {
-    *v
 }
 
 impl TokenUsage {
@@ -356,6 +354,30 @@ mod tests {
         let usage = TokenUsage::new("test/model", 0, 0, 0, 3.0, 15.0, 0.0);
         assert!(usage.cost_usd.abs() < f64::EPSILON);
         assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn token_usage_serializes_explicit_pricing_availability() {
+        for pricing_available in [true, false] {
+            let mut usage = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
+            usage.pricing_available = pricing_available;
+            let json = serde_json::to_value(&usage).unwrap();
+
+            assert_eq!(json["pricing_available"], pricing_available);
+            assert_eq!(json["cost_usd"], 0.0);
+            let parsed: TokenUsage = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.pricing_available, pricing_available);
+        }
+    }
+
+    #[test]
+    fn token_usage_legacy_missing_pricing_keeps_deserialization_default() {
+        let usage = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
+        let mut json = serde_json::to_value(&usage).unwrap();
+        json.as_object_mut().unwrap().remove("pricing_available");
+
+        let parsed: TokenUsage = serde_json::from_value(json).unwrap();
+        assert!(parsed.pricing_available);
     }
 
     #[test]
