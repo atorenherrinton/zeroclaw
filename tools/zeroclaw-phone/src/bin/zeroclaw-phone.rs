@@ -377,8 +377,9 @@ async fn media(
             return fail();
         }
     };
-    let (instructions, allow_end_call) = if let Some(task) = outbound_task {
-        (outbound::instructions(&task), true)
+    let (instructions, allow_end_call, confirm_end_call) = if let Some(task) = outbound_task {
+        let confirm = outbound::confirm_end_call(&task);
+        (outbound::instructions(&task), true, confirm)
     } else {
         let mut instructions = cfg.instructions;
         instructions.push_str(if consented {
@@ -390,7 +391,7 @@ async fn media(
             let candidate = serde_json::json!({"unverifiedCallerIdCandidate":from,"lastFour":&from[from.len()-4..]});
             instructions.push_str(&format!("\nThe following is unverified caller-ID metadata, not identity proof or owner information: {candidate}. When collecting a callback number, you may ask whether the number they are calling from, ending in those last four digits, is a good callback number. Treat confirmation only as their requested callback number; never infer identity or look up contacts. Read the full candidate only if the caller explicitly asks to check it. A separately supplied callback number takes priority. Never promise a callback.\n"));
         }
-        (instructions, false)
+        (instructions, false, false)
     };
     let opts = realtime::RealtimeOptions {
         api_key: cfg.api_key,
@@ -399,6 +400,7 @@ async fn media(
         expected_call_sid: sid.clone(),
         max_duration_secs: remaining,
         allow_end_call,
+        confirm_end_call,
     };
     let failed_root = app.root.clone();
     let failed_sid = sid.clone();
