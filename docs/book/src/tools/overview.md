@@ -52,6 +52,31 @@ Conditionally registered:
 | `sop_*` tools | Registered when the SOP runtime is enabled (`sop.sops_dir` set to a non-empty value; unset by default, which disables it; the documented value is `shared/sops`): run and inspect SOPs |
 | `discord_search` | Registered when a Discord alias has `archive` enabled |
 
+## Bounded Codex recovery
+
+`codex_cli` is an internal, repair-only recovery capability. It is not
+advertised to the task model and does not accept a model-authored prompt or
+working directory. To opt in, an operator must enable it and provide the
+absolute path to a ZeroClaw source checkout:
+
+```toml
+[codex_cli]
+enabled = true
+recovery_source_workspace = "/absolute/path/to/zeroclaw"
+```
+
+The application agent workspace may be elsewhere. Before every recovery
+attempt, ZeroClaw canonicalizes `recovery_source_workspace` and validates the
+root `zeroclaw` package plus the `zeroclaw-runtime` and `zeroclaw-tools`
+workspace members. Recovery fails closed without starting Codex when the field
+is absent, relative, inaccessible, or not a matching source tree. The
+configured source is the only Codex working directory; `--cd` and `-C` are not
+allowed in `codex_cli.extra_args`.
+
+All ordinary tool authorization, allowlist narrowing, caller and cron policy,
+rate limits, and sandbox execution still apply. ZeroClaw owns and resumes the
+original application task after the single bounded recovery attempt.
+
 ## Extension protocols
 
 Beyond built-in tools, ZeroClaw supports the **[MCP](./mcp.md)** (Model Context Protocol) extension surface. Connect any MCP server (Claude Code's filesystem, Playwright, your own) and the agent picks up its tools at startup.
