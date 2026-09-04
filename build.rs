@@ -13,7 +13,7 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed={}", file!());
     let sha = command_text("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let state = match command_text(
         "git",
