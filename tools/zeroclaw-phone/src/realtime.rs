@@ -43,6 +43,9 @@ const MAX_ITEMS: usize = 256;
 const MAX_TRANSCRIPT: usize = 128 * 1024;
 const MAX_INSTRUCTIONS: usize = 32 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const END_CONFIRM_SILENCE: Duration = Duration::from_secs(8);
+const END_CONFIRM_PURPOSE: &str = "zeroclaw_end_call_confirmation";
+const END_CONFIRM_INSTRUCTIONS: &str = "The call must remain open for one final confirmation turn. Briefly recap the current outcome in one sentence, ask whether the other party needs anything else before you go, then add that if not, you thank them and say goodbye. Do not call any tool in this response. Do not claim the call has already ended. Wait for their reply.";
 type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type BridgeResult<T> = Result<T, EndReason>;
 
@@ -55,6 +58,9 @@ pub struct RealtimeOptions {
     pub max_duration_secs: u64,
     /// Allows only the fixed no-argument `end_call` function.
     pub allow_end_call: bool,
+    /// Requires a server-controlled audible close check and a remote reply (or
+    /// bounded silence) before an interactive call may end. Voicemail disables it.
+    pub confirm_end_call: bool,
 }
 
 /// Text is generated/transcribed, NOT a word-accurate record of what was heard.
@@ -122,6 +128,17 @@ struct EndCall {
     arguments_done: bool,
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum ClosePhase {
+    #[default]
+    Open,
+    PromptPending,
+    Prompting(String),
+    PromptPlayback(String),
+    AwaitingReply,
+    Ready,
+}
+
 #[derive(Default)]
 struct State {
     stream_sid: Option<String>,
@@ -143,7 +160,11 @@ struct State {
     uncommitted_input_bytes: usize,
     transcript_bytes: usize,
     allow_end_call: bool,
+    confirm_end_call: bool,
+    session_instructions: String,
     end_calls: BTreeMap<String, EndCall>,
+    close_phase: ClosePhase,
+    close_deadline: Option<Instant>,
     ending: bool,
 }
 
@@ -190,7 +211,31 @@ fn decode_audio(encoded: &str) -> BridgeResult<Vec<u8>> {
 }
 
 fn end_call_tools() -> Value {
-    json!([{"type":"function","name":"end_call","description":"End this phone call after you have audibly said goodbye. Use only when the bounded call task is complete, refused, a wrong number, or cannot continue.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}])
+    json!([{"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Interactive calls may return a fixed confirmation requirement; follow it, wait for the other party, then audibly say goodbye before requesting end_call again.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}])
+}
+
+fn close_prompt_actions(call_id: &str, session_instructions: &str) -> Vec<Action> {
+    let instructions =
+        format!("{session_instructions}\n\nRuntime close protocol: {END_CONFIRM_INSTRUCTIONS}");
+    vec![
+        Action::Model(json!({
+            "type":"conversation.item.create",
+            "item":{
+                "type":"function_call_output",
+                "call_id":call_id,
+                "output":"{\"ended\":false,\"reason\":\"confirmation_required\"}"
+            }
+        })),
+        Action::Model(json!({
+            "type":"response.create",
+            "response":{
+                "instructions":instructions,
+                "tools":[],
+                "tool_choice":"none",
+                "metadata":{"purpose":END_CONFIRM_PURPOSE}
+            }
+        })),
+    ]
 }
 
 fn session_update(instructions: &str, allow_end_call: bool) -> Value {
@@ -356,6 +401,47 @@ impl State {
         Ok(actions)
     }
 
+    fn response_has_pending_playback(&self, response_id: &str) -> bool {
+        self.marks
+            .values()
+            .any(|mark| self.items[mark.item_index].response_id.as_deref() == Some(response_id))
+    }
+
+    fn response_was_audible(&self, response_id: &str) -> bool {
+        self.items.iter().any(|item| {
+            item.response_id.as_deref() == Some(response_id)
+                && item.speaker == "assistant"
+                && item.audio_done
+                && item.sent_bytes > 0
+                && !item.interrupted
+        })
+    }
+
+    fn start_close_wait_if_played(&mut self) {
+        let response_id = match &self.close_phase {
+            ClosePhase::PromptPlayback(response_id) => response_id.clone(),
+            _ => return,
+        };
+        if !self.response_has_pending_playback(&response_id) {
+            self.close_phase = ClosePhase::AwaitingReply;
+            self.close_deadline = Some(Instant::now() + END_CONFIRM_SILENCE);
+        }
+    }
+
+    fn request_close_confirmation(&mut self, call_id: &str) -> Vec<Action> {
+        self.close_phase = ClosePhase::PromptPending;
+        self.close_deadline = None;
+        close_prompt_actions(call_id, &self.session_instructions)
+    }
+
+    fn close_timeout(&self) -> Option<Instant> {
+        if self.close_phase == ClosePhase::AwaitingReply {
+            self.close_deadline
+        } else {
+            None
+        }
+    }
+
     fn twilio(&mut self, value: Value) -> BridgeResult<Vec<Action>> {
         if value["streamSid"].as_str() != self.stream_sid.as_deref() {
             return Err(EndReason::ProtocolError);
@@ -397,6 +483,7 @@ impl State {
                     item.played_bytes = item.played_bytes.max(mark.end_bytes);
                     self.queued_output_bytes -= mark.chunk_bytes;
                 }
+                self.start_close_wait_if_played();
                 if self.ending && self.active_response.is_none() && self.marks.is_empty() {
                     Err(EndReason::AssistantEnded)
                 } else {
@@ -429,7 +516,8 @@ impl State {
             }
             self.ready = true;
             // The sole initial response trigger; the probe never calls this path.
-            // No per-response override can drop the caller's isolation instructions.
+            // The sole later per-response override repeats these exact isolation
+            // instructions before adding its fixed, tool-free close protocol.
             let mut actions = vec![Action::Model(json!({"type": "response.create"}))];
             while let Some(audio) = self.pending_input.pop_front() {
                 actions.push(Action::Model(json!({
@@ -448,6 +536,21 @@ impl State {
         match event_type {
             "input_audio_buffer.speech_started" => {
                 self.speaking = true;
+                match self.close_phase {
+                    ClosePhase::AwaitingReply => {
+                        self.close_phase = ClosePhase::Ready;
+                        self.close_deadline = None;
+                    }
+                    ClosePhase::PromptPending
+                    | ClosePhase::Prompting(_)
+                    | ClosePhase::PromptPlayback(_) => {
+                        // A barge-in is a continuation, not confirmation that it
+                        // is safe to close. The next close request starts over.
+                        self.close_phase = ClosePhase::Open;
+                        self.close_deadline = None;
+                    }
+                    ClosePhase::Open | ClosePhase::Ready => {}
+                }
                 self.interrupt()
             }
             "input_audio_buffer.speech_stopped" => {
@@ -477,7 +580,15 @@ impl State {
                 if self.active_response.is_some() {
                     return Err(EndReason::ProtocolError);
                 }
-                self.active_response = Some(id);
+                let confirmation = value["response"]["metadata"]["purpose"] == END_CONFIRM_PURPOSE;
+                self.active_response = Some(id.clone());
+                if confirmation {
+                    if self.close_phase != ClosePhase::PromptPending || self.speaking {
+                        self.close_phase = ClosePhase::Open;
+                        return Ok(vec![self.cancel(id)?]);
+                    }
+                    self.close_phase = ClosePhase::Prompting(id);
+                }
                 Ok(Vec::new())
             }
             "response.output_item.added" => {
@@ -579,6 +690,10 @@ impl State {
             "response.done" => {
                 let response = &value["response"];
                 let response_id = item_id(response, "id")?;
+                let confirmation_response = matches!(
+                    &self.close_phase,
+                    ClosePhase::Prompting(id) if id == &response_id
+                );
                 if self.active_response.as_deref() == Some(&response_id) {
                     self.active_response = None;
                 }
@@ -589,7 +704,7 @@ impl State {
                 if !matches!(status, "completed" | "cancelled" | "incomplete") {
                     return Err(EndReason::ProtocolError);
                 }
-                let mut completed_end_call = false;
+                let mut completed_end_call = None;
                 if let Some(output) = response["output"].as_array() {
                     for item in output {
                         if item["type"] == "function_call" {
@@ -610,7 +725,11 @@ impl State {
                             {
                                 return Err(EndReason::ProtocolError);
                             }
-                            completed_end_call |= status == "completed";
+                            if status == "completed"
+                                && completed_end_call.replace(call_id).is_some()
+                            {
+                                return Err(EndReason::ProtocolError);
+                            }
                             continue;
                         }
                         if item["type"] != "message" || item["role"] != "assistant" {
@@ -632,7 +751,28 @@ impl State {
                 }
                 self.end_calls
                     .retain(|_, call| call.response_id != response_id);
-                self.ending |= completed_end_call;
+                if confirmation_response {
+                    self.close_deadline = None;
+                    if status == "completed" && self.response_was_audible(&response_id) {
+                        self.close_phase = ClosePhase::PromptPlayback(response_id);
+                        self.start_close_wait_if_played();
+                    } else {
+                        self.close_phase = ClosePhase::Open;
+                    }
+                    return Ok(Vec::new());
+                }
+                if let Some(call_id) = completed_end_call {
+                    let confirmed_audible_close = self.close_phase == ClosePhase::Ready
+                        && self.response_was_audible(&response_id);
+                    if self.confirm_end_call && !confirmed_audible_close {
+                        return Ok(self.request_close_confirmation(&call_id));
+                    }
+                    self.ending = true;
+                } else if self.close_phase == ClosePhase::Ready {
+                    // The remote party continued the conversation and the agent
+                    // answered without closing. A later close must confirm again.
+                    self.close_phase = ClosePhase::Open;
+                }
                 if self.ending && self.marks.is_empty() {
                     Err(EndReason::AssistantEnded)
                 } else {
@@ -902,13 +1042,20 @@ where
     )
     .await?;
     loop {
-        let current_deadline = if state.ready {
+        let bridge_deadline = if state.ready {
             deadline
         } else {
             setup_deadline
         };
+        let close_timeout = state.close_timeout();
+        let current_deadline = close_timeout
+            .map(|value| value.min(bridge_deadline))
+            .unwrap_or(bridge_deadline);
         let generated_actions = tokio::select! {
             _ = tokio::time::sleep_until(current_deadline) => {
+                if close_timeout.is_some_and(|value| value <= bridge_deadline && Instant::now() >= value) {
+                    return Err(EndReason::AssistantEnded);
+                }
                 return Err(if state.ready { EndReason::DurationLimit } else { EndReason::SetupFailed });
             }
             value = next_twilio(twilio, current_deadline) => state.twilio(value?)?,
@@ -971,6 +1118,8 @@ pub async fn bridge(mut socket: WebSocket, options: RealtimeOptions) -> BridgeOu
     let deadline = started + Duration::from_secs(options.max_duration_secs.min(MAX_SECONDS));
     let mut state = State {
         allow_end_call: options.allow_end_call,
+        confirm_end_call: options.confirm_end_call,
+        session_instructions: options.instructions.clone(),
         ..State::default()
     };
     let mut upstream = None;
@@ -978,6 +1127,7 @@ pub async fn bridge(mut socket: WebSocket, options: RealtimeOptions) -> BridgeOu
         && !options.api_key.is_empty()
         && !options.instructions.trim().is_empty()
         && options.instructions.len() <= MAX_INSTRUCTIONS
+        && (!options.confirm_end_call || options.allow_end_call)
         && valid_sid(&options.expected_account_sid, "AC")
         && valid_sid(&options.expected_call_sid, "CA");
     let reason = if valid {
@@ -1076,6 +1226,7 @@ mod tests {
             expected_call_sid: format!("CA{}", "2".repeat(32)),
             max_duration_secs: 180,
             allow_end_call: false,
+            confirm_end_call: false,
         }
     }
 
@@ -1114,6 +1265,33 @@ mod tests {
     fn delta(response: &str, item: &str, bytes: usize) -> Value {
         json!({"type":"response.output_audio.delta","response_id":response,
             "item_id":item,"content_index":0,"delta":STANDARD.encode(vec![0xff;bytes])})
+    }
+
+    fn add_end_call(state: &mut State, response: &str, item: &str, call: &str) {
+        state
+            .model(
+                json!({"type":"response.output_item.added","response_id":response,
+                "item":{"id":item,"type":"function_call","name":"end_call","call_id":call}}),
+            )
+            .unwrap();
+        state
+            .model(
+                json!({"type":"response.function_call_arguments.delta","response_id":response,
+                "item_id":item,"call_id":call,"delta":"{}"}),
+            )
+            .unwrap();
+        state
+            .model(
+                json!({"type":"response.function_call_arguments.done","response_id":response,
+                "item_id":item,"name":"end_call","call_id":call,"arguments":"{}"}),
+            )
+            .unwrap();
+    }
+
+    fn end_call_done(response: &str, item: &str, call: &str) -> Value {
+        json!({"type":"response.done","response":{"id":response,"status":"completed",
+            "output":[{"id":item,"type":"function_call","name":"end_call",
+            "call_id":call,"arguments":"{}"}]}})
     }
 
     #[test]
@@ -1220,6 +1398,175 @@ mod tests {
         assert!(matches!(
             blocked.model(json!({"type":"response.output_item.added","response_id":"resp_1","item":{"type":"function_call","name":"end_call","call_id":"call_end"}})),
             Err(EndReason::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn interactive_end_call_requires_played_close_check_reply_and_audible_goodbye() {
+        let mut ready = session_update("One bounded outbound task", true);
+        ready["type"] = json!("session.updated");
+        ready["session"]["model"] = json!(MODEL);
+        let mut outbound = State {
+            allow_end_call: true,
+            confirm_end_call: true,
+            session_instructions: "One bounded outbound task".into(),
+            ..State::default()
+        };
+        outbound.start(&start_event(), &options()).unwrap();
+        outbound.model(ready).unwrap();
+
+        start_response(&mut outbound, "resp_first_end");
+        add_end_call(
+            &mut outbound,
+            "resp_first_end",
+            "item_first_end",
+            "call_first_end",
+        );
+        let actions = outbound
+            .model(end_call_done(
+                "resp_first_end",
+                "item_first_end",
+                "call_first_end",
+            ))
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(&actions[0], Action::Model(v)
+            if v["type"] == "conversation.item.create"
+                && v["item"]["type"] == "function_call_output"
+                && v["item"]["call_id"] == "call_first_end"));
+        assert!(matches!(&actions[1], Action::Model(v)
+            if v["type"] == "response.create"
+                && v["response"]["tools"] == json!([])
+                && v["response"]["tool_choice"] == "none"
+                && v["response"]["instructions"].as_str().is_some_and(|text|
+                    text.starts_with("One bounded outbound task\n\nRuntime close protocol:"))
+                && v["response"]["metadata"]["purpose"] == END_CONFIRM_PURPOSE));
+        assert!(outbound.close_phase == ClosePhase::PromptPending);
+        assert!(!outbound.ending);
+
+        outbound
+            .model(
+                json!({"type":"response.created","response":{"id":"resp_close_check",
+                "metadata":{"purpose":END_CONFIRM_PURPOSE}}}),
+            )
+            .unwrap();
+        outbound
+            .model(
+                json!({"type":"response.output_item.added","response_id":"resp_close_check",
+                "item":{"id":"msg_close_check","type":"message","role":"assistant"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            outbound
+                .model(delta("resp_close_check", "msg_close_check", 800))
+                .unwrap()
+                .len(),
+            2
+        );
+        outbound
+            .model(
+                json!({"type":"response.output_audio.done","response_id":"resp_close_check",
+                "item_id":"msg_close_check"}),
+            )
+            .unwrap();
+        outbound
+            .model(json!({"type":"response.output_audio_transcript.done","response_id":"resp_close_check",
+                "item_id":"msg_close_check","transcript":"Anything else before I go? If not, thank you and goodbye."}))
+            .unwrap();
+        outbound
+            .model(json!({"type":"response.done","response":{"id":"resp_close_check",
+                "status":"completed","output":[{"id":"msg_close_check","type":"message",
+                "role":"assistant","content":[{"type":"output_audio","transcript":"Anything else before I go? If not, thank you and goodbye."}]}]}}))
+            .unwrap();
+        assert!(matches!(
+            outbound.close_phase,
+            ClosePhase::PromptPlayback(_)
+        ));
+        assert!(outbound.close_deadline.is_none());
+        outbound
+            .twilio(json!({"event":"mark","streamSid":outbound.stream_sid,
+                "mark":{"name":"zc-play-1"}}))
+            .unwrap();
+        assert!(outbound.close_phase == ClosePhase::AwaitingReply);
+        let close_deadline = outbound.close_timeout().unwrap();
+        assert!(close_deadline > Instant::now());
+        assert!(close_deadline <= Instant::now() + END_CONFIRM_SILENCE);
+
+        outbound
+            .model(json!({"type":"input_audio_buffer.speech_started"}))
+            .unwrap();
+        outbound
+            .model(json!({"type":"input_audio_buffer.speech_stopped"}))
+            .unwrap();
+        assert!(outbound.close_phase == ClosePhase::Ready);
+        assert!(outbound.close_timeout().is_none());
+
+        start_response(&mut outbound, "resp_silent_end");
+        add_end_call(
+            &mut outbound,
+            "resp_silent_end",
+            "item_silent_end",
+            "call_silent_end",
+        );
+        let retry = outbound
+            .model(end_call_done(
+                "resp_silent_end",
+                "item_silent_end",
+                "call_silent_end",
+            ))
+            .unwrap();
+        assert_eq!(retry.len(), 2);
+        assert!(outbound.close_phase == ClosePhase::PromptPending);
+        assert!(!outbound.ending);
+
+        // A confirmed final response is honored only when it also contains
+        // audible assistant audio; Twilio playback marks still gate disconnect.
+        outbound.close_phase = ClosePhase::Ready;
+        start_response(&mut outbound, "resp_final");
+        outbound
+            .model(
+                json!({"type":"response.output_item.added","response_id":"resp_final",
+                "item":{"id":"msg_final","type":"message","role":"assistant"}}),
+            )
+            .unwrap();
+        assert_eq!(
+            outbound
+                .model(delta("resp_final", "msg_final", 800))
+                .unwrap()
+                .len(),
+            2
+        );
+        outbound
+            .model(
+                json!({"type":"response.output_audio.done","response_id":"resp_final",
+                "item_id":"msg_final"}),
+            )
+            .unwrap();
+        outbound
+            .model(
+                json!({"type":"response.output_audio_transcript.done","response_id":"resp_final",
+                "item_id":"msg_final","transcript":"Thank you. Goodbye."}),
+            )
+            .unwrap();
+        add_end_call(
+            &mut outbound,
+            "resp_final",
+            "item_final_end",
+            "call_final_end",
+        );
+        outbound
+            .model(json!({"type":"response.done","response":{"id":"resp_final",
+                "status":"completed","output":[
+                    {"id":"msg_final","type":"message","role":"assistant",
+                     "content":[{"type":"output_audio","transcript":"Thank you. Goodbye."}]},
+                    {"id":"item_final_end","type":"function_call","name":"end_call",
+                     "call_id":"call_final_end","arguments":"{}"}]}}))
+            .unwrap();
+        assert!(outbound.ending);
+        assert!(matches!(
+            outbound.twilio(json!({"event":"mark","streamSid":outbound.stream_sid,
+                "mark":{"name":"zc-play-2"}})),
+            Err(EndReason::AssistantEnded)
         ));
     }
 
