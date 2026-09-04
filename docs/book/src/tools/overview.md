@@ -62,16 +62,20 @@ absolute path to a ZeroClaw source checkout:
 ```toml
 [codex_cli]
 enabled = true
+executable_path = "/absolute/path/to/codex"
 recovery_source_workspace = "/absolute/path/to/zeroclaw"
 ```
 
 The application agent workspace may be elsewhere. Before every recovery
-attempt, ZeroClaw canonicalizes `recovery_source_workspace` and validates the
-root `zeroclaw` package plus the `zeroclaw-runtime` and `zeroclaw-tools`
-workspace members. Recovery fails closed without starting Codex when the field
-is absent, relative, inaccessible, or not a matching source tree. The
-configured source is the only Codex working directory; `--cd` and `-C` are not
-allowed in `codex_cli.extra_args`.
+attempt, ZeroClaw canonicalizes `executable_path`, requires it to be an
+executable regular file, and uses that resolved path directly instead of the
+daemon's `PATH`. It also canonicalizes `recovery_source_workspace` and
+validates the root `zeroclaw` package plus the `zeroclaw-runtime` and
+`zeroclaw-tools` workspace members. Recovery fails closed without starting
+Codex when either field is absent, relative, inaccessible, or invalid. These
+typed operator values are the only executable and working-directory sources;
+the model cannot override them, and `--cd` and `-C` are not allowed in
+`codex_cli.extra_args`.
 
 All ordinary tool authorization, allowlist narrowing, caller and cron policy,
 rate limits, and sandbox execution still apply. ZeroClaw owns and resumes the
