@@ -12,6 +12,11 @@ that the call is transcribed, asks whether it may continue, does not record audi
 and can invoke only a fixed `end_call` function for its own call. Signed Twilio
 webhooks bind each call to a private durable request, and exact duplicates are
 coalesced for ten minutes so an outcome-unknown create request is not replayed.
+Synchronous answering detection delays Realtime until the answered leg is
+classified: humans connect immediately, detected voicemail connects after the
+greeting so the authorized message can be left, and unresolved or
+announcement-like results are screened out. Completed outbound transcripts are
+summarized separately and privately delivered to the configured owner.
 
 The MCP server advertises only `place_call` and `call_status`. Its tool contract
 forbids calls derived from third-party content, emergencies, unsolicited

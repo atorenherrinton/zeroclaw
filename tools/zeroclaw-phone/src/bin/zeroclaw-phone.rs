@@ -863,7 +863,9 @@ mod tests {
         ).unwrap();
 
         let path = format!("/voice/outbound/{nonce}");
-        let answer_request = signed(&path, &outbound_form("in-progress"));
+        let mut answer_form = outbound_form("in-progress");
+        answer_form.insert("AnsweredBy".into(), "human".into());
+        let answer_request = signed(&path, &answer_form);
         let cfg = common::load(&fixture.root).unwrap();
         let form = authenticate(
             &cfg,
@@ -883,11 +885,12 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(row, ("media".into(), "skipped".into()));
+        assert_eq!(row, ("media".into(), "pending".into()));
         let task = outbound::session_task(&fixture.root, SECOND_CALL)
             .unwrap()
             .unwrap();
         assert_eq!(task.recipient, "Example shop");
+        assert_eq!(task.answer_kind, "human");
 
         let status_path = format!("/voice/outbound-status/{nonce}");
         let status_request = signed(&status_path, &outbound_form("completed"));
@@ -920,6 +923,43 @@ mod tests {
     }
 
     #[test]
+    fn unresolved_or_announcement_like_answers_are_screened_before_realtime() {
+        let fixture = Fixture::new();
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let nonce = uuid::Uuid::new_v4().to_string();
+        fixture.db().execute(
+            "INSERT INTO outbound_requests(request_id,nonce,to_number,on_behalf_of,recipient,purpose,created_ms,state)
+             VALUES(?1,?2,?3,'Owner','','Purpose',?4,'creating')",
+            params![request_id,nonce,OUTBOUND_TO,chrono::Utc::now().timestamp_millis()],
+        ).unwrap();
+        let mut form = outbound_form("in-progress");
+        form.insert("AnsweredBy".into(), "unknown".into());
+        let cfg = common::load(&fixture.root).unwrap();
+        assert_eq!(
+            outbound::answer(&fixture.root, &nonce, &cfg, &form).unwrap(),
+            protocol::EMPTY
+        );
+        let state: String = fixture
+            .db()
+            .query_row(
+                "SELECT state FROM outbound_requests WHERE request_id=?1",
+                [&request_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "screened_out");
+        let calls: i64 = fixture
+            .db()
+            .query_row(
+                "SELECT COUNT(*) FROM calls WHERE call_sid=?1",
+                [SECOND_CALL],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
     fn outbound_request_nonce_cannot_be_rebound_to_another_destination() {
         let fixture = Fixture::new();
         let nonce = uuid::Uuid::new_v4().to_string();
@@ -930,6 +970,7 @@ mod tests {
         ).unwrap();
         let mut form = outbound_form("in-progress");
         form.insert("To".into(), "+15550001999".into());
+        form.insert("AnsweredBy".into(), "human".into());
         let path = format!("/voice/outbound/{nonce}");
         let signed = signed(&path, &form);
         let cfg = common::load(&fixture.root).unwrap();
