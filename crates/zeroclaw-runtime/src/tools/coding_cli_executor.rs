@@ -395,6 +395,9 @@ mod tests {
         let tool = CodexCliTool::new_with_executor(
             security,
             CodexCliConfig {
+                executable_path: Some(
+                    std::env::current_exe().expect("test executable path should be available"),
+                ),
                 recovery_source_workspace: Some(source_workspace.path().to_path_buf()),
                 timeout_secs: 5,
                 ..CodexCliConfig::default()
@@ -416,7 +419,14 @@ mod tests {
             .expect("fake runtime mutex")
             .clone()
             .expect("runtime should receive the coding CLI command");
-        assert!(command.contains("codex"), "command was {command:?}");
+        let canonical_executable = std::fs::canonicalize(
+            std::env::current_exe().expect("test executable path should be available"),
+        )
+        .expect("canonical test executable path");
+        assert!(
+            command.contains(canonical_executable.to_string_lossy().as_ref()),
+            "command was {command:?}"
+        );
         assert!(command.contains("exec"), "command was {command:?}");
         let working_dir = seen_working_dir
             .lock()

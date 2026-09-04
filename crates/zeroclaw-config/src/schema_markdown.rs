@@ -832,11 +832,21 @@ mod tests {
     fn codex_recovery_source_contract_appears_in_generated_reference() {
         let schema = schemars::schema_for!(crate::schema::Config);
         let md = generate(&schema.to_value());
+        let executable_row = md
+            .lines()
+            .find(|line| {
+                line.contains("`executable_path`") && line.contains("no daemon `PATH` fallback")
+            })
+            .expect("generated config reference should include the Codex executable path");
         let row = md
             .lines()
             .find(|line| line.contains("`recovery_source_workspace`"))
             .expect("generated config reference should include the Codex recovery source");
 
+        assert!(executable_row.contains("Absolute operator-controlled"));
+        assert!(executable_row.contains("executable regular file"));
+        assert!(executable_row.contains("unset or invalid paths fail closed"));
+        assert!(executable_row.contains("canonical validation"));
         assert!(row.contains("Absolute operator-controlled"));
         assert!(row.contains("unset or invalid paths fail closed"));
         assert!(row.contains("canonical validation"));

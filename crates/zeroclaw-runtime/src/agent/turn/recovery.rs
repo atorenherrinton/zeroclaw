@@ -532,6 +532,9 @@ mod tests {
             ScopedToolRegistry::from_raw_for_test(vec![Box::new(CodexCliTool::new_with_executor(
                 security,
                 CodexCliConfig {
+                    executable_path: Some(
+                        std::env::current_exe().expect("test executable path should be available"),
+                    ),
                     recovery_source_workspace: Some(workspace.path().to_path_buf()),
                     ..CodexCliConfig::default()
                 },
