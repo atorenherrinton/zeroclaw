@@ -45,7 +45,7 @@ const MAX_INSTRUCTIONS: usize = 32 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
 const END_CONFIRM_SILENCE: Duration = Duration::from_secs(8);
 const END_CONFIRM_PURPOSE: &str = "zeroclaw_end_call_confirmation";
-const END_CONFIRM_INSTRUCTIONS: &str = "The call must remain open for one final confirmation turn. Briefly recap the current outcome in one sentence, ask whether the other party needs anything else before you go, then add that if not, you thank them and say goodbye. Do not call any tool in this response. Do not claim the call has already ended. Wait for their reply.";
+const END_CONFIRM_INSTRUCTIONS: &str = "The call must remain open for one final confirmation turn. Briefly recap the current outcome in one sentence, ask whether the other party needs anything else before you go, then add that if not, you thank them and say goodbye. Do not call any tool in this response and never speak a tool name aloud. Do not claim the call has already ended. Wait for their reply. After they reply, invoke the end_call tool without saying its name aloud unless they continue the authorized task.";
 type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type BridgeResult<T> = Result<T, EndReason>;
 
@@ -211,7 +211,7 @@ fn decode_audio(encoded: &str) -> BridgeResult<Vec<u8>> {
 }
 
 fn end_call_tools() -> Value {
-    json!([{"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Interactive calls may return a fixed confirmation requirement; follow it, wait for the other party, then audibly say goodbye before requesting end_call again.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}])
+    json!([{"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Invoke this as a tool call; never say the tool name aloud. Interactive calls may return a fixed confirmation requirement. Follow it, wait for the other party's reply, then invoke this tool again unless they continue the authorized task.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}])
 }
 
 fn close_prompt_actions(call_id: &str, session_instructions: &str) -> Vec<Action> {
@@ -537,16 +537,15 @@ impl State {
             "input_audio_buffer.speech_started" => {
                 self.speaking = true;
                 match self.close_phase {
-                    ClosePhase::AwaitingReply => {
-                        self.close_phase = ClosePhase::Ready;
-                        self.close_deadline = None;
-                    }
                     ClosePhase::PromptPending
                     | ClosePhase::Prompting(_)
-                    | ClosePhase::PromptPlayback(_) => {
-                        // A barge-in is a continuation, not confirmation that it
-                        // is safe to close. The next close request starts over.
-                        self.close_phase = ClosePhase::Open;
+                    | ClosePhase::PromptPlayback(_)
+                    | ClosePhase::AwaitingReply => {
+                        // Any speech after the first close request is a remote
+                        // turn. It may be an explicit hangup request or a task
+                        // continuation; in either case, let the model respond and
+                        // keep final-close authorization until it invokes the tool.
+                        self.close_phase = ClosePhase::Ready;
                         self.close_deadline = None;
                     }
                     ClosePhase::Open | ClosePhase::Ready => {}
@@ -584,7 +583,12 @@ impl State {
                 self.active_response = Some(id.clone());
                 if confirmation {
                     if self.close_phase != ClosePhase::PromptPending || self.speaking {
-                        self.close_phase = ClosePhase::Open;
+                        // If the remote party spoke before this requested
+                        // response was created, preserve that final-close
+                        // authorization while cancelling the now-stale prompt.
+                        if self.close_phase != ClosePhase::Ready {
+                            self.close_phase = ClosePhase::Open;
+                        }
                         return Ok(vec![self.cancel(id)?]);
                     }
                     self.close_phase = ClosePhase::Prompting(id);
@@ -762,16 +766,10 @@ impl State {
                     return Ok(Vec::new());
                 }
                 if let Some(call_id) = completed_end_call {
-                    let confirmed_audible_close = self.close_phase == ClosePhase::Ready
-                        && self.response_was_audible(&response_id);
-                    if self.confirm_end_call && !confirmed_audible_close {
+                    if self.confirm_end_call && self.close_phase != ClosePhase::Ready {
                         return Ok(self.request_close_confirmation(&call_id));
                     }
                     self.ending = true;
-                } else if self.close_phase == ClosePhase::Ready {
-                    // The remote party continued the conversation and the agent
-                    // answered without closing. A later close must confirm again.
-                    self.close_phase = ClosePhase::Open;
                 }
                 if self.ending && self.marks.is_empty() {
                     Err(EndReason::AssistantEnded)
@@ -1402,7 +1400,7 @@ mod tests {
     }
 
     #[test]
-    fn interactive_end_call_requires_played_close_check_reply_and_audible_goodbye() {
+    fn interactive_end_call_authorization_survives_separate_goodbye_and_tool_responses() {
         let mut ready = session_update("One bounded outbound task", true);
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
@@ -1501,73 +1499,81 @@ mod tests {
         assert!(outbound.close_phase == ClosePhase::Ready);
         assert!(outbound.close_timeout().is_none());
 
-        start_response(&mut outbound, "resp_silent_end");
-        add_end_call(
-            &mut outbound,
-            "resp_silent_end",
-            "item_silent_end",
-            "call_silent_end",
-        );
-        let retry = outbound
-            .model(end_call_done(
-                "resp_silent_end",
-                "item_silent_end",
-                "call_silent_end",
-            ))
-            .unwrap();
-        assert_eq!(retry.len(), 2);
-        assert!(outbound.close_phase == ClosePhase::PromptPending);
-        assert!(!outbound.ending);
-
-        // A confirmed final response is honored only when it also contains
-        // audible assistant audio; Twilio playback marks still gate disconnect.
-        outbound.close_phase = ClosePhase::Ready;
-        start_response(&mut outbound, "resp_final");
+        // The model may say a natural goodbye in one response and emit the tool
+        // in the next. Authorization must remain sticky across that boundary.
+        start_response(&mut outbound, "resp_goodbye");
         outbound
             .model(
-                json!({"type":"response.output_item.added","response_id":"resp_final",
-                "item":{"id":"msg_final","type":"message","role":"assistant"}}),
+                json!({"type":"response.output_item.added","response_id":"resp_goodbye",
+                "item":{"id":"msg_goodbye","type":"message","role":"assistant"}}),
             )
             .unwrap();
         assert_eq!(
             outbound
-                .model(delta("resp_final", "msg_final", 800))
+                .model(delta("resp_goodbye", "msg_goodbye", 800))
                 .unwrap()
                 .len(),
             2
         );
         outbound
             .model(
-                json!({"type":"response.output_audio.done","response_id":"resp_final",
-                "item_id":"msg_final"}),
+                json!({"type":"response.output_audio.done","response_id":"resp_goodbye",
+                "item_id":"msg_goodbye"}),
             )
             .unwrap();
         outbound
             .model(
-                json!({"type":"response.output_audio_transcript.done","response_id":"resp_final",
-                "item_id":"msg_final","transcript":"Thank you. Goodbye."}),
+                json!({"type":"response.output_audio_transcript.done","response_id":"resp_goodbye",
+                "item_id":"msg_goodbye","transcript":"Thank you. Goodbye."}),
             )
             .unwrap();
+        outbound
+            .model(json!({"type":"response.done","response":{"id":"resp_goodbye",
+                "status":"completed","output":[{"id":"msg_goodbye","type":"message",
+                "role":"assistant","content":[{"type":"output_audio","transcript":"Thank you. Goodbye."}]}]}}))
+            .unwrap();
+        assert!(outbound.close_phase == ClosePhase::Ready);
+        outbound
+            .twilio(json!({"event":"mark","streamSid":outbound.stream_sid,
+                "mark":{"name":"zc-play-2"}}))
+            .unwrap();
+
+        start_response(&mut outbound, "resp_final_tool");
         add_end_call(
             &mut outbound,
-            "resp_final",
-            "item_final_end",
-            "call_final_end",
+            "resp_final_tool",
+            "item_final_tool",
+            "call_final_tool",
         );
-        outbound
-            .model(json!({"type":"response.done","response":{"id":"resp_final",
-                "status":"completed","output":[
-                    {"id":"msg_final","type":"message","role":"assistant",
-                     "content":[{"type":"output_audio","transcript":"Thank you. Goodbye."}]},
-                    {"id":"item_final_end","type":"function_call","name":"end_call",
-                     "call_id":"call_final_end","arguments":"{}"}]}}))
-            .unwrap();
-        assert!(outbound.ending);
         assert!(matches!(
-            outbound.twilio(json!({"event":"mark","streamSid":outbound.stream_sid,
-                "mark":{"name":"zc-play-2"}})),
+            outbound.model(end_call_done(
+                "resp_final_tool",
+                "item_final_tool",
+                "call_final_tool"
+            )),
             Err(EndReason::AssistantEnded)
         ));
+    }
+
+    #[test]
+    fn remote_barge_in_before_close_prompt_creation_preserves_authorization() {
+        let mut state = state();
+        state.allow_end_call = true;
+        state.confirm_end_call = true;
+        state.close_phase = ClosePhase::PromptPending;
+        state
+            .model(json!({"type":"input_audio_buffer.speech_started"}))
+            .unwrap();
+        assert!(state.close_phase == ClosePhase::Ready);
+        let actions = state
+            .model(
+                json!({"type":"response.created","response":{"id":"resp_stale_close",
+                "metadata":{"purpose":END_CONFIRM_PURPOSE}}}),
+            )
+            .unwrap();
+        assert!(state.close_phase == ClosePhase::Ready);
+        assert!(matches!(&actions[..], [Action::Model(v)]
+            if v["type"] == "response.cancel" && v["response_id"] == "resp_stale_close"));
     }
 
     #[test]
