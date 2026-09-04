@@ -26,6 +26,7 @@ use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+const COMPLETION_CHECK_TIMEOUT_SECS: u64 = 30;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -485,6 +486,7 @@ pub async fn run(
             uses_memory: true,
             timeout_secs: None,
             missed_run_policy: None,
+            completion_check: None,
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
@@ -1102,7 +1104,72 @@ async fn run_agent_job(
         }
     };
 
+    let run_result = check_cron_agent_completion(config, security, job, run_result).await;
     finish_cron_agent_run(config, agent_alias, job, &session_path, run_result).await
+}
+
+async fn check_cron_agent_completion(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    run_result: Result<String>,
+) -> Result<String> {
+    // Declarative config is the only authority; an imperative same-ID job must
+    // never acquire a command from an unrelated declaration.
+    if job.source != "declarative" || job.job_type != JobType::Agent {
+        return run_result;
+    }
+    let Some(declaration) = config.cron.get(&job.id) else {
+        return run_result;
+    };
+    let command = match declaration.validated_completion_check() {
+        Ok(Some(command)) => command,
+        Ok(None) => return run_result,
+        Err(error) => return failed_cron_completion_check(run_result, &error.to_string()),
+    };
+    let runtime = match crate::platform::create_runtime(&config.runtime) {
+        Ok(runtime) => runtime,
+        Err(error) => return failed_cron_completion_check(run_result, &error.to_string()),
+    };
+    let mut check_job = job.clone();
+    check_job.command = command.to_string();
+    check_job.shell_output_format = CronShellOutputFormat::Wrapped;
+    let (success, output) = run_job_command_with_runtime_and_timeout(
+        config,
+        runtime.as_ref(),
+        security,
+        &check_job,
+        false,
+        Duration::from_secs(COMPLETION_CHECK_TIMEOUT_SECS),
+    )
+    .await;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "job_id": job.id,
+                "error_key": "cron.completion_check",
+                "success": success,
+            })
+        ),
+        "Cron agent completion check finished"
+    );
+    if success {
+        run_result
+    } else {
+        failed_cron_completion_check(run_result, &output)
+    }
+}
+
+fn failed_cron_completion_check(run_result: Result<String>, detail: &str) -> Result<String> {
+    let check_error = crate::i18n::get_required_cli_string_with_args(
+        "cli-cron-completion-check-failed",
+        &[("detail", detail)],
+    );
+    Err(anyhow::Error::msg(match run_result {
+        Ok(_) => check_error,
+        Err(error) => format!("{error}\n{check_error}"),
+    }))
 }
 
 async fn finish_cron_agent_run(
@@ -1907,6 +1974,85 @@ mod tests {
             await_cron_agent_run(&config, &job, async { Ok("must not run".into()) })
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn completion_check_overrides_false_success_and_preserves_agent_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let job = declarative_agent_deadline(&mut config, None);
+        let security = SecurityPolicy {
+            allowed_commands: vec!["true".into(), "false".into()],
+            require_approval_for_medium_risk: false,
+            ..test_security(&config)
+        };
+        config.cron.get_mut(&job.id).unwrap().completion_check = Some("false".into());
+        let result =
+            check_cron_agent_completion(&config, &security, &job, Ok("NO_REPLY".into())).await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("completion check failed")
+        );
+        let result = check_cron_agent_completion(
+            &config,
+            &security,
+            &job,
+            Err(anyhow::anyhow!("provider failed")),
+        )
+        .await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("provider failed"));
+        assert!(
+            error.contains("completion check failed"),
+            "check must run after agent failure"
+        );
+        config.cron.get_mut(&job.id).unwrap().completion_check = Some("true".into());
+        assert_eq!(
+            check_cron_agent_completion(&config, &security, &job, Ok("NO_REPLY".into()))
+                .await
+                .unwrap(),
+            "NO_REPLY"
+        );
+        assert_eq!(
+            check_cron_agent_completion(
+                &config,
+                &security,
+                &job,
+                Err(anyhow::anyhow!("provider failed"))
+            )
+            .await
+            .unwrap_err()
+            .to_string(),
+            "provider failed"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn completion_check_honors_current_policy_and_ignores_imperative_collision() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        let mut job = declarative_agent_deadline(&mut config, None);
+        config.cron.get_mut(&job.id).unwrap().completion_check = Some("true".into());
+        let security = SecurityPolicy {
+            allowed_commands: vec![],
+            ..test_security(&config)
+        };
+        assert!(
+            check_cron_agent_completion(&config, &security, &job, Ok("done".into()))
+                .await
+                .is_err()
+        );
+        job.source = "imperative".into();
+        assert_eq!(
+            check_cron_agent_completion(&config, &security, &job, Ok("done".into()))
+                .await
+                .unwrap(),
+            "done"
         );
     }
 

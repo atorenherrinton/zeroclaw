@@ -13805,6 +13805,13 @@ pub struct CronJobDecl {
     /// never copied into the scheduler database. Applies at scheduler startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub missed_run_policy: Option<CronMissedRunPolicy>,
+    /// Optional shell command that verifies a declarative agent attempt's result.
+    /// Runs after the attempt, including failure, under its owning agent's shell
+    /// policy with a 30-second deadline. Nonzero exit makes the attempt fail;
+    /// zero exit never converts an agent failure to success. Keep checks read-only.
+    /// Resolved from this declaration, not copied into the execution database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_check: Option<String>,
     /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
     /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
@@ -13845,6 +13852,7 @@ impl Default for CronJobDecl {
             model: None,
             timeout_secs: None,
             missed_run_policy: None,
+            completion_check: None,
             allowed_tools: None,
             uses_memory: true,
             session_target: None,
@@ -13855,6 +13863,20 @@ impl Default for CronJobDecl {
 }
 
 impl CronJobDecl {
+    pub fn validated_completion_check(&self) -> Result<Option<&str>> {
+        let Some(command) = self.completion_check.as_deref() else {
+            return Ok(None);
+        };
+        if !self.job_type.eq_ignore_ascii_case("agent") || command.trim().is_empty() {
+            validation_bail!(
+                InvalidFormat,
+                "cron.completion_check",
+                "cron completion_check requires an agent job and a non-empty command"
+            );
+        }
+        Ok(Some(command))
+    }
+
     /// Validate the canonical deadline even for programmatically built config.
     pub fn validated_timeout_secs(&self) -> Result<Option<u64>> {
         validate_cron_timeout_secs(self.timeout_secs)
@@ -13864,6 +13886,40 @@ impl CronJobDecl {
 #[cfg(test)]
 mod cron_timeout_tests {
     use super::*;
+
+    #[test]
+    fn completion_check_round_trip_and_validation() {
+        let declaration: CronJobDecl =
+            toml::from_str("job_type = 'agent'\ncompletion_check = 'checker verify'").unwrap();
+        assert_eq!(
+            declaration.validated_completion_check().unwrap(),
+            Some("checker verify")
+        );
+        let round_trip: CronJobDecl =
+            toml::from_str(&toml::to_string(&declaration).unwrap()).unwrap();
+        assert_eq!(round_trip.completion_check, declaration.completion_check);
+        assert_eq!(
+            CronJobDecl::default().validated_completion_check().unwrap(),
+            None
+        );
+        for invalid in [
+            CronJobDecl {
+                job_type: "shell".into(),
+                completion_check: Some("checker verify".into()),
+                ..Default::default()
+            },
+            CronJobDecl {
+                job_type: "agent".into(),
+                completion_check: Some(" ".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validated_completion_check().is_err());
+            let mut config = Config::default();
+            config.cron.insert("fixture".into(), invalid);
+            assert!(config.validate().is_err());
+        }
+    }
 
     #[test]
     fn cron_timeout_optional_bounds_and_serde_round_trip() {
@@ -21546,6 +21602,7 @@ impl Config {
         validate_memory_rerank_config(&self.memory)?;
         for declaration in self.cron.values() {
             declaration.validated_timeout_secs()?;
+            declaration.validated_completion_check()?;
         }
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
