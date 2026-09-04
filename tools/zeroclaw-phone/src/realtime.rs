@@ -115,6 +115,13 @@ struct PlaybackMark {
     chunk_bytes: usize,
 }
 
+struct EndCall {
+    item_id: String,
+    response_id: String,
+    argument_bytes: usize,
+    arguments_done: bool,
+}
+
 #[derive(Default)]
 struct State {
     stream_sid: Option<String>,
@@ -136,7 +143,7 @@ struct State {
     uncommitted_input_bytes: usize,
     transcript_bytes: usize,
     allow_end_call: bool,
-    end_call_ids: BTreeSet<String>,
+    end_calls: BTreeMap<String, EndCall>,
     ending: bool,
 }
 
@@ -479,10 +486,24 @@ impl State {
                     if !self.allow_end_call || item["name"] != "end_call" {
                         return Err(EndReason::ProtocolError);
                     }
+                    let response_id = item_id(&value, "response_id")?;
+                    let output_item_id = item_id(item, "id")?;
                     let call_id = item_id(item, "call_id")?;
-                    if !self.end_call_ids.insert(call_id) {
+                    if self.active_response.as_deref() != Some(&response_id)
+                        || self.end_calls.len() >= MAX_ITEMS
+                        || self.end_calls.contains_key(&call_id)
+                    {
                         return Err(EndReason::ProtocolError);
                     }
+                    self.end_calls.insert(
+                        call_id,
+                        EndCall {
+                            item_id: output_item_id,
+                            response_id,
+                            argument_bytes: 0,
+                            arguments_done: false,
+                        },
+                    );
                     return Ok(Vec::new());
                 }
                 if item["type"] != "message" || item["role"] != "assistant" {
@@ -561,19 +582,35 @@ impl State {
                 if self.active_response.as_deref() == Some(&response_id) {
                     self.active_response = None;
                 }
-                if response["status"] == "failed" {
+                let status = string(response, "status")?;
+                if status == "failed" {
                     return Err(EndReason::UpstreamError);
                 }
+                if !matches!(status, "completed" | "cancelled" | "incomplete") {
+                    return Err(EndReason::ProtocolError);
+                }
+                let mut completed_end_call = false;
                 if let Some(output) = response["output"].as_array() {
                     for item in output {
                         if item["type"] == "function_call" {
+                            let output_item_id = item_id(item, "id")?;
                             let call_id = item_id(item, "call_id")?;
+                            let arguments: Value = serde_json::from_str(string(item, "arguments")?)
+                                .map_err(|_| EndReason::ProtocolError)?;
+                            let binding = self
+                                .end_calls
+                                .get(&call_id)
+                                .ok_or(EndReason::ProtocolError)?;
                             if !self.allow_end_call
                                 || item["name"] != "end_call"
-                                || !self.end_call_ids.contains(&call_id)
+                                || binding.item_id != output_item_id
+                                || binding.response_id != response_id
+                                || !binding.arguments_done
+                                || arguments != json!({})
                             {
                                 return Err(EndReason::ProtocolError);
                             }
+                            completed_end_call |= status == "completed";
                             continue;
                         }
                         if item["type"] != "message" || item["role"] != "assistant" {
@@ -593,23 +630,62 @@ impl State {
                         }
                     }
                 }
+                self.end_calls
+                    .retain(|_, call| call.response_id != response_id);
+                self.ending |= completed_end_call;
                 if self.ending && self.marks.is_empty() {
                     Err(EndReason::AssistantEnded)
                 } else {
                     Ok(Vec::new())
                 }
             }
-            "response.function_call_arguments.done" => {
-                let arguments: Value = serde_json::from_str(string(&value, "arguments")?)
-                    .map_err(|_| EndReason::ProtocolError)?;
-                if !self.allow_end_call
-                    || string(&value, "name")? != "end_call"
-                    || arguments != json!({})
-                    || !self.end_call_ids.contains(string(&value, "call_id")?)
+            "response.function_call_arguments.delta" => {
+                let response_id = item_id(&value, "response_id")?;
+                let output_item_id = item_id(&value, "item_id")?;
+                let call_id = item_id(&value, "call_id")?;
+                let delta = string(&value, "delta")?;
+                let binding = self
+                    .end_calls
+                    .get_mut(&call_id)
+                    .ok_or(EndReason::ProtocolError)?;
+                if binding.response_id != response_id
+                    || binding.item_id != output_item_id
+                    || binding.arguments_done
                 {
                     return Err(EndReason::ProtocolError);
                 }
-                self.ending = true;
+                binding.argument_bytes = binding
+                    .argument_bytes
+                    .checked_add(delta.len())
+                    .ok_or(EndReason::ResourceLimit)?;
+                if binding.argument_bytes > 64 {
+                    return Err(EndReason::ResourceLimit);
+                }
+                Ok(Vec::new())
+            }
+            "response.function_call_arguments.done" => {
+                let response_id = item_id(&value, "response_id")?;
+                let output_item_id = item_id(&value, "item_id")?;
+                let call_id = item_id(&value, "call_id")?;
+                let raw_arguments = string(&value, "arguments")?;
+                if raw_arguments.len() > 64 {
+                    return Err(EndReason::ResourceLimit);
+                }
+                let arguments: Value =
+                    serde_json::from_str(raw_arguments).map_err(|_| EndReason::ProtocolError)?;
+                let binding = self
+                    .end_calls
+                    .get_mut(&call_id)
+                    .ok_or(EndReason::ProtocolError)?;
+                if !self.allow_end_call
+                    || string(&value, "name")? != "end_call"
+                    || arguments != json!({})
+                    || binding.response_id != response_id
+                    || binding.item_id != output_item_id
+                {
+                    return Err(EndReason::ProtocolError);
+                }
+                binding.arguments_done = true;
                 Ok(Vec::new())
             }
             name if name.contains("function_call") || name.contains("mcp") => {
@@ -1101,7 +1177,7 @@ mod tests {
             ..State::default()
         };
         outbound.start(&start_event(), &options()).unwrap();
-        outbound.model(ready).unwrap();
+        outbound.model(ready.clone()).unwrap();
         outbound
             .model(json!({"type":"response.created","response":{"id":"resp_end"}}))
             .unwrap();
@@ -1109,12 +1185,36 @@ mod tests {
             .model(json!({"type":"response.output_item.added","response_id":"resp_end","item":{"id":"item_end","type":"function_call","name":"end_call","call_id":"call_end"}}))
             .unwrap();
         outbound
+            .model(json!({"type":"response.function_call_arguments.delta","response_id":"resp_end","item_id":"item_end","call_id":"call_end","delta":"{}"}))
+            .unwrap();
+        outbound
             .model(json!({"type":"response.function_call_arguments.done","response_id":"resp_end","item_id":"item_end","name":"end_call","call_id":"call_end","arguments":"{ }"}))
             .unwrap();
+        assert!(!outbound.ending);
         assert!(matches!(
             outbound.model(json!({"type":"response.done","response":{"id":"resp_end","status":"completed","output":[{"id":"item_end","type":"function_call","name":"end_call","call_id":"call_end","arguments":"{}"}]}})),
             Err(EndReason::AssistantEnded)
         ));
+
+        let mut cancelled = State {
+            allow_end_call: true,
+            ..State::default()
+        };
+        cancelled.start(&start_event(), &options()).unwrap();
+        cancelled.model(ready).unwrap();
+        cancelled
+            .model(json!({"type":"response.created","response":{"id":"resp_cancel"}}))
+            .unwrap();
+        cancelled
+            .model(json!({"type":"response.output_item.added","response_id":"resp_cancel","item":{"id":"item_cancel","type":"function_call","name":"end_call","call_id":"call_cancel"}}))
+            .unwrap();
+        cancelled
+            .model(json!({"type":"response.function_call_arguments.done","response_id":"resp_cancel","item_id":"item_cancel","name":"end_call","call_id":"call_cancel","arguments":"{}"}))
+            .unwrap();
+        cancelled
+            .model(json!({"type":"response.done","response":{"id":"resp_cancel","status":"cancelled","output":[{"id":"item_cancel","type":"function_call","name":"end_call","call_id":"call_cancel","arguments":"{}"}]}}))
+            .unwrap();
+        assert!(!cancelled.ending);
 
         let mut blocked = state();
         assert!(matches!(
