@@ -9628,6 +9628,14 @@ pub struct CodexCliConfig {
     /// Enable repair-only `codex_cli` recovery
     #[serde(default)]
     pub enabled: bool,
+    /// Absolute operator-controlled path to an executable regular file; unset or invalid paths fail closed after canonical validation, with no daemon `PATH` fallback.
+    ///
+    /// Before each recovery attempt, ZeroClaw canonicalizes this path and
+    /// verifies that it names an executable regular file. Recovery fails
+    /// closed when the value is absent or invalid; the daemon's `PATH` is not
+    /// used as a fallback.
+    #[serde(default)]
+    pub executable_path: Option<PathBuf>,
     /// Absolute operator-controlled ZeroClaw source path; unset or invalid paths fail closed after canonical validation, with no application workspace fallback.
     ///
     /// Before each use, ZeroClaw canonicalizes this path and validates the
@@ -9958,6 +9966,7 @@ impl Default for CodexCliConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            executable_path: None,
             recovery_source_workspace: None,
             timeout_secs: default_codex_cli_timeout_secs(),
             max_output_bytes: default_codex_cli_max_output_bytes(),
@@ -42258,6 +42267,22 @@ group_policy = "ignore"
         assert_eq!(
             configured.recovery_source_workspace,
             Some(PathBuf::from("/srv/zeroclaw/source"))
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_executable_path_is_optional_and_deserializes_from_operator_config() {
+        let default_config: CodexCliConfig = toml::from_str("").expect("default Codex config");
+        assert!(default_config.executable_path.is_none());
+
+        let configured: CodexCliConfig = toml::from_str(
+            r#"executable_path = "/opt/codex/bin/codex"
+"#,
+        )
+        .expect("configured Codex executable path");
+        assert_eq!(
+            configured.executable_path,
+            Some(PathBuf::from("/opt/codex/bin/codex"))
         );
     }
 

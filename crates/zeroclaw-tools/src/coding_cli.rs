@@ -375,6 +375,9 @@ mod tests {
             Box::new(CodexCliTool::new_with_executor(
                 security.clone(),
                 CodexCliConfig {
+                    executable_path: Some(
+                        std::env::current_exe().expect("test executable path should be available"),
+                    ),
                     recovery_source_workspace: Some(workspace.path().to_path_buf()),
                     env_passthrough: passthrough.clone(),
                     ..CodexCliConfig::default()
@@ -418,15 +421,15 @@ mod tests {
                 .lock()
                 .expect("recorded command lock should not be poisoned"),
         );
+        assert_eq!(commands[0].program, OsString::from("claude"));
         assert_eq!(
-            commands
-                .iter()
-                .map(|command| command.program.clone())
-                .collect::<Vec<_>>(),
-            ["claude", "codex", "gemini", "opencode"]
-                .map(OsString::from)
-                .to_vec()
+            commands[1].program,
+            std::fs::canonicalize(std::env::current_exe().expect("test executable path"))
+                .expect("canonical test executable path")
+                .into_os_string()
         );
+        assert_eq!(commands[2].program, OsString::from("gemini"));
+        assert_eq!(commands[3].program, OsString::from("opencode"));
 
         // Compare names only so assertion failures cannot expose host paths.
         let mut expected_env_keys = SAFE_ENV_VARS

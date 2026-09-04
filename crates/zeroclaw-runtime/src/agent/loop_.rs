@@ -5597,6 +5597,9 @@ mod tests {
             Box::new(zeroclaw_tools::codex_cli::CodexCliTool::new_with_executor(
                 security,
                 zeroclaw_config::schema::CodexCliConfig {
+                    executable_path: Some(
+                        std::env::current_exe().expect("test executable path should be available"),
+                    ),
                     recovery_source_workspace: Some(workspace.path().to_path_buf()),
                     ..zeroclaw_config::schema::CodexCliConfig::default()
                 },
