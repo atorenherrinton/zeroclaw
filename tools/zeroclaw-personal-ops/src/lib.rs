@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+pub mod contacts;
 pub mod install;
 pub mod messages;
 
@@ -597,10 +598,16 @@ pub fn schema() -> Value {
         .expect("literal tool array")
         .extend(messages::schema());
     tools
+        .as_array_mut()
+        .expect("literal tool array")
+        .extend(contacts::schema());
+    tools
 }
 
 pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "contacts_search" => contacts::lookup(args, false).await,
+        "contacts_get" => contacts::lookup(args, true).await,
         "voicemail_list" => ops.list_calls(args),
         "voicemail_prepare" => ops.prepare_calls(args),
         "text_prepare" => ops.prepare_text(args),

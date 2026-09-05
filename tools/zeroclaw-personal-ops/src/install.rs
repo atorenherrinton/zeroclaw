@@ -114,6 +114,8 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                     "personal_ops__voicemail_list",
                     "personal_ops__voicemail_prepare",
                     "personal_ops__delivery_status",
+                    "personal_ops__contacts_search",
+                    "personal_ops__contacts_get",
                 ],
                 vec!["google_read", "google_write", "personal_ops"],
                 "openai.terra",
@@ -564,7 +566,14 @@ pub fn install(root: &Path, github: &Path) -> Result<()> {
         "phone MCP configuration changed"
     );
     let next = main_path.with_extension("md.next");
-    private_write(&next, format!("{original}\n{ROUTING}\n").as_bytes())?;
+    private_write(
+        &next,
+        format!(
+            "{original}\n{ROUTING}\n{}\n",
+            include_str!("../templates/contacts.md")
+        )
+        .as_bytes(),
+    )?;
     fs::rename(next, &main_path)?;
     println!(
         "Installed four bounded specialists. Backup: {}. Restart the main daemon to load them; do not restart the phone service.",
