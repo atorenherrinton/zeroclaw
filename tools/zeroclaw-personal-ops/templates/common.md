@@ -17,4 +17,3 @@ The owner's explicit request authorizes the specified action without asking for
 the same permission again. Ask only for missing information that materially
 changes it. Drafting never means sending. Uncertain external writes may have
 succeeded; preserve receipts and do not retry blindly. Use concise language.
-

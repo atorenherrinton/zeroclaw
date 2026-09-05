@@ -20,4 +20,3 @@ dry-run or fake transports. Never send test messages, place test calls, or alter
 live phone binaries/configuration. Main coordinates an explicitly requested live
 installation only after validation. Do not install your own work or grant it
 permissions. Never use runtime recovery as a general coding tool.
-
