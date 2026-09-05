@@ -126,6 +126,8 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                     "google_read__gmail_get_thread",
                     "google_write__calendar_create_event",
                     "reminders__list",
+                    "reminders__list_lists",
+                    "reminders__create_list",
                     "reminders__search",
                     "reminders__add",
                     "reminders__edit",
