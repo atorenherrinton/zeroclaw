@@ -99,6 +99,57 @@ Run `tools` to inspect the JSON tool schemas, or `mcp CONFIG_DIR` for stdio MCP.
 | voicemail_prepare | Prepare transcripts or consented archived audio from that source |
 | delivery_execute | Attempt up to four new items in an authorized prepared plan |
 | delivery_status | Read per-item prepared, submitted or uncertain state |
+| imessage_draft | Save text, exact recipients and an optional future time for Telegram review |
+| imessage_approve | Require native owner approval, then send now or approve the saved schedule |
+| imessage_list | Review drafts, schedules and outcomes |
+| imessage_cancel | Cancel before dispatch claims the message |
+
+## Reviewed iMessages and scheduled sending
+
+For an existing personal-agent installation, build the current helper and run:
+
+```sh
+tools/zeroclaw-personal-ops/target/release/zeroclaw-personal-ops enable-messages "$HOME/.zeroclaw"
+zeroclaw service restart
+```
+
+This operator upgrade validates a candidate, backs up the config, helper and
+affected instructions, upgrades the helper, and adds a native cron dispatcher.
+It requires main to use the supervised default risk profile. It adds
+`imessage_approve` and the legacy `delivery_execute` to `always_ask`; neither
+can auto-approve. Specialists can prepare or inspect drafts but cannot approve.
+Use the Telegram **Approve** button after reviewing the exact recipients,
+complete text and send time. A timed-out or denied approval sends nothing.
+The native runtime gate is the human approval boundary; the content hash is an
+integrity binding, not an authentication token. Local operators with database
+or executable access remain trusted.
+
+Drafts appear in Telegram, not in the Messages app. Each listed recipient gets
+an individual iMessage, not a newly created group chat. Edits require cancelling
+the old draft/schedule and preparing a fresh one for approval. Omit `send_at` to
+send immediately after approval; otherwise use RFC3339 with an explicit UTC
+offset, at most 90 days ahead. Unapproved drafts can be approved for seven days.
+
+The existing operations ledger owns immutable text, recipients, review hashes,
+approval state and due times. Native cron owns only the once-per-minute wakeup.
+Its dedicated worker has no inbound channels, delegates, MCP servers or model
+turns; its sole allowed command is the fixed helper. The worker cannot approve
+drafts or generate content. It does not create a cron job for every message.
+
+The Mac and ZeroClaw must be running. Due messages normally dispatch within
+about a minute. If more than 15 minutes late, a message expires without sending.
+Cancellation wins only before the worker's atomic claim. The worker commits an
+uncertain state before an external attempt; interrupted or ambiguous sends are
+not replayed after a retry or restart. Existing content/recipient fingerprint
+deduplication also applies to new schedules: identical previously attempted
+content is not resent. Inspect `imessage_list` for outcomes and partial failure.
+`submitted` means Messages accepted the command, not a delivery/read receipt.
+
+The upgrade preserves existing schedules, phone service, credentials and channel
+settings. Roll back the upgrade's config, instructions and binary from the
+private `backups/imessage-review-<id>/` directory, preserving newer changes,
+then restart only the main daemon. Cancel pending schedules before rollback;
+keep the operations ledger so uncertain sends cannot be replayed on re-enable.
 
 Messages and files use iMessage only, without SMS fallback. An email-shaped
 recipient is an iMessage handle, not email delivery. Gmail remains draft-only.

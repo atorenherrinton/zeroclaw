@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     let mode = args.get(1).map(String::as_str).unwrap_or("help");
     if mode == "help" {
         println!(
-            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | tools"
+            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | enable-messages CONFIG_DIR | dispatch-messages CONFIG_DIR | tools"
         );
         return Ok(());
     }
@@ -19,6 +19,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let root = Path::new(args.get(2).context("CONFIG_DIR required")?);
+    if mode == "dispatch-messages" {
+        println!("{}", Ops::open(root)?.dispatch_due().await?);
+        return Ok(());
+    }
+    if mode == "enable-messages" {
+        return zeroclaw_personal_ops::install::enable_messages(root);
+    }
     if mode == "repair-routing" {
         return zeroclaw_personal_ops::install::repair_routing(root);
     }

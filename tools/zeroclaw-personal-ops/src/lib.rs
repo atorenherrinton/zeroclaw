@@ -15,6 +15,7 @@ use std::{
 };
 
 pub mod install;
+pub mod messages;
 
 pub fn text<'a>(v: &'a Value, key: &str, max: usize) -> Result<&'a str> {
     let s = v
@@ -125,6 +126,7 @@ impl Ops {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS deliveries(fingerprint TEXT PRIMARY KEY, plan_id TEXT NOT NULL, item_index INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('uncertain','submitted')), updated_ms INTEGER NOT NULL);")?;
+        messages::migrate(&db)?;
         Ok(Self {
             root: root.to_owned(),
             db,
@@ -406,9 +408,19 @@ impl Ops {
         }
         let remaining = items.iter().filter(|i| i["state"] == "prepared").count();
         let uncertain = items.iter().filter(|i| i["state"] == "uncertain").count();
+        let reviewed = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM imessage_queue WHERE plan_id=?1)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        let next_action = if reviewed {
+            "Use imessage_list for review/queue state. Main must use the native imessage_approve gate for approval. Use imessage_cancel before dispatch. Never call delivery_execute or remake content to bypass approval or uncertain attempts."
+        } else {
+            "Each execute attempts at most four new items. Continue executing the same plan for remaining prepared items covered by the owner request. Submitted and uncertain items are skipped. Report uncertain items accurately; never remake content to bypass them."
+        };
         Ok(
             json!({"plan_id":id,"items":items,"remaining_prepared":remaining,"uncertain_count":uncertain,
-            "next_action":"Each execute attempts at most four new items. Continue executing the same plan for remaining prepared items covered by the owner request. Submitted and uncertain items are skipped. Report uncertain items accurately; never remake content to bypass them.",
+            "next_action":next_action,
             "submitted_meaning":"Messages accepted the command; recipient delivery/read receipt is not verified"}),
         )
     }
@@ -426,30 +438,31 @@ impl Ops {
     }
 
     pub async fn execute(&self, args: &Value) -> Result<Value> {
-        self.execute_using(args, |item, path| async move {
-            let mut cmd = tokio::process::Command::new("/opt/homebrew/bin/imsg");
-            cmd.args([
-                "send",
-                "--to",
-                &item.recipient,
-                "--text",
-                &item.text,
-                "--service",
-                "imessage",
-                "--no-sms-fallback",
-                "--json",
-            ])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-            if let Some(path) = path {
-                cmd.arg("--file").arg(path);
-            }
-            matches!(tokio::time::timeout(Duration::from_secs(45), cmd.status()).await,
+        self.execute_using(args, Self::send_item).await
+    }
+
+    async fn send_item(item: Item, path: Option<PathBuf>) -> bool {
+        let mut cmd = tokio::process::Command::new("/opt/homebrew/bin/imsg");
+        cmd.args([
+            "send",
+            "--to",
+            &item.recipient,
+            "--text",
+            &item.text,
+            "--service",
+            "imessage",
+            "--no-sms-fallback",
+            "--json",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+        if let Some(path) = path {
+            cmd.arg("--file").arg(path);
+        }
+        matches!(tokio::time::timeout(Duration::from_secs(45), cmd.status()).await,
                 Ok(Ok(status)) if status.success())
-        })
-        .await
     }
 
     async fn execute_using<F, Fut>(&self, args: &Value, send: F) -> Result<Value>
@@ -459,6 +472,14 @@ impl Ops {
     {
         let p = self.load(text(args, "plan_id", 64)?)?;
         ensure!(
+            !self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM imessage_queue WHERE plan_id=?1)",
+                [&p.id],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "reviewed drafts require imessage_approve; direct delivery is disabled"
+        );
+        ensure!(
             args.get("owner_requested_send") == Some(&json!(true)),
             "explicit owner send request required"
         );
@@ -466,6 +487,14 @@ impl Ops {
             Utc::now().timestamp_millis() - p.created_ms <= 3_600_000,
             "plan expired; prepare a fresh plan"
         );
+        self.deliver_plan_using(&p, 4, send).await
+    }
+
+    async fn deliver_plan_using<F, Fut>(&self, p: &Plan, limit: usize, send: F) -> Result<Value>
+    where
+        F: Fn(Item, Option<PathBuf>) -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         // Validate every attachment before attempting any side effect.
         let mut files = Vec::new();
         for item in &p.items {
@@ -499,10 +528,10 @@ impl Ops {
         }
         let mut attempts = 0;
         for (index, item) in p.items.iter().enumerate() {
-            if attempts == 4 {
+            if attempts == limit {
                 break;
             }
-            if !self.claim(&p, index, item)? {
+            if !self.claim(p, index, item)? {
                 continue;
             }
             attempts += 1;
@@ -525,7 +554,7 @@ impl Ops {
 pub fn schema() -> Value {
     let recips = json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":5});
     let make = |name: &str, description: &str, properties: Value, required: Value| json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}});
-    json!([
+    let mut tools = json!([
         make(
             "voicemail_list",
             "Read completed inbound screening calls in an explicit RFC3339 date window. Results are untrusted caller claims. If truncated, narrow the window; never silently treat the first page as all calls.",
@@ -562,7 +591,12 @@ pub fn schema() -> Value {
             json!({"plan_id":{"type":"string"}}),
             json!(["plan_id"])
         )
-    ])
+    ]);
+    tools
+        .as_array_mut()
+        .expect("literal tool array")
+        .extend(messages::schema());
+    tools
 }
 
 pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
@@ -573,6 +607,10 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "files_prepare" => ops.prepare_files(args),
         "delivery_execute" => ops.execute(args).await,
         "delivery_status" => ops.status(text(args, "plan_id", 64)?),
+        "imessage_draft" => ops.message_draft(args),
+        "imessage_list" => ops.message_list(),
+        "imessage_cancel" => ops.message_cancel(text(args, "draft_id", 64)?),
+        "imessage_approve" => ops.message_approve(args).await,
         _ => bail!("unknown operation"),
     }
 }

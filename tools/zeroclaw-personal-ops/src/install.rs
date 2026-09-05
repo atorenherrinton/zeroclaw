@@ -40,7 +40,9 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
     let mut auto = default["auto_approve"].clone();
     push_unique(&mut auto, json!("delegate"))?;
     for name in &helper_tools {
-        push_unique(&mut auto, json!(name))?;
+        if name != "personal_ops__imessage_approve" {
+            push_unique(&mut auto, json!(name))?;
+        }
     }
     add("/risk_profiles/default/auto_approve".into(), auto);
     add(
@@ -284,6 +286,163 @@ pub fn candidate(config: &Value, root: &Path, github: &Path) -> Result<Value> {
     Ok(result)
 }
 
+/// Add one native cron wakeup and a worker with no inbound channel or delegate
+/// route. Per-message due times and approvals remain solely in the outbox.
+pub fn message_config(config: &Value, root: &Path) -> Result<Value> {
+    let mut next = config.clone();
+    let gate = "personal_ops__imessage_approve";
+    let profile = &mut next["risk_profiles"]["default"];
+    ensure!(
+        profile["level"] == "supervised",
+        "Telegram message approval requires supervised main risk profile"
+    );
+    ensure!(
+        next["agents"]["main"]["risk_profile"] == "default",
+        "main must use default risk profile"
+    );
+    let profile = &mut next["risk_profiles"]["default"];
+    profile["auto_approve"]
+        .as_array_mut()
+        .context("auto_approve")?
+        .retain(|v| v != gate && v != "personal_ops__delivery_execute");
+    if !profile["always_ask"].is_array() {
+        profile["always_ask"] = json!([]);
+    }
+    push_unique(&mut profile["always_ask"], json!(gate))?;
+    push_unique(
+        &mut profile["always_ask"],
+        json!("personal_ops__delivery_execute"),
+    )?;
+    for name in ["imessage_draft", "imessage_list", "imessage_cancel"] {
+        push_unique(
+            &mut profile["auto_approve"],
+            json!(format!("personal_ops__{name}")),
+        )?;
+    }
+    for alias in ["communications", "task_scheduler"] {
+        let risk = &mut next["risk_profiles"][alias];
+        for field in ["allowed_tools", "auto_approve"] {
+            for name in if alias == "communications" {
+                vec!["imessage_draft", "imessage_list"]
+            } else {
+                vec!["imessage_list", "imessage_cancel"]
+            } {
+                push_unique(&mut risk[field], json!(format!("personal_ops__{name}")))?;
+            }
+        }
+        push_unique(
+            &mut next["agents"][alias]["mcp_bundles"],
+            json!("personal_ops"),
+        )?;
+    }
+    let worker = "imessage_delivery";
+    if next["agents"].get(worker).is_some() {
+        ensure!(
+            next["cron"][worker]["name"] == "Approved iMessage dispatcher",
+            "worker name is already in use"
+        );
+    }
+    let binary = root.join("bin/zeroclaw-personal-ops");
+    let mut risk = next["risk_profiles"]["default"].clone();
+    risk["allowed_tools"] = json!(["shell"]);
+    risk["auto_approve"] = json!(["shell"]);
+    risk["always_ask"] = json!([]);
+    risk["excluded_tools"] = json!([]);
+    risk["allowed_commands"] = json!([binary]);
+    risk["allowed_roots"] = json!([root]);
+    risk["require_approval_for_medium_risk"] = json!(false);
+    risk["delegation_policy"] = json!({"mode":"forbidden"});
+    next["risk_profiles"][worker] = risk;
+    let mut runtime = next["runtime_profiles"]["default"].clone();
+    runtime["agentic"] = json!(false);
+    runtime["max_delegation_depth"] = json!(0);
+    // Sixty fixed wakeups per hour plus bounded retries; do not inherit a
+    // conversational profile's lower action cap and silently miss schedules.
+    runtime["max_actions_per_hour"] = json!(120);
+    next["runtime_profiles"][worker] = runtime;
+    next["agents"][worker] = json!({"enabled":true,"channels":[],"cron_jobs":[worker],"delegates":[],"model_provider":"openai.sol","risk_profile":worker,"runtime_profile":worker,"mcp_bundles":[],"skill_bundles":[],"knowledge_bundles":[],"memory":{"backend":"none"},"workspace":{"path":root.join("agents").join(worker).join("workspace"),"read_memory_from":[],"unrestricted_filesystem":false}});
+    let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
+    next["cron"][worker] = json!({"name":"Approved iMessage dispatcher","job_type":"shell","enabled":true,"schedule":{"kind":"every","every_ms":60000},"command":format!("{} dispatch-messages {}",quote(&binary),quote(root)),"allowed_tools":[],"uses_memory":false,"shell_output_format":"raw","delivery":{"mode":"none"}});
+    Ok(next)
+}
+
+pub fn enable_messages(root: &Path) -> Result<()> {
+    ensure!(root.is_absolute(), "absolute CONFIG_DIR required");
+    let raw = fs::read_to_string(root.join("config.toml"))?;
+    let config: Value = toml::from_str::<toml::Value>(&raw)?.try_into()?;
+    let next = message_config(&config, root)?;
+    let backup = root
+        .join("backups")
+        .join(format!("imessage-review-{}", uuid::Uuid::new_v4()));
+    private_dir(&backup)?;
+    private_write(&backup.join("config.toml"), raw.as_bytes())?;
+    let stage = backup.join("validation");
+    private_dir(&stage)?;
+    let rendered = toml::to_string_pretty(&next)?;
+    private_write(&stage.join("config.toml"), rendered.as_bytes())?;
+    if root.join(".secret_key").exists() {
+        private_write(
+            &stage.join(".secret_key"),
+            &fs::read(root.join(".secret_key"))?,
+        )?;
+    }
+    let check = backup.join("validate.json");
+    private_write(
+        &check,
+        b"[{\"op\":\"replace\",\"path\":\"/cron/imessage_delivery/enabled\",\"value\":true}]",
+    )?;
+    let home = std::env::var("HOME")?;
+    let result = Command::new(Path::new(&home).join(".cargo/bin/zeroclaw"))
+        .arg("--config-dir")
+        .arg(&stage)
+        .args(["config", "patch"])
+        .arg(check)
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "candidate validation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // All policy and tool changes are validated before live mutation.
+    ensure!(
+        fs::read_to_string(root.join("config.toml"))? == raw,
+        "live config changed during validation"
+    );
+    let binary = root.join("bin/zeroclaw-personal-ops");
+    private_write(&backup.join("zeroclaw-personal-ops"), &fs::read(&binary)?)?;
+    fs::set_permissions(
+        backup.join("zeroclaw-personal-ops"),
+        fs::Permissions::from_mode(0o700),
+    )?;
+    let pending_binary = binary.with_extension("messages-next");
+    private_write(&pending_binary, &fs::read(std::env::current_exe()?)?)?;
+    fs::set_permissions(&pending_binary, fs::Permissions::from_mode(0o700))?;
+    fs::rename(pending_binary, binary)?;
+    let pending = root.join("config.toml.messages-next");
+    private_write(&pending, rendered.as_bytes())?;
+    fs::rename(pending, root.join("config.toml"))?;
+    private_dir(&root.join("agents/imessage_delivery/workspace"))?;
+    for alias in ["main", "communications", "task_scheduler"] {
+        let path = root.join("agents").join(alias).join("workspace/AGENTS.md");
+        let original = fs::read_to_string(&path)?;
+        private_write(
+            &backup.join(format!("{alias}-AGENTS.md")),
+            original.as_bytes(),
+        )?;
+        let section = include_str!("../templates/imessage-review.md");
+        if !original.contains("## Reviewed iMessage drafts and schedules") {
+            let pending = path.with_extension("messages-next");
+            private_write(&pending, format!("{original}\n{section}").as_bytes())?;
+            fs::rename(pending, path)?;
+        }
+    }
+    println!(
+        "Enabled Telegram-reviewed iMessage drafts and native dispatch wakeup. Backup: {}. Restart only the main daemon.",
+        backup.display()
+    );
+    Ok(())
+}
+
 pub fn install(root: &Path, github: &Path) -> Result<()> {
     ensure!(
         root.is_absolute() && github.is_absolute(),
@@ -471,5 +630,36 @@ mod tests {
     #[test]
     fn native_routing_rejects_unverified_provider_family() {
         assert!(native_routing_patch(&json!({})).is_err());
+    }
+
+    #[test]
+    fn reviewed_message_install_preserves_services_and_requires_human_gate() -> Result<()> {
+        let c = json!({"agents":{"main":{"risk_profile":"default"},"communications":{"mcp_bundles":[]},"task_scheduler":{"mcp_bundles":[]}},"risk_profiles":{"default":{"level":"supervised","auto_approve":["personal_ops__delivery_execute"],"always_ask":[]},"communications":{"allowed_tools":[],"auto_approve":[]},"task_scheduler":{"allowed_tools":[],"auto_approve":[]}},"runtime_profiles":{"default":{}},"cron":{"existing":{"enabled":true}},"channels":{"fixture":true},"mcp":{"servers":[{"name":"phone_calls"}]}});
+        let n = message_config(&c, Path::new("/example/root"))?;
+        assert_eq!(n["channels"], c["channels"]);
+        assert_eq!(n["mcp"], c["mcp"]);
+        assert_eq!(n["cron"]["existing"], c["cron"]["existing"]);
+        let gate = json!("personal_ops__imessage_approve");
+        assert!(
+            n["risk_profiles"]["default"]["always_ask"]
+                .as_array()
+                .context("gates")?
+                .contains(&gate)
+        );
+        for alias in ["communications", "task_scheduler", "imessage_delivery"] {
+            assert!(
+                !n["risk_profiles"][alias]["allowed_tools"]
+                    .as_array()
+                    .context("tools")?
+                    .contains(&gate)
+            );
+        }
+        assert_eq!(n["agents"]["imessage_delivery"]["channels"], json!([]));
+        assert_eq!(n["cron"]["imessage_delivery"]["job_type"], "shell");
+        assert_eq!(message_config(&n, Path::new("/example/root"))?, n);
+        let mut unsafe_config = c;
+        unsafe_config["risk_profiles"]["default"]["level"] = json!("full");
+        assert!(message_config(&unsafe_config, Path::new("/example/root")).is_err());
+        Ok(())
     }
 }
