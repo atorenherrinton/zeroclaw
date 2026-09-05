@@ -9,7 +9,9 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).map(String::as_str).unwrap_or("help");
     if mode == "help" {
-        println!("zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | tools");
+        println!(
+            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | tools"
+        );
         return Ok(());
     }
     if mode == "tools" {
@@ -17,6 +19,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let root = Path::new(args.get(2).context("CONFIG_DIR required")?);
+    if mode == "repair-routing" {
+        return zeroclaw_personal_ops::install::repair_routing(root);
+    }
     if mode == "plan" || mode == "candidate" {
         let config: Value =
             toml::from_str::<toml::Value>(&std::fs::read_to_string(root.join("config.toml"))?)?

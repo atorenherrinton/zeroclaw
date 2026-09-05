@@ -191,7 +191,67 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
             json!({"enabled":true,"channels":[],"cron_jobs":[],"delegate_same_risk_profile":false,"delegates":[],"model_provider":provider,"risk_profile":alias,"runtime_profile":alias,"mcp_bundles":bundles,"skill_bundles":[],"knowledge_bundles":[],"memory":{"backend":"sqlite"},"workspace":{"path":root.join("agents").join(alias).join("workspace"),"read_memory_from":[],"unrestricted_filesystem":false}}),
         );
     }
+    ops.extend(
+        native_routing_patch(config)?
+            .as_array()
+            .context("routing patch")?
+            .clone(),
+    );
     Ok(json!(ops))
+}
+
+/// The resilient provider advertises native tools only when every fallback
+/// supports them. Gemini currently uses text tools, so including it disables
+/// native tool definitions even on successful primary OpenAI requests.
+pub fn native_routing_patch(config: &Value) -> Result<Value> {
+    for alias in ["sol", "terra"] {
+        let provider = &config["providers"]["models"]["openai"][alias];
+        ensure!(
+            provider.is_object() && provider["requires_openai_auth"] == true,
+            "native OpenAI authentication required for {alias}"
+        );
+    }
+    Ok(json!([
+        {"op":"add","path":"/providers/models/openai/sol/fallback","value":["openai.terra"]},
+        {"op":"add","path":"/providers/models/openai/terra/fallback","value":[]}
+    ]))
+}
+
+/// Operator-only upgrade: validated native patch, private rollback copy, no
+/// agent instructions, tool policy, channel configuration, or phone changes.
+pub fn repair_routing(root: &Path) -> Result<()> {
+    ensure!(root.is_absolute(), "absolute CONFIG_DIR required");
+    let raw = fs::read_to_string(root.join("config.toml"))?;
+    let config: Value = toml::from_str::<toml::Value>(&raw)?.try_into()?;
+    let patch = native_routing_patch(&config)?;
+    let backup = root
+        .join("backups")
+        .join(format!("native-tool-routing-{}", uuid::Uuid::new_v4()));
+    private_dir(&backup)?;
+    private_write(&backup.join("config.toml"), raw.as_bytes())?;
+    let path = backup.join("routing-patch.json");
+    private_write(&path, &serde_json::to_vec_pretty(&patch)?)?;
+    ensure!(
+        fs::read_to_string(root.join("config.toml"))? == raw,
+        "live config changed during preparation"
+    );
+    let cli_home = std::env::var("HOME").context("HOME missing")?;
+    let result = Command::new(Path::new(&cli_home).join(".cargo/bin/zeroclaw"))
+        .arg("--config-dir")
+        .arg(root)
+        .args(["config", "patch"])
+        .arg(path)
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "native routing patch failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    println!(
+        "Native tool routing enabled: Sol falls back to Terra; Terra has no cross-provider fallback. Backup: {}. Restart the main daemon to refresh its channel prompt; leave the phone service running.",
+        backup.display()
+    );
+    Ok(())
 }
 
 pub fn candidate(config: &Value, root: &Path, github: &Path) -> Result<Value> {
@@ -357,7 +417,7 @@ mod tests {
     use super::*;
     #[test]
     fn patch_does_not_target_phone_or_schedules() -> Result<()> {
-        let c = json!({"agents":{"main":{"mcp_bundles":["phone_calls"],"delegates":[]}},"risk_profiles":{"default":{"auto_approve":[]}},"runtime_profiles":{"default":{}},"providers":{"models":{"openai":{"sol":{"model":"existing"}}}},"mcp":{"servers":[{"name":"phone_calls"}]}});
+        let c = json!({"agents":{"main":{"mcp_bundles":["phone_calls"],"delegates":[]}},"risk_profiles":{"default":{"auto_approve":[]}},"runtime_profiles":{"default":{}},"providers":{"models":{"openai":{"sol":{"model":"existing","requires_openai_auth":true},"terra":{"model":"existing","requires_openai_auth":true}}}},"mcp":{"servers":[{"name":"phone_calls"}]}});
         let p = patch(
             &c,
             Path::new("/example/config"),
@@ -379,5 +439,37 @@ mod tests {
                     && op["value"]["model"] == "gpt-6-astra")
         );
         Ok(())
+    }
+
+    #[test]
+    fn native_routing_removes_mixed_protocol_and_cycles() -> Result<()> {
+        let c = json!({"providers":{"models":{"openai":{
+            "sol":{"requires_openai_auth":true,"fallback":["gemini.flash"]},
+            "terra":{"requires_openai_auth":true,"fallback":["gemini.flash","openai.sol"]}
+        }}}});
+        let patch = native_routing_patch(&c)?;
+        let mut repaired = c;
+        for op in patch.as_array().context("patch")? {
+            let target = repaired
+                .pointer_mut(op["path"].as_str().context("path")?)
+                .context("target")?;
+            *target = op["value"].clone();
+        }
+        assert_eq!(
+            repaired["providers"]["models"]["openai"]["sol"]["fallback"],
+            json!(["openai.terra"])
+        );
+        assert_eq!(
+            repaired["providers"]["models"]["openai"]["terra"]["fallback"],
+            json!([])
+        );
+        assert_eq!(native_routing_patch(&repaired)?, patch);
+        assert_eq!(patch.as_array().context("patch")?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn native_routing_rejects_unverified_provider_family() {
+        assert!(native_routing_patch(&json!({})).is_err());
     }
 }

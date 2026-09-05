@@ -56,6 +56,37 @@ candidate configuration, which may include secrets. Treat both as private
 operator artifacts; never commit their output. The live configuration remains
 the source of truth. Templates apply only at initial installation.
 
+## Native tool routing repair
+
+The installer configures `openai.sol` to fall back to `openai.terra`, with no
+further fallback from Terra. Both must use native OpenAI authentication. This
+also affects other agents using these shared profiles. Astra remains pinned.
+
+ZeroClaw resolves native tool support across the entire fallback chain. A
+text-only fallback such as the current Gemini adapter suppresses native tool
+definitions even when the primary OpenAI request succeeds. In channel turns,
+this can produce an acknowledgement followed by a claim that tools did not
+execute. A successful CLI check alone does not establish channel health.
+
+For an existing installation, build the helper and run the operator-only repair:
+
+```sh
+tools/zeroclaw-personal-ops/target/release/zeroclaw-personal-ops repair-routing "$HOME/.zeroclaw"
+zeroclaw service restart
+```
+
+The repair saves a private `backups/native-tool-routing-<id>/config.toml` copy
+and applies two fallback leaves through ZeroClaw's validated atomic config
+patch command. It is repeatable and creates no reminders, schedules, drafts,
+or messages. Restart only the main daemon so its channel prompt is rebuilt.
+Keep the phone service running. Verify a read-only tool request through the
+actual messaging channel and confirm a tool-call receipt in the runtime trace.
+
+Rollback these two fallback leaves from the private backup and restart the main
+daemon. Preserve any newer config edits, authentication, phone data and delivery
+receipts. Removing the Gemini fallback trades cross-provider failover for
+native tool availability; if both OpenAI profiles fail, report the failure.
+
 ## Named operations
 
 Run `tools` to inspect the JSON tool schemas, or `mcp CONFIG_DIR` for stdio MCP.
