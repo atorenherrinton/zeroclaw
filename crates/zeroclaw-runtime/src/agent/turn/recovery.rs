@@ -86,7 +86,9 @@ impl RecoveryTrigger {
 
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryTracker {
-    last_failure: Option<(String, u64)>,
+    // The turn iteration is the source of retry boundaries: parallel failures
+    // in one tool round are one observation, not independent retries.
+    last_failure: Option<(String, u64, usize)>,
     consecutive_failures: usize,
 }
 
@@ -120,16 +122,17 @@ impl RecoveryTracker {
                 let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
                 let fingerprint = failure_fingerprint(reason);
                 let tool = sanitize_identifier(tool);
-                if self
-                    .last_failure
-                    .as_ref()
-                    .is_some_and(|last| last == &(tool.clone(), fingerprint))
+                if let Some((last_tool, last_fingerprint, last_iteration)) = &self.last_failure
+                    && last_tool == &tool
+                    && *last_fingerprint == fingerprint
                 {
-                    self.consecutive_failures += 1;
+                    if *last_iteration != iteration {
+                        self.consecutive_failures += 1;
+                    }
                 } else {
-                    self.last_failure = Some((tool.clone(), fingerprint));
                     self.consecutive_failures = 1;
                 }
+                self.last_failure = Some((tool.clone(), fingerprint, iteration));
                 (self.consecutive_failures >= REPEATED_FAILURE_THRESHOLD).then_some(
                     RecoveryTrigger {
                         kind: RecoveryTriggerKind::RepeatedToolFailure,
@@ -479,6 +482,48 @@ mod tests {
                 .observe("shell", &outcome(true, None, "ok"), 2)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn batched_failures_count_once_per_retry_round() {
+        let mut tracker = RecoveryTracker::default();
+        let failed = outcome(
+            false,
+            Some(ToolFailureKind::Ordinary),
+            "HTTP 502 Bad Gateway",
+        );
+        for iteration in 0..2 {
+            for _ in 0..4 {
+                assert!(tracker.observe("web_fetch", &failed, iteration).is_none());
+            }
+        }
+        let trigger = tracker.observe("web_fetch", &failed, 2).unwrap();
+        assert_eq!(trigger.kind, RecoveryTriggerKind::RepeatedToolFailure);
+        assert_eq!(trigger.occurrences, 3);
+        assert_eq!(trigger.iteration, 3);
+
+        tracker.reset();
+        for _ in 0..4 {
+            assert!(tracker.observe("web_fetch", &failed, 3).is_none());
+        }
+    }
+
+    #[test]
+    fn successful_tool_clears_failed_retry_rounds() {
+        let mut tracker = RecoveryTracker::default();
+        let failed = outcome(false, Some(ToolFailureKind::Ordinary), "HTTP 404");
+        assert!(tracker.observe("http_request", &failed, 0).is_none());
+        assert!(tracker.observe("http_request", &failed, 1).is_none());
+        assert!(
+            tracker
+                .observe("shell", &outcome(true, None, "ok"), 2)
+                .is_none()
+        );
+        for _ in 0..4 {
+            assert!(tracker.observe("http_request", &failed, 3).is_none());
+        }
+        assert!(tracker.observe("http_request", &failed, 4).is_none());
+        assert!(tracker.observe("http_request", &failed, 5).is_some());
     }
 
     #[test]

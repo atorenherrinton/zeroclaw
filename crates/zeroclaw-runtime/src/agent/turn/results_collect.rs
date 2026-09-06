@@ -292,7 +292,15 @@ mod tests {
         // NOT abort the turn: a recoverable rate-limit/budget error is not a
         // "no progress" exploration loop. Regression for the circuit breaker
         // firing on `file_read` "called N times ... identical results".
-        assert!(run(8, RATE_LIMIT_ERR, false).is_ok());
+        let collected = run(8, RATE_LIMIT_ERR, false).expect("collect failed batch");
+        assert!(collected.recovery_trigger.is_none());
+        assert_eq!(collected.individual_results.len(), 8);
+        assert!(
+            collected
+                .individual_results
+                .iter()
+                .all(|(_, result)| result.contains(RATE_LIMIT_ERR))
+        );
     }
 
     #[test]

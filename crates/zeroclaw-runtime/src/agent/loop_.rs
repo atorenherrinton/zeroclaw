@@ -5557,11 +5557,16 @@ mod tests {
                 "<tool_call>\n{{\"name\":\"failing\",\"arguments\":{{\"attempt\":{value}}}}}\n</tool_call>"
             )
         };
-        let responses = [tool_call(1), tool_call(2), tool_call(3)];
+        // After a genuine repeated failure and one repair, a single batch
+        // of failed requests must still return to the model for a response.
+        // Counting calls instead of retry rounds would abort at this batch.
+        let retry_batch = (4..8).map(tool_call).collect::<Vec<_>>().join("\n");
+        let responses = [tool_call(1), tool_call(2), tool_call(3), retry_batch];
         let model_provider = ScriptedModelProvider::from_text_responses(vec![
             &responses[0],
             &responses[1],
             &responses[2],
+            &responses[3],
             "ZeroClaw resumed and finished the original task",
         ]);
 
@@ -5636,7 +5641,7 @@ mod tests {
                 model_switch_callback: None,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
                 strict_tool_parsing: false,
-                parallel_tools: false,
+                parallel_tools: true,
                 max_tool_result_chars: 0,
                 context_token_budget: 0,
                 receipt_generator: None,
