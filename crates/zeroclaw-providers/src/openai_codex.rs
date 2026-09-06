@@ -277,6 +277,24 @@ fn legacy_tool_output_message(content: &str) -> Value {
     )
 }
 
+fn function_call_output_content(output: &str) -> Value {
+    let (text, images) = multimodal::parse_image_markers(output);
+    if images.is_empty() {
+        return Value::String(output.to_string());
+    }
+
+    // Normalization owns image loading and limits. At the wire boundary,
+    // keep its data URIs out of text so image bytes are not tokenized as prose.
+    let mut content = Vec::with_capacity(images.len() + 1);
+    if !text.trim().is_empty() {
+        content.push(serde_json::json!({"type": "input_text", "text": text}));
+    }
+    for image in images {
+        content.push(serde_json::json!({"type": "input_image", "image_url": image}));
+    }
+    Value::Array(content)
+}
+
 fn response_item_type(item: &Value) -> Option<&str> {
     item.get("type").and_then(Value::as_str)
 }
@@ -459,7 +477,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                         input.push(serde_json::json!({
                             "type": "function_call_output",
                             "call_id": call_id,
-                            "output": output,
+                            "output": function_call_output_content(output),
                         }));
                     } else if !msg.content.trim().is_empty() {
                         input.push(legacy_tool_output_message(&msg.content));
@@ -2553,6 +2571,51 @@ data: [DONE]
         assert_eq!(input[0]["call_id"], "call_123");
         assert_eq!(input[0]["output"], "result");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn build_responses_input_normalized_tool_images_are_typed_content() {
+        let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+        let messages = vec![ChatMessage {
+            role: "tool".into(),
+            content: serde_json::json!({
+                "tool_call_id": "call_image",
+                "content": format!("Scan result\n[IMAGE:{image}]"),
+            })
+            .to_string(),
+        }];
+        let prepared = multimodal::prepare_messages_for_provider(
+            &messages,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .unwrap();
+        let (_, input) = build_responses_input(&prepared.messages);
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_image");
+        let content = input[0]["output"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[0]["text"].as_str().unwrap().trim(), "Scan result");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], image);
+    }
+
+    #[test]
+    fn function_call_output_content_preserves_image_only_and_multiple_images() {
+        let images = [
+            "data:image/png;base64,first",
+            "data:image/jpeg;base64,second",
+        ];
+        let output =
+            function_call_output_content(&format!("[IMAGE:{}]\n[IMAGE:{}]", images[0], images[1]));
+        let content = output.as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        for (part, image) in content.iter().zip(images) {
+            assert_eq!(part["type"], "input_image");
+            assert_eq!(part["image_url"], image);
+        }
     }
 
     #[test]
