@@ -3194,6 +3194,21 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
             }
 
+            if index == 0
+                && let Some(route) = zeroclaw_api::conversation::current().filter(|r| {
+                    r.channel == format!("telegram.{}", self.alias)
+                        && r.recipient.split(':').next() == Some(chat_id)
+                        && r.recipient
+                            .split_once(':')
+                            .map(|(_, thread)| thread)
+                            .or(r.thread.as_deref())
+                            == thread_id
+                })
+                && let Ok(message_id) = route.reply_to.parse::<i64>()
+            {
+                markdown_body["reply_parameters"] =
+                    serde_json::json!({"message_id":message_id,"allow_sending_without_reply":true});
+            }
             let markdown_resp = self
                 .http_client()
                 .post(self.api_url("sendMessage"))
@@ -3218,6 +3233,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 "Telegram sendMessage with Markdown failed; retrying without parse_mode"
             );
 
+            // Only a definitive invalid request may be reformatted. A 429/5xx
+            // or lost response must not trigger a second potentially accepted send.
+            anyhow::ensure!(
+                markdown_status == reqwest::StatusCode::BAD_REQUEST,
+                "Telegram send outcome uncertain; do not replay"
+            );
             let mut plain_body = serde_json::json!({
                 "chat_id": chat_id,
                 "text": text,
@@ -3226,6 +3247,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // Add message_thread_id for forum topic support
             if let Some(tid) = thread_id {
                 plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
+            }
+            if let Some(reply) = markdown_body.get("reply_parameters") {
+                plain_body["reply_parameters"] = reply.clone();
             }
             let plain_resp = self
                 .http_client()
@@ -4056,7 +4080,50 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // ── Handle callback_query (inline keyboard taps) ──
         if let Some(cb) = update.get("callback_query") {
-            self.handle_approval_callback(cb).await;
+            if let Some(data) = cb
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|d| d.strip_prefix("choice:"))
+            {
+                if let Some((id, answer)) = data.split_once(':') {
+                    let mut source = cb["message"].clone();
+                    source["from"] = cb["from"].clone();
+                    let (_, _, sender) = Self::extract_sender_info(&source);
+                    if let Some(chat) = source["chat"]["id"].as_i64() {
+                        let thread = Self::topic_thread_id(&source);
+                        let recipient = thread
+                            .as_ref()
+                            .map_or_else(|| chat.to_string(), |t| format!("{chat}:{t}"));
+                        let route = zeroclaw_api::conversation::ConversationRoute {
+                            channel: format!("telegram.{}", self.alias),
+                            recipient,
+                            sender,
+                            thread,
+                            reply_to: String::new(),
+                        };
+                        let (identities, _) = Self::approval_callback_context(cb);
+                        if self.is_any_user_allowed(identities.iter().map(String::as_str))
+                            && let Ok(id) = id.parse::<u64>()
+                        {
+                            zeroclaw_api::conversation::deliver_route(
+                                &route,
+                                Some(id),
+                                answer.to_owned(),
+                            );
+                        }
+                    }
+                }
+                // Dismiss only this callback's spinner. Reply authorization is
+                // bound to the pending route, independent of callback content.
+                let _ = self
+                    .client
+                    .post(self.api_url("answerCallbackQuery"))
+                    .json(&serde_json::json!({"callback_query_id":cb["id"]}))
+                    .send()
+                    .await;
+            } else {
+                self.handle_approval_callback(cb).await;
+            }
 
             // A callback_query is terminal for inbound processing: there is
             // no message to deliver downstream, so nothing can be lost by
@@ -4971,6 +5038,61 @@ Ensure only one `zeroclaw` process is using this bot token."
             .request_approval_attributed(recipient, request)
             .await?
             .map(|attributed| attributed.response))
+    }
+
+    async fn request_choice(
+        &self,
+        question: &str,
+        choices: &[String],
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<String>> {
+        let route = zeroclaw_api::conversation::current()
+            .ok_or_else(|| anyhow::Error::msg("No active conversation for Telegram question"))?;
+        anyhow::ensure!(
+            route.channel == format!("telegram.{}", self.alias),
+            "Question route targets a different Telegram instance"
+        );
+        anyhow::ensure!(
+            !choices.is_empty() && choices.len() <= 10,
+            "Choose one to ten options"
+        );
+        let mut pending = zeroclaw_api::conversation::Question::register(&route)?;
+        let (chat, thread) = Self::parse_reply_target(&route.recipient);
+        let keyboard: Vec<_> = choices.iter().enumerate().map(|(i, label)| serde_json::json!([{"text":label,"callback_data":format!("choice:{}:{}",pending.id,i+1)}])).collect();
+        let mut body = serde_json::json!({"chat_id":chat,"text":question,"reply_markup":{"inline_keyboard":keyboard}});
+        if let Some(thread) = thread {
+            body["message_thread_id"] = serde_json::json!(thread);
+        }
+        if let Ok(id) = route.reply_to.parse::<i64>() {
+            body["reply_parameters"] =
+                serde_json::json!({"message_id":id,"allow_sending_without_reply":true});
+        }
+        let response: serde_json::Value = self
+            .client
+            .post(self.api_url("sendMessage"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        anyhow::ensure!(response["ok"] == true, "Telegram question was not accepted");
+        let answer = tokio::time::timeout(timeout, pending.answer()).await;
+        // Remove stale buttons after completion/timeout; never resend the prompt.
+        let _ = self.client.post(self.api_url("editMessageReplyMarkup")).json(&serde_json::json!({"chat_id":chat,"message_id":response["result"]["message_id"],"reply_markup":{"inline_keyboard":[]}})).send().await;
+        match answer {
+            Ok(Ok(answer)) => Ok(Some(
+                answer
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| choices.get(i))
+                    .cloned()
+                    .unwrap_or(answer),
+            )),
+            Ok(Err(e)) => Err(e),
+            Err(_) => anyhow::bail!("Question timed out; no choice was made"),
+        }
     }
 
     async fn request_approval_attributed(
@@ -12903,5 +13025,113 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+    #[tokio::test]
+    async fn choice_callback_keeps_topic_sender_and_reply_target() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::conversation::{ACTIVE_CONVERSATION, ConversationRoute};
+        let server = MockServer::start().await;
+        for endpoint in [
+            "sendMessage",
+            "answerCallbackQuery",
+            "editMessageReplyMarkup",
+        ] {
+            Mock::given(method("POST"))
+                .and(path_regex(format!("/{endpoint}$")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":77}})),
+                )
+                .mount(&server)
+                .await;
+        }
+        let ch = Arc::new(
+            TelegramChannel::new(
+                "fake-token".into(),
+                "choice_fixture",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(server.uri()),
+        );
+        let route = ConversationRoute {
+            channel: "telegram.choice_fixture".into(),
+            recipient: "12345:7".into(),
+            sender: "1001".into(),
+            thread: Some("7".into()),
+            reply_to: "66".into(),
+        };
+        let task_channel = ch.clone();
+        let task = tokio::spawn(async move {
+            ACTIVE_CONVERSATION
+                .scope(
+                    Some(route),
+                    task_channel.request_choice(
+                        "Pick",
+                        &["First".into(), "Second".into()],
+                        std::time::Duration::from_secs(5),
+                    ),
+                )
+                .await
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(r) = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|r| r.url.path().ends_with("sendMessage"))
+                {
+                    break r;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["chat_id"], "12345");
+        assert_eq!(body["message_thread_id"], "7");
+        assert_eq!(body["reply_parameters"]["message_id"], 66);
+        let data = body["reply_markup"]["inline_keyboard"][1][0]["callback_data"].clone();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let mut offset = 0;
+        let mut retry = None;
+        for sender in [9999, 1001] {
+            let update = serde_json::json!({"update_id":sender,"callback_query":{"id":"fixture","from":{"id":sender},"message":{"message_id":77,"message_thread_id":7,"is_topic_message":true,"chat":{"id":12345}},"data":data}});
+            ch.process_update(&update, &tx, &mut offset, &mut retry)
+                .await;
+            if sender == 9999 {
+                assert!(!task.is_finished());
+            }
+        }
+        assert_eq!(task.await.unwrap().unwrap(), Some("Second".into()));
+        assert!(rx.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn uncertain_telegram_send_is_not_replayed_as_plain_text() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/sendMessage$"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "failure_fixture",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri());
+        assert!(
+            ch.send(&SendMessage::new("fixture", "12345"))
+                .await
+                .is_err()
+        );
     }
 }

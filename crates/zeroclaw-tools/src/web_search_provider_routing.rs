@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSearchProviderRoute {
     DuckDuckGo,
+    Bing,
     Brave,
     SearXNG,
     Tavily,
@@ -55,6 +56,11 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
                 used_fallback: false,
             }
         }
+        "bing" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Bing,
+            canonical_provider: "bing",
+            used_fallback: false,
+        },
         "brave" | "brave-search" | "brave_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Brave,
             canonical_provider: BRAVE_PROVIDER,
@@ -170,8 +176,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_bing() {
+        assert_eq!(
+            resolve_web_search_provider("bing").route,
+            WebSearchProviderRoute::Bing
+        );
+        assert!(!resolve_web_search_provider("bing").used_fallback);
+    }
+
+    #[test]
     fn resolve_unknown_provider_falls_back_to_default() {
-        let resolved = resolve_web_search_provider("bing");
+        let resolved = resolve_web_search_provider("unconfigured-provider");
         assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
         assert_eq!(resolved.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
         assert!(resolved.used_fallback);

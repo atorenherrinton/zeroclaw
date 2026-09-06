@@ -5288,6 +5288,7 @@ pub(crate) mod tests {
                 channel: Some("fail-delivery".into()),
                 to: Some("123456".into()),
                 thread_id: None,
+                reply_to: None,
                 best_effort: true,
             }),
             true,

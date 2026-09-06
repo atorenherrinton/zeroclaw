@@ -173,6 +173,74 @@ impl WebSearchTool {
         }
     }
 
+    async fn search_bing(&self, query: &str) -> anyhow::Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut response = client
+            .get("https://www.bing.com/search")
+            .query(&[("q", query), ("format", "rss")])
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(http_search_failure("Bing", response.status()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= 2_000_000,
+                "Bing response too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let text = std::str::from_utf8(&bytes)?;
+        anyhow::ensure!(
+            text.contains("<rss"),
+            "Bing returned an unsupported verification page (search_status=blocked)"
+        );
+        let items = Regex::new(r"(?s)<item>(.*?)</item>")?;
+        let field = |item: &str, name: &str| -> anyhow::Result<String> {
+            let re = Regex::new(&format!("(?s)<{name}>(.*?)</{name}>"))?;
+            Ok(re
+                .captures(item)
+                .map(|c| strip_tags(&c[1]))
+                .unwrap_or_default())
+        };
+        let mut blocks = Vec::new();
+        for item in items.captures_iter(text).take(self.max_results) {
+            let title = field(&item[1], "title")?;
+            let url = field(&item[1], "link")?;
+            let description = field(&item[1], "description")?;
+            if reqwest::Url::parse(&url).is_ok_and(|u| matches!(u.scheme(), "https" | "http")) {
+                blocks.push(vec![title, url, truncate_with_ellipsis(&description, 2000)]);
+            }
+        }
+        if blocks.is_empty() {
+            return Ok(no_results_message(query));
+        }
+        Ok(render_results(
+            format!("Bing search results for: {}", cap_query_echo(query)),
+            blocks,
+        ))
+    }
+
+    async fn search_route(
+        &self,
+        route: WebSearchProviderRoute,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        match route {
+            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await,
+            WebSearchProviderRoute::Bing => self.search_bing(query).await,
+            WebSearchProviderRoute::Brave => self.search_brave(query).await,
+            WebSearchProviderRoute::Tavily => self.search_tavily(query).await,
+            WebSearchProviderRoute::SearXNG => self.search_searxng(query).await,
+            WebSearchProviderRoute::Jina => self.search_jina(query).await,
+            WebSearchProviderRoute::Bocha => self.search_bocha(query).await,
+        }
+    }
+
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
         // Throttling lives here rather than in `search_duckduckgo_at` so the
         // wiremock-backed request tests that target the inner method do not
@@ -1354,6 +1422,15 @@ fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::E
     ))
 }
 
+fn search_failure_allows_failover(error: &anyhow::Error) -> bool {
+    let text = error.to_string();
+    text.contains("search_status=unavailable")
+        || text.contains("search_status=blocked")
+        || error
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_timeout() || e.is_connect())
+}
+
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
     haystack
         .as_bytes()
@@ -1425,13 +1502,45 @@ impl Tool for WebSearchTool {
             );
         }
 
-        let result = match resolution.route {
-            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
-            WebSearchProviderRoute::Brave => self.search_brave(query).await?,
-            WebSearchProviderRoute::Tavily => self.search_tavily(query).await?,
-            WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
-            WebSearchProviderRoute::Jina => self.search_jina(query).await?,
-            WebSearchProviderRoute::Bocha => self.search_bocha(query).await?,
+        let mut result = self.search_route(resolution.route, query).await;
+        let mut attempts = vec![resolution.canonical_provider.to_owned()];
+        // Canonical live config owns permission to disclose a query to another
+        // provider. No fallback is inferred from the presence of API keys.
+        let fallbacks = std::fs::read_to_string(&self.config_path)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("web_search")
+                    .and_then(|v| v.get("fallback_providers"))
+                    .and_then(|v| v.as_array())
+                    .cloned()
+            })
+            .unwrap_or_default();
+        for provider in fallbacks.iter().filter_map(|v| v.as_str()).take(4) {
+            let Some(error) = result.as_ref().err() else {
+                break;
+            };
+            if !search_failure_allows_failover(error) {
+                break;
+            }
+            let next = resolve_web_search_provider(provider);
+            if next.used_fallback || attempts.iter().any(|p| p == next.canonical_provider) {
+                continue;
+            }
+            attempts.push(next.canonical_provider.to_owned());
+            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new("connector.search.failover", ::zeroclaw_log::Action::Note).with_attrs(json!({"from":resolution.canonical_provider,"to":next.canonical_provider,"reason":"temporary_outage_or_block"})), "using configured read-only search failover");
+            result = self.search_route(next.route, query).await;
+        }
+        let result = result?;
+        let result = if attempts.len() > 1 {
+            format!(
+                "Search provider: {} (fallback after {}).\n{}",
+                attempts.last().map(String::as_str).unwrap_or("unknown"),
+                attempts[..attempts.len() - 1].join(", "),
+                result
+            )
+        } else {
+            result
         };
 
         Ok(ToolResult {
@@ -1445,6 +1554,19 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failover_does_not_mask_credentials_or_unsupported_operations() {
+        assert!(search_failure_allows_failover(&anyhow::anyhow!(
+            "search_status=unavailable"
+        )));
+        assert!(!search_failure_allows_failover(&anyhow::anyhow!(
+            "search_status=client_error http=403"
+        )));
+        assert!(!search_failure_allows_failover(&anyhow::anyhow!(
+            "missing API key"
+        )));
+    }
 
     #[test]
     fn test_tool_name() {

@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     let mode = args.get(1).map(String::as_str).unwrap_or("help");
     if mode == "help" {
         println!(
-            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | enable-messages CONFIG_DIR | dispatch-messages CONFIG_DIR | tools"
+            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | enable-messages CONFIG_DIR | dispatch-messages CONFIG_DIR | upgrade-operations CONFIG_DIR | serve CONFIG_DIR | dashboard-url CONFIG_DIR | activity CONFIG_DIR | call CONFIG_DIR TOOL | tools"
         );
         return Ok(());
     }
@@ -19,6 +19,35 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let root = Path::new(args.get(2).context("CONFIG_DIR required")?);
+    if mode == "call" {
+        let mut data = String::new();
+        tokio::io::stdin().read_to_string(&mut data).await?;
+        let args: Value = serde_json::from_str(&data)?;
+        println!(
+            "{}",
+            call(
+                &Ops::open(root)?,
+                args_name(&std::env::args().collect::<Vec<_>>())?,
+                &args
+            )
+            .await?
+        );
+        return Ok(());
+    }
+    if mode == "upgrade-operations" {
+        return zeroclaw_personal_ops::install::upgrade_operations(root);
+    }
+    if mode == "serve" {
+        return zeroclaw_personal_ops::service::serve(root).await;
+    }
+    if mode == "dashboard-url" {
+        println!("{}", zeroclaw_personal_ops::service::dashboard_url(root)?);
+        return Ok(());
+    }
+    if mode == "activity" {
+        println!("{}", Ops::open(root)?.activity()?);
+        return Ok(());
+    }
     if mode == "dispatch-messages" {
         println!("{}", Ops::open(root)?.dispatch_due().await?);
         return Ok(());
@@ -121,4 +150,10 @@ async fn main() -> Result<()> {
         out.flush().await?;
     }
     Ok(())
+}
+
+fn args_name(args: &[String]) -> Result<&str> {
+    args.get(3)
+        .map(String::as_str)
+        .context("tool name required")
 }

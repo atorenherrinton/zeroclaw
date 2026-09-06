@@ -149,14 +149,19 @@ zeroclaw service restart
 
 This operator upgrade validates a candidate, backs up the config, helper and
 affected instructions, upgrades the helper, and adds a native cron dispatcher.
-It requires main to use the supervised default risk profile. It adds
-`imessage_approve` and the legacy `delivery_execute` to `always_ask`; neither
-can auto-approve. Specialists can prepare or inspect drafts but cannot approve.
-Use the Telegram **Approve** button after reviewing the exact recipients,
-complete text and send time. A timed-out or denied approval sends nothing.
-The native runtime gate is the human approval boundary; the content hash is an
-integrity binding, not an authentication token. Local operators with database
-or executable access remain trusted.
+Main's live default risk profile selects the authorization mode. Supervised
+mode keeps the native Telegram **Approve** button for the exact saved content.
+Full autonomy executes an explicit owner request to send or schedule without
+another permission prompt; main must pass `owner_requested_send=true`. An
+instruction to draft is never a send request. The installer preserves the
+operator's selected mode. Specialists can prepare or inspect drafts but cannot
+execute them.
+
+Full autonomy trusts the owner-facing agent to identify the owner's send request;
+the boolean is an assertion of that request, not a new authorization source.
+The unchanged saved review and hash still bind recipients, text and timing.
+Duplicate suppression, expiry and uncertain-send protection remain active.
+Local operators with database or executable access remain trusted.
 
 Drafts appear in Telegram, not in the Messages app. Each listed recipient gets
 an individual iMessage, not a newly created group chat. Edits require cancelling
@@ -186,7 +191,7 @@ then restart only the main daemon. Cancel pending schedules before rollback;
 keep the operations ledger so uncertain sends cannot be replayed on re-enable.
 
 Messages and files use iMessage only, without SMS fallback. An email-shaped
-recipient is an iMessage handle, not email delivery. Gmail remains draft-only.
+recipient is an iMessage handle, not email delivery. Gmail legacy draft operations remain available; the durable outbox below adds explicit authorized email sending.
 The communications specialist can prepare but cannot call delivery_execute.
 Main can execute only when the owner's request explicitly covers the exact
 recipients and content. The `owner_requested_send` flag is the calling agent's
@@ -218,8 +223,8 @@ Messages command accepted the item, not a recipient delivery/read receipt.
 For batches, inspect status and continue the same plan for remaining prepared
 items, without retrying uncertain items. Partial success is reported per item.
 
-Google event editing/invitations and email sending are not added by this package.
-Calendar creation and Reminders mutations reuse the existing narrow connectors.
+The durable operations extension below adds Calendar editing/invitations and
+email sending through fixed provider adapters. Reminders reuse the native connector.
 The scheduler uses the existing native cron interface and preserves task state.
 The coding specialist builds/test helpers in repository source and returns an
 installation proposal; development does not authorize live deployment.
@@ -244,3 +249,96 @@ phone databases or delivery receipts. Keep `extensions/personal-ops/` intact so
 uncertain attempts cannot be replayed by reinstalling. The new agent directories
 and helper may remain dormant after the old config is restored. Preserve any
 subsequent configuration changes when rolling back a later installation.
+
+
+## Existing-group voicemail sharing
+
+Recipient arrays target separate individual iMessages. Use
+`imessage_group_search` with exact normalized external participants to find
+an existing iMessage conversation, `imessage_group_get` to inspect an ID, and
+`voicemail_group_prepare` with the returned token to prepare archive items.
+No group is created. The immutable plan binds chat ID, GUID, service and
+participants; all are revalidated before dispatch. One recording creates one
+group delivery item. A group display-name change does not defeat deduplication.
+
+The `imsg rpc` transport returns structured outcomes. A submitted command is
+not proof of recipient delivery. Unknown or in-flight outcomes remain
+uncertain and are never replayed. Explicit pre-dispatch failures remain
+prepared and report the reason so an authorized caller can repair the cause
+and reuse the plan. Existing individual delivery fingerprints are preserved.
+
+macOS Full Disk Access must be granted to the actual ZeroClaw service, not
+only its terminal launcher. The service launch environment must include the
+installed Codex, Rust, and imsg binary directories. Verify through the running
+service; a successful interactive CLI test does not establish daemon access.
+
+Stored group service labels can disagree with the live Messages composer.
+Explicit group selection accepts supported Messages service labels and targets
+that same conversation with its current transport. It does not convert handles,
+open individual chats, create a group, or enable direct SMS fallback. Resolve
+contact aliases before selecting the exact participant set. Search reports
+its scanned count and truncation.
+
+
+## Durable operations, dashboard and packages
+
+`upgrade-operations CONFIG_DIR` performs an additive upgrade of an existing
+full-autonomy installation, preserving the owner's mode, channel configuration,
+credentials, phone service and ledger. It backs up the helper, config and affected
+instructions, uses the validated native config patch API, and installs the
+current executable. Build/install the matching core and Google writer first.
+Specialists can prepare and inspect; the main agent owns outbox execution.
+
+`serve CONFIG_DIR` runs the private dashboard on 127.0.0.1:42619 and two independent
+workers: event/source reconciliation and authorized scheduled sends. Run it as a
+per-user LaunchAgent with KeepAlive, fixed absolute arguments, private logs and
+PATH containing the existing gog/gh/native helpers. No shell evaluation is used.
+`dashboard-url CONFIG_DIR` prints a private unlock URL; never share or commit it.
+The root shell exposes no personal data. Activity requires a private bearer key
+or HttpOnly SameSite cookie; POST /events requires the bearer key and is bounded
+to 64 KB. External push producers require a separately configured authenticated
+bridge to this loopback listener. The service does not open a public port.
+
+Operator-owned extensions/personal-ops/service.json contains timezone (IANA),
+alerts_enabled, telegram_channel (exact instance) and telegram_recipient (exact
+owner destination). Enable alerts after establishing an initial snapshot and
+seeding existing shipment alert keys to avoid historical notifications.
+An operator may instead leave alerts disabled and use the dashboard alone.
+
+Every batch receives input validation before preparation and again before execution,
+including every staged attachment. Calendar preflight uses the writer's canonical
+calendar_validate schema; actual resource scope/ETags are read at execution.
+
+The SQLite operations database owns immutable plans, review hashes, claims,
+receipts, contextual owner preferences, project revisions, attributed package
+facts and the event inbox. WAL/FULL durability and a write-ahead uncertain claim
+prevent a restart from replaying a possible external effect. A transaction is an
+ordered saga; it cannot promise atomic rollback across external services.
+Scheduled sends over 15 minutes late become failed without sending. Uncertain
+writes require read-only reconciliation; cancellation cannot recall an effect.
+
+Email uses stable Message-ID and exact Sent-mail reconciliation; iMessage and
+Telegram report submitted when the provider accepts, never delivered without
+evidence. Attachments are immutable staged copies verified by digest. Telegram
+attachments are currently unsupported in this outbox; use email or iMessage.
+Calendar uses stable IDs, ETag preconditions, exact read-back verification,
+explicit single/instance/series scope, guest editing and reminder rules.
+
+Package discovery scans bounded recent shipping email and attributes every
+status to its source message/time. Supported exact tracking patterns are UPS,
+USPS, FedEx and DHL, with manual registration for other carriers. Direct carrier
+links are available. This installation does not possess carrier API credentials;
+email evidence is not a carrier-confirmed live scan and no ETA is invented.
+
+Filesystem events wake cron/Reminders refresh; cached reminder deadlines enqueue
+durable events. Gmail, Calendar and GitHub event handlers accept deduplicated
+notifications and perform authoritative reads, with retry/backoff/dead letters.
+Cloud subscriptions require provider infrastructure and are marked not_configured
+until an operator connects them; 15-minute reconciliation covers missed events.
+The dashboard shows source freshness, pending work and repeated failures.
+
+Rollback: unload only the operations LaunchAgent, restore the selected binaries,
+policy leaves and appended instructions from the private upgrade backup, preserve
+newer settings, then restart main. Keep all action ledgers and staged receipts;
+restoring an old database can defeat duplicate protection. Existing phone and
+legacy message scheduler services remain independently owned.

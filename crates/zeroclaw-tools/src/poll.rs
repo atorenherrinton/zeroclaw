@@ -166,7 +166,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 },
                 "channel": {
                     "type": "string",
-                    "description": "Target channel name. Defaults to the first available channel if omitted."
+                    "description": "Target channel name. Defaults to the active conversation channel."
                 },
                 "recipient": {
                     "type": "string",
@@ -187,6 +187,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let args = zeroclaw_api::conversation::inherit(args, "poll");
         // Security gate: Act operation
         if let Err(e) = self
             .security
@@ -269,6 +270,7 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
                 (name.clone(), ch)
             } else {
                 // Fall back to first available channel
+                anyhow::ensure!(channels.len() == 1, "No active route; specify a channel");
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -283,6 +285,16 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
             }
         };
 
+        if let Some(route) = zeroclaw_api::conversation::current() {
+            anyhow::ensure!(
+                route.channel == channel_name
+                    && args
+                        .get("recipient")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|r| r == route.recipient),
+                "Interactive questions must target the active conversation; a different destination needs its own conversation"
+            );
+        }
         let recipient_id = recipient.unwrap_or_default();
 
         let interactive_timeout =
@@ -358,7 +370,16 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
 
         let poll_text = format_text_poll(&question, &options, duration_minutes, multi_select);
 
-        let msg = SendMessage::new(&poll_text, &recipient_id);
+        anyhow::ensure!(
+            !recipient_id.is_empty(),
+            "No active recipient; specify recipient"
+        );
+        let msg = zeroclaw_api::conversation::current()
+            .filter(|r| r.channel == channel_name && r.recipient == recipient_id)
+            .map_or_else(
+                || SendMessage::new(&poll_text, &recipient_id),
+                |r| r.message(&poll_text),
+            );
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
@@ -393,6 +414,37 @@ On ACP channels that advertise elicitation.form, the tool blocks until the user 
 #[cfg(test)]
 mod tests {
     use super::*;
+    impl PollTool {
+        async fn execute_routed(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let channel = args["channel"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| self.channels.read().keys().next().cloned())
+                .unwrap_or("test".into());
+            let recipient = args["recipient"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "fixture-{}",
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                });
+            args["recipient"] = serde_json::json!(recipient);
+            let route = zeroclaw_api::conversation::ConversationRoute {
+                channel,
+                recipient,
+                sender: "user".into(),
+                thread: None,
+                reply_to: "fixture-parent".into(),
+            };
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION
+                .scope(Some(route), self.execute(args))
+                .await
+        }
+    }
+
     use zeroclaw_api::channel::ChannelMessage;
 
     struct StubChannel {
@@ -543,7 +595,7 @@ mod tests {
         let tool = PollTool::new(security, channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Lunch?",
                 "options": ["Pizza", "Sushi"],
                 "channel": "slack",
@@ -577,7 +629,7 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_missing_question() {
         let tool = default_tool();
-        let result = tool.execute(json!({ "options": ["a", "b"] })).await;
+        let result = tool.execute_routed(json!({ "options": ["a", "b"] })).await;
         assert!(
             result.is_err() || {
                 let r = result.unwrap();
@@ -589,7 +641,10 @@ mod tests {
     #[tokio::test]
     async fn execute_rejects_missing_options() {
         let tool = default_tool();
-        let result = tool.execute(json!({ "question": "What?" })).await.unwrap();
+        let result = tool
+            .execute_routed(json!({ "question": "What?" }))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Missing"));
     }
@@ -598,7 +653,7 @@ mod tests {
     async fn execute_rejects_invalid_option_count() {
         let tool = default_tool();
         let result = tool
-            .execute(json!({ "question": "Q?", "options": ["only_one"] }))
+            .execute_routed(json!({ "question": "Q?", "options": ["only_one"] }))
             .await
             .unwrap();
         assert!(!result.success);
@@ -609,7 +664,7 @@ mod tests {
     async fn execute_succeeds_with_valid_args() {
         let tool = default_tool();
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Lunch?",
                 "options": ["Pizza", "Sushi"],
                 "channel": "slack",
@@ -626,7 +681,7 @@ mod tests {
     async fn execute_reports_unknown_channel() {
         let tool = default_tool();
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Q?",
                 "options": ["a", "b"],
                 "channel": "nonexistent"
@@ -800,7 +855,7 @@ mod tests {
         let tool = PollTool::new(security, channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick one",
                 "options": ["Option A", "Option B", "Option C"],
                 "channel": "acp",
@@ -835,7 +890,7 @@ mod tests {
         let tool = PollTool::new(security, channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick colors",
                 "options": ["Red", "Green", "Blue"],
                 "channel": "acp",
@@ -867,7 +922,7 @@ mod tests {
         let tool = PollTool::new(security, channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick one",
                 "options": ["A", "B"],
                 "channel": "slack",
@@ -905,7 +960,7 @@ mod tests {
         let tool = PollTool::new(security, channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick one",
                 "options": ["A", "B"],
                 "channel": "noop",
@@ -990,7 +1045,7 @@ mod tests {
         let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Ship it?",
                 "options": ["Yes", "No"],
                 "channel": "rpc",
@@ -1026,7 +1081,7 @@ mod tests {
         let tool = PollTool::new(Arc::new(SecurityPolicy::default()), channels);
 
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick releases",
                 "options": ["A", "B", "C"],
                 "multi_select": true,
@@ -1060,7 +1115,7 @@ mod tests {
 
         for multi in [false, true] {
             let result = tool
-                .execute(json!({
+                .execute_routed(json!({
                     "question": "Lunch?",
                     "options": ["Pizza", "Sushi"],
                     "multi_select": multi,

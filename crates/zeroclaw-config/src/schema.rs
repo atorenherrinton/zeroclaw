@@ -8232,6 +8232,9 @@ pub struct EscalationConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_search"]
 pub struct WebSearchConfig {
+    /// Explicitly permitted read-only search failover providers, in order. Empty disables failover.
+    #[serde(default)]
+    pub fallback_providers: Vec<String>,
     /// Enable `web_search_tool` for web searches
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -8288,6 +8291,7 @@ fn default_web_search_timeout_secs() -> u64 {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
+            fallback_providers: Vec::new(),
             enabled: true,
             search_provider: default_web_search_provider(),
             brave_api_key: None,
@@ -13968,6 +13972,9 @@ pub struct DeliveryConfigDecl {
     /// webhook callbacks bridging into agent-chat platforms).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Original platform message to reply to, preserved when scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
     /// Best-effort delivery. Default: `true`.
     #[serde(default = "default_true")]
     pub best_effort: bool,
@@ -13980,6 +13987,7 @@ impl Default for DeliveryConfigDecl {
             channel: None,
             to: None,
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         }
     }

@@ -5387,7 +5387,8 @@ async fn process_channel_message(
         sender: sender.as_str(),
         message_id: message_id.as_str(),
         => async move {
-            process_channel_message_body(ctx, msg, cancellation_token, composite_for_body).await;
+            let route = zeroclaw_api::conversation::ConversationRoute::from_message(&msg);
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route), process_channel_message_body(ctx, msg, cancellation_token, composite_for_body)).await;
         }
     )
     .await;
@@ -8768,6 +8769,10 @@ async fn run_message_dispatch_loop(
                     "stop command: no registered channel found for reply"
                 );
             }
+            continue;
+        }
+
+        if zeroclaw_api::conversation::deliver(&msg) {
             continue;
         }
 

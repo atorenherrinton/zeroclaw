@@ -5,7 +5,9 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::Channel;
+#[cfg(test)]
+use zeroclaw_api::channel::{ChannelMessage, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -75,9 +77,10 @@ impl Tool for AskUserTool {
                     "type": "integer",
                     "description": "Seconds to wait for a response (default: 300)"
                 },
+                "recipient": {"type":"string","description":"Defaults to the active chat; required outside an active conversation."},
                 "channel": {
                     "type": "string",
-                    "description": "Target channel name. Defaults to the first available channel if omitted."
+                    "description": "Target channel name. Defaults to the active conversation channel."
                 }
             },
             "required": ["question"]
@@ -85,6 +88,7 @@ impl Tool for AskUserTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let args = zeroclaw_api::conversation::inherit(args, "ask_user");
         // Security gate: Act operation
         if let Err(e) = self
             .security
@@ -164,6 +168,7 @@ impl Tool for AskUserTool {
                 })?;
                 (name.clone(), ch)
             } else {
+                anyhow::ensure!(channels.len() == 1, "No active route; specify a channel");
                 let (name, ch) = channels.iter().next().ok_or_else(|| {
                     ::zeroclaw_log::record!(
                         ERROR,
@@ -178,6 +183,16 @@ impl Tool for AskUserTool {
             }
         };
 
+        if let Some(route) = zeroclaw_api::conversation::current() {
+            anyhow::ensure!(
+                route.channel == channel_name
+                    && args
+                        .get("recipient")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|r| r == route.recipient),
+                "Interactive questions must target the active conversation; a different destination needs its own conversation"
+            );
+        }
         let timeout = std::time::Duration::from_secs(timeout_secs);
 
         // Prefer the channel's native structured-choice flow when choices are
@@ -243,7 +258,19 @@ impl Tool for AskUserTool {
 
         // Format and send the question
         let text = format_question(&question, choices.as_deref());
-        let msg = SendMessage::new(&text, "");
+        let active = zeroclaw_api::conversation::current();
+        let recipient = args.get("recipient").and_then(|v| v.as_str()).unwrap_or("");
+        anyhow::ensure!(
+            !recipient.is_empty(),
+            "No active recipient; specify recipient"
+        );
+        let route = active
+            .filter(|r| r.channel == channel_name && r.recipient == recipient)
+            .ok_or_else(|| {
+                anyhow::Error::msg("Interactive replies require the active conversation route")
+            })?;
+        let mut pending = zeroclaw_api::conversation::Question::register(&route)?;
+        let msg = route.message(&text);
         if let Err(e) = channel.send(&msg).await {
             return Ok(ToolResult {
                 success: false,
@@ -254,25 +281,15 @@ impl Tool for AskUserTool {
             });
         }
 
-        // Listen for user response with timeout
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
-
-        // Spawn a listener task on the channel
-        let listen_channel = Arc::clone(&channel);
-        let listen_handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
-
-        let response = tokio::time::timeout(timeout, rx.recv()).await;
-
-        // Abort the listener once we have a response or timeout
-        listen_handle.abort();
+        let response = tokio::time::timeout(timeout, pending.answer()).await;
 
         match response {
-            Ok(Some(msg)) => Ok(ToolResult {
+            Ok(Ok(answer)) => Ok(ToolResult {
                 success: true,
-                output: msg.content.into(),
+                output: answer.into(),
                 error: None,
             }),
-            Ok(None) => Ok(ToolResult {
+            Ok(Err(_)) => Ok(ToolResult {
                 success: false,
                 output: "TIMEOUT".to_string().into(),
                 error: Some("Channel closed before receiving a response".to_string()),
@@ -291,6 +308,36 @@ impl Tool for AskUserTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    impl AskUserTool {
+        async fn execute_routed(&self, mut args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let channel = args["channel"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| self.channels.read().keys().next().cloned())
+                .unwrap_or("test".into());
+            let recipient = args["recipient"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!(
+                        "fixture-{}",
+                        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                });
+            args["recipient"] = serde_json::json!(recipient);
+            let route = zeroclaw_api::conversation::ConversationRoute {
+                channel,
+                recipient,
+                sender: "user".into(),
+                thread: None,
+                reply_to: "fixture-parent".into(),
+            };
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION
+                .scope(Some(route), self.execute(args))
+                .await
+        }
+    }
 
     /// A stub channel that records sent messages but never produces incoming messages.
     struct SilentChannel {
@@ -375,30 +422,23 @@ mod tests {
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent.write().push(message.content.clone());
+            let inbound = ChannelMessage {
+                id: "fixture-answer".into(),
+                sender: "user".into(),
+                reply_target: message.recipient.clone(),
+                content: self.response.clone(),
+                channel: self.channel_name.clone(),
+                ..Default::default()
+            };
+            assert!(zeroclaw_api::conversation::deliver(&inbound));
             Ok(())
         }
 
         async fn listen(
             &self,
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         ) -> anyhow::Result<()> {
-            let msg = ChannelMessage {
-                id: "resp_1".to_string(),
-                sender: "user".to_string(),
-                reply_target: "user".to_string(),
-                content: self.response.clone(),
-                channel: self.channel_name.clone(),
-                channel_alias: None,
-                timestamp: 1000,
-                thread_ts: None,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            };
-            let _ = tx.send(msg).await;
-            Ok(())
+            panic!("ask_user must use existing ingress, not start a second listener")
         }
     }
 
@@ -486,7 +526,7 @@ mod tests {
             "test",
             Arc::new(SilentChannel::new("test")) as Arc<dyn Channel>,
         )]);
-        let result = tool.execute(json!({})).await;
+        let result = tool.execute_routed(json!({})).await;
         assert!(result.is_err());
     }
 
@@ -496,7 +536,7 @@ mod tests {
             "test",
             Arc::new(SilentChannel::new("test")) as Arc<dyn Channel>,
         )]);
-        let result = tool.execute(json!({ "question": "  " })).await;
+        let result = tool.execute_routed(json!({ "question": "  " })).await;
         assert!(result.is_err());
     }
 
@@ -506,7 +546,10 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             Arc::new(RwLock::new(HashMap::new())),
         );
-        let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
+        let result = tool
+            .execute_routed(json!({ "question": "Hello?" }))
+            .await
+            .unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("not initialized"));
     }
@@ -518,7 +561,7 @@ mod tests {
             Arc::new(SilentChannel::new("slack")) as Arc<dyn Channel>,
         )]);
         let result = tool
-            .execute(json!({ "question": "Hello?", "channel": "nonexistent" }))
+            .execute_routed(json!({ "question": "Hello?", "channel": "nonexistent" }))
             .await;
         assert!(result.is_err());
     }
@@ -530,7 +573,7 @@ mod tests {
             Arc::new(SilentChannel::new("test")) as Arc<dyn Channel>,
         )]);
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Confirm?",
                 "timeout_secs": 1
             }))
@@ -548,7 +591,7 @@ mod tests {
             Arc::new(RespondingChannel::new("test", "Yes, proceed!")) as Arc<dyn Channel>,
         )]);
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Should we deploy?",
                 "timeout_secs": 5
             }))
@@ -566,7 +609,7 @@ mod tests {
             Arc::new(RespondingChannel::new("telegram", "2")) as Arc<dyn Channel>,
         )]);
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "Pick an option",
                 "choices": ["Option A", "Option B"],
                 "channel": "telegram",
@@ -584,7 +627,10 @@ mod tests {
         let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()), handle.clone());
 
         // Initially empty — tool reports not initialized
-        let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
+        let result = tool
+            .execute_routed(json!({ "question": "Hello?" }))
+            .await
+            .unwrap();
         assert!(!result.success);
 
         // Populate via the shared handle
@@ -598,7 +644,7 @@ mod tests {
 
         // Now the tool can route to the channel
         let result = tool
-            .execute(json!({ "question": "Hello?", "timeout_secs": 5 }))
+            .execute_routed(json!({ "question": "Hello?", "timeout_secs": 5 }))
             .await
             .unwrap();
         assert!(result.success);
@@ -685,7 +731,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let result = tool
-            .execute(json!({
+            .execute_routed(json!({
                 "question": "How should users set a name?",
                 "choices": ["Slash only", "Slash + picker", "Something else"],
                 "timeout_secs": 30

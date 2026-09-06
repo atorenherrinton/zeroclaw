@@ -56,6 +56,7 @@ fn build_delivery(args: &crate::CronDeliveryArgs) -> Option<DeliveryConfig> {
         channel: args.delivery_channel.clone(),
         to: args.delivery_to.clone(),
         thread_id: args.delivery_thread.clone(),
+        reply_to: None,
         best_effort: args.best_effort_override().unwrap_or(true),
     })
 }
@@ -84,11 +85,24 @@ fn merge_delivery(
     } else {
         DeliveryConfig::default()
     };
+    let same_route = args
+        .delivery_channel
+        .as_ref()
+        .is_none_or(|v| Some(v) == base.channel.as_ref())
+        && args
+            .delivery_to
+            .as_ref()
+            .is_none_or(|v| Some(v) == base.to.as_ref())
+        && args
+            .delivery_thread
+            .as_ref()
+            .is_none_or(|v| Some(v) == base.thread_id.as_ref());
     Some(DeliveryConfig {
         mode: "announce".to_string(),
         channel: args.delivery_channel.clone().or(base.channel),
         to: args.delivery_to.clone().or(base.to),
         thread_id: args.delivery_thread.clone().or(base.thread_id),
+        reply_to: if same_route { base.reply_to } else { None },
         best_effort: args.best_effort_override().unwrap_or(base.best_effort),
     })
 }

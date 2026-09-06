@@ -113,6 +113,9 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                     "personal_ops__files_prepare",
                     "personal_ops__voicemail_list",
                     "personal_ops__voicemail_prepare",
+                    "personal_ops__voicemail_group_prepare",
+                    "personal_ops__imessage_group_search",
+                    "personal_ops__imessage_group_get",
                     "personal_ops__delivery_status",
                     "personal_ops__contacts_search",
                     "personal_ops__contacts_get",
@@ -127,6 +130,7 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                     "google_read__gmail_get_message",
                     "google_read__gmail_get_thread",
                     "google_write__calendar_create_event",
+                    "google_write__calendar_update_event",
                     "reminders__list",
                     "reminders__list_lists",
                     "reminders__create_list",
@@ -297,26 +301,41 @@ pub fn message_config(config: &Value, root: &Path) -> Result<Value> {
     let gate = "personal_ops__imessage_approve";
     let profile = &mut next["risk_profiles"]["default"];
     ensure!(
-        profile["level"] == "supervised",
-        "Telegram message approval requires supervised main risk profile"
+        profile["level"] == "supervised" || profile["level"] == "full",
+        "Telegram message execution requires supervised or full main risk profile"
     );
     ensure!(
         next["agents"]["main"]["risk_profile"] == "default",
         "main must use default risk profile"
     );
     let profile = &mut next["risk_profiles"]["default"];
-    profile["auto_approve"]
-        .as_array_mut()
-        .context("auto_approve")?
-        .retain(|v| v != gate && v != "personal_ops__delivery_execute");
+    let full_autonomy = profile["level"] == "full";
+    if !full_autonomy {
+        profile["auto_approve"]
+            .as_array_mut()
+            .context("auto_approve")?
+            .retain(|v| v != gate && v != "personal_ops__delivery_execute");
+    }
     if !profile["always_ask"].is_array() {
         profile["always_ask"] = json!([]);
     }
-    push_unique(&mut profile["always_ask"], json!(gate))?;
-    push_unique(
-        &mut profile["always_ask"],
-        json!("personal_ops__delivery_execute"),
-    )?;
+    if full_autonomy {
+        profile["always_ask"]
+            .as_array_mut()
+            .context("always_ask")?
+            .retain(|v| v != gate && v != "personal_ops__delivery_execute");
+        push_unique(&mut profile["auto_approve"], json!(gate))?;
+        push_unique(
+            &mut profile["auto_approve"],
+            json!("personal_ops__delivery_execute"),
+        )?;
+    } else {
+        push_unique(&mut profile["always_ask"], json!(gate))?;
+        push_unique(
+            &mut profile["always_ask"],
+            json!("personal_ops__delivery_execute"),
+        )?;
+    }
     for name in ["imessage_draft", "imessage_list", "imessage_cancel"] {
         push_unique(
             &mut profile["auto_approve"],
@@ -348,6 +367,8 @@ pub fn message_config(config: &Value, root: &Path) -> Result<Value> {
     }
     let binary = root.join("bin/zeroclaw-personal-ops");
     let mut risk = next["risk_profiles"]["default"].clone();
+    // Main's owner-facing autonomy must not widen the fixed dispatcher.
+    risk["level"] = json!("supervised");
     risk["allowed_tools"] = json!(["shell"]);
     risk["auto_approve"] = json!(["shell"]);
     risk["always_ask"] = json!([]);
@@ -582,6 +603,126 @@ pub fn install(root: &Path, github: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Additive operator upgrade; live configuration and the existing ledger remain
+/// canonical. External push registrations are deliberately not inferred.
+pub fn upgrade_operations(root: &Path) -> Result<()> {
+    ensure!(root.is_absolute(), "absolute CONFIG_DIR required");
+    let raw = fs::read_to_string(root.join("config.toml"))?;
+    let config: Value = toml::from_str::<toml::Value>(&raw)?.try_into()?;
+    let backup = root
+        .join("backups")
+        .join(format!("durable-operations-{}", uuid::Uuid::new_v4()));
+    private_dir(&backup)?;
+    private_write(&backup.join("config.toml"), raw.as_bytes())?;
+    let mut patch = Vec::new();
+    ensure!(
+        config["risk_profiles"][config["agents"]["main"]["risk_profile"]
+            .as_str()
+            .context("main risk profile")?]["level"]
+            == "full",
+        "upgrade requires the owner-selected full autonomy profile; supervised installs need an explicit approval gate"
+    );
+    let new_tools: Vec<String> = crate::operations_api::schema()
+        .iter()
+        .filter_map(|s| s["name"].as_str().map(|s| format!("personal_ops__{s}")))
+        .collect();
+    for alias in ["main", "communications", "calendar_tasks", "task_scheduler"] {
+        let agent = &config["agents"][alias];
+        if !agent.is_object() {
+            continue;
+        }
+        let risk = agent["risk_profile"].as_str().context("risk profile")?;
+        let mut names = new_tools.clone();
+        if alias != "main" {
+            names.retain(|n| {
+                !matches!(
+                    n.as_str(),
+                    "personal_ops__outbox_send"
+                        | "personal_ops__contact_destination_set"
+                        | "personal_ops__shipment_update"
+                        | "personal_ops__event_ingest"
+                )
+            });
+        }
+        if alias == "main" {
+            names.extend([
+                "google_write__calendar_mutate".into(),
+                "google_write__calendar_reconcile".into(),
+            ]);
+        }
+        for field in ["auto_approve", "allowed_tools"] {
+            let mut list = config["risk_profiles"][risk][field].clone();
+            if field == "allowed_tools" && list.as_array().is_some_and(Vec::is_empty) {
+                continue;
+            }
+            for name in &names {
+                push_unique(&mut list, json!(name))?;
+            }
+            patch.push(
+                json!({"op":"add","path":format!("/risk_profiles/{risk}/{field}"),"value":list}),
+            );
+        }
+        let mut bundles = agent["mcp_bundles"].clone();
+        push_unique(&mut bundles, json!("personal_ops"))?;
+        patch.push(
+            json!({"op":"add","path":format!("/agents/{alias}/mcp_bundles"),"value":bundles}),
+        );
+    }
+    let patch_path = backup.join("patch.json");
+    private_write(&patch_path, &serde_json::to_vec_pretty(&patch)?)?;
+    let binary = root.join("bin/zeroclaw-personal-ops");
+    private_write(&backup.join("zeroclaw-personal-ops"), &fs::read(&binary)?)?;
+    fs::set_permissions(
+        backup.join("zeroclaw-personal-ops"),
+        fs::Permissions::from_mode(0o700),
+    )?;
+    ensure!(
+        fs::read_to_string(root.join("config.toml"))? == raw,
+        "config changed during preparation"
+    );
+    let cli = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME")?)
+        .join(".cargo/bin/zeroclaw");
+    let result = Command::new(cli)
+        .arg("--config-dir")
+        .arg(root)
+        .args(["config", "patch"])
+        .arg(&patch_path)
+        .output()?;
+    ensure!(
+        result.status.success(),
+        "validated config patch failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let pending = binary.with_extension("next");
+    private_write(&pending, &fs::read(std::env::current_exe()?)?)?;
+    fs::set_permissions(&pending, fs::Permissions::from_mode(0o700))?;
+    fs::rename(pending, binary)?;
+    for alias in ["main", "communications", "calendar_tasks", "task_scheduler"] {
+        let path = root.join("agents").join(alias).join("workspace/AGENTS.md");
+        if !path.exists() {
+            continue;
+        }
+        let original = fs::read_to_string(&path)?;
+        private_write(
+            &backup.join(format!("{alias}-AGENTS.md")),
+            original.as_bytes(),
+        )?;
+        if !original.contains("## Durable personal operations") {
+            let pending = path.with_extension("next");
+            private_write(
+                &pending,
+                format!("{original}\n{}", include_str!("../templates/operations.md")).as_bytes(),
+            )?;
+            fs::rename(pending, path)?;
+        }
+    }
+    println!(
+        "Durable operations installed. Private rollback: {}. Restart main and the operations service to load the upgrade.",
+        backup.display()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,9 +809,23 @@ mod tests {
         assert_eq!(n["agents"]["imessage_delivery"]["channels"], json!([]));
         assert_eq!(n["cron"]["imessage_delivery"]["job_type"], "shell");
         assert_eq!(message_config(&n, Path::new("/example/root"))?, n);
-        let mut unsafe_config = c;
-        unsafe_config["risk_profiles"]["default"]["level"] = json!("full");
-        assert!(message_config(&unsafe_config, Path::new("/example/root")).is_err());
+        let mut full_config = c;
+        full_config["risk_profiles"]["default"]["level"] = json!("full");
+        let full = message_config(&full_config, Path::new("/example/root"))?;
+        assert_eq!(
+            full["risk_profiles"]["imessage_delivery"]["level"],
+            "supervised"
+        );
+        assert_eq!(full["risk_profiles"]["default"]["always_ask"], json!([]));
+        assert!(
+            full["risk_profiles"]["default"]["auto_approve"]
+                .as_array()
+                .context("tools")?
+                .contains(&gate)
+        );
+        assert_eq!(message_config(&full, Path::new("/example/root"))?, full);
+        full_config["risk_profiles"]["default"]["level"] = json!("read_only");
+        assert!(message_config(&full_config, Path::new("/example/root")).is_err());
         Ok(())
     }
 }

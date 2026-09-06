@@ -15,6 +15,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-
 toml = "1"
 uuid = { version = "1", features = ["v4"] }
 
+chrono-tz = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.8"
+notify = "8"
+regex = "1"
+base64 = "0.22"
+
 [dev-dependencies]
 tempfile = "3"
 

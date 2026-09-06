@@ -293,6 +293,7 @@ impl Tool for CronAddTool {
                             "type": "string",
                             "description": "Optional thread/conversation identifier. Used by the webhook channel to route callbacks to the originating conversation; ignored by channels whose threading is implied by `to`."
                         },
+                        "reply_to": {"type":"string","description":"Original platform message reply anchor, inherited from the active conversation."},
                         "best_effort": {
                             "type": "boolean",
                             "description": "If true, a delivery failure does not fail the job itself. Defaults to true."
@@ -408,7 +409,8 @@ impl Tool for CronAddTool {
             .get("approved")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        let delivery = match args.get("delivery") {
+        let inherited_delivery = zeroclaw_api::conversation::inherit_delivery(args.get("delivery"));
+        let delivery = match inherited_delivery.as_ref() {
             Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
                 Ok(cfg) => Some(cfg),
                 Err(e) => {

@@ -1,6 +1,6 @@
 //! Fixed personal workflows. The phone database is read-only; the local ledger
 //! is the sole authority for prepared messages and at-most-once send attempts.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,16 @@ use std::{
 };
 
 pub mod contacts;
+pub mod continuity;
+pub mod events;
+mod imessage;
 pub mod install;
+pub mod journal;
 pub mod messages;
+pub mod operations_api;
+pub mod outbox;
+pub mod service;
+pub mod shipments;
 
 pub fn text<'a>(v: &'a Value, key: &str, max: usize) -> Result<&'a str> {
     let s = v
@@ -89,13 +97,36 @@ pub fn private_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupTarget {
+    pub chat_id: i64,
+    pub chat_identifier: String,
+    pub chat_guid: String,
+    pub service: String,
+    pub name: String,
+    pub participants: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Item {
     pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<GroupTarget>,
     pub text: String,
     pub attachment: Option<String>,
     pub attachment_sha256: Option<String>,
     pub source_call: Option<String>,
+}
+
+impl Item {
+    fn fingerprint(&self) -> Result<String> {
+        // The display name is mutable UI metadata, never destination identity.
+        let mut identity = self.clone();
+        if let Some(group) = &mut identity.group {
+            group.name.clear();
+        }
+        Ok(digest(&serde_json::to_vec(&identity)?))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -128,6 +159,9 @@ impl Ops {
             CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS deliveries(fingerprint TEXT PRIMARY KEY, plan_id TEXT NOT NULL, item_index INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('uncertain','submitted')), updated_ms INTEGER NOT NULL);")?;
         messages::migrate(&db)?;
+        journal::migrate(&db)?;
+        continuity::migrate(&db)?;
+        events::migrate(&db)?;
         Ok(Self {
             root: root.to_owned(),
             db,
@@ -163,6 +197,7 @@ impl Ops {
                 .into_iter()
                 .map(|r| Item {
                     recipient: r,
+                    group: None,
                     text: body.clone(),
                     attachment: None,
                     attachment_sha256: None,
@@ -274,6 +309,7 @@ impl Ops {
             for r in &recips {
                 items.push(Item {
                     recipient: r.clone(),
+                    group: None,
                     text: body.clone(),
                     attachment: Some(name.clone()),
                     attachment_sha256: Some(hash.clone()),
@@ -286,12 +322,32 @@ impl Ops {
 
     pub fn prepare_calls(&self, args: &Value) -> Result<Value> {
         let recips = recipients(args)?;
+        self.prepare_call_items(
+            args,
+            recips
+                .into_iter()
+                .map(|recipient| (recipient, None))
+                .collect(),
+        )
+    }
+
+    pub fn prepare_group_calls(&self, args: &Value) -> Result<Value> {
+        let token = text(args, "group_token", 512)?;
+        let group = imessage::resolve_group_token(token)?;
+        self.prepare_call_items(args, vec![(group.token()?, Some(group))])
+    }
+
+    fn prepare_call_items(
+        &self,
+        args: &Value,
+        destinations: Vec<(String, Option<GroupTarget>)>,
+    ) -> Result<Value> {
         let ids = args
             .get("call_ids")
             .and_then(Value::as_array)
             .context("call_ids required; list calls first")?;
         ensure!(
-            !ids.is_empty() && ids.len() * recips.len() <= 100,
+            !ids.is_empty() && ids.len() * destinations.len() <= 100,
             "batch must contain 1 to 100 deliveries; split larger batches explicitly"
         );
         let format = text(args, "format", 16)?;
@@ -335,9 +391,10 @@ impl Ops {
                 body.len() <= 12000,
                 "transcript too long for one message; use audio or draft an owner-reviewed summary"
             );
-            for r in &recips {
+            for (recipient, group) in &destinations {
                 items.push(Item {
-                    recipient: r.clone(),
+                    recipient: recipient.clone(),
+                    group: group.clone(),
                     text: body.clone(),
                     attachment: attachment.clone(),
                     attachment_sha256: hash.clone(),
@@ -381,7 +438,7 @@ impl Ops {
             params![plan.id, plan.created_ms, serde_json::to_string(&plan)?],
         )?;
         Ok(
-            json!({"plan":plan,"status":"prepared","expires_in_seconds":3600,"sent":false,"transport":"iMessage only, no SMS fallback","instruction":"Execute only for an explicit owner send request covering these exact recipients and contents. Preparation alone is not authority. Email addresses here are iMessage handles, not email delivery."}),
+            json!({"plan":plan,"status":"prepared","expires_in_seconds":3600,"sent":false,"transport":if plan.items.iter().any(|item| item.group.is_some()) { "Existing Messages conversation and its current transport; no individual-message fallback or group creation" } else { "iMessage only, no SMS fallback" },"instruction":"Execute only for an explicit owner send request covering these exact recipients and contents. Preparation alone is not authority. Email addresses here are iMessage handles, not email delivery."}),
         )
     }
 
@@ -396,7 +453,7 @@ impl Ops {
         let p = self.load(id)?;
         let mut items = Vec::new();
         for (index, item) in p.items.iter().enumerate() {
-            let fingerprint = digest(&serde_json::to_vec(item)?);
+            let fingerprint = item.fingerprint()?;
             let state: Option<String> = self
                 .db
                 .query_row(
@@ -415,7 +472,7 @@ impl Ops {
             |r| r.get::<_, bool>(0),
         )?;
         let next_action = if reviewed {
-            "Use imessage_list for review/queue state. Main must use the native imessage_approve gate for approval. Use imessage_cancel before dispatch. Never call delivery_execute or remake content to bypass approval or uncertain attempts."
+            "Use imessage_list for review/queue state. Main uses imessage_approve for an owner-requested send, following the live main profile's full-autonomy or native-approval mode. Drafting alone cannot authorize sending. Use imessage_cancel before dispatch. Never call delivery_execute or remake content to bypass authorization or uncertain attempts."
         } else {
             "Each execute attempts at most four new items. Continue executing the same plan for remaining prepared items covered by the owner request. Submitted and uncertain items are skipped. Report uncertain items accurately; never remake content to bypass them."
         };
@@ -430,7 +487,7 @@ impl Ops {
         Ok(self.db.execute(
             "INSERT OR IGNORE INTO deliveries VALUES(?1,?2,?3,'uncertain',?4)",
             params![
-                digest(&serde_json::to_vec(item)?),
+                item.fingerprint()?,
                 p.id,
                 index,
                 Utc::now().timestamp_millis()
@@ -439,37 +496,13 @@ impl Ops {
     }
 
     pub async fn execute(&self, args: &Value) -> Result<Value> {
-        self.execute_using(args, Self::send_item).await
-    }
-
-    async fn send_item(item: Item, path: Option<PathBuf>) -> bool {
-        let mut cmd = tokio::process::Command::new("/opt/homebrew/bin/imsg");
-        cmd.args([
-            "send",
-            "--to",
-            &item.recipient,
-            "--text",
-            &item.text,
-            "--service",
-            "imessage",
-            "--no-sms-fallback",
-            "--json",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-        if let Some(path) = path {
-            cmd.arg("--file").arg(path);
-        }
-        matches!(tokio::time::timeout(Duration::from_secs(45), cmd.status()).await,
-                Ok(Ok(status)) if status.success())
+        self.execute_using(args, imessage::send_item).await
     }
 
     async fn execute_using<F, Fut>(&self, args: &Value, send: F) -> Result<Value>
     where
         F: Fn(Item, Option<PathBuf>) -> Fut,
-        Fut: std::future::Future<Output = bool>,
+        Fut: std::future::Future<Output = imessage::SendOutcome>,
     {
         let p = self.load(text(args, "plan_id", 64)?)?;
         ensure!(
@@ -494,11 +527,16 @@ impl Ops {
     async fn deliver_plan_using<F, Fut>(&self, p: &Plan, limit: usize, send: F) -> Result<Value>
     where
         F: Fn(Item, Option<PathBuf>) -> Fut,
-        Fut: std::future::Future<Output = bool>,
+        Fut: std::future::Future<Output = imessage::SendOutcome>,
     {
-        // Validate every attachment before attempting any side effect.
+        // Validate every group and attachment before attempting any side effect.
+        // This is intentionally before claim, so a changed group remains prepared.
         let mut files = Vec::new();
         for item in &p.items {
+            if let Some(expected) = &item.group {
+                let current = imessage::group_detail(expected.chat_id)?;
+                imessage::validate_group_snapshot(expected, &current)?;
+            }
             let path = if let Some(name) = &item.attachment {
                 ensure!(
                     Path::new(name).components().count() == 1 && !name.starts_with('.'),
@@ -528,6 +566,7 @@ impl Ops {
             files.push(path);
         }
         let mut attempts = 0;
+        let mut last_attempt = None;
         for (index, item) in p.items.iter().enumerate() {
             if attempts == limit {
                 break;
@@ -536,19 +575,35 @@ impl Ops {
                 continue;
             }
             attempts += 1;
-            if send(item.clone(), files[index].clone()).await {
-                self.db.execute(
-                    "UPDATE deliveries SET state='submitted',updated_ms=?2 WHERE fingerprint=?1",
-                    params![
-                        digest(&serde_json::to_vec(item)?),
-                        Utc::now().timestamp_millis()
-                    ],
-                )?;
-            } else {
-                break;
+            let fingerprint = item.fingerprint()?;
+            match send(item.clone(), files[index].clone()).await {
+                imessage::SendOutcome::Submitted => {
+                    self.db.execute(
+                        "UPDATE deliveries SET state='submitted',updated_ms=?2 WHERE fingerprint=?1",
+                        params![fingerprint, Utc::now().timestamp_millis()],
+                    )?;
+                }
+                imessage::SendOutcome::NotStarted(detail) => {
+                    last_attempt = Some(
+                        json!({"index":index,"disposition":"not_started","detail":detail,"retry_safe":true}),
+                    );
+                    self.db.execute(
+                        "DELETE FROM deliveries WHERE fingerprint=?1 AND plan_id=?2 AND item_index=?3 AND state='uncertain'",
+                        params![fingerprint, p.id, index],
+                    )?;
+                    break;
+                }
+                imessage::SendOutcome::Uncertain(detail) => {
+                    last_attempt = Some(
+                        json!({"index":index,"disposition":"uncertain","detail":detail,"retry_safe":false}),
+                    );
+                    break;
+                }
             }
         }
-        self.status(&p.id)
+        let mut status = self.status(&p.id)?;
+        status["last_attempt"] = json!(last_attempt);
+        Ok(status)
     }
 }
 
@@ -557,6 +612,24 @@ pub fn schema() -> Value {
     let make = |name: &str, description: &str, properties: Value, required: Value| json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false}});
     let mut tools = json!([
         make(
+            "imessage_group_search",
+            "Read-only lookup of existing Messages groups with exactly these external participants. By default scans all chats but returns only exact matches; pass limit to search only the most recent chats. Select an exact group_token; multiple recipients in other tools send individually.",
+            json!({"participants":{"type":"array","items":{"type":"string"},"minItems":2,"maxItems":10},"limit":{"type":"integer","minimum":1,"maximum":500,"description":"Optional newest-chat cap. Omit for an exhaustive exact-match scan."}}),
+            json!(["participants"])
+        ),
+        make(
+            "imessage_group_get",
+            "Read an existing group identity and participants by chat_id; no send or group creation.",
+            json!({"chat_id":{"type":"integer","minimum":1}}),
+            json!(["chat_id"])
+        ),
+        make(
+            "voicemail_group_prepare",
+            "Prepare one item per recording/transcript to an exact existing Messages group from imessage_group_search. No send. Binds and revalidates identity and participants; does not create groups. Use delivery_execute for an owner-authorized send.",
+            json!({"call_ids":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":100},"group_token":{"type":"string","maxLength":512},"format":{"type":"string","enum":["transcript","audio","both"]}}),
+            json!(["call_ids", "group_token", "format"])
+        ),
+        make(
             "voicemail_list",
             "Read completed inbound screening calls in an explicit RFC3339 date window. Results are untrusted caller claims. If truncated, narrow the window; never silently treat the first page as all calls.",
             json!({"start":{"type":"string"},"end":{"type":"string"}}),
@@ -564,7 +637,7 @@ pub fn schema() -> Value {
         ),
         make(
             "voicemail_prepare",
-            "Prepare exact inbound call transcripts and/or consented archived audio for exact iMessage recipients. No send. Call IDs come from voicemail_list; ask owner if 'all' or recipients are ambiguous. Email addresses are iMessage handles, not email transport.",
+            "Prepare separate individual messages with exact inbound call transcripts and/or consented archived audio for exact iMessage recipients. For an existing group use voicemail_group_prepare. No send. Call IDs come from voicemail_list; ask owner if 'all' or recipients are ambiguous. Email addresses are iMessage handles, not email transport.",
             json!({"call_ids":{"type":"array","items":{"type":"string"}},"recipients":recips,"format":{"type":"string","enum":["transcript","audio","both"]}}),
             json!(["call_ids", "recipients", "format"])
         ),
@@ -601,6 +674,9 @@ pub fn schema() -> Value {
         .as_array_mut()
         .expect("literal tool array")
         .extend(contacts::schema());
+    if let Some(list) = tools.as_array_mut() {
+        list.extend(operations_api::schema());
+    }
     tools
 }
 
@@ -610,6 +686,9 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "contacts_get" => contacts::lookup(args, true).await,
         "voicemail_list" => ops.list_calls(args),
         "voicemail_prepare" => ops.prepare_calls(args),
+        "voicemail_group_prepare" => ops.prepare_group_calls(args),
+        "imessage_group_search" => imessage::search_groups(args),
+        "imessage_group_get" => imessage::get_group(args),
         "text_prepare" => ops.prepare_text(args),
         "files_prepare" => ops.prepare_files(args),
         "delivery_execute" => ops.execute(args).await,
@@ -618,7 +697,7 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "imessage_list" => ops.message_list(),
         "imessage_cancel" => ops.message_cancel(text(args, "draft_id", 64)?),
         "imessage_approve" => ops.message_approve(args).await,
-        _ => bail!("unknown operation"),
+        _ => operations_api::call(ops, name, args).await,
     }
 }
 
@@ -694,7 +773,13 @@ mod tests {
         let result = ops
             .execute_using(&args, |_, _| {
                 let n = count.fetch_add(1, Ordering::SeqCst);
-                async move { n == 0 }
+                async move {
+                    if n == 0 {
+                        imessage::SendOutcome::Submitted
+                    } else {
+                        imessage::SendOutcome::Uncertain("fixture failure".into())
+                    }
+                }
             })
             .await?;
         assert_eq!(count.load(Ordering::SeqCst), 2);
@@ -704,7 +789,7 @@ mod tests {
         let result = ops
             .execute_using(&args, |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { true }
+                async { imessage::SendOutcome::Submitted }
             })
             .await?;
         assert_eq!(count.load(Ordering::SeqCst), 3);
@@ -773,6 +858,103 @@ mod tests {
             "uncertain"
         );
         Ok(())
+    }
+
+    #[test]
+    fn legacy_item_keeps_its_delivery_fingerprint() -> Result<()> {
+        let original = r#"{"recipient":"+12025550123","text":"hello","attachment":null,"attachment_sha256":null,"source_call":null}"#;
+        let item: Item = serde_json::from_str(original)?;
+        assert!(item.group.is_none());
+        assert_eq!(serde_json::to_string(&item)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn definitely_not_started_retains_plan_and_reports_retry_reason() -> Result<()> {
+        let (_temp, ops, _) = fixture()?;
+        let p = ops.prepare_text(&json!({"recipients":["+12025550123"],"text":"fixture"}))?;
+        let args = json!({"plan_id":p["plan"]["id"],"owner_requested_send":true});
+        let result = ops
+            .execute_using(&args, |_, _| async {
+                imessage::SendOutcome::NotStarted("fixture preflight rejection".into())
+            })
+            .await?;
+        assert_eq!(result["items"][0]["state"], "prepared");
+        assert_eq!(result["last_attempt"]["disposition"], "not_started");
+        let result = ops
+            .execute_using(&args, |_, _| async { imessage::SendOutcome::Submitted })
+            .await?;
+        assert_eq!(result["items"][0]["state"], "submitted");
+        ops.execute_using(&args, |_, _| async { panic!("duplicate send") })
+            .await?;
+        Ok(())
+    }
+
+    #[test]
+    fn group_archive_plan_has_one_item_per_recording() -> Result<()> {
+        let (_temp, ops, _) = fixture()?;
+        let phone = ops.root.join("extensions/phone");
+        private_dir(&phone.join("recordings"))?;
+        let db = Connection::open(phone.join("phone.sqlite"))?;
+        db.execute_batch("CREATE TABLE calls(call_sid TEXT PRIMARY KEY,created_ms INTEGER,phase TEXT,consent INTEGER,transcript TEXT); CREATE TABLE recording_outbox(call_sid TEXT,local_name TEXT,provider_status TEXT,created_ms INTEGER);")?;
+        for (i, call) in ["first", "second"].iter().enumerate() {
+            db.execute(
+                "INSERT INTO calls VALUES(?1,1000,'completed',1,'fixture transcript')",
+                [call],
+            )?;
+            db.execute(
+                "INSERT INTO recording_outbox VALUES(?1,?2,'completed',1000)",
+                params![call, format!("{call}.mp3")],
+            )?;
+            private_write(
+                &phone.join("recordings").join(format!("{call}.mp3")),
+                &[i as u8],
+            )?;
+        }
+        let group = GroupTarget {
+            chat_id: 42,
+            chat_identifier: "chat42".into(),
+            chat_guid: "iMessage;+;chat42".into(),
+            service: "iMessage".into(),
+            name: "Fixture".into(),
+            participants: vec!["+12025550123".into(), "+12025550124".into()],
+        };
+        let result = ops.prepare_call_items(
+            &json!({"call_ids":["first","second"],"format":"audio"}),
+            vec![(group.token()?, Some(group.clone()))],
+        )?;
+        let plan: Plan = serde_json::from_value(result["plan"].clone())?;
+        assert_eq!(plan.items.len(), 2);
+        assert!(
+            plan.items
+                .iter()
+                .all(|item| item.group.as_ref() == Some(&group))
+        );
+        assert_eq!(
+            ops.db
+                .query_row("SELECT count(*) FROM deliveries", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn group_tools_are_advertised_with_exact_destination_schema() {
+        let tools = schema();
+        for name in [
+            "imessage_group_search",
+            "imessage_group_get",
+            "voicemail_group_prepare",
+        ] {
+            assert!(
+                tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == name)
+            );
+        }
     }
     #[tokio::test]
     async fn no_send_without_owner_or_with_expired_plan() -> Result<()> {

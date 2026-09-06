@@ -122,6 +122,9 @@ pub struct DeliveryConfig {
     pub to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    /// Original platform message to reply to, preserved when scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
 }
@@ -133,6 +136,7 @@ impl Default for DeliveryConfig {
             channel: None,
             to: None,
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         }
     }

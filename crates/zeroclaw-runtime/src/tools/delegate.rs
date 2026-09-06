@@ -52,11 +52,17 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
-async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
+async fn scope_delegate_session_key<F>(
+    session_key: Option<String>,
+    route: Option<zeroclaw_api::conversation::ConversationRoute>,
+    future: F,
+) -> F::Output
 where
     F: std::future::Future,
 {
-    TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+    zeroclaw_api::conversation::ACTIVE_CONVERSATION
+        .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future))
+        .await
 }
 
 /// Serializable result of a background delegate task.
@@ -1665,10 +1671,11 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_route = zeroclaw_api::conversation::current();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, async move {
+            scope_delegate_session_key(parent_session_key, parent_route, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1884,6 +1891,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_route = zeroclaw_api::conversation::current();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1916,6 +1924,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let route = parent_route.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1943,7 +1952,7 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
+                    let result = scope_delegate_session_key(session_key, route, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
                                 Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
@@ -5645,9 +5654,11 @@ mod tests {
             .scope(Some("channel_session".to_string()), async {
                 let session_key = current_tool_loop_session_key();
                 zeroclaw_spawn::spawn!(async move {
-                    scope_delegate_session_key(session_key, async {
-                        current_tool_loop_session_key()
-                    })
+                    scope_delegate_session_key(
+                        session_key,
+                        zeroclaw_api::conversation::current(),
+                        async { current_tool_loop_session_key() },
+                    )
                     .await
                 })
                 .await

@@ -1550,6 +1550,7 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
         channel: decl.channel.clone(),
         to: decl.to.clone(),
         thread_id: decl.thread_id.clone(),
+        reply_to: decl.reply_to.clone(),
         best_effort: decl.best_effort,
     }
 }
@@ -2325,6 +2326,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 thread_id: None,
+                reply_to: None,
                 best_effort: true,
             }),
         )
@@ -2361,6 +2363,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: None,
                 thread_id: None,
+                reply_to: None,
                 best_effort: true,
             }),
             false,
@@ -2399,6 +2402,7 @@ mod tests {
                     channel: Some("discord".into()),
                     to: None,
                     thread_id: None,
+                    reply_to: None,
                     best_effort: true,
                 }),
                 ..CronJobPatch::default()
@@ -2430,6 +2434,7 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 thread_id: None,
+                reply_to: None,
                 best_effort: true,
             }),
         )
@@ -4125,6 +4130,7 @@ schedule = { kind = "every", every_ms = 300000 }
                     channel: Some("telegram".to_string()),
                     to: Some("111".to_string()),
                     thread_id: None,
+                    reply_to: None,
                     best_effort: true,
                 }),
                 ..CronJobPatch::default()

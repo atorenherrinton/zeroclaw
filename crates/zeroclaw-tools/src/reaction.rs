@@ -64,11 +64,12 @@ impl Tool for ReactionTool {
                     "description": "Whether to add or remove the reaction (default: 'add')"
                 }
             },
-            "required": ["channel", "channel_id", "message_id", "emoji"]
+            "required": ["emoji"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let args = zeroclaw_api::conversation::inherit(args, "reaction");
         // Security gate
         if let Err(error) = self
             .security
@@ -316,9 +317,9 @@ mod tests {
         assert!(schema["properties"]["emoji"].is_object());
         assert!(schema["properties"]["action"].is_object());
         let required = schema["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "channel"));
-        assert!(required.iter().any(|v| v == "channel_id"));
-        assert!(required.iter().any(|v| v == "message_id"));
+        assert!(!required.iter().any(|v| v == "channel"));
+        assert!(!required.iter().any(|v| v == "channel_id"));
+        assert!(!required.iter().any(|v| v == "message_id"));
         assert!(required.iter().any(|v| v == "emoji"));
         // action is optional (defaults to "add")
         assert!(!required.iter().any(|v| v == "action"));

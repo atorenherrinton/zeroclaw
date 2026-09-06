@@ -1138,14 +1138,29 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::Error::msg("delivery.to is required for announce mode")
     })?;
 
-    deliver_announcement(
-        config,
-        channel,
-        target,
-        delivery.thread_id.as_deref(),
-        output,
-    )
-    .await
+    let route =
+        delivery
+            .reply_to
+            .as_ref()
+            .map(|reply_to| zeroclaw_api::conversation::ConversationRoute {
+                channel: channel.into(),
+                recipient: target.into(),
+                sender: String::new(),
+                thread: delivery.thread_id.clone(),
+                reply_to: reply_to.clone(),
+            });
+    zeroclaw_api::conversation::ACTIVE_CONVERSATION
+        .scope(
+            route,
+            deliver_announcement(
+                config,
+                channel,
+                target,
+                delivery.thread_id.as_deref(),
+                output,
+            ),
+        )
+        .await
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -2955,6 +2970,7 @@ mod tests {
                 channel: Some("telegram".into()),
                 to: Some("123456".into()),
                 thread_id: None,
+                reply_to: None,
                 best_effort: false,
             }),
             false,
@@ -2988,6 +3004,7 @@ mod tests {
             channel: Some("fail-delivery".into()),
             to: Some("123456".into()),
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         };
         let started = Utc::now();
@@ -3023,6 +3040,7 @@ mod tests {
             channel: Some("fail-delivery".into()),
             to: Some("123456".into()),
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         };
 
@@ -3116,6 +3134,7 @@ mod tests {
             channel: Some(COUNT_CHANNEL.to_string()),
             to: Some("chat-id".to_string()),
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         };
         job
