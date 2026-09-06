@@ -38,3 +38,29 @@ cargo clippy --manifest-path tools/zeroclaw-phone/Cargo.toml --all-targets -- -D
 The service reads an owner-private `phone.toml`, the existing ZeroClaw encrypted
 configuration, and `screening.md` from its extension root. Credentials and live
 configuration are intentionally not part of this repository.
+
+## Private voicemail channel
+
+Inbound voicemail summaries and consented recordings can use a dedicated bot
+and owner-only private Telegram channel. Outbound call summaries continue using
+the existing owner chat. The canonical optional route is in `phone.toml`:
+
+```toml
+[voicemail]
+telegram_alias = "voicemail"
+bot_username = "voicemail_bot"
+channel_id = "-1001234567890"
+```
+
+The alias resolves its encrypted bot token from native ZeroClaw configuration.
+The existing paired owner remains the authority; channel IDs do not enter the
+agent peer allowlist. Before delivery the service verifies the exact bot, exact
+channel ID, absence of public usernames, owner creator status, bot posting
+permission, and exactly two members (owner and bot). Additional members or a
+public channel stop delivery. It rechecks live routing before the send and keeps
+uncertain receipts from being retried. Without this section, existing private
+chat delivery is unchanged.
+
+Changing routes does not resend old outbox entries or silently redirect claimed
+work. Migrate historical messages as a separately authorized, receipt-tracked
+copy from the archive; preserve the original messages and delivery records.

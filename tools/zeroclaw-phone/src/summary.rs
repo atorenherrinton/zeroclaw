@@ -325,6 +325,11 @@ fn enqueue(root: &Path, settings: &Settings) -> SafeResult<()> {
             .map_err(|_| "summary_update_failed")?;
             continue;
         }
+        if outbound_context(&job)?.is_none() {
+            let destination = common::load_voicemail(root)?;
+            job.recipient_id = destination.telegram_chat_id;
+            job.bot_username = destination.telegram_bot_username;
+        }
         job.source_hash = source_hash(&job);
         let now = Utc::now().timestamp_millis();
         conn.execute("INSERT OR IGNORE INTO summary_outbox
@@ -1039,8 +1044,7 @@ fn classify_send(status: StatusCode, value: &Value, recipient: &str, text: &str)
     if !status.is_success()
         || value["ok"] != true
         || message_id <= 0
-        || result["chat"]["type"] != "private"
-        || result["chat"]["id"].as_i64()?.to_string() != recipient
+        || !common::delivery_chat_matches(&result["chat"], recipient)
         || result["text"] != text
     {
         return None;
@@ -1055,13 +1059,18 @@ async fn send_summary(
     job: &Job,
     text: &str,
 ) -> SafeResult<()> {
-    if let Err(error) = crate::recording::validate_private_destination(client, settings).await {
+    if let Err(error) = crate::recording::validate_delivery_destination(client, settings).await {
         return defer(root, job, "preflight", error);
     }
-    let current = common::load(root)?;
+    let current = if outbound_context(job)?.is_none() {
+        common::load_voicemail(root)?
+    } else {
+        common::load(root)?
+    };
     if !current.enabled
         || !same_destination(job, &current)
         || settings.telegram_token != current.telegram_token
+        || settings.telegram_owner_id != current.telegram_owner_id
     {
         return finish(
             root,
@@ -1139,6 +1148,11 @@ async fn tick_locked(root: &Path, telegram: &Client, memory: &Client) -> SafeRes
     enqueue(root, &settings)?;
     let Some(job) = select_job(root)? else {
         return Ok(());
+    };
+    let settings = if outbound_context(&job)?.is_none() {
+        common::load_voicemail(root)?
+    } else {
+        settings
     };
     if !same_destination(&job, &settings)
         || !crate::protocol::valid_sid(&job.call_sid, "CA")

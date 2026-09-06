@@ -494,7 +494,13 @@ async fn preflight(root: &Path) -> SafeResult<()> {
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|_| "preflight_client_failed")?;
-    recording::validate_private_destination(&client, &cfg).await?;
+    recording::validate_delivery_destination(&client, &cfg).await?;
+    let voicemail = common::load_voicemail(root)?;
+    if voicemail.telegram_chat_id != cfg.telegram_chat_id
+        || voicemail.telegram_bot_username != cfg.telegram_bot_username
+    {
+        recording::validate_delivery_destination(&client, &voicemail).await?;
+    }
     let endpoint = format!(
         "https://api.twilio.com/2010-04-01/Accounts/{}/IncomingPhoneNumbers.json",
         cfg.account_sid
@@ -700,6 +706,7 @@ mod tests {
             common::atomic_private_write(&native.join("config.toml"), native_text.as_bytes())
                 .unwrap();
             let config = common::PhoneConfig {
+                voicemail: None,
                 enabled: true,
                 port: 43335,
                 public_base: BASE.into(),

@@ -179,7 +179,7 @@ struct Job {
 }
 
 async fn tick_locked(root: &Path, client: &Client) -> SafeResult<()> {
-    let settings = common::load(root)?;
+    let settings = common::load_voicemail(root)?;
     if !settings.enabled {
         return Ok(());
     }
@@ -230,7 +230,8 @@ fn claim_job(root: &Path, settings: &Settings) -> SafeResult<Option<Job>> {
         || !valid_sid(&job.call_sid, "CA")
         || !valid_sid(&job.recording_sid, "RE")
         || settings.account_sid != job.account_sid
-        || !valid_owner(&settings.telegram_chat_id)
+        || !(valid_owner(&settings.telegram_chat_id)
+            || common::valid_private_channel_id(&settings.telegram_chat_id))
         || settings.telegram_bot_username.is_empty()
     {
         return Err("recording_configuration_mismatch");
@@ -460,7 +461,10 @@ fn telegram_url(token: &str, method: &str) -> SafeResult<String> {
         || !secret
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        || !matches!(method, "getMe" | "getChat" | "sendAudio")
+        || !matches!(
+            method,
+            "getMe" | "getChat" | "getChatMember" | "getChatMemberCount" | "sendAudio"
+        )
     {
         return Err("invalid_telegram_credentials");
     }
@@ -501,14 +505,72 @@ async fn preflight(client: &Client, settings: &Settings) -> SafeResult<()> {
         .await
         .map_err(|_| "telegram_preflight_transport_failed")?;
     let chat = telegram_json(chat).await?;
-    if !private_chat_matches(&chat["result"], &settings.telegram_chat_id) {
+    if !common::delivery_chat_matches(&chat["result"], &settings.telegram_chat_id) {
         return Err("telegram_private_owner_mismatch");
+    }
+    if common::valid_private_channel_id(&settings.telegram_chat_id) {
+        let bot_id = me["result"]["id"]
+            .as_i64()
+            .ok_or("telegram_bot_id_missing")?
+            .to_string();
+        let mut members = Vec::new();
+        for user_id in [&settings.telegram_owner_id, &bot_id] {
+            let response = client
+                .post(telegram_url(&settings.telegram_token, "getChatMember")?)
+                .form(&[
+                    ("chat_id", settings.telegram_chat_id.as_str()),
+                    ("user_id", user_id.as_str()),
+                ])
+                .send()
+                .await
+                .map_err(|_| "telegram_preflight_transport_failed")?;
+            members.push(telegram_json(response).await?);
+        }
+        let response = client
+            .post(telegram_url(
+                &settings.telegram_token,
+                "getChatMemberCount",
+            )?)
+            .form(&[("chat_id", settings.telegram_chat_id.as_str())])
+            .send()
+            .await
+            .map_err(|_| "telegram_preflight_transport_failed")?;
+        let count = telegram_json(response).await?;
+        if !owner_only_channel_members(
+            &members[0]["result"],
+            &members[1]["result"],
+            &count["result"],
+            &settings.telegram_owner_id,
+            &bot_id,
+        ) {
+            return Err("telegram_channel_membership_mismatch");
+        }
     }
     Ok(())
 }
 
-/// Validate the configured bot identity and its exact paired private recipient.
-pub async fn validate_private_destination(client: &Client, settings: &Settings) -> SafeResult<()> {
+fn owner_only_channel_members(
+    owner: &Value,
+    bot: &Value,
+    count: &Value,
+    owner_id: &str,
+    bot_id: &str,
+) -> bool {
+    owner["status"] == "creator"
+        && owner["user"]["id"]
+            .as_i64()
+            .is_some_and(|id| id.to_string() == owner_id)
+        && bot["status"] == "administrator"
+        && bot["can_post_messages"] == true
+        && bot["user"]["is_bot"] == true
+        && bot["user"]["id"]
+            .as_i64()
+            .is_some_and(|id| id.to_string() == bot_id)
+        && count.as_u64() == Some(2)
+}
+
+/// Validate the exact owner DM or explicitly configured owner-only private channel.
+pub async fn validate_delivery_destination(client: &Client, settings: &Settings) -> SafeResult<()> {
     preflight(client, settings).await
 }
 
@@ -530,11 +592,12 @@ async fn send_job(root: &Path, client: &Client, settings: &Settings, job: &Job) 
         }
         return defer(root, job, "ready", error, job.preflight_attempts + 1, true);
     }
-    let current = common::load(root)?;
+    let current = common::load_voicemail(root)?;
     if !current.enabled
         || current.account_sid != job.account_sid
         || !same_destination(job, &current)
         || current.telegram_token != settings.telegram_token
+        || current.telegram_owner_id != settings.telegram_owner_id
         || current.recording_dir != settings.recording_dir
     {
         return finish(root, job, "failed", "recording_configuration_changed", None);
@@ -606,7 +669,7 @@ fn classify_send(http_ok: bool, response: Option<&Value>, owner: &str) -> SendRe
     }
     if http_ok
         && response.get("ok").and_then(Value::as_bool) == Some(true)
-        && private_chat_matches(&response["result"]["chat"], owner)
+        && common::delivery_chat_matches(&response["result"]["chat"], owner)
         && let Some(id) = response["result"]["message_id"]
             .as_i64()
             .filter(|id| *id > 0)
@@ -614,14 +677,6 @@ fn classify_send(http_ok: bool, response: Option<&Value>, owner: &str) -> SendRe
         return SendResult::Sent(id);
     }
     SendResult::Uncertain
-}
-
-fn private_chat_matches(chat: &Value, owner: &str) -> bool {
-    valid_owner(owner)
-        && chat["type"].as_str() == Some("private")
-        && chat["id"]
-            .as_i64()
-            .is_some_and(|id| id > 0 && id.to_string() == owner)
 }
 
 fn defer(
@@ -804,12 +859,67 @@ mod tests {
             classify_send(false, Some(&json!({"ok":false})), "12345"),
             SendResult::Rejected
         ));
-        assert!(!private_chat_matches(
+        assert!(!common::delivery_chat_matches(
             &json!({"id":12345,"type":"group"}),
             "12345"
         ));
         assert!(!valid_owner("-12345"));
         assert!(!valid_owner("0012345"));
+    }
+
+    #[test]
+    fn channel_delivery_requires_exact_private_channel_and_owner_only_membership() {
+        for method in ["getMe", "getChat", "getChatMember", "getChatMemberCount"] {
+            assert!(telegram_url("12345:fixture_secret", method).is_ok());
+        }
+        assert!(telegram_url("12345:fixture_secret", "promoteChatMember").is_err());
+        let id = "-1001234567890";
+        let response = json!({"ok":true,"result":{"message_id":9,"chat":{"id":-1001234567890_i64,"type":"channel"}}});
+        assert!(matches!(
+            classify_send(true, Some(&response), id),
+            SendResult::Sent(9)
+        ));
+        let mut public = response.clone();
+        public["result"]["chat"]["username"] = json!("public_channel");
+        assert!(matches!(
+            classify_send(true, Some(&public), id),
+            SendResult::Uncertain
+        ));
+        assert!(matches!(
+            classify_send(true, Some(&response), "-1009999999999"),
+            SendResult::Uncertain
+        ));
+        let owner = json!({"status":"creator","user":{"id":12345}});
+        let mut bot = json!({"status":"administrator","can_post_messages":true,"user":{"id":23456,"is_bot":true}});
+        assert!(owner_only_channel_members(
+            &owner,
+            &bot,
+            &json!(2),
+            "12345",
+            "23456"
+        ));
+        assert!(!owner_only_channel_members(
+            &owner,
+            &bot,
+            &json!(3),
+            "12345",
+            "23456"
+        ));
+        assert!(!owner_only_channel_members(
+            &owner,
+            &bot,
+            &json!(2),
+            "54321",
+            "23456"
+        ));
+        bot["can_post_messages"] = json!(false);
+        assert!(!owner_only_channel_members(
+            &owner,
+            &bot,
+            &json!(2),
+            "12345",
+            "23456"
+        ));
     }
 
     #[test]

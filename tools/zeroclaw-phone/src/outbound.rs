@@ -703,6 +703,47 @@ mod tests {
     };
     use zeroclaw_config::secrets::SecretStore;
 
+    #[test]
+    fn voicemail_channel_configuration_does_not_redirect_outbound_delivery() {
+        let (_directory, root) = fixture();
+        let native = root.parent().unwrap().parent().unwrap();
+        let store = SecretStore::new(native, true);
+        let mut config: common::PhoneConfig =
+            toml::from_str(&common::private_read(&root.join("phone.toml")).unwrap()).unwrap();
+        config.voicemail = Some(common::VoicemailConfig {
+            telegram_alias: "voicemail".into(),
+            bot_username: "voicemail_bot".into(),
+            channel_id: "-1001234567890".into(),
+        });
+        let token = store.encrypt("23456:fixture_voicemail_secret").unwrap();
+        let mut text = common::private_read(&native.join("config.toml")).unwrap();
+        text.push_str(&format!(
+            "\n[channels.telegram.voicemail]\nenabled=true\nbot_token=\"{token}\"\n"
+        ));
+        common::atomic_private_write(&native.join("config.toml"), text.as_bytes()).unwrap();
+        common::atomic_private_write(
+            &root.join("phone.toml"),
+            toml::to_string(&config).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let base = common::load(&root).unwrap();
+        let voicemail = common::load_voicemail(&root).unwrap();
+        assert_eq!(base.telegram_chat_id, "12345");
+        assert_eq!(base.telegram_bot_username, "fixture_bot");
+        assert_eq!(voicemail.telegram_chat_id, "-1001234567890");
+        assert_eq!(voicemail.telegram_owner_id, "12345");
+        assert_eq!(voicemail.telegram_bot_username, "voicemail_bot");
+        assert_ne!(base.telegram_token, voicemail.telegram_token);
+        config.voicemail.as_mut().unwrap().channel_id = "@public_channel".into();
+        common::atomic_private_write(
+            &root.join("phone.toml"),
+            toml::to_string(&config).unwrap().as_bytes(),
+        )
+        .unwrap();
+        assert!(common::load(&root).is_ok());
+        assert!(common::load_voicemail(&root).is_err());
+    }
+
     fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -713,6 +754,7 @@ mod tests {
         common::private_dir(&root).unwrap();
         let store = SecretStore::new(&native, true);
         let config = common::PhoneConfig {
+            voicemail: None,
             enabled: true,
             port: 43335,
             public_base: "https://phone.test.invalid".into(),

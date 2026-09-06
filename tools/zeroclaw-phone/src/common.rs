@@ -91,6 +91,17 @@ pub struct PhoneConfig {
     pub telegram_peer_group: String,
     pub telegram_bot_username: String,
     pub openai_key_path: String,
+    /// Optional owner-only private channel for inbound voicemail deliveries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voicemail: Option<VoicemailConfig>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoicemailConfig {
+    pub telegram_alias: String,
+    pub bot_username: String,
+    pub channel_id: String,
 }
 
 pub struct Settings {
@@ -104,6 +115,7 @@ pub struct Settings {
     pub max_duration_secs: u64,
     pub telegram_token: String,
     pub telegram_chat_id: String,
+    pub telegram_owner_id: String,
     pub telegram_bot_username: String,
     pub recording_dir: PathBuf,
     pub api_key: String,
@@ -129,6 +141,14 @@ fn at<'a>(value: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
 }
 
 pub fn load(root: &Path) -> SafeResult<Settings> {
+    load_delivery(root, false)
+}
+
+pub fn load_voicemail(root: &Path) -> SafeResult<Settings> {
+    load_delivery(root, true)
+}
+
+fn load_delivery(root: &Path, voicemail: bool) -> SafeResult<Settings> {
     private_dir(root)?;
     let config_dir = native_dir(root)?;
     private_dir(&config_dir)?;
@@ -214,7 +234,7 @@ pub fn load(root: &Path) -> SafeResult<Settings> {
         !instructions.is_empty() && instructions.len() < 64_000,
         "screening_policy_invalid",
     )?;
-    let telegram_token = store
+    let mut telegram_token = store
         .decrypt(token)
         .map_err(|_| "telegram_credential_unavailable")?;
     let api_key = store.decrypt(key).map_err(|_| "voice_key_unavailable")?;
@@ -222,6 +242,41 @@ pub fn load(root: &Path) -> SafeResult<Settings> {
         !telegram_token.is_empty() && !api_key.is_empty(),
         "empty_native_credential",
     )?;
+    let mut telegram_chat_id = owner.to_owned();
+    let mut telegram_bot_username = p.telegram_bot_username;
+    if let Some(destination) = p.voicemail.filter(|_| voicemail) {
+        check(
+            valid_private_channel_id(&destination.channel_id),
+            "voicemail_channel_invalid",
+        )?;
+        check(
+            !destination.bot_username.is_empty(),
+            "voicemail_bot_invalid",
+        )?;
+        let channel = at(
+            &native,
+            &format!("channels.telegram.{}", destination.telegram_alias),
+        )
+        .ok_or("voicemail_telegram_alias_missing")?;
+        check(
+            channel.get("enabled").and_then(toml::Value::as_bool) == Some(true),
+            "voicemail_telegram_disabled",
+        )?;
+        let token = channel
+            .get("bot_token")
+            .and_then(toml::Value::as_str)
+            .ok_or("voicemail_credential_missing")?;
+        check(
+            token.starts_with("enc2:"),
+            "unencrypted_voicemail_credential",
+        )?;
+        telegram_token = store
+            .decrypt(token)
+            .map_err(|_| "voicemail_credential_unavailable")?;
+        check(!telegram_token.is_empty(), "voicemail_credential_empty")?;
+        telegram_chat_id = destination.channel_id;
+        telegram_bot_username = destination.bot_username;
+    }
     Ok(Settings {
         enabled: p.enabled,
         port: p.port,
@@ -232,13 +287,40 @@ pub fn load(root: &Path) -> SafeResult<Settings> {
         forwarded_from: p.forwarded_from,
         max_duration_secs: p.max_duration_secs,
         telegram_token,
-        telegram_chat_id: owner.to_owned(),
-        telegram_bot_username: p.telegram_bot_username,
+        telegram_chat_id,
+        telegram_owner_id: owner.to_owned(),
+        telegram_bot_username,
         recording_dir: root.join("recordings"),
         api_key,
         instructions,
         config_dir,
     })
+}
+
+pub fn valid_private_channel_id(value: &str) -> bool {
+    value.starts_with("-100")
+        && value.len() > 4
+        && value
+            .parse::<i64>()
+            .is_ok_and(|id| id < 0 && id.to_string() == value)
+}
+
+pub fn delivery_chat_matches(chat: &serde_json::Value, expected: &str) -> bool {
+    let Some(id) = chat["id"].as_i64() else {
+        return false;
+    };
+    if id.to_string() != expected {
+        return false;
+    }
+    if id > 0 {
+        return chat["type"] == "private";
+    }
+    valid_private_channel_id(expected)
+        && chat["type"] == "channel"
+        && chat["username"].as_str().is_none_or(str::is_empty)
+        && chat["active_usernames"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
 }
 
 pub fn e164(s: &str) -> bool {
