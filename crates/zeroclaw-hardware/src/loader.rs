@@ -314,6 +314,45 @@ required    = true
         assert_eq!(plugin.tool.name(), "test_plugin");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn loaded_plugin_retains_parent_deadline_before_spawn() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_valid_manifest(dir.path());
+        let binary = dir.path().join("tool.sh");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+printf started > "$0.started"
+cat >/dev/null
+printf '%s\n' '{"success":true,"output":"loaded fixture","error":null}'
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let plugin = load_one_plugin(dir.path(), &dir.path().join("tool.toml")).unwrap();
+        let error = zeroclaw_api::deadline::PARENT
+            .scope(
+                Some(tokio::time::Instant::now()),
+                plugin
+                    .tool
+                    .execute(serde_json::json!({"device":"synthetic"})),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<zeroclaw_api::deadline::DeadlineExceeded>());
+        assert!(!dir.path().join("tool.sh.started").exists());
+        let result = plugin
+            .tool
+            .execute(serde_json::json!({"device":"synthetic"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(result.output, "loaded fixture");
+        assert!(dir.path().join("tool.sh.started").exists());
+    }
+
     #[test]
     fn load_one_plugin_fails_on_missing_name() {
         let dir = tempfile::tempdir().unwrap();

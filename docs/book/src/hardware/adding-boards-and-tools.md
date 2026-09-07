@@ -76,6 +76,37 @@ See [`docs/hardware/hardware-peripherals-design.md`](../hardware/hardware-periph
 2. Register in `create_peripheral_tools` (for hardware tools) or the agent tool registry.
 3. Add a tool description to the agent's `tool_descs` in `crates/zeroclaw-runtime/src/agent/loop_.rs`.
 
+## Subprocess tool lifecycle
+
+The manifest loader in `zeroclaw-hardware` runs a `tool.toml` binary through
+`SubprocessTool`. It sends one JSON argument line and expects one JSON
+`ToolResult` line on stdout. Both protocol envelopes are limited to 1 MiB,
+including the newline. Oversized requests are refused before the child starts;
+oversized, malformed or empty responses fail explicitly.
+
+The active turn's parent deadline covers admission, stdin writes, response reads,
+exit and cleanup. An expired parent prevents spawning and returns the existing
+typed deadline error. Without an earlier parent deadline, exchange work has a
+10-second ceiling. Natural exit gets at most 5 seconds within that exchange;
+error cleanup gets at most 5 additional seconds for kill/reap. Cancellation drops
+the owned kill-on-drop child and all pipe readers. No reader or cleanup task is
+detached from the invocation.
+
+Stderr is drained concurrently with stdin/stdout work, retaining at most a
+512-byte diagnostic prefix. A received `ToolResult` needs a successful process
+exit before success is reported. A later exit failure or local timeout changes
+success to false while retaining the received text and structured output in the
+runner's return value. This source-supplied output is not a trusted effect receipt.
+The generic runtime failure/history projection and durable effect-receipt
+preservation remain separate unfinished work.
+
+Synthetic process tests cover blocked stdin, stderr backpressure, oversized
+responses, parent expiry after one effect, direct-child reaping and exit failure.
+The runner does not contain detached descendants or reverse external effects.
+A timeout, killed child or malformed response is never proof of non-delivery;
+no automatic retry is performed. Loader path checks and extension attribution
+continue to apply.
+
 ## CLI Reference
 
 See the [generated CLI reference](../reference/cli.md) for `zeroclaw peripheral` and `zeroclaw hardware` subcommands.

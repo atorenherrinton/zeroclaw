@@ -165,6 +165,13 @@ succeed before readiness. Direct-child cleanup is covered by synthetic process
 tests; detached descendants, generic effect receipts and coordinated process
 shutdown remain unfinished. See [MCP](../tools/mcp.md#parent-deadlines-and-recovery).
 
+Manifest-loaded hardware subprocess tools also inherit the parent deadline.
+The child and concurrent pipe readers stay owned by the invocation; cancellation
+cannot detach the direct child. Protocol payloads and stderr retention are
+bounded. The runner retains received output when a later exit check fails, but
+this does not establish generic durable effect receipts or change the runtime's
+failure/history projection. See [Subprocess tool lifecycle](../hardware/adding-boards-and-tools.md#subprocess-tool-lifecycle).
+
 ## Results, receipts, and history
 
 Successful tool executions normalize empty output to `(no output)`. When

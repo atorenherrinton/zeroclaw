@@ -4,20 +4,21 @@ use super::manifest::ToolManifest;
 use async_trait::async_trait;
 use serde_json::json;
 use std::path::PathBuf;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
+use zeroclaw_api::deadline::{Phase, run_inherited_phase};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 tool_attribution!(SubprocessTool, ToolKind::Plugin, ToolProvenance::Extension);
 
-/// Subprocess timeout — kill the child process after this many seconds.
+/// Total I/O/execution budget; explicit error cleanup has its own bounded wait.
 const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
 
-/// Timeout for waiting on child process exit after stdout has been read.
-/// Prevents a hung cleanup phase from blocking indefinitely.
+/// Ceiling for natural exit and for explicit kill/reap after an error.
+/// The inherited parent deadline can shorten either wait.
 const PROCESS_EXIT_TIMEOUT_SECS: u64 = 5;
 
 pub struct SubprocessTool {
@@ -88,241 +89,189 @@ impl Tool for SubprocessTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let args_json = serde_json::to_string(&args).map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "plugin": self.manifest.tool.name,
-                        "error": format!("{}", e),
-                    })),
-                "subprocess plugin: failed to serialise tool args"
-            );
-            anyhow::Error::msg(format!("failed to serialise args: {e}"))
-        })?;
+        run_inherited_phase(
+            Phase::Tool,
+            self.execute_with_budget(
+                args,
+                Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
+                Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS),
+            ),
+        )
+        .await
+    }
+}
 
-        // Spawn child process.
+// Bound the serialized protocol envelope before spawning or allocating an
+// unbounded line. The caller's original argument Value remains caller-owned.
+const MAX_PROTOCOL_BYTES: usize = 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 512;
+
+// Reserve one byte for the trailing protocol newline.
+struct ProtocolBuffer(Vec<u8>);
+
+impl std::io::Write for ProtocolBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_PROTOCOL_BYTES.saturating_sub(self.0.len() + 1) {
+            return Err(std::io::Error::other("plugin request exceeds 1 MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl SubprocessTool {
+    async fn execute_with_budget(
+        &self,
+        args: serde_json::Value,
+        operation_budget: Duration,
+        cleanup_budget: Duration,
+    ) -> anyhow::Result<ToolResult> {
+        use anyhow::Context;
+
+        let mut encoded = ProtocolBuffer(Vec::new());
+        serde_json::to_writer(&mut encoded, &args)
+            .context("failed to encode bounded plugin request before spawn")?;
         let mut child = Command::new(&self.binary_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // The Child is the sole process owner throughout writes, reads and
+            // cleanup. Dropping the caller cannot detach a live direct child.
+            .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "plugin": self.manifest.tool.name,
-                            "binary_path": self.binary_path.display().to_string(),
-                            "error": format!("{}", e),
-                        })),
-                    "subprocess plugin spawn failed"
+            .with_context(|| format!("failed to spawn plugin '{}'", self.manifest.tool.name))?;
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let mut stderr_prefix = Vec::new();
+        // This is the sole received protocol result. Retain its output if a
+        // later exit/cleanup check fails; never fabricate execution confirmation.
+        let mut received = None;
+        let exchange_result = {
+            let exchange = async {
+                let mut stdin = stdin.context("plugin stdin pipe unavailable")?;
+                let write = async {
+                    stdin.write_all(&encoded.0).await?;
+                    stdin.write_all(b"\n").await
+                }
+                .await;
+                // Fixed-output plugins may close stdin without reading it.
+                if let Err(error) = write
+                    && error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(error).context("failed to write plugin arguments");
+                }
+                drop(stdin);
+                let stdout = stdout.context("plugin stdout pipe unavailable")?;
+                let mut reader = BufReader::new(stdout).take((MAX_PROTOCOL_BYTES + 1) as u64);
+                let mut line = Vec::new();
+                reader
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .context("failed to read plugin response")?;
+                if line.len() > MAX_PROTOCOL_BYTES {
+                    anyhow::bail!("plugin response exceeds 1 MiB");
+                }
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    anyhow::bail!("plugin returned empty stdout");
+                }
+                received = Some(
+                    serde_json::from_slice::<ToolResult>(&line)
+                        .context("failed to parse plugin ToolResult")?,
                 );
-                anyhow::Error::msg(format!(
-                    "failed to spawn plugin '{}' at {}: {e}",
-                    self.manifest.tool.name,
-                    self.binary_path.display()
-                ))
-            })?;
-
-        // Write JSON args + newline to stdin, then drop stdin to signal EOF.
-        // BrokenPipe is tolerated — the child may exit before reading stdin
-        // (e.g. tools that only use command-line args or produce fixed output).
-        if let Some(mut stdin) = child.stdin.take() {
-            let write_result = async {
-                stdin.write_all(args_json.as_bytes()).await?;
-                stdin.write_all(b"\n").await?;
-                Ok::<(), std::io::Error>(())
-            }
-            .await;
-            if let Err(e) = write_result
-                && e.kind() != std::io::ErrorKind::BrokenPipe
-            {
-                let _ = child.kill().await;
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "plugin": self.manifest.tool.name,
-                            "error": format!("{}", e),
-                        })),
-                    "subprocess plugin: failed to write args to stdin"
-                );
-                anyhow::bail!(
-                    "failed to write args to plugin '{}' stdin: {}",
-                    self.manifest.tool.name,
-                    e
-                );
-            }
-            // stdin dropped here → child receives EOF
-        }
-
-        // Take stdout and stderr handles before we move `child`.
-        let stdout_handle = child.stdout.take();
-        let stderr_handle = child.stderr.take();
-
-        // Read one line from stdout with a hard timeout.
-        let read_result = match stdout_handle {
-            None => {
-                // No stdout — kill and error.
-                let _ = child.kill().await;
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "plugin '{}': could not attach stdout pipe",
-                        self.manifest.tool.name
-                    )),
-                });
-            }
-            Some(stdout) => {
-                let mut reader = BufReader::new(stdout);
-                let mut line = String::new();
-                timeout(
-                    Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
-                    reader.read_line(&mut line),
-                )
-                .await
-                .map(|inner| inner.map(|_| line))
-            }
+                let status = timeout(cleanup_budget, child.wait())
+                    .await
+                    .context("plugin exit timed out after its response")?
+                    .context("failed to wait for plugin exit")?;
+                if !status.success() {
+                    anyhow::bail!("plugin exited with {status}");
+                }
+                Ok::<(), anyhow::Error>(())
+            };
+            // Poll stderr alongside *all* exchange phases, including a blocked
+            // stdin write. Keep only a prefix, but drain excess to avoid pipe
+            // backpressure. No spawned drain task can outlive this invocation.
+            let drain = drain_stderr(stderr, &mut stderr_prefix);
+            timeout(operation_budget, async {
+                tokio::pin!(exchange);
+                tokio::pin!(drain);
+                tokio::select! {
+                    result = &mut exchange => result,
+                    result = &mut drain => {
+                        result.context("failed to drain plugin stderr")?;
+                        exchange.await
+                    },
+                }
+            })
+            .await
+            .map_err(|error| anyhow::Error::new(error).context("plugin exchange timed out"))
+            .and_then(std::convert::identity)
         };
 
-        match read_result {
-            // ── Timeout ────────────────────────────────────────────────────
-            // The read deadline elapsed — force-kill the plugin and collect
-            // any stderr it emitted before dying.
-            Err(_elapsed) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let stderr_msg = collect_stderr(stderr_handle).await;
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "plugin '{}' timed out after {}s{}",
-                        self.manifest.tool.name,
-                        SUBPROCESS_TIMEOUT_SECS,
-                        if stderr_msg.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; stderr: {}", stderr_msg)
-                        }
-                    )),
-                })
+        if let Err(error) = exchange_result {
+            // Bound explicit reaping too. Parent expiry during this wait drops
+            // the same kill-on-drop Child; no detached cleanup task or retry.
+            let cleanup = async {
+                child.start_kill().context("failed to kill plugin child")?;
+                child.wait().await.context("failed to reap plugin child")?;
+                Ok::<(), anyhow::Error>(())
+            };
+            let cleanup_error = match timeout(cleanup_budget, cleanup).await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("plugin child cleanup timed out".to_string()),
+            };
+            let mut result = received.unwrap_or_else(|| ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: None,
+            });
+            result.success = false;
+            let mut diagnostic = format!(
+                "plugin '{}': {error:#}; external effects may have occurred; do not replay automatically",
+                self.manifest.tool.name
+            );
+            if let Some(cleanup_error) = cleanup_error {
+                diagnostic.push_str(&format!("; {cleanup_error}"));
             }
-
-            // ── I/O error reading stdout ───────────────────────────────────
-            Ok(Err(io_err)) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let stderr_msg = collect_stderr(stderr_handle).await;
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "plugin '{}': I/O error reading stdout: {}{}",
-                        self.manifest.tool.name,
-                        io_err,
-                        if stderr_msg.is_empty() {
-                            String::new()
-                        } else {
-                            format!("; stderr: {}", stderr_msg)
-                        }
-                    )),
-                })
+            let stderr = String::from_utf8_lossy(&stderr_prefix);
+            if !stderr.trim().is_empty() {
+                diagnostic.push_str(&format!("; stderr: {}", stderr.trim()));
             }
-
-            // ── Got a line ────────────────────────────────────────────────
-            // Let the process finish naturally — plugins that write their
-            // result and then do cleanup should not be interrupted.
-            Ok(Ok(line)) => {
-                let child_status =
-                    timeout(Duration::from_secs(PROCESS_EXIT_TIMEOUT_SECS), child.wait())
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok());
-                let stderr_msg = collect_stderr(stderr_handle).await;
-                let line = line.trim();
-
-                if line.is_empty() {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "plugin '{}': empty stdout{}",
-                            self.manifest.tool.name,
-                            if stderr_msg.is_empty() {
-                                String::new()
-                            } else {
-                                format!("; stderr: {}", stderr_msg)
-                            }
-                        )),
-                    });
-                }
-
-                match serde_json::from_str::<ToolResult>(line) {
-                    Ok(result) => {
-                        // Non-zero exit overrides a parsed result: the plugin
-                        // signalled failure even if it wrote a success line.
-                        if let Some(status) = child_status
-                            && !status.success()
-                        {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: ToolOutput::default(),
-                                error: Some(format!(
-                                    "plugin '{}' exited with {}{}",
-                                    self.manifest.tool.name,
-                                    status,
-                                    if stderr_msg.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!("; stderr: {}", stderr_msg)
-                                    }
-                                )),
-                            });
-                        }
-                        Ok(result)
-                    }
-                    Err(parse_err) => Ok(ToolResult {
-                        success: false,
-                        output: ToolOutput::default(),
-                        error: Some(format!(
-                            "plugin '{}': failed to parse output as ToolResult: {} (got: {:?})",
-                            self.manifest.tool.name,
-                            parse_err,
-                            // Truncate oversized output in the error message.
-                            // Use char-based truncation to avoid panic on multi-byte UTF-8.
-                            if line.chars().count() > 200 {
-                                let truncated: String = line.chars().take(200).collect();
-                                format!("{}...", truncated)
-                            } else {
-                                line.to_string()
-                            }
-                        )),
-                    }),
-                }
+            if let Some(prior_error) = result.error.take() {
+                diagnostic.push_str(&format!("; plugin error: {prior_error}"));
             }
+            result.error = Some(diagnostic);
+            return Ok(result);
         }
+        received.context("plugin exchange completed without a protocol result")
     }
 }
 
-/// Collect up to 512 bytes from an optional stderr handle.
-/// Used to enrich error messages when a plugin writes nothing to stdout.
-async fn collect_stderr(handle: Option<tokio::process::ChildStderr>) -> String {
-    use tokio::io::AsyncReadExt;
+async fn drain_stderr(
+    handle: Option<tokio::process::ChildStderr>,
+    prefix: &mut Vec<u8>,
+) -> std::io::Result<()> {
     let Some(mut stderr) = handle else {
-        return String::new();
+        return Ok(());
     };
-    let mut buf = vec![0u8; 512];
-    match stderr.read(&mut buf).await {
-        Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).trim().to_string(),
-        _ => String::new(),
+    let mut buffer = [0u8; 4096];
+    loop {
+        let n = stderr.read(&mut buffer).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        let keep = n.min(MAX_STDERR_BYTES.saturating_sub(prefix.len()));
+        prefix.extend_from_slice(&buffer[..keep]);
     }
 }
+
+#[cfg(all(test, unix))]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -330,7 +279,7 @@ mod tests {
     use crate::manifest::{ExecConfig, ParameterDef, ToolManifest, ToolMeta};
     use zeroclaw_api::attribution::Attributable;
 
-    fn make_manifest(name: &str, params: Vec<ParameterDef>) -> ToolManifest {
+    pub(super) fn make_manifest(name: &str, params: Vec<ParameterDef>) -> ToolManifest {
         ToolManifest {
             tool: ToolMeta {
                 name: name.to_string(),
@@ -458,7 +407,7 @@ mod tests {
         // "timed out" error once SUBPROCESS_TIMEOUT_SECS elapses.
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("tool.sh");
-        std::fs::write(&script_path, "#!/bin/sh\nsleep 60\n").unwrap();
+        std::fs::write(&script_path, "#!/bin/sh\nexec sleep 60\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
