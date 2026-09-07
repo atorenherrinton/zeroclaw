@@ -1557,13 +1557,13 @@ mod tests {
 
     #[test]
     fn failover_does_not_mask_credentials_or_unsupported_operations() {
-        assert!(search_failure_allows_failover(&anyhow::anyhow!(
+        assert!(search_failure_allows_failover(&anyhow::Error::msg(
             "search_status=unavailable"
         )));
-        assert!(!search_failure_allows_failover(&anyhow::anyhow!(
+        assert!(!search_failure_allows_failover(&anyhow::Error::msg(
             "search_status=client_error http=403"
         )));
-        assert!(!search_failure_allows_failover(&anyhow::anyhow!(
+        assert!(!search_failure_allows_failover(&anyhow::Error::msg(
             "missing API key"
         )));
     }
