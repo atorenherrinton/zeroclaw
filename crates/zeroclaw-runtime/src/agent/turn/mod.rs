@@ -764,16 +764,14 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             tools_registry,
             excluded_tools,
             activated_tools,
-            if iteration == 0 {
+            Some(&zeroclaw_tools::schema_selection::owner_intent(
                 turn_state
                     .history
                     .iter()
                     .rev()
-                    .find(|m| m.role == "user")
-                    .map(|m| m.content.as_str())
-            } else {
-                None
-            },
+                    .filter(|m| m.role == "user" && !m.content.starts_with("[Tool results]"))
+                    .map(|m| m.content.as_str()),
+            )),
         )?;
 
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(

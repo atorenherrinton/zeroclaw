@@ -34,20 +34,20 @@ pub(crate) fn build_iteration_tool_specs(
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
     intent: Option<&str>,
 ) -> Result<IterationToolSpecs> {
+    // Full catalogs support safe discovery. Explicitly assembled task/child
+    // registries may have no discovery tool and already represent the required
+    // task scope; retain those contracts until catalog capabilities are typed.
     let discovery_available = tools_registry.iter().any(|tool| {
         tool.name() == "tool_search" && !excluded_tools.iter().any(|name| name == "tool_search")
     });
+    let intent = intent.filter(|_| discovery_available);
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| {
             crate::tools::model_may_invoke_tool(tool.name())
                 && !excluded_tools.iter().any(|ex| ex == tool.name())
-                && zeroclaw_tools::schema_selection::relevant(
-                    tool.name(),
-                    intent,
-                    discovery_available,
-                )
+                && zeroclaw_tools::schema_selection::relevant(tool.name(), intent)
         })
         .map(|tool| tool.spec())
         .collect();
@@ -68,11 +68,7 @@ pub(crate) fn build_iteration_tool_specs(
         for spec in activated_tools.tool_specs() {
             if crate::tools::model_may_invoke_tool(&spec.name)
                 && !excluded_tools.iter().any(|ex| ex == &spec.name)
-                && zeroclaw_tools::schema_selection::relevant(
-                    &spec.name,
-                    intent,
-                    discovery_available,
-                )
+                && zeroclaw_tools::schema_selection::relevant(&spec.name, intent)
             {
                 tool_specs.push(spec);
             }
@@ -227,6 +223,55 @@ mod tests {
         fn alias(&self) -> &str {
             self.name()
         }
+    }
+
+    #[test]
+    fn intent_filter_applies_to_registered_and_activated_tools_each_iteration() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = ["tool_search", "shell", "ops__calendar_events"]
+            .into_iter()
+            .map(|name| {
+                Box::new(CountingTool::new(name, Arc::clone(&invocations))) as Box<dyn Tool>
+            })
+            .collect();
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().activate(
+            "ops__calendar_create".into(),
+            Arc::new(CountingTool::new(
+                "ops__calendar_create",
+                Arc::clone(&invocations),
+            )),
+        );
+        for _iteration in 0..3 {
+            let specs = build_iteration_tool_specs(
+                &NativeToolsProvider,
+                "test",
+                &registry,
+                &[],
+                Some(&activated),
+                Some("List calendar meetings"),
+            )
+            .unwrap();
+            assert!(specs.known_tool_names.contains("tool_search"));
+            assert!(specs.known_tool_names.contains("ops__calendar_events"));
+            assert!(!specs.known_tool_names.contains("shell"));
+            assert!(!specs.known_tool_names.contains("ops__calendar_create"));
+        }
+        let followup = zeroclaw_tools::schema_selection::owner_intent(
+            ["Continue", "Create a calendar meeting"].into_iter(),
+        );
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test",
+            &registry,
+            &[],
+            Some(&activated),
+            Some(&followup),
+        )
+        .unwrap();
+        assert!(specs.known_tool_names.contains("ops__calendar_create"));
+        assert!(!specs.known_tool_names.contains("shell"));
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
     #[test]
