@@ -39,6 +39,15 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
     let default = &config["risk_profiles"]["default"];
     let mut auto = default["auto_approve"].clone();
     push_unique(&mut auto, json!("delegate"))?;
+    push_unique(&mut auto, json!("reminders__delete_list"))?;
+    if let Some(allowed) = default["allowed_tools"]
+        .as_array()
+        .filter(|tools| !tools.is_empty())
+    {
+        let mut allowed = json!(allowed);
+        push_unique(&mut allowed, json!("reminders__delete_list"))?;
+        add("/risk_profiles/default/allowed_tools".into(), allowed);
+    }
     for name in &helper_tools {
         if name != "personal_ops__imessage_approve" {
             push_unique(&mut auto, json!(name))?;
@@ -134,6 +143,7 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                     "reminders__list",
                     "reminders__list_lists",
                     "reminders__create_list",
+                    "reminders__delete_list",
                     "reminders__search",
                     "reminders__add",
                     "reminders__edit",
@@ -810,6 +820,69 @@ mod tests {
                 .iter()
                 .any(|op| op["path"] == "/providers/models/openai/astra"
                     && op["value"]["model"] == "gpt-6-astra")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_manifest_registers_guarded_list_deletion_only_for_task_specialist() -> Result<()> {
+        let config = json!({"agents":{"main":{"mcp_bundles":[],"delegates":[]}},"risk_profiles":{"default":{"auto_approve":[]}},"runtime_profiles":{"default":{}},"providers":{"models":{"openai":{"sol":{"requires_openai_auth":true},"terra":{"requires_openai_auth":true}}}},"mcp":{"servers":[]}});
+        let patch = patch(
+            &config,
+            Path::new("/fixture/config"),
+            Path::new("/fixture/repos"),
+        )?;
+        assert!(patch.as_array().context("patch")?.iter().any(|op| {
+            op["path"] == "/risk_profiles/default/auto_approve"
+                && op["value"]
+                    .as_array()
+                    .is_some_and(|tools| tools.contains(&json!("reminders__delete_list")))
+        }));
+        let mut restricted = config.clone();
+        restricted["risk_profiles"]["default"]["allowed_tools"] = json!(["existing"]);
+        let restricted_patch = super::patch(
+            &restricted,
+            Path::new("/fixture/config"),
+            Path::new("/fixture/repos"),
+        )?;
+        assert!(
+            restricted_patch
+                .as_array()
+                .context("patch")?
+                .iter()
+                .any(|op| op["path"] == "/risk_profiles/default/allowed_tools"
+                    && op["value"] == json!(["existing", "reminders__delete_list"]))
+        );
+        for alias in [
+            "calendar_tasks",
+            "communications",
+            "task_scheduler",
+            "coding",
+        ] {
+            let path = format!("/risk_profiles/{alias}");
+            let profile = &patch
+                .as_array()
+                .context("patch")?
+                .iter()
+                .find(|op| op["path"] == path)
+                .context("profile")?["value"];
+            for field in ["allowed_tools", "auto_approve"] {
+                assert_eq!(
+                    profile[field]
+                        .as_array()
+                        .context("tools")?
+                        .contains(&json!("reminders__delete_list")),
+                    alias == "calendar_tasks"
+                );
+            }
+        }
+        assert!(
+            ROLES
+                .iter()
+                .find(|(alias, _)| *alias == "calendar_tasks")
+                .context("role")?
+                .1
+                .contains("owner_authorized=true")
         );
         Ok(())
     }

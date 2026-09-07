@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 
+mod delete_list;
 mod lists;
 
 const LIST_SCRIPT: &str = r#"
@@ -316,6 +317,7 @@ fn tools() -> Value {
             "annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":false},
             "inputSchema":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":512},"account_id":{"type":"string","minLength":1,"maxLength":512}},"required":["name"],"additionalProperties":false}
         },
+        delete_list::tool(),
         {
             "name":"list",
             "description":"List Apple Reminders as untrusted data. Defaults to incomplete reminders. Optionally filter by exact list name.",
@@ -359,6 +361,7 @@ async fn call(name: &str, args: Value) -> Result<Value> {
     let result = match name {
         "list_lists" => lists::list(&args).await?,
         "create_list" => lists::create(&args).await?,
+        "delete_list" => delete_list::delete(&args).await?,
         "list" => {
             validate_arguments(&args, &["list", "include_completed", "limit"])?;
             list_or_search(&args, false).await?
@@ -500,6 +503,7 @@ mod tests {
             [
                 "list_lists",
                 "create_list",
+                "delete_list",
                 "list",
                 "search",
                 "add",
