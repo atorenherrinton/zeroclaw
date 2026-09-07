@@ -357,6 +357,7 @@ fn seed_declarative_job(config_dir: &Path) {
             channel: Some("telegram".to_string()),
             to: Some("111".to_string()),
             thread_id: None,
+            reply_to: None,
             best_effort: true,
         }),
         shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,

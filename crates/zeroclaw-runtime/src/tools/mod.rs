@@ -3125,6 +3125,23 @@ permissions = ["http_client"]
                 .await
                 .unwrap_or_else(|error| panic!("{tool_name} should return a tool result: {error}"));
 
+            if tool_name == "codex_cli" {
+                assert!(
+                    !result.success,
+                    "model-authored tasks must not invoke recovery"
+                );
+                assert!(
+                    result
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("reserved for ZeroClaw runtime recovery"))
+                );
+                assert!(
+                    seen_command.lock().unwrap().is_none(),
+                    "reserved recovery must not launch a subprocess"
+                );
+                continue;
+            }
             assert!(
                 result.success,
                 "{tool_name} unexpected error: {:?}",
