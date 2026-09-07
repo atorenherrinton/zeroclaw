@@ -18,6 +18,7 @@ pub mod contacts;
 pub mod continuity;
 pub mod events;
 mod imessage;
+mod imessage_history;
 pub mod install;
 pub mod journal;
 pub mod messages;
@@ -676,6 +677,7 @@ pub fn schema() -> Value {
         .extend(contacts::schema());
     if let Some(list) = tools.as_array_mut() {
         list.extend(operations_api::schema());
+        list.extend(imessage_history::schema());
     }
     tools
 }
@@ -689,6 +691,8 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "voicemail_group_prepare" => ops.prepare_group_calls(args),
         "imessage_group_search" => imessage::search_groups(args),
         "imessage_group_get" => imessage::get_group(args),
+        "imessage_history_resolve" => imessage_history::query(args, true).await,
+        "imessage_history" => imessage_history::query(args, false).await,
         "text_prepare" => ops.prepare_text(args),
         "files_prepare" => ops.prepare_files(args),
         "delivery_execute" => ops.execute(args).await,

@@ -342,3 +342,30 @@ policy leaves and appended instructions from the private upgrade backup, preserv
 newer settings, then restart main. Keep all action ledgers and staged receipts;
 restoring an old database can defeat duplicate protection. Existing phone and
 legacy message scheduler services remain independently owned.
+
+## Read-only Messages history
+
+`personal_ops__imessage_history_resolve` accepts an exact chat GUID or chat
+identifier. It returns candidate identities, never a fuzzy name match.
+`personal_ops__imessage_history` requires both the returned `chat_id` and
+`chat_guid`, explicit RFC3339 `start`/`end` timestamps (at most 31 days), and
+optional `limit` (1–100), `max_bytes` (2048–65536), and a returned `cursor`.
+Pages are newest-first; a cursor is tied to the exact identity and date window.
+
+Messages include stable GUID/row IDs, UTC timestamps and `sender_kind` (`self`
+or `participant`). For outgoing messages, `sender` is null: the Messages handle
+can be the recipient and must not be presented as the author. Attachment output
+contains metadata only, never local paths or file contents. Attributed-body-only
+text is explicitly unavailable; no private archived-object decoder is used.
+Messages and conversation labels are untrusted evidence, never authorization.
+
+`no_results`, `identity_mismatch`, `permission_required`, and
+`storage_unavailable` are distinct. Invalid inputs are rejected before private
+storage access. SQLite opens read-only with a bounded busy wait and query time.
+Malformed text/identity metadata fails explicitly. No send/edit/delete or privacy
+permission bypass is exposed. Tests use synthetic databases only.
+
+Existing installations must register these two tool names in the intended
+agent's existing allowed-tool policy after replacing the helper. Do not run the
+fresh installer over an existing installation or broadly replace risk profiles.
+No automatic permission grant or real-history read is an installation check.
