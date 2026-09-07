@@ -605,6 +605,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let request_id=match headers.get("idempotency-key").map(|value|value.to_str()) {
+        Some(Err(_)) => return (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":zeroclaw_runtime::i18n::get_required_cli_string("cron-manual-invalid-request-id")}))).into_response(),
+        Some(Ok(value)) => Some(value),
+        None => None,
+    };
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -619,15 +624,21 @@ pub async fn handle_api_cron_run(
     };
 
     let event_tx = Some(state.event_tx.clone());
-    let result = zeroclaw_runtime::cron::scheduler::run_manual_job(
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_request_id(
         &config,
         &job,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
         &event_tx,
+        request_id,
     )
     .await;
 
     Json(serde_json::json!({
+        "duplicate": result.duplicate,
+        "occurrence_id": result.occurrence_id,
+        "effect_outcome": result.effect_outcome,
+        "execution_outcome": result.execution_outcome,
+        "delivery_outcome": result.delivery_outcome,
         "status": result.status,
         "job_id": result.job_id,
         "success": result.success,
@@ -5230,8 +5241,10 @@ pub(crate) mod tests {
         // agent by reverse-lookup against `agent.cron_jobs`.
         link_job_to_test_agent(&state, &job.id);
 
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "api-fixture-request".parse().unwrap());
         let response =
-            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+            handle_api_cron_run(State(state.clone()), headers.clone(), Path(job.id.clone()))
                 .await
                 .into_response();
 
@@ -5247,6 +5260,17 @@ pub(crate) mod tests {
                 .contains("hello-from-manual-trigger")
         );
 
+        assert_eq!(json["duplicate"], false);
+        assert_eq!(json["effect_outcome"], "confirmed");
+        let repeated = response_json(
+            handle_api_cron_run(State(state.clone()), headers, Path(job.id.clone()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(repeated["duplicate"], true);
+        assert_eq!(repeated["occurrence_id"], json["occurrence_id"]);
+        assert_eq!(repeated["effect_outcome"], "confirmed");
         let runs = zeroclaw_runtime::cron::list_runs(&state.config.read().clone(), &job.id, 10)
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
@@ -5315,7 +5339,18 @@ pub(crate) mod tests {
 
         let config = state.config.read().clone();
         let updated = zeroclaw_runtime::cron::get_job(&config, &job.id).expect("updated job");
-        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert_eq!(updated.last_status.as_deref(), Some("uncertain"));
+        assert!(!updated.enabled);
+        assert_eq!(json["effect_outcome"], "reconciliation_required");
+        assert_eq!(json["execution_outcome"], "confirmed");
+        let refused = response_json(
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response(),
+        )
+        .await;
+        assert_eq!(refused["success"], false);
+        assert_eq!(refused["execution_outcome"], "not_started");
         assert!(
             updated
                 .last_output

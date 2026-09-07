@@ -35,6 +35,12 @@ fn bounded_excerpt(output: &str, max_bytes: usize) -> String {
                 "outcome",
                 "retry_allowed",
                 "request_id",
+                "occurrence_id",
+                "job_id",
+                "duplicate",
+                "effect_outcome",
+                "execution_outcome",
+                "delivery_outcome",
                 "operation_id",
                 "message_id",
                 "receipt",
@@ -55,10 +61,22 @@ fn bounded_excerpt(output: &str, max_bytes: usize) -> String {
         output.len()
     );
     footer.push_str("\n[full output resource unavailable; narrow the source query]");
-    if !evidence.is_empty() && evidence.len() + footer.len() < max_bytes / 2 {
-        footer.push_str(&format!("\n[untrusted source evidence: {evidence}]"));
+    if !evidence.is_empty() {
+        let evidence_footer = format!("\n[untrusted source evidence: {evidence}]");
+        if footer.len() + evidence_footer.len() <= max_bytes {
+            footer.push_str(&evidence_footer);
+        } else {
+            // Evidence takes priority over the excerpt, including at the
+            // 512-byte per-result budget for the maximum 128-call round.
+            let compact = format!(
+                "\n[truncated; full output resource unavailable; do not replay writes]{evidence_footer}"
+            );
+            if compact.len() <= max_bytes {
+                footer = compact;
+            }
+        }
     }
-    if footer.len() >= max_bytes {
+    if footer.len() > max_bytes {
         // A long workspace path must not blow the model budget. Never return a
         // partial path that could be mistaken for a real retrievable resource.
         footer = "\n[output truncated; full evidence unavailable here; never replay external writes from this excerpt]".into();
@@ -83,6 +101,45 @@ mod tests {
         assert!(result.contains("full output resource unavailable"));
         assert!(16 * budget <= ROUND_PAYLOAD_BYTES);
     }
+    #[test]
+    fn manual_occurrence_receipt_survives_output_trimming() {
+        let id = format!("manual:key:{}", "a".repeat(64));
+        let output = serde_json::json!({"body":"😀".repeat(20000),
+            "job_id":"00000000-0000-0000-0000-000000000001", "duplicate":true,
+            "status":"uncertain", "occurrence_id":id,
+            "effect_outcome":"reconciliation_required","execution_outcome":"confirmed",
+            "delivery_outcome":"possibly_applied"})
+        .to_string();
+        let budget = per_result_budget(0, MAX_BATCH_CALLS);
+        let bounded = bound_output(&output, budget);
+        assert!(bounded.len() <= budget);
+        assert!(bounded.len() * MAX_BATCH_CALLS <= ROUND_PAYLOAD_BYTES);
+        let evidence = bounded
+            .split("[untrusted source evidence: ")
+            .nth(1)
+            .unwrap();
+        let evidence: serde_json::Value =
+            serde_json::from_str(evidence.strip_suffix(']').unwrap()).unwrap();
+        for key in [
+            "job_id",
+            "duplicate",
+            "status",
+            "occurrence_id",
+            "effect_outcome",
+            "execution_outcome",
+            "delivery_outcome",
+        ] {
+            let original: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(evidence[key], original[key], "{key}");
+        }
+        assert!(bounded.contains("do not replay writes"));
+        let evidence_only_budget = bounded.len() - bounded.find("\n[truncated").unwrap();
+        let evidence_only = bound_output(&output, evidence_only_budget);
+        assert_eq!(evidence_only.len(), evidence_only_budget);
+        assert!(evidence_only.contains(&id));
+        assert!(evidence_only.contains("reconciliation_required"));
+    }
+
     #[test]
     fn outcome_and_request_id_survive_large_json_result() {
         let output=serde_json::json!({"state":"uncertain","retry_allowed":false,"request_id":"fixture","body":"x".repeat(10000)}).to_string();

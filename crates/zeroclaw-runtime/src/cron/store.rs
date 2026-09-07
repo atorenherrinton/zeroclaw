@@ -9,7 +9,13 @@ use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
-const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
+mod manual;
+pub(crate) use manual::{
+    DuplicateManualReceipt, ManualAdmissionError, checkpoint_manual_execution,
+    claim_manual_run_with_key, finish_manual_run,
+};
+
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -234,25 +240,21 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
 /// re-persist a config-resolved snapshot into a column declarative jobs
 /// don't own; every other caller should use [`get_job`] instead.
 fn get_job_raw(config: &Config, job_id: &str) -> Result<CronJob> {
-    let Some(job) = with_read_connection(config, |conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
-             FROM cron_jobs WHERE id = ?1",
-        )?;
+    with_read_connection(config, |conn| read_job_row(conn, job_id))?
+        .ok_or_else(|| anyhow::Error::msg(format!("Cron job '{job_id}' not found")))
+}
 
-        let mut rows = stmt.query(params![job_id])?;
-        if let Some(row) = rows.next()? {
-            map_cron_job_row(row).map_err(Into::into)
-        } else {
-            anyhow::bail!("Cron job '{job_id}' not found")
-        }
-    })?
-    else {
-        anyhow::bail!("Cron job '{job_id}' not found")
-    };
-    Ok(job)
+fn read_job_row(conn: &Connection, job_id: &str) -> Result<CronJob> {
+    match conn.query_row(
+        "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+         enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+         allowed_tools, source, uses_memory, agent_alias, shell_output_format FROM cron_jobs WHERE id=?1",
+        [job_id], map_cron_job_row,
+    ) {
+        Ok(job) => Ok(job),
+        Err(rusqlite::Error::QueryReturnedNoRows) => anyhow::bail!("Cron job '{job_id}' not found"),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// A job the calling agent owns. Anyone else's is reported as missing rather
@@ -853,7 +855,7 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     with_initialized_connection(config, |conn| {
         conn.execute_batch("PRAGMA synchronous=FULL")?;
         let tx = conn.unchecked_transaction()?;
-        let claimed=tx.execute("UPDATE cron_jobs SET locked_at=?1 WHERE id=?2 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
+        let claimed=tx.execute("UPDATE cron_jobs SET locked_at=?1 WHERE id=?2 AND locked_at IS NULL AND lock_owner IS NULL AND COALESCE(last_status,'') != 'uncertain'
             AND NOT EXISTS(SELECT 1 FROM cron_occurrences o WHERE o.job_id=cron_jobs.id AND o.scheduled_at=cron_jobs.next_run AND o.execution_state!='claimed')",
             params![now.to_rfc3339(),job_id])?;
         if claimed == 1 {
@@ -873,6 +875,27 @@ pub(crate) fn checkpoint_occurrence(
     delivery: &str,
     output: Option<&str>,
 ) -> Result<()> {
+    with_initialized_connection(config, |conn| {
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        checkpoint_occurrence_inner(
+            conn,
+            &job.id,
+            &job.next_run.to_rfc3339(),
+            execution,
+            delivery,
+            output,
+        )
+    })
+}
+
+fn checkpoint_occurrence_inner(
+    conn: &Connection,
+    job_id: &str,
+    occurrence_id: &str,
+    execution: &str,
+    delivery: &str,
+    output: Option<&str>,
+) -> Result<()> {
     anyhow::ensure!(
         ["running", "confirmed", "possibly_applied"].contains(&execution),
         "invalid occurrence execution state"
@@ -880,6 +903,7 @@ pub(crate) fn checkpoint_occurrence(
     anyhow::ensure!(
         [
             "not_started",
+            "not_requested",
             "submitting",
             "confirmed",
             "confirmed_failed",
@@ -890,28 +914,25 @@ pub(crate) fn checkpoint_occurrence(
         .contains(&delivery),
         "invalid occurrence delivery state"
     );
-    with_initialized_connection(config, |conn| {
-        conn.execute_batch("PRAGMA synchronous=FULL")?;
-        let output = output.map(|s| &s[..s.floor_char_boundary(MAX_CRON_OUTPUT_BYTES)]);
-        let changed=conn.execute("UPDATE cron_occurrences SET execution_state=?3,delivery_state=?4,output=COALESCE(?5,output),updated_at=?6 WHERE job_id=?1 AND scheduled_at=?2 AND (
+    let output = output.map(|s| &s[..s.floor_char_boundary(MAX_CRON_OUTPUT_BYTES)]);
+    let changed=conn.execute("UPDATE cron_occurrences SET execution_state=?3,delivery_state=?4,output=COALESCE(?5,output),updated_at=CASE WHEN execution_state=?3 AND delivery_state=?4 AND (?5 IS NULL OR output=?5) THEN updated_at ELSE ?6 END WHERE job_id=?1 AND scheduled_at=?2 AND (
             (execution_state='claimed' AND ?3='running' AND ?4='not_started') OR
             (execution_state='running' AND ?3 IN ('confirmed','possibly_applied') AND ?4='submitting') OR
             (execution_state=?3 AND delivery_state='submitting' AND ?4 NOT IN ('submitting')) OR
             (execution_state=?3 AND delivery_state=?4 AND (?5 IS NULL OR output=?5))
         )",
-            params![job.id,job.next_run.to_rfc3339(),execution,delivery,output,Utc::now().to_rfc3339()])?;
-        anyhow::ensure!(
-            changed == 1,
-            "scheduled occurrence claim missing or transition refused"
-        );
-        Ok(())
-    })
+            params![job_id,occurrence_id,execution,delivery,output,Utc::now().to_rfc3339()])?;
+    anyhow::ensure!(
+        changed == 1,
+        "scheduled occurrence claim missing or transition refused"
+    );
+    Ok(())
 }
 
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1 AND lock_owner IS NULL",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -948,7 +969,7 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
         )?;
         let count = tx
             .execute(
-                "UPDATE cron_jobs SET locked_at = NULL, enabled = 0, last_status = 'uncertain'
+                "UPDATE cron_jobs SET locked_at = NULL, lock_owner = NULL, enabled = 0, last_status = 'uncertain'
              WHERE locked_at IS NOT NULL",
                 [],
             )
@@ -988,46 +1009,6 @@ pub fn record_run(
 
         tx.commit()
             .context("Failed to commit cron run transaction")?;
-        Ok(())
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn persist_manual_run_result(
-    config: &Config,
-    job: &CronJob,
-    started_at: DateTime<Utc>,
-    finished_at: DateTime<Utc>,
-    status: &str,
-    output: Option<&str>,
-    duration_ms: i64,
-) -> Result<()> {
-    let bounded_output = output.map(truncate_cron_output);
-
-    with_initialized_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
-
-        insert_run_and_prune(
-            &tx,
-            config,
-            &job.id,
-            started_at,
-            finished_at,
-            status,
-            bounded_output.as_deref(),
-            duration_ms,
-        )?;
-
-        apply_last_run_state(
-            &tx,
-            &job.id,
-            finished_at,
-            status,
-            bounded_output.as_deref().unwrap_or(""),
-        )?;
-
-        tx.commit()
-            .context("Failed to commit manual cron run result transaction")?;
         Ok(())
     })
 }
@@ -1916,6 +1897,8 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    // Binds a manual invocation to its lock; ordinary release cannot unlock it.
+    add_column_if_missing(conn, "lock_owner", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",

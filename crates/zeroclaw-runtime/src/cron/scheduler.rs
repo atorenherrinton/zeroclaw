@@ -1,6 +1,7 @@
 use crate::cron::store::{
-    RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
-    persist_run_result, reconcile_missed_run,
+    DuplicateManualReceipt, ManualAdmissionError, RunCompletionAction, checkpoint_manual_execution,
+    claim_manual_run_with_key, finish_manual_run, persist_run_completion_state, persist_run_result,
+    reconcile_missed_run,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
@@ -115,6 +116,11 @@ impl CronDeliveryContext {
 }
 
 pub struct ManualCronRunResult {
+    pub duplicate: bool,
+    pub occurrence_id: Option<String>,
+    pub effect_outcome: EffectOutcome,
+    pub execution_outcome: EffectOutcome,
+    pub delivery_outcome: Option<EffectOutcome>,
     pub job_id: String,
     pub success: bool,
     pub status: String,
@@ -235,7 +241,27 @@ pub async fn run_manual_job(
     context: CronDeliveryContext,
     event_tx: &EventBroadcast,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, None, false).await
+    run_manual_job_with_request_id(config, job, context, event_tx, None).await
+}
+
+pub async fn run_manual_job_with_request_id(
+    config: &Config,
+    job: &CronJob,
+    context: CronDeliveryContext,
+    event_tx: &EventBroadcast,
+    request_id: Option<&str>,
+) -> ManualCronRunResult {
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        None,
+        false,
+        DELIVERY_FN.get(),
+        request_id,
+    )
+    .await
 }
 
 pub(crate) async fn run_manual_job_with_runtime(
@@ -245,10 +271,22 @@ pub(crate) async fn run_manual_job_with_runtime(
     event_tx: &EventBroadcast,
     runtime: &dyn RuntimeAdapter,
     approved: bool,
+    request_id: Option<&str>,
 ) -> ManualCronRunResult {
-    run_manual_job_inner(config, job, context, event_tx, Some(runtime), approved).await
+    run_manual_job_inner(
+        config,
+        job,
+        context,
+        event_tx,
+        Some(runtime),
+        approved,
+        DELIVERY_FN.get(),
+        request_id,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_manual_job_inner(
     config: &Config,
     job: &CronJob,
@@ -256,83 +294,166 @@ async fn run_manual_job_inner(
     event_tx: &EventBroadcast,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
+    handler: Option<&DeliveryFn>,
+    request_id: Option<&str>,
 ) -> ManualCronRunResult {
+    use crate::i18n::get_required_cli_string;
     let started_at = Utc::now();
-    // Manual triggers must not erase a quarantine by running and persisting a
-    // fresh string status. Read current durable state rather than trusting the
-    // caller's potentially stale job snapshot. Full manual occurrence claims
-    // remain separate work; this guard rejects already-known uncertainty.
+    let mut result = ManualCronRunResult {
+        duplicate: false,
+        occurrence_id: None,
+        effect_outcome: EffectOutcome::NotStarted,
+        execution_outcome: EffectOutcome::NotStarted,
+        delivery_outcome: None,
+        job_id: job.id.clone(),
+        success: false,
+        status: "error".into(),
+        output: String::new(),
+        duration_ms: 0,
+        started_at,
+        finished_at: started_at,
+    };
     let admission_config = config.clone();
-    let admission_job_id = job.id.clone();
+    let admission_job = job.clone();
+    let keyed_request = request_id.is_some();
+    let request_id = request_id.map(str::to_owned);
     let admission = tokio::task::spawn_blocking(move || {
-        crate::cron::get_job(&admission_config, &admission_job_id)
+        claim_manual_run_with_key(&admission_config, &admission_job, request_id.as_deref())
     })
     .await;
-    let refusal = match admission {
-        Ok(Ok(current)) if current.last_status.as_deref() != Some("uncertain") => None,
-        Ok(Ok(_)) => Some((
-            "uncertain",
-            "cron job is quarantined; operator reconciliation is required; execution not started",
-        )),
-        _ => Some((
-            "error",
-            "manual cron admission could not read durable state; execution not started",
-        )),
+    let claim = match admission {
+        Ok(Ok(claim)) => claim,
+        failure => {
+            if let Ok(Err(error)) = &failure
+                && let Some(existing) = error.downcast_ref::<DuplicateManualReceipt>()
+            {
+                result.duplicate = true;
+                result.occurrence_id = Some(existing.occurrence_id.clone());
+                result.effect_outcome = existing.effect;
+                result.execution_outcome = existing.execution;
+                result.delivery_outcome = existing.delivery;
+                result.success = existing.effect == EffectOutcome::Confirmed;
+                result.status = if result.success { "ok" } else { "uncertain" }.into();
+                result.output = existing.output.clone();
+                result.finished_at = Utc::now();
+                return result;
+            }
+            let reason = match &failure {
+                Ok(Err(error)) => error.downcast_ref::<ManualAdmissionError>().copied(),
+                _ => None,
+            };
+            let key = match reason {
+                Some(ManualAdmissionError::Quarantined) => {
+                    result.status = "uncertain".into();
+                    result.effect_outcome = EffectOutcome::ReconciliationRequired;
+                    "cron-manual-quarantined"
+                }
+                Some(ManualAdmissionError::InFlight) => "cron-manual-in-flight",
+                Some(ManualAdmissionError::Changed) => "cron-manual-changed",
+                Some(ManualAdmissionError::InvalidRequestId) => "cron-manual-invalid-request-id",
+                None if keyed_request => {
+                    // Failure to retrieve a prior keyed receipt is not evidence
+                    // that the original invocation never executed.
+                    result.status = "uncertain".into();
+                    result.effect_outcome = EffectOutcome::ReconciliationRequired;
+                    result.execution_outcome = EffectOutcome::PossiblyApplied;
+                    "cron-manual-receipt-unavailable"
+                }
+                None => "cron-manual-storage-unavailable",
+            };
+            result.output = get_required_cli_string(key);
+            result.finished_at = Utc::now();
+            return result;
+        }
     };
-    if let Some((status, output)) = refusal {
-        return ManualCronRunResult {
-            job_id: job.id.clone(),
-            success: false,
-            status: status.into(),
-            output: output.into(),
-            duration_ms: 0,
-            started_at,
-            finished_at: Utc::now(),
-        };
-    }
+    result.occurrence_id = Some(claim.id().to_owned());
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
-    let finished_at = Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+    result.execution_outcome = if success {
+        EffectOutcome::Confirmed
+    } else {
+        EffectOutcome::PossiblyApplied
+    };
+    result.finished_at = Utc::now();
+    result.duration_ms = (result.finished_at - started_at).num_milliseconds();
+    result.output = output;
 
-    if let Err(e) = persist_manual_run_result(
-        config,
-        job,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
+    // A dropped future leaves its durable running/submitting claim locked. It
+    // cannot be admitted again; startup recovery quarantines the uncertain work.
+    let checkpoint_config = config.clone();
+    let checkpoint_claim = claim.clone();
+    let checkpoint_output = result.output[..result
+        .output
+        .floor_char_boundary(super::store::MAX_CRON_OUTPUT_BYTES)]
+        .to_owned();
+    if !matches!(
+        tokio::task::spawn_blocking(move || checkpoint_manual_execution(
+            &checkpoint_config,
+            &checkpoint_claim,
+            success,
+            &checkpoint_output
+        ))
+        .await,
+        Ok(Ok(()))
     ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
+        result.effect_outcome = EffectOutcome::ReconciliationRequired;
+        result.status = "uncertain".into();
+        result.output.push('\n');
+        result
+            .output
+            .push_str(&get_required_cli_string("cron-manual-checkpoint-failed"));
+        return result;
     }
 
+    let outcome =
+        deliver_and_classify_with_handler(config, job, success, result.output, context, handler)
+            .await;
+    result.delivery_outcome = outcome.delivery_outcome;
+    result.success = outcome.success;
+    result.status = outcome.status;
+    result.output = outcome.output;
+    let completion_config = config.clone();
+    let completion_claim = claim;
+    let completion_output = result.output[..result
+        .output
+        .floor_char_boundary(super::store::MAX_CRON_OUTPUT_BYTES)]
+        .to_owned();
+    let completion_status = result.status.clone();
+    let delivery = result.delivery_outcome;
+    let finished_at = result.finished_at;
+    match tokio::task::spawn_blocking(move || {
+        finish_manual_run(
+            &completion_config,
+            &completion_claim,
+            success,
+            delivery,
+            started_at,
+            finished_at,
+            &completion_status,
+            &completion_output,
+        )
+    })
+    .await
+    {
+        Ok(Ok(effect)) => result.effect_outcome = effect,
+        _ => {
+            result.success = false;
+            result.effect_outcome = EffectOutcome::ReconciliationRequired;
+            result.status = "uncertain".into();
+            result.output.push('\n');
+            result
+                .output
+                .push_str(&get_required_cli_string("cron-manual-checkpoint-failed"));
+        }
+    }
     if let Some(tx) = event_tx {
         let _ = tx.send(serde_json::json!({
-            "type": "cron_result",
-            "job_id": job.id,
-            "success": outcome.success,
-            "output": &outcome.output,
-            "manual": true,
-            "timestamp": finished_at.to_rfc3339(),
+            "type": "cron_result", "job_id": job.id, "success": result.success,
+            "output": result.output, "manual": true, "timestamp": finished_at.to_rfc3339(),
+            "occurrence_id": result.occurrence_id, "effect_outcome": result.effect_outcome,
+            "execution_outcome": result.execution_outcome, "delivery_outcome": result.delivery_outcome,
         }));
     }
-
-    ManualCronRunResult {
-        job_id: job.id.clone(),
-        success: outcome.success,
-        status: outcome.status,
-        output: outcome.output,
-        duration_ms,
-        started_at,
-        finished_at,
-    }
+    result
 }
 
 pub async fn run(
@@ -1110,7 +1231,7 @@ async fn persist_job_result(
     outcome
 }
 
-fn occurrence_delivery_state(outcome: Option<EffectOutcome>) -> &'static str {
+pub(crate) fn occurrence_delivery_state(outcome: Option<EffectOutcome>) -> &'static str {
     match outcome {
         None | Some(EffectOutcome::NotStarted) => "not_started",
         Some(EffectOutcome::Confirmed) => "confirmed",
@@ -2098,6 +2219,151 @@ mod tests {
             output.contains("status="),
             "imperative job's own Wrapped format must win over a same-ID declarative config entry: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn manual_invocation_blocks_competitors_and_cancellation_preserves_receipts() {
+        for cancel in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp).await;
+            config
+                .risk_profiles
+                .get_mut(TEST_AGENT)
+                .unwrap()
+                .allowed_commands = vec!["echo".into()];
+            let job = cron::store::add_shell_job(
+                &config,
+                TEST_AGENT,
+                None,
+                Schedule::Every { every_ms: 60000 },
+                "echo synthetic",
+                Some(DeliveryConfig {
+                    mode: "announce".into(),
+                    channel: Some("telegram.synthetic".into()),
+                    to: Some("synthetic-peer".into()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+            let runtime = Arc::new(PowerShellProbeRuntime::new());
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let handler: DeliveryFn = {
+                let entered = entered.clone();
+                let release = release.clone();
+                Box::new(move |_, _, _, _, _| {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        zeroclaw_api::delivery::record_summary(DeliverySummary {
+                            outcome: EffectOutcome::Confirmed,
+                            confirmed_chunks: 1,
+                            total_chunks: 1,
+                        });
+                        Ok(())
+                    })
+                })
+            };
+            let first = {
+                let config = config.clone();
+                let job = job.clone();
+                let runtime = runtime.clone();
+                ::zeroclaw_spawn::spawn!(async move {
+                    run_manual_job_inner(
+                        &config,
+                        &job,
+                        CronDeliveryContext::RpcManual,
+                        &None,
+                        Some(runtime.as_ref()),
+                        true,
+                        Some(&handler),
+                        Some("boundary-fixture"),
+                    )
+                    .await
+                })
+            };
+            tokio::time::timeout(Duration::from_secs(5), entered.notified())
+                .await
+                .unwrap();
+            assert!(!claim_job(&config, &job.id, Utc::now()).unwrap());
+            let second = run_manual_job_with_runtime(
+                &config,
+                &job,
+                CronDeliveryContext::ToolManual,
+                &None,
+                runtime.as_ref(),
+                true,
+                None,
+            )
+            .await;
+            assert_eq!(second.effect_outcome, EffectOutcome::NotStarted);
+            assert_eq!(second.execution_outcome, EffectOutcome::NotStarted);
+            assert!(second.occurrence_id.is_none());
+            assert_eq!(
+                runtime
+                    .build_calls
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            if cancel {
+                first.abort();
+                assert!(matches!(first.await, Err(error) if error.is_cancelled()));
+                assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+                assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+                let blocked = run_manual_job_with_request_id(
+                    &config,
+                    &job,
+                    CronDeliveryContext::GatewayManual,
+                    &None,
+                    Some("boundary-fixture"),
+                )
+                .await;
+                assert_eq!(
+                    blocked.effect_outcome,
+                    EffectOutcome::ReconciliationRequired
+                );
+                assert!(blocked.duplicate);
+                assert_eq!(blocked.execution_outcome, EffectOutcome::Confirmed);
+                assert_eq!(
+                    runtime
+                        .build_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+            } else {
+                release.notify_one();
+                let result = first.await.unwrap();
+                assert!(result.success, "{}", result.output);
+                assert_eq!(result.effect_outcome, EffectOutcome::Confirmed);
+                let duplicate = run_manual_job_with_request_id(
+                    &config,
+                    &job,
+                    CronDeliveryContext::RpcManual,
+                    &None,
+                    Some("boundary-fixture"),
+                )
+                .await;
+                assert!(duplicate.duplicate && duplicate.success);
+                assert_eq!(duplicate.occurrence_id, result.occurrence_id);
+                assert_eq!(
+                    runtime
+                        .build_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+
+                assert_eq!(result.execution_outcome, EffectOutcome::Confirmed);
+                assert_eq!(result.delivery_outcome, Some(EffectOutcome::Confirmed));
+                assert!(result.occurrence_id.unwrap().starts_with("manual:"));
+                assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+                assert_eq!(
+                    cron::get_job(&config, &job.id).unwrap().next_run,
+                    job.next_run
+                );
+            }
+        }
     }
 
     #[tokio::test]

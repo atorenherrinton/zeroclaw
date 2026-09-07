@@ -1256,3 +1256,14 @@ channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
 
 channel-runtime-admission-refused = ⚠️ This request was not started because the work queue or durable storage is unavailable. Please wait before submitting a new request.
+
+cron-manual-quarantined = This cron job requires operator reconciliation; execution not started.
+cron-manual-in-flight = This cron job already has an active invocation; execution not started.
+cron-manual-changed = This cron job changed after it was selected; execution not started. Review its current definition before a new request.
+cron-manual-storage-unavailable = Manual cron admission could not read durable state; execution not started.
+cron-manual-checkpoint-failed = Durable cron evidence could not be checkpointed. Execution or delivery may have occurred; reconcile the occurrence before requesting more work.
+
+cron-manual-invalid-request-id = A cron request ID must contain 1 to 128 printable ASCII characters without spaces; execution not started.
+cron-manual-request-id-description = Stable ID for this invocation. Reuse it when checking an interrupted request; an existing occurrence is returned without execution. Use a new ID only for a genuinely new owner request.
+
+cron-manual-receipt-unavailable = The saved cron receipt could not be read. A prior execution may have occurred; reconcile the original invocation before requesting new work.

@@ -59,6 +59,8 @@ impl Tool for CronRunTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string" },
+                "request_id": { "type": "string", "minLength": 1, "maxLength": 128,
+                    "description": crate::i18n::get_required_cli_string("cron-manual-request-id-description") },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
@@ -85,6 +87,19 @@ impl Tool for CronRunTool {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
+                });
+            }
+        };
+        let request_id = match args.get("request_id") {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(crate::i18n::get_required_cli_string(
+                        "cron-manual-invalid-request-id",
+                    )),
                 });
             }
         };
@@ -150,12 +165,18 @@ impl Tool for CronRunTool {
             &None,
             self.runtime.as_ref(),
             approved,
+            request_id,
         )
         .await;
 
         Ok(ToolResult {
             success: result.success,
             output: serde_json::to_string_pretty(&json!({
+                "duplicate": result.duplicate,
+                "occurrence_id": result.occurrence_id,
+                "effect_outcome": result.effect_outcome,
+                "execution_outcome": result.execution_outcome,
+                "delivery_outcome": result.delivery_outcome,
                 "job_id": result.job_id,
                 "status": result.status,
                 "duration_ms": result.duration_ms,
@@ -245,9 +266,21 @@ mod tests {
         let cfg = Arc::new(config);
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
-        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        let result = tool
+            .execute(json!({ "job_id": job.id, "request_id":"tool-fixture-request" }))
+            .await
+            .unwrap();
         assert!(result.success, "{:?}", result.error);
 
+        let original: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        let duplicate = tool
+            .execute(json!({"job_id":job.id,"request_id":"tool-fixture-request"}))
+            .await
+            .unwrap();
+        let duplicate: serde_json::Value = serde_json::from_str(&duplicate.output).unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+        assert_eq!(duplicate["occurrence_id"], original["occurrence_id"]);
+        assert_eq!(duplicate["effect_outcome"], "confirmed");
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
     }
@@ -314,7 +347,10 @@ mod tests {
         );
 
         let updated = cron::get_job(&cfg, &job.id).unwrap();
-        assert_eq!(updated.last_status.as_deref(), Some("degraded"));
+        assert_eq!(updated.last_status.as_deref(), Some("uncertain"));
+        assert!(!updated.enabled);
+        assert_eq!(response["effect_outcome"], "reconciliation_required");
+        assert_eq!(response["execution_outcome"], "confirmed");
         assert!(
             updated
                 .last_output

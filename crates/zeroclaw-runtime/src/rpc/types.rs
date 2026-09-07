@@ -584,7 +584,20 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct CronTriggerParams {
+        pub id: String,
+        #[serde(default)]
+        pub request_id: Option<String>,
+    }
+}
+
+rpc_type! {
     pub struct CronTriggerResult {
+        pub duplicate: bool,
+        pub occurrence_id: Option<String>,
+        pub effect_outcome: zeroclaw_api::delivery::EffectOutcome,
+        pub execution_outcome: zeroclaw_api::delivery::EffectOutcome,
+        pub delivery_outcome: Option<zeroclaw_api::delivery::EffectOutcome>,
         pub id: String,
         pub success: bool,
         pub status: String,

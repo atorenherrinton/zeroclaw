@@ -3096,19 +3096,25 @@ impl RpcDispatcher {
     }
 
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
-        let req: CronIdParams = parse_params(params)?;
+        let req: CronTriggerParams = parse_params(params)?;
         let config = self.ctx.config.read().clone();
         let job = crate::cron::get_job(&config, &req.id)
             .map_err(|e| rpc_err(INVALID_PARAMS, format!("Cron job not found: {e}")))?;
         let event_tx = self.ctx.event_tx.clone();
-        let result = crate::cron::scheduler::run_manual_job(
+        let result = crate::cron::scheduler::run_manual_job_with_request_id(
             &config,
             &job,
             crate::cron::scheduler::CronDeliveryContext::RpcManual,
             &event_tx,
+            req.request_id.as_deref(),
         )
         .await;
         to_result(CronTriggerResult {
+            duplicate: result.duplicate,
+            occurrence_id: result.occurrence_id,
+            effect_outcome: result.effect_outcome,
+            execution_outcome: result.execution_outcome,
+            delivery_outcome: result.delivery_outcome,
             id: result.job_id,
             success: result.success,
             status: result.status,
@@ -8756,7 +8762,7 @@ mod tests {
         let (dispatcher, _sessions) = make_acp_test_dispatcher(config.clone());
 
         let value = dispatcher
-            .handle_cron_trigger(&json!({ "id": job.id }))
+            .handle_cron_trigger(&json!({ "id": job.id, "request_id":"rpc-fixture-request" }))
             .await
             .expect("cron/trigger should succeed");
 
@@ -8770,6 +8776,13 @@ mod tests {
                 .contains("rpc-trigger-ok")
         );
 
+        let duplicate = dispatcher
+            .handle_cron_trigger(&json!({"id":job.id,"request_id":"rpc-fixture-request"}))
+            .await
+            .unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+        assert_eq!(duplicate["occurrence_id"], value["occurrence_id"]);
+        assert_eq!(duplicate["effect_outcome"], "confirmed");
         let updated = crate::cron::get_job(&config, &job.id).expect("job should still exist");
         assert_eq!(updated.last_status.as_deref(), Some("ok"));
         assert!(
@@ -8869,6 +8882,15 @@ mod tests {
                 .contains("delivery failed:")
         );
 
+        assert_eq!(value["effect_outcome"], "reconciliation_required");
+        assert_eq!(event["effect_outcome"], "reconciliation_required");
+        assert_eq!(
+            crate::cron::get_job(&config, &job.id)
+                .unwrap()
+                .last_status
+                .as_deref(),
+            Some("uncertain")
+        );
         let runs =
             crate::cron::list_runs(&config, &job.id, 10).expect("RPC trigger should persist runs");
         assert_eq!(runs.len(), 1);
