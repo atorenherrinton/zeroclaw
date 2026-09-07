@@ -5388,7 +5388,12 @@ async fn process_channel_message(
         message_id: message_id.as_str(),
         => async move {
             let route = zeroclaw_api::conversation::ConversationRoute::from_message(&msg);
-            zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route), process_channel_message_body(ctx, msg, cancellation_token, composite_for_body)).await;
+            let journal = ctx.session_store.as_ref()
+                .filter(|store| store.supports_delivery_journal())
+                .map(|store| Arc::new(zeroclaw_infra::session_delivery::SessionDeliveryJournal(Arc::clone(store))) as Arc<dyn zeroclaw_api::delivery::DeliveryJournal>);
+            zeroclaw_api::delivery::SUMMARY.scope(std::sync::Mutex::new(None),
+                zeroclaw_api::delivery::JOURNAL.scope(journal,
+                zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route), process_channel_message_body(ctx, msg, cancellation_token, composite_for_body)))).await;
         }
     )
     .await;
@@ -7626,7 +7631,7 @@ async fn process_channel_message_body(
 
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Outbound)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_duration(
                         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -7635,9 +7640,10 @@ async fn process_channel_message_body(
                         "model_provider": route.model_provider,
                         "model": route.model,
                         "sender": msg.sender,
-                        "response": scrub_credentials(&delivered_response),
+                        "response_bytes": delivered_response.len(),
+                        "delivery_state": "generated",
                     })),
-                "channel_message_outbound"
+                "channel_response_generated"
             );
 
             // Persist intermediate tool-call/result messages from this turn
@@ -7698,7 +7704,7 @@ async fn process_channel_message_body(
 
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Outbound)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_duration(
                         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -7708,9 +7714,10 @@ async fn process_channel_message_body(
                         "message_id": msg.id,
                         "reply_target": msg.reply_target,
                         "thread_ts": msg.thread_ts,
-                        "content": delivered_response,
+                        "response_bytes": delivered_response.len(),
+                        "delivery_state": "response_ready",
                     })),
-                "reply delivered"
+                "response ready for submission"
             );
             let receipts_block = if ctx.show_receipts_in_response {
                 let receipts = tool_receipts_collector
@@ -7765,6 +7772,8 @@ async fn process_channel_message_body(
             };
 
             if let Some(channel) = delivery_channel.as_ref() {
+                // A prior tool/progress send is not evidence for this final response.
+                let _ = zeroclaw_api::delivery::take_summary();
                 let is_redirect = turn_route
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
@@ -7815,22 +7824,27 @@ async fn process_channel_message_body(
                             .await
                         {
                             Ok(()) => true,
+                            Err(e)
+                                if e.downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+                                    .is_some() =>
+                            {
+                                ::zeroclaw_log::record!(WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                        .with_attrs(serde_json::json!({"delivery": e.downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()})),
+                                    "Draft delivery incomplete; preserving content without replay");
+                                false
+                            }
                             Err(e) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
                                     ::zeroclaw_log::Event::new(
                                         module_path!(),
-                                        ::zeroclaw_log::Action::Note
+                                        ::zeroclaw_log::Action::Fail
                                     )
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Failed to finalize draft; sending as new message"
+                                    .with_attrs(serde_json::json!({"error":e.to_string()})),
+                                    "Draft finalization failed without non-delivery proof; preserving draft, no replay"
                                 );
-                                let mut fallback = SendMessage::reply_to(&msg, &delivered_response);
-                                if suppress {
-                                    fallback = fallback.suppress_voice();
-                                }
-                                channel.send_final(&fallback).await.is_ok()
+                                false
                             }
                         }
                     }
@@ -7861,6 +7875,13 @@ async fn process_channel_message_body(
                         }
                     }
                 };
+                let delivery = zeroclaw_api::delivery::take_summary();
+                ::zeroclaw_log::record!(INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Outbound)
+                        .with_outcome(if reply_delivered { ::zeroclaw_log::EventOutcome::Success } else { ::zeroclaw_log::EventOutcome::Unknown })
+                        .with_duration(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+                        .with_attrs(serde_json::json!({"message_id":msg.id,"submission_ok":reply_delivered,"response_bytes":delivered_response.len(),"delivery":delivery})),
+                    "Channel final submission completed; consult per-chunk receipts for platform confirmation");
                 if reply_delivered && let Some(hooks) = ctx.hooks.as_ref() {
                     hooks
                         .fire_message_sent(&msg.channel, &msg.reply_target, &delivered_response)
@@ -17340,6 +17361,7 @@ api_key = "anthropic-key"
         channel_name: &'static str,
         supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
+        finalize_typed_failure: bool,
         fallback_send_should_fail: bool,
         final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
@@ -17374,6 +17396,7 @@ api_key = "anthropic-key"
                 channel_name: "test-channel",
                 supports_multi_message_streaming: false,
                 finalize_should_fail,
+                finalize_typed_failure: false,
                 fallback_send_should_fail,
                 final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
@@ -17788,6 +17811,15 @@ api_key = "anthropic-key"
             text: &str,
             _suppress_voice: bool,
         ) -> anyhow::Result<()> {
+            if self.finalize_typed_failure {
+                return Err(zeroclaw_api::delivery::DeliveryFailure {
+                    outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+                    chunk_index: 1,
+                    total_chunks: 2,
+                    confirmed_chunks: 1,
+                }
+                .into());
+            }
             if self.finalize_should_fail {
                 anyhow::bail!("finalize boom")
             }
@@ -18860,7 +18892,8 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
-    async fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
+    async fn process_channel_message_does_not_replay_or_fire_success_after_ambiguous_draft_failure()
+    {
         let channel_impl = Arc::new(DraftRecordingChannel::new(true, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let (hook_events, hook_runner) = recording_message_sent_runner();
@@ -18886,23 +18919,51 @@ api_key = "anthropic-key"
             ["chat-42:..."]
         );
         assert!(channel_impl.finalized_messages.lock().await.is_empty());
-        assert_eq!(
-            channel_impl.sent_messages.lock().await.as_slice(),
-            ["chat-42:ok"]
-        );
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
         assert_eq!(
             channel_impl.final_send_calls.load(Ordering::SeqCst),
-            1,
-            "a failed draft finalization must preserve final-response policy on fallback"
+            0,
+            "an unclassified finalization failure is not proof of non-delivery"
         );
+        assert!(hook_events.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_does_not_replay_partially_delivered_typed_failure() {
+        let mut fixture = DraftRecordingChannel::new(false, false);
+        fixture.finalize_typed_failure = true;
+        let channel_impl = Arc::new(fixture);
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (hook_events, hook_runner) = recording_message_sent_runner();
+
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(hook_runner),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
         assert_eq!(
-            hook_events.lock().await.as_slice(),
-            [(
-                "test-channel".to_string(),
-                "chat-42".to_string(),
-                "ok".to_string()
-            )]
+            channel_impl.draft_messages.lock().await.as_slice(),
+            ["chat-42:..."]
         );
+        assert!(channel_impl.finalized_messages.lock().await.is_empty());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            0,
+            "an unclassified finalization failure is not proof of non-delivery"
+        );
+        assert!(hook_events.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -19250,7 +19311,10 @@ BTC is currently around $65,000 based on latest tool output."#
         fn completed_tool_iterations(messages: &[ChatMessage]) -> usize {
             messages
                 .iter()
-                .filter(|msg| msg.role == "user" && msg.content.contains("[Tool results]"))
+                .filter(|msg| {
+                    msg.role == "tool"
+                        || (msg.role == "user" && msg.content.contains("[Tool results]"))
+                })
                 .count()
         }
     }
@@ -19279,7 +19343,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     "Completed after {completed_iterations} tool iterations."
                 ))
             } else {
-                Ok(tool_call_payload())
+                Ok(format!(
+                    "<tool_call>\n{{\"name\":\"mock_price\",\"arguments\":{{\"symbol\":\"BTC\",\"iteration\":{completed_iterations}}}}}\n</tool_call>"
+                ))
             }
         }
     }
@@ -19737,7 +19803,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
             Ok(ToolResult {
                 success: true,
-                output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into(),
+                output: if let Some(iteration) = args.get("iteration") {
+                    serde_json::json!({"symbol":"BTC","price_usd":65000,"iteration":iteration})
+                        .to_string()
+                        .into()
+                } else {
+                    r#"{"symbol":"BTC","price_usd":65000}"#.to_string().into()
+                },
                 error: None,
             })
         }
@@ -22626,7 +22698,10 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
+                &zeroclaw_config::schema::RiskProfileConfig {
+                    auto_approve: vec!["mock_price".into()],
+                    ..Default::default()
+                },
             )),
             activated_tools: None,
             cost_tracking: None,

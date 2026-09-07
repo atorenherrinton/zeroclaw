@@ -1,3 +1,5 @@
+mod delivery;
+
 use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -3178,104 +3180,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         chat_id: &str,
         thread_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let chunks = split_message_for_telegram(message);
-
-        for (index, chunk) in chunks.iter().enumerate() {
-            let text = format_telegram_text_chunk(chunk, index, chunks.len());
-
-            let mut markdown_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": Self::markdown_to_telegram_html(&text),
-                "parse_mode": "HTML"
-            });
-
-            // Add message_thread_id for forum topic support
-            if let Some(tid) = thread_id {
-                markdown_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-            }
-
-            if index == 0
-                && let Some(route) = zeroclaw_api::conversation::current().filter(|r| {
-                    r.channel == format!("telegram.{}", self.alias)
-                        && r.recipient.split(':').next() == Some(chat_id)
-                        && r.recipient
-                            .split_once(':')
-                            .map(|(_, thread)| thread)
-                            .or(r.thread.as_deref())
-                            == thread_id
-                })
-                && let Ok(message_id) = route.reply_to.parse::<i64>()
-            {
-                markdown_body["reply_parameters"] =
-                    serde_json::json!({"message_id":message_id,"allow_sending_without_reply":true});
-            }
-            let markdown_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&markdown_body)
-                .send()
-                .await?;
-
-            if markdown_resp.status().is_success() {
-                if index < chunks.len() - 1 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                continue;
-            }
-
-            let markdown_status = markdown_resp.status();
-            let markdown_err = markdown_resp.text().await.unwrap_or_default();
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"status": markdown_status.to_string()})),
-                "Telegram sendMessage with Markdown failed; retrying without parse_mode"
-            );
-
-            // Only a definitive invalid request may be reformatted. A 429/5xx
-            // or lost response must not trigger a second potentially accepted send.
-            anyhow::ensure!(
-                markdown_status == reqwest::StatusCode::BAD_REQUEST,
-                "Telegram send outcome uncertain; do not replay"
-            );
-            let mut plain_body = serde_json::json!({
-                "chat_id": chat_id,
-                "text": text,
-            });
-
-            // Add message_thread_id for forum topic support
-            if let Some(tid) = thread_id {
-                plain_body["message_thread_id"] = serde_json::Value::String(tid.to_string());
-            }
-            if let Some(reply) = markdown_body.get("reply_parameters") {
-                plain_body["reply_parameters"] = reply.clone();
-            }
-            let plain_resp = self
-                .http_client()
-                .post(self.api_url("sendMessage"))
-                .json(&plain_body)
-                .send()
-                .await?;
-
-            if !plain_resp.status().is_success() {
-                let plain_status = plain_resp.status();
-                let plain_err = plain_resp.text().await.unwrap_or_default();
-                anyhow::bail!(
-                    "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
-                    markdown_status,
-                    markdown_err,
-                    plain_status,
-                    plain_err
-                );
-            }
-
-            if index < chunks.len() - 1 {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-
-        Ok(())
+        self.deliver_text_chunks(message, chat_id, thread_id, None)
+            .await
     }
 
     async fn send_media_by_url(
@@ -4432,190 +4338,52 @@ impl Channel for TelegramChannel {
         // Clean up rate-limit tracking for this chat
         self.last_draft_edit.lock().remove(&chat_id);
 
-        // Voice-only peers: delete the draft placeholder and let the voice
-        // bubble be the sole reply. Bypassed when suppress_voice forces text.
-        if !suppress_voice && self.is_voice_peer(recipient) {
-            if let Ok(id) = message_id.parse::<i64>() {
-                let _ = self
-                    .client
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-            return Ok(());
-        }
+        // Retain visible text even for voice peers: queueing synthesized audio
+        // does not prove that its external delivery succeeded.
 
         // Parse attachments before processing
         let (text_without_markers, attachments) = parse_attachment_markers(text);
 
         // Parse message ID once for reuse
-        let msg_id = match message_id.parse::<i64>() {
-            Ok(id) => Some(id),
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e)), "message_id": message_id})
-                        ),
-                    "Invalid Telegram message_id ''"
-                );
-                None
+        let msg_id = message_id.parse::<i64>().ok().filter(|id| *id > 0);
+        if msg_id.is_none() {
+            return Err(zeroclaw_api::delivery::DeliveryFailure {
+                outcome: zeroclaw_api::delivery::EffectOutcome::NotStarted,
+                chunk_index: 0,
+                total_chunks: split_message_for_telegram(&text_without_markers).len(),
+                confirmed_chunks: 0,
             }
-        };
+            .into());
+        }
 
-        // If we have attachments, delete the draft and send fresh messages
-        // (Telegram editMessageText can't add attachments)
+        // Preserve the draft as the first text chunk. A later failure leaves
+        // earlier acknowledged content visible, including its continuation marker.
+        // Attachment-only replies keep the placeholder until every send succeeds.
+        if !text_without_markers.is_empty() {
+            self.deliver_text_chunks(
+                &text_without_markers,
+                &chat_id,
+                thread_id.as_deref(),
+                msg_id,
+            )
+            .await?;
+        }
         if !attachments.is_empty() {
-            // Delete the draft message
-            if let Some(id) = msg_id {
-                let _ = self
-                    .client
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-
-            // Send text without markers
-            if !text_without_markers.is_empty() {
-                self.send_text_chunks(&text_without_markers, &chat_id, thread_id.as_deref())
-                    .await?;
-            }
-
-            // Send attachments
-            for attachment in &attachments {
-                self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
-                    .await?;
-            }
-
-            return Ok(());
+            let _ = zeroclaw_api::delivery::take_summary();
         }
-
-        // If text exceeds limit, delete draft and send as chunked messages
-        if text.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
-            if let Some(id) = msg_id {
-                let _ = self
-                    .client
-                    .post(self.api_url("deleteMessage"))
-                    .json(&serde_json::json!({
-                        "chat_id": chat_id,
-                        "message_id": id,
-                    }))
-                    .send()
-                    .await;
-            }
-
-            // Fall back to chunked send
-            return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
+        for attachment in &attachments {
+            self.send_attachment(&chat_id, thread_id.as_deref(), attachment)
+                .await
+                .map_err(|_| zeroclaw_api::delivery::DeliveryFailure {
+                    outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+                    chunk_index: 0,
+                    total_chunks: attachments.len(),
+                    confirmed_chunks: usize::from(!text_without_markers.is_empty()),
+                })?;
         }
-
-        let Some(id) = msg_id else {
-            return self
-                .send_text_chunks(text, &chat_id, thread_id.as_deref())
-                .await;
-        };
-
-        // Try editing with HTML formatting
-        let body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": id,
-            "text": Self::markdown_to_telegram_html(text),
-            "parse_mode": "HTML",
-        });
-
-        let resp = self
-            .client
-            .post(self.api_url("editMessageText"))
-            .json(&body)
-            .send()
-            .await?;
-
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft HTML edit failed; retrying without parse_mode"
-                );
-            }
-        }
-
-        // HTML failed — retry without parse_mode
-        let plain_body = serde_json::json!({
-            "chat_id": chat_id,
-            "message_id": id,
-            "text": text,
-        });
-
-        let resp = self
-            .client
-            .post(self.api_url("editMessageText"))
-            .json(&plain_body)
-            .send()
-            .await?;
-
-        match Self::classify_edit_message_response(resp).await {
-            EditMessageResult::Success | EditMessageResult::NotModified => return Ok(()),
-            EditMessageResult::Failed(status) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": status.to_string()})),
-                    "Telegram finalize_draft plain edit failed; attempting delete+send fallback"
-                );
-            }
-        }
-
-        let delete_resp = self
-            .client
-            .post(self.api_url("deleteMessage"))
-            .json(&serde_json::json!({
-                "chat_id": chat_id,
-                "message_id": id,
-            }))
-            .send()
-            .await;
-
-        match delete_resp {
-            Ok(resp) if resp.status().is_success() => {
-                self.send_text_chunks(text, &chat_id, thread_id.as_deref())
-                    .await
-            }
-            Ok(resp) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"status": resp.status().to_string()})),
-                    "Telegram finalize_draft delete failed; skipping sendMessage to avoid duplicate"
-                );
-                Ok(())
-            }
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"err": err.to_string()})),
-                    "Telegram finalize_draft delete request failed: ; skipping sendMessage to avoid duplicate"
-                );
-                Ok(())
-            }
-        }
+        // Do not delete the only visible status for an empty or voice-only
+        // result: voice queue submission is not a delivery acknowledgement.
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -4692,6 +4460,7 @@ impl Channel for TelegramChannel {
                     .await?;
             }
 
+            let _ = zeroclaw_api::delivery::take_summary();
             for attachment in &attachments {
                 self.send_attachment(chat_id, thread_id, attachment).await?;
             }
@@ -13063,7 +12832,7 @@ mod tests {
             reply_to: "66".into(),
         };
         let task_channel = ch.clone();
-        let task = tokio::spawn(async move {
+        let task = ::zeroclaw_spawn::spawn!(async move {
             ACTIVE_CONVERSATION
                 .scope(
                     Some(route),

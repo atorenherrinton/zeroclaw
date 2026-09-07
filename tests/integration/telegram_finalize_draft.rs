@@ -37,9 +37,8 @@ fn telegram_error_response(description: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn finalize_draft_treats_not_modified_as_success() {
+async fn finalize_draft_requires_positive_ack_even_for_not_modified_errors() {
     let server = MockServer::start().await;
-
     Mock::given(method("POST"))
         .and(path("/botTEST_TOKEN/editMessageText"))
         .respond_with(
@@ -47,38 +46,37 @@ async fn finalize_draft_treats_not_modified_as_success() {
                 "Bad Request: message is not modified",
             )),
         )
+        .expect(2)
         .mount(&server)
         .await;
-
-    let channel = test_channel(&server.uri());
-    let result = channel
+    let error = test_channel(&server.uri())
         .finalize_draft("123", "42", "final text", false)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "not modified should be treated as success, got: {result:?}"
-    );
-
-    let requests = server
-        .received_requests()
         .await
-        .expect("requests should be captured");
-    assert_eq!(requests.len(), 1, "should stop after first edit response");
-    assert_eq!(requests[0].url.path(), "/botTEST_TOKEN/editMessageText");
+        .unwrap_err();
+    let receipt = error
+        .downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+        .unwrap();
+    assert_eq!(
+        receipt.outcome,
+        zeroclaw_api::delivery::EffectOutcome::ConfirmedFailed
+    );
+    assert_eq!(receipt.confirmed_chunks, 0);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.url.path().ends_with("editMessageText"))
+    );
 }
 
 #[tokio::test]
-async fn finalize_draft_plain_retry_treats_not_modified_as_success() {
+async fn finalize_draft_formatting_rejection_allows_plain_edit_with_positive_ack() {
     let server = MockServer::start().await;
-
     Mock::given(method("POST"))
         .and(path("/botTEST_TOKEN/editMessageText"))
-        .and(body_partial_json(json!({
-            "chat_id": "123",
-            "message_id": 42,
-            "parse_mode": "HTML",
-        })))
+        .and(body_partial_json(json!({"parse_mode":"HTML"})))
         .respond_with(
             ResponseTemplate::new(400)
                 .set_body_json(telegram_error_response("Bad Request: can't parse entities")),
@@ -86,139 +84,94 @@ async fn finalize_draft_plain_retry_treats_not_modified_as_success() {
         .expect(1)
         .mount(&server)
         .await;
-
     Mock::given(method("POST"))
         .and(path("/botTEST_TOKEN/editMessageText"))
-        .and(body_partial_json(json!({
-            "chat_id": "123",
-            "message_id": 42,
-            "text": "Use **bold**",
-        })))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(telegram_error_response(
-                "Bad Request: message is not modified",
-            )),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let channel = test_channel(&server.uri());
-    let result = channel
-        .finalize_draft("123", "42", "Use **bold**", false)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "plain retry should accept not modified, got: {result:?}"
-    );
-
-    let requests = server
-        .received_requests()
-        .await
-        .expect("requests should be captured");
-    assert_eq!(requests.len(), 2, "should only attempt the two edit calls");
-}
-
-#[tokio::test]
-async fn finalize_draft_skips_send_message_when_delete_fails() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/botTEST_TOKEN/editMessageText"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(telegram_error_response(
-                "Bad Request: message cannot be edited",
-            )),
-        )
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/botTEST_TOKEN/deleteMessage"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(telegram_error_response(
-                "Bad Request: message to delete not found",
-            )),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let channel = test_channel(&server.uri());
-    let result = channel
-        .finalize_draft("123", "42", "final text", false)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "delete failure should skip sendMessage instead of erroring, got: {result:?}"
-    );
-
-    let requests = server
-        .received_requests()
-        .await
-        .expect("requests should be captured");
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|req| req.url.path() == "/botTEST_TOKEN/sendMessage")
-            .count(),
-        0,
-        "sendMessage should be skipped when deleteMessage fails"
-    );
-}
-
-#[tokio::test]
-async fn finalize_draft_sends_fresh_message_after_successful_delete() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("POST"))
-        .and(path("/botTEST_TOKEN/editMessageText"))
-        .respond_with(
-            ResponseTemplate::new(400).set_body_json(telegram_error_response(
-                "Bad Request: message cannot be edited",
-            )),
-        )
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    Mock::given(method("POST"))
-        .and(path("/botTEST_TOKEN/deleteMessage"))
+        .and(body_partial_json(json!({"text":"Use **bold**"})))
         .respond_with(ResponseTemplate::new(200).set_body_json(telegram_ok_response(42)))
         .expect(1)
         .mount(&server)
         .await;
+    test_channel(&server.uri())
+        .finalize_draft("123", "42", "Use **bold**", false)
+        .await
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(plain.get("parse_mode").is_none());
+    assert_eq!(plain["message_id"], 42);
+}
 
+#[tokio::test]
+async fn finalize_draft_rejected_edits_never_delete_or_send_replacements() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/editMessageText"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_json(telegram_error_response(
+                "Bad Request: message cannot be edited",
+            )),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/deleteMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok":true,"result":true})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/sendMessage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_ok_response(43)))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let error = test_channel(&server.uri())
+        .finalize_draft("123", "42", "final text", false)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+            .unwrap()
+            .confirmed_chunks,
+        0
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn finalize_draft_oversized_reply_edits_then_sends_without_deletion() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/botTEST_TOKEN/editMessageText"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(telegram_ok_response(42)))
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("POST"))
         .and(path("/botTEST_TOKEN/sendMessage"))
         .respond_with(ResponseTemplate::new(200).set_body_json(telegram_ok_response(43)))
         .expect(1)
         .mount(&server)
         .await;
-
-    let channel = test_channel(&server.uri());
-    let result = channel
-        .finalize_draft("123", "42", "final text", false)
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "successful delete should allow safe sendMessage fallback, got: {result:?}"
-    );
-
-    let requests = server
-        .received_requests()
+    test_channel(&server.uri())
+        .finalize_draft("123", "42", &"x".repeat(5314), false)
         .await
-        .expect("requests should be captured");
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|req| req.url.path() == "/botTEST_TOKEN/sendMessage")
-            .count(),
-        1,
-        "sendMessage should be attempted exactly once after delete succeeds"
-    );
+        .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].url.path().ends_with("editMessageText"));
+    assert!(requests[1].url.path().ends_with("sendMessage"));
+    let text: String = requests
+        .iter()
+        .map(|r| {
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(text.matches('x').count(), 5314);
 }
