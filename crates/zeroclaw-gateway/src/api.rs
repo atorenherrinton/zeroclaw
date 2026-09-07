@@ -4992,6 +4992,7 @@ pub(crate) mod tests {
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,

@@ -782,32 +782,71 @@ pub fn reschedule_after_run_with_status(
 }
 
 pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<()> {
-    if matches!(job.schedule, Schedule::At { .. }) {
-        // One-shot job whose scheduled moment has already passed —
-        // disable it so it won't execute late.
-        let bounded_output = truncate_cron_output("skipped — catch_up_on_startup disabled");
-        with_initialized_connection(config, |conn| {
-            conn.execute(
-                "UPDATE cron_jobs
-                 SET enabled = 0, last_run = ?1, last_status = 'skipped', last_output = ?2
-                 WHERE id = ?3",
-                params![now.to_rfc3339(), bounded_output, job.id],
-            )
-            .context("Failed to disable overdue one-shot cron job on startup skip")?;
-            Ok(())
-        })
+    checkpoint_missed_run(config, job, now, false)
+}
+
+pub(crate) fn reconcile_missed_run(
+    config: &Config,
+    job: &CronJob,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    checkpoint_missed_run(config, job, now, true)
+}
+
+/// Persist policy evidence and schedule disposition in one transaction. Never
+/// overwrite an existing claim/receipt or advance a concurrently changed row.
+/// Reconciliation here means a scheduling decision needs review, not that an
+/// external effect happened: both execution and delivery remain not_started.
+fn checkpoint_missed_run(
+    config: &Config,
+    job: &CronJob,
+    now: DateTime<Utc>,
+    reconcile: bool,
+) -> Result<()> {
+    let one_shot = matches!(job.schedule, Schedule::At { .. });
+    let next_run = if reconcile || one_shot {
+        job.next_run
     } else {
-        // Recurring job — advance next_run to the next future occurrence.
-        let next_run = next_run_for_schedule(&job.schedule, now)?;
-        with_initialized_connection(config, |conn| {
-            conn.execute(
-                "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
-                params![next_run.to_rfc3339(), job.id],
-            )
-            .context("Failed to advance next_run on startup skip")?;
-            Ok(())
-        })
-    }
+        next_run_for_schedule(&job.schedule, now)?
+    };
+    let reason = if reconcile {
+        "missed occurrence requires operator review; execution not started"
+    } else {
+        "missed occurrence skipped by startup policy; execution not started"
+    };
+    with_initialized_connection(config, |conn| {
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let tx = conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE cron_jobs SET next_run=?3, enabled=?4,
+                 last_status=?5, last_output=?6
+             WHERE id=?1 AND next_run=?2 AND next_run<=?7 AND enabled=1
+                 AND locked_at IS NULL AND COALESCE(last_status,'')!='uncertain'
+                 AND NOT EXISTS (SELECT 1 FROM cron_occurrences
+                     WHERE job_id=?1 AND scheduled_at=?2)",
+            params![
+                job.id,
+                job.next_run.to_rfc3339(),
+                next_run.to_rfc3339(),
+                !reconcile && !one_shot,
+                if reconcile { "uncertain" } else { "skipped" },
+                reason,
+                now.to_rfc3339()
+            ],
+        )?;
+        anyhow::ensure!(
+            changed == 1,
+            "missed cron occurrence changed or already has execution evidence"
+        );
+        tx.execute(
+            "INSERT INTO cron_occurrences(job_id,scheduled_at,execution_state,delivery_state,output,updated_at)
+             VALUES(?1,?2,?3,'not_started',?4,?5)",
+            params![job.id, job.next_run.to_rfc3339(),
+                if reconcile { "not_started" } else { "skipped" }, reason, now.to_rfc3339()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
@@ -889,7 +928,11 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
         let tx = conn.unchecked_transaction()?;
         // Repair occurrence evidence in the same transaction as quarantine.
         // Completed execution and positive acknowledgements remain facts even
-        // when the process died before releasing the job's lock.
+        // when the process died before releasing the job's lock. Auto-deleted
+        // one-shots have no job row left: their occurrence still owns delivery
+        // evidence and must not remain indefinitely "submitting" after restart.
+        // Only change unfinished states, preserving terminal evidence and its
+        // timestamp across repeated recovery passes.
         tx.execute(
             "UPDATE cron_occurrences SET
                 execution_state = CASE WHEN execution_state IN ('claimed','running')
@@ -897,7 +940,10 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
                 delivery_state = CASE WHEN delivery_state IN ('submitting','submitted','uncertain')
                     THEN 'reconciliation_required' ELSE delivery_state END,
                 updated_at = ?1
-             WHERE job_id IN (SELECT id FROM cron_jobs WHERE locked_at IS NOT NULL)",
+             WHERE (execution_state IN ('claimed','running')
+                    OR delivery_state IN ('submitting','submitted','uncertain'))
+               AND (job_id IN (SELECT id FROM cron_jobs WHERE locked_at IS NOT NULL)
+                    OR NOT EXISTS (SELECT 1 FROM cron_jobs j WHERE j.id=cron_occurrences.job_id))",
             [Utc::now().to_rfc3339()],
         )?;
         let count = tx
@@ -1416,6 +1462,7 @@ pub fn sync_declarative_jobs(
             if exists {
                 // Update existing declarative job — preserve runtime state
                 // (next_run, last_run, last_status, last_output, created_at).
+                // Preserve quarantines and completed one-shots when config is resynced.
                 // Only update the schedule's next_run if the schedule itself changed.
                 let current_schedule_raw: Option<String> = conn
                     .prepare("SELECT schedule FROM cron_jobs WHERE id = ?1")?
@@ -1430,7 +1477,8 @@ pub fn sync_declarative_jobs(
                         "UPDATE cron_jobs
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
-                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                             enabled = CASE WHEN last_status='uncertain' THEN 0 ELSE ?9 END,
+                             delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative', next_run = ?13,
                              uses_memory = ?14
                          WHERE id = ?15",
@@ -1458,7 +1506,11 @@ pub fn sync_declarative_jobs(
                         "UPDATE cron_jobs
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
-                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                             enabled = CASE
+                                 WHEN last_status='uncertain' OR
+                                     (enabled=0 AND delete_after_run=1 AND last_status IS NOT NULL)
+                                 THEN 0 ELSE ?9 END,
+                             delivery = ?10, delete_after_run = ?11,
                              allowed_tools = ?12, source = 'declarative',
                              uses_memory = ?13
                          WHERE id = ?14",
@@ -2968,6 +3020,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -3101,6 +3154,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -3309,6 +3363,7 @@ mod tests {
                 allowed_tools: None,
                 uses_memory: true,
                 timeout_secs: None,
+                missed_run_policy: None,
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
@@ -3337,6 +3392,7 @@ mod tests {
                 allowed_tools: None,
                 uses_memory: true,
                 timeout_secs: None,
+                missed_run_policy: None,
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
@@ -3619,6 +3675,7 @@ mod tests {
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: Default::default(),
@@ -3753,6 +3810,112 @@ schedule = { kind = "every", every_ms = 300000 }
             Some("skipped"),
             "one-shot job last_status must be 'skipped'"
         );
+    }
+
+    #[test]
+    fn missed_run_dispositions_survive_reopen_without_fabricating_execution() {
+        for reconcile in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let now = Utc::now();
+            let job = add_job_with_schedule(
+                &config,
+                "test-agent",
+                &Schedule::At {
+                    at: now - ChronoDuration::hours(1),
+                },
+                "echo synthetic",
+            )
+            .unwrap();
+            checkpoint_missed_run(&config, &job, now, reconcile).unwrap();
+            let updated = get_job(&config, &job.id).unwrap();
+            assert!(!updated.enabled);
+            assert_eq!(updated.last_run, None, "a missed run is not an execution");
+            assert_eq!(
+                updated.last_status.as_deref(),
+                Some(if reconcile { "uncertain" } else { "skipped" })
+            );
+            assert!(list_runs(&config, &job.id, 10).unwrap().is_empty());
+            let read = || {
+                with_initialized_connection(&config, |conn| {
+                conn.query_row("SELECT execution_state,delivery_state,output,updated_at FROM cron_occurrences WHERE job_id=?1",
+                    [&job.id], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?)))
+                    .map_err(Into::into)
+            }).unwrap()
+            };
+            let receipt = read();
+            assert_eq!(receipt.0, if reconcile { "not_started" } else { "skipped" });
+            assert_eq!(receipt.1, "not_started");
+            assert!(receipt.2.contains("execution not started"));
+            assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+            assert_eq!(read(), receipt);
+            assert!(all_overdue_jobs(&config, now).unwrap().is_empty());
+            assert!(!claim_job(&config, &job.id, now).unwrap());
+            assert!(checkpoint_missed_run(&config, &job, now, reconcile).is_err());
+            assert_eq!(read(), receipt);
+        }
+    }
+
+    #[test]
+    fn missed_run_checkpoint_failure_rolls_back_schedule_and_disposition() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let now = Utc::now();
+        let job = add_job_with_schedule(
+            &config,
+            "test-agent",
+            &Schedule::At {
+                at: now - ChronoDuration::hours(1),
+            },
+            "echo synthetic",
+        )
+        .unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch("CREATE TRIGGER reject_missed BEFORE INSERT ON cron_occurrences BEGIN SELECT RAISE(FAIL,'synthetic fault'); END;")?;
+            Ok(())
+        }).unwrap();
+        for reconcile in [false, true] {
+            assert!(checkpoint_missed_run(&config, &job, now, reconcile).is_err());
+            let after = get_job(&config, &job.id).unwrap();
+            assert!(after.enabled);
+            assert_eq!(after.last_status, job.last_status);
+            assert_eq!(after.next_run, job.next_run);
+        }
+    }
+
+    #[test]
+    fn missed_run_policy_cannot_overwrite_claim_or_newer_schedule() {
+        for claimed in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let now = Utc::now();
+            let job = add_job_with_schedule(
+                &config,
+                "test-agent",
+                &Schedule::At {
+                    at: now - ChronoDuration::hours(1),
+                },
+                "echo synthetic",
+            )
+            .unwrap();
+            if claimed {
+                assert!(claim_job(&config, &job.id, now).unwrap());
+                release_job(&config, &job.id).unwrap();
+            } else {
+                with_initialized_connection(&config, |conn| {
+                    conn.execute(
+                        "UPDATE cron_jobs SET next_run=?2 WHERE id=?1",
+                        params![job.id, (now + ChronoDuration::hours(1)).to_rfc3339()],
+                    )?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            for reconcile in [false, true] {
+                assert!(checkpoint_missed_run(&config, &job, now, reconcile).is_err());
+                assert!(get_job(&config, &job.id).unwrap().enabled);
+            }
+        }
     }
 
     fn add_job_with_schedule(
@@ -3965,6 +4128,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -4020,6 +4184,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
@@ -4149,6 +4314,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4198,6 +4364,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4308,6 +4475,7 @@ schedule = { kind = "every", every_ms = 300000 }
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
@@ -4431,6 +4599,127 @@ schedule = { kind = "every", every_ms = 300000 }
         assert_eq!(clear_stale_locks(&config).unwrap(), 1);
         assert_eq!(clear_stale_locks(&config).unwrap(), 0);
         assert!(checkpoint_occurrence(&config, &job, "running", "not_started", None).is_err());
+    }
+
+    #[test]
+    fn deleted_one_shot_recovery_quarantines_only_unfinished_notifications() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let old_time = "2001-01-01T00:00:00+00:00";
+        for delivery in [
+            "not_started",
+            "confirmed",
+            "confirmed_failed",
+            "partially_applied",
+            "possibly_applied",
+            "reconciliation_required",
+            "submitting",
+            "submitted",
+            "uncertain",
+        ] {
+            let now = Utc::now();
+            let job = add_shell_job(
+                &config,
+                "test-agent",
+                None,
+                Schedule::At {
+                    at: now + ChronoDuration::hours(1),
+                },
+                "echo fixture",
+                None,
+            )
+            .unwrap();
+            assert!(job.delete_after_run);
+            assert!(claim_job(&config, &job.id, now).unwrap());
+            checkpoint_occurrence(&config, &job, "running", "not_started", None).unwrap();
+            checkpoint_occurrence(
+                &config,
+                &job,
+                "confirmed",
+                "submitting",
+                Some("durable receipt fixture"),
+            )
+            .unwrap();
+            // Use the actual completion transaction that deletes successful
+            // one-shots, then model process loss before the final delivery ack.
+            persist_run_result(
+                &config,
+                &job,
+                now,
+                now,
+                now,
+                "ok",
+                Some("durable receipt fixture"),
+                0,
+                RunCompletionAction::Delete,
+            )
+            .unwrap();
+            assert!(get_job(&config, &job.id).is_err());
+            with_initialized_connection(&config, |conn| {
+                // Raw values also cover older binaries' submitted/uncertain
+                // encodings; neither is positive acknowledgement evidence.
+                conn.execute(
+                    "UPDATE cron_occurrences SET delivery_state=?2,updated_at=?3 WHERE job_id=?1",
+                    params![job.id, delivery, old_time],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+            let read = || {
+                with_read_connection(&config, |conn| {
+                conn.query_row("SELECT execution_state,delivery_state,output,updated_at FROM cron_occurrences WHERE job_id=?1", [&job.id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).map_err(Into::into)
+            }).unwrap().unwrap()
+            };
+            assert_eq!(
+                clear_stale_locks(&config).unwrap(),
+                0,
+                "return value counts job locks, not orphan receipts"
+            );
+            let recovered = read();
+            assert_eq!(recovered.0, "confirmed");
+            assert_eq!(recovered.2, "durable receipt fixture");
+            if ["submitting", "submitted", "uncertain"].contains(&delivery) {
+                assert_eq!(recovered.1, "reconciliation_required");
+                assert_ne!(recovered.3, old_time);
+            } else {
+                assert_eq!(recovered.1, delivery);
+                assert_eq!(
+                    recovered.3, old_time,
+                    "terminal evidence age must not reset"
+                );
+            }
+            assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+            assert_eq!(
+                read(),
+                recovered,
+                "recovery is idempotent including timestamps"
+            );
+            assert!(!claim_job(&config, &job.id, now).unwrap());
+            assert!(checkpoint_occurrence(&config, &job, "running", "not_started", None).is_err());
+        }
+    }
+
+    #[test]
+    fn recovery_leaves_unlocked_existing_occurrence_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo fixture").unwrap();
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        checkpoint_occurrence(&config, &job, "running", "not_started", None).unwrap();
+        release_job(&config, &job.id).unwrap();
+        // An existing unlocked job is not an orphan. This repair does not
+        // invent evidence about a different owner's still-running operation.
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        with_read_connection(&config, |conn| {
+            let execution: String = conn.query_row(
+                "SELECT execution_state FROM cron_occurrences WHERE job_id=?1",
+                [&job.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(execution, "running");
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]

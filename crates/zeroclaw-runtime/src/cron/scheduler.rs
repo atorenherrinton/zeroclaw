@@ -1,6 +1,6 @@
 use crate::cron::store::{
     RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
-    persist_run_result,
+    persist_run_result, reconcile_missed_run,
 };
 use crate::cron::{
     CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs, claim_job,
@@ -8,7 +8,7 @@ use crate::cron::{
     sync_declarative_jobs,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
@@ -18,7 +18,9 @@ use tokio_util::sync::CancellationToken;
 use zeroclaw_api::delivery::{DeliveryFailure, DeliverySummary, EffectOutcome};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
-use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
+use zeroclaw_config::schema::{
+    CronJobDecl, CronMissedRunPolicy, CronScheduleDecl, CronShellOutputFormat,
+};
 use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
@@ -256,6 +258,38 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
+    // Manual triggers must not erase a quarantine by running and persisting a
+    // fresh string status. Read current durable state rather than trusting the
+    // caller's potentially stale job snapshot. Full manual occurrence claims
+    // remain separate work; this guard rejects already-known uncertainty.
+    let admission_config = config.clone();
+    let admission_job_id = job.id.clone();
+    let admission = tokio::task::spawn_blocking(move || {
+        crate::cron::get_job(&admission_config, &admission_job_id)
+    })
+    .await;
+    let refusal = match admission {
+        Ok(Ok(current)) if current.last_status.as_deref() != Some("uncertain") => None,
+        Ok(Ok(_)) => Some((
+            "uncertain",
+            "cron job is quarantined; operator reconciliation is required; execution not started",
+        )),
+        _ => Some((
+            "error",
+            "manual cron admission could not read durable state; execution not started",
+        )),
+    };
+    if let Some((status, output)) = refusal {
+        return ManualCronRunResult {
+            job_id: job.id.clone(),
+            success: false,
+            status: status.into(),
+            output: output.into(),
+            duration_ms: 0,
+            started_at,
+            finished_at: Utc::now(),
+        };
+    }
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -329,6 +363,7 @@ pub async fn run(
             allowed_tools: None,
             uses_memory: true,
             timeout_secs: None,
+            missed_run_policy: None,
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
@@ -362,36 +397,16 @@ pub async fn run(
         ),
     }
 
-    // ── Stale-lock recovery: any in-flight lock present at boot was left by a
-    //    run that died with the previous process. Clear it so those jobs are
-    //    eligible again instead of being wedged out of `due_jobs` forever.
-    match clear_stale_locks(&config) {
-        Ok(0) => {}
-        Ok(cleared) => ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"cleared": cleared})),
-            "Cleared stale cron in-flight locks at startup"
-        ),
-        Err(e) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to clear stale cron in-flight locks at startup"
-        ),
-    }
-
-    if config.scheduler.catch_up_on_startup {
-        catch_up_overdue_jobs(&config, &event_tx).await;
-    } else {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Scheduler startup: catch-up disabled by config"
-        );
-        skip_missed_jobs_on_startup(&config).await;
-    }
+    // Checkpoint interrupted work before admitting any catch-up work. Failure
+    // must stop startup; continuing could replay an uncheckpointed occurrence.
+    let startup_config = config.clone();
+    let jobs = tokio::task::spawn_blocking(move || {
+        clear_stale_locks(&startup_config).context("scheduler startup recovery failed")?;
+        prepare_startup_jobs(&startup_config, Utc::now())
+    })
+    .await??;
+    let jobs = claim_due_jobs(&config, jobs);
+    process_due_jobs(&config, jobs, SCHEDULER_COMPONENT, &event_tx).await;
 
     loop {
         tokio::select! {
@@ -442,115 +457,54 @@ fn resolve_owning_agent<'a>(config: &'a Config, job: &CronJob) -> Option<&'a str
     config.agent_for_cron_job(&job.id)
 }
 
-/// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
-/// Called once at scheduler startup so that jobs missed during downtime
-/// (e.g. late boot, daemon restart) are caught up immediately.
-async fn catch_up_overdue_jobs(config: &Config, event_tx: &EventBroadcast) {
-    let now = Utc::now();
-    let jobs = match all_overdue_jobs(config, now) {
-        Ok(jobs) => jobs,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Startup catch-up query failed"
-            );
-            return;
-        }
-    };
-
-    if jobs.is_empty() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Scheduler startup: no overdue jobs to catch up"
-        );
-        return;
+/// Resolve canonical config only for its owning declarative row. An imperative
+/// job with a colliding id must not inherit a declaration's policy.
+fn missed_run_policy(config: &Config, job: &CronJob) -> CronMissedRunPolicy {
+    if job.source == "declarative"
+        && let Some(policy) = config
+            .cron
+            .get(&job.id)
+            .and_then(|decl| decl.missed_run_policy)
+    {
+        return policy;
     }
+    if config.scheduler.catch_up_on_startup {
+        CronMissedRunPolicy::CatchUpOnce
+    } else {
+        CronMissedRunPolicy::Skip
+    }
+}
 
+/// Apply durable dispositions before executing any startup work. Fetch all
+/// overdue jobs, regardless of the normal polling batch size. Propagate errors
+/// so a failed skip/quarantine cannot fall through to the ordinary polling loop.
+fn prepare_startup_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    let mut ready = Vec::new();
+    let mut skipped = 0;
+    let mut quarantined = 0;
+    for job in all_overdue_jobs(config, now)? {
+        match missed_run_policy(config, &job) {
+            CronMissedRunPolicy::CatchUpOnce => ready.push(job),
+            CronMissedRunPolicy::Skip => {
+                skip_missed_run(config, &job, now)
+                    .with_context(|| format!("startup skip failed for cron job {}", job.id))?;
+                skipped += 1;
+            }
+            CronMissedRunPolicy::Reconcile => {
+                reconcile_missed_run(config, &job, now).with_context(|| {
+                    format!("startup quarantine failed for cron job {}", job.id)
+                })?;
+                quarantined += 1;
+            }
+        }
+    }
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(::serde_json::json!({"count": jobs.len()})),
-        "Scheduler startup: catching up overdue jobs"
+            .with_attrs(::serde_json::json!({"catch_up_count": ready.len(), "skipped": skipped, "quarantined": quarantined})),
+        "Scheduler startup policies checkpointed"
     );
-
-    let jobs = claim_due_jobs(config, jobs);
-    process_due_jobs(config, jobs, SCHEDULER_COMPONENT, event_tx).await;
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-        "Scheduler startup: catch-up complete"
-    );
-}
-
-async fn skip_missed_jobs_on_startup(config: &Config) {
-    let now = Utc::now();
-    let jobs = match all_overdue_jobs(config, now) {
-        Ok(jobs) => jobs,
-        Err(e) => {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Scheduler startup skip: query failed",
-            );
-            return;
-        }
-    };
-
-    if jobs.is_empty() {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Scheduler startup skip: no overdue jobs to advance",
-        );
-        return;
-    }
-
-    let mut skipped_recurring: u64 = 0;
-    let mut skipped_oneshot: u64 = 0;
-
-    for job in &jobs {
-        let is_oneshot = matches!(job.schedule, Schedule::At { .. });
-        match skip_missed_run(config, job, now) {
-            Ok(()) => {
-                if is_oneshot {
-                    skipped_oneshot += 1;
-                } else {
-                    skipped_recurring += 1;
-                }
-            }
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "job_id": job.id,
-                            "error": format!("{}", e),
-                        })),
-                    "Scheduler startup skip: failed to advance job",
-                );
-            }
-        }
-    }
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-            ::serde_json::json!({
-                "total": jobs.len(),
-                "skipped_recurring": skipped_recurring,
-                "skipped_oneshot": skipped_oneshot,
-            })
-        ),
-        "Scheduler startup skip: advanced overdue jobs without executing",
-    );
+    Ok(ready)
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
@@ -2147,6 +2101,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_trigger_rejects_durable_quarantine_even_with_stale_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let now = Utc::now();
+        let job = cron::store::add_shell_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::At {
+                at: now + ChronoDuration::hours(1),
+            },
+            "echo must-not-run",
+            None,
+        )
+        .unwrap();
+        reconcile_missed_run(&config, &job, now + ChronoDuration::hours(2)).unwrap();
+        assert_eq!(
+            job.last_status, None,
+            "the caller holds a stale pre-quarantine snapshot"
+        );
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        for context in [
+            CronDeliveryContext::ToolManual,
+            CronDeliveryContext::GatewayManual,
+            CronDeliveryContext::RpcManual,
+        ] {
+            let result = run_manual_job(&config, &job, context, &Some(tx.clone())).await;
+            assert!(!result.success);
+            assert_eq!(result.status, "uncertain");
+            assert!(result.output.contains("execution not started"));
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "no synthetic execution or notification event"
+        );
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+        let current = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(current.last_status.as_deref(), Some("uncertain"));
+        assert_eq!(current.last_run, None);
+        assert!(!current.enabled);
+        cron::remove_job(&config, &job.id).unwrap();
+        let missing = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+        assert!(!missing.success);
+        assert!(missing.output.contains("could not read durable state"));
+    }
+
+    #[tokio::test]
     async fn run_manual_job_persists_history_and_broadcasts() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
@@ -3674,6 +3675,124 @@ mod tests {
         // all_overdue_jobs ignores the limit
         let overdue = cron::all_overdue_jobs(&config, far_future).unwrap();
         assert_eq!(overdue.len(), 3, "all_overdue_jobs must return all");
+    }
+
+    #[test]
+    fn startup_policy_uses_live_declarative_owner_and_global_default() {
+        let mut config = Config::default();
+        let mut job = test_job("echo synthetic");
+        for catch_up in [false, true] {
+            config.scheduler.catch_up_on_startup = catch_up;
+            let expected = if catch_up {
+                CronMissedRunPolicy::CatchUpOnce
+            } else {
+                CronMissedRunPolicy::Skip
+            };
+            job.source = "declarative".into();
+            config.cron.insert(job.id.clone(), CronJobDecl::default());
+            assert_eq!(missed_run_policy(&config, &job), expected);
+            for policy in [
+                CronMissedRunPolicy::CatchUpOnce,
+                CronMissedRunPolicy::Skip,
+                CronMissedRunPolicy::Reconcile,
+            ] {
+                config.cron.get_mut(&job.id).unwrap().missed_run_policy = Some(policy);
+                assert_eq!(missed_run_policy(&config, &job), policy);
+            }
+            job.source = "imperative".into();
+            assert_eq!(
+                missed_run_policy(&config, &job),
+                expected,
+                "an alias collision cannot borrow config"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_policies_partition_jobs_and_preserve_quarantine_after_resync() {
+        for catch_up in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp).await;
+            config.scheduler.catch_up_on_startup = catch_up;
+            config.scheduler.max_tasks = 1;
+            let now = Utc::now();
+            for (id, policy) in [
+                ("catch", CronMissedRunPolicy::CatchUpOnce),
+                ("skip", CronMissedRunPolicy::Skip),
+                ("review", CronMissedRunPolicy::Reconcile),
+            ] {
+                config
+                    .agents
+                    .get_mut("test-agent")
+                    .unwrap()
+                    .cron_jobs
+                    .push(id.into());
+                config.cron.insert(
+                    id.into(),
+                    CronJobDecl {
+                        command: Some("echo synthetic-never-executed".into()),
+                        schedule: CronScheduleDecl::At {
+                            at: (now - ChronoDuration::hours(1)).to_rfc3339(),
+                        },
+                        missed_run_policy: Some(policy),
+                        ..Default::default()
+                    },
+                );
+            }
+            sync_declarative_jobs(&config, &config.cron).unwrap();
+            let ready = prepare_startup_jobs(&config, now).unwrap();
+            assert_eq!(
+                ready.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+                vec!["catch"]
+            );
+            for id in ["catch", "skip", "review"] {
+                assert!(cron::list_runs(&config, id, 10).unwrap().is_empty());
+            }
+            assert!(!cron::get_job(&config, "skip").unwrap().enabled);
+            assert_eq!(
+                cron::get_job(&config, "review")
+                    .unwrap()
+                    .last_status
+                    .as_deref(),
+                Some("uncertain")
+            );
+            sync_declarative_jobs(&config, &config.cron).unwrap();
+            clear_stale_locks(&config).unwrap();
+            let after = prepare_startup_jobs(&config, now).unwrap();
+            assert_eq!(
+                after.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+                vec!["catch"]
+            );
+            assert!(!claim_job(&config, "review", now).unwrap());
+            assert!(!claim_job(&config, "skip", now).unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_policy_storage_failure_does_not_return_work_for_execution() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.catch_up_on_startup = false;
+        let now = Utc::now();
+        let job = cron::store::add_shell_job(
+            &config,
+            "test-agent",
+            None,
+            Schedule::At {
+                at: now + ChronoDuration::hours(1),
+            },
+            "echo synthetic",
+            None,
+        )
+        .unwrap();
+        assert!(claim_job(&config, &job.id, now).unwrap());
+        release_job(&config, &job.id).unwrap();
+        assert!(
+            prepare_startup_jobs(&config, now + ChronoDuration::hours(2)).is_err(),
+            "an existing receipt must abort startup skip"
+        );
+        assert!(cron::get_job(&config, &job.id).unwrap().enabled);
+        assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
     }
 
     // scan_and_redact_output tests moved to zeroclaw-channels orchestrator

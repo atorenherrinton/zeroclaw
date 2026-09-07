@@ -19,9 +19,25 @@ Durable metadata is not the same as durable execution. A result file or task row
 
 Cron combines declarative membership with a SQLite execution store. Runtime-created jobs and reconciled config jobs both carry an owning `agent_alias`; execution resolves that agent's security policy instead of running under an ambient daemon identity.
 
-The scheduler polls for due, enabled, unclaimed rows. Claiming a row prevents duplicate selection while it is in flight. Completion records bounded output, then reschedules a recurring job, deletes a successful auto-delete one-shot, or disables another one-shot. If the process exits before releasing a claim, the next scheduler startup clears the stale lock.
+The scheduler polls for due, enabled, unclaimed rows. Each scheduled occurrence has a stable `(job_id, scheduled_at)` identity in the existing cron database. A durable claim precedes execution, and execution state is separate from notification evidence. Completion records bounded output, then reschedules a recurring job, deletes a successful auto-delete one-shot, or disables another one-shot. Occurrence receipts survive deletion of the job row.
 
-Startup behavior is explicit. With catch-up enabled, overdue jobs are considered for execution. Otherwise an overdue one-shot is disabled with a skipped result, while a recurring job advances to its next future occurrence without recording a run result. The scheduler checks its cancellation token between polling iterations, so shutdown waits for the current due-job batch to finish before the loop exits. Cancelling the scheduler is not a promise that an already-dispatched external side effect can be rolled back.
+Startup recovery quarantines interrupted jobs and notification submissions with missing acknowledgements. It preserves confirmed execution and delivery evidence; it does not replay uncertain effects. Recovery also covers unfinished notifications belonging to deleted one-shots. A storage failure during recovery or missed-run policy handling stops scheduler startup before polling can execute work.
+
+Declarative jobs can set `cron.<alias>.missed_run_policy`:
+
+| Value | Startup behavior |
+| --- | --- |
+| `catch_up_once` | Consider the oldest pending occurrence once, then use the ordinary completion schedule. Does not enumerate every missed interval. |
+| `skip` | Persist a skipped occurrence, advance recurring jobs to a future time, and disable overdue one-shots. |
+| `reconcile` | Persist an occurrence with execution and delivery both `not_started`, disable the job with an `uncertain` scheduling status, and require operator review. This does not assert that an external effect occurred. |
+
+Omission inherits `scheduler.catch_up_on_startup`: `true` selects `catch_up_once`, `false` selects `skip`. Imperative jobs still use this global default; they do not yet expose per-job policy overrides. Policy is read from the owning config declaration, never copied into the scheduler database or borrowed by an imperative row with a colliding alias. It applies when the scheduler starts, including a daemon reload that recreates the scheduler. No running configuration is changed by adding this field to the schema.
+
+Skip and reconciliation checkpoint the schedule change and occurrence evidence together. They preserve prior execution timestamps and refuse to overwrite an existing claim or receipt. Config resync preserves quarantines and completed one-shot disablement. Changing policy or setting enabled does not authorize replay of an uncertain occurrence; no reconciliation-reset API is provided. An operator must inspect the occurrence evidence and arrange any genuinely new work separately.
+
+Manual tool, gateway, and RPC triggers re-read the stored job before execution. A known quarantine or unreadable durable state is rejected before notification or result persistence, so a stale caller snapshot cannot erase the quarantine. Manual execution still lacks an occurrence claim; concurrent manual triggers and races with a newly created quarantine remain an unfinished durability boundary.
+
+The scheduler checks its cancellation token between polling iterations, so shutdown still waits for the current due-job batch to finish. Cancelling it does not promise that an already-dispatched external effect can be rolled back.
 
 Declarative agent jobs may set `cron.<alias>.timeout_secs` to an integer from 1 through 86400. Each agent attempt resolves this optional deadline from the current config declaration; the cron database does not own a copy. Omission preserves the existing behavior without a scheduler agent deadline. Imperative jobs, including rows whose IDs collide with a config alias, do not inherit it. Shell jobs retain their existing independent timeout.
 

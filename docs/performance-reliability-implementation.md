@@ -72,9 +72,9 @@ and what remains incomplete. No partial milestone is merged to `master`.
 
 The original numbering (1–23) is used below; the handoff groups the same work into
 15 sections plus iMessage. Status describes the entire numbered requirement, so a
-working, tested subset is still `prerequisite-only`. Evidence logs from the current
-atomic-config/scheduler continuation are under the audit directory's `atomic/`
-subdirectory; `finish/` and `completion/` record preceding verified checkpoints. Earlier logs are
+working, tested subset is still `prerequisite-only`. Evidence logs from the current scheduler continuation are under the audit
+directory's `orphan-recovery/` subdirectory; `atomic/`, `finish/`, and
+`completion/` record preceding verified checkpoints. Earlier logs are
 retained as historical evidence, including failing intermediate runs.
 
 Ownership inspection found that **all** changes to
@@ -110,7 +110,7 @@ and P = `tools/zeroclaw-personal-ops/`. These are path prefixes, not new owners.
 | 12. Provider retry/fallback | prerequisite-only | `crates/zeroclaw-providers/src/reliable.rs` | 1,512 provider tests passed in `current-tests.log`, including 167 reliable tests; streamed 429 shared-cooldown and HTTP-date Retry-After regressions | Full numeric/HTTP-date Retry-After, monotonic instance-shared cooldown and single-provider gate apply to ordinary and streaming calls. Concurrent streaming observations cannot shorten cooldown. The web-search failover fixture now uses the allowed Error::msg constructor, without changing its assertions. Account-global pooling and fallback safety after uncertain external tools remain incomplete. No provider configuration changes. |
 | 13. Conflict-aware concurrency/backpressure | prerequisite-only | R`agent/tool_execution.rs`, C`orchestrator/mod.rs`, R`cron/scheduler.rs` | Parallel classification and reservation tests passed in checkpoint runtime/channels suites | Known stateless read batches use buffered(4), max 128 calls. Unknown/shell/UI writes serialize within a batch. Cross-turn exact resource locks and global interactive worker reservation absent; separate pools are not proof against resource starvation. |
 | 14. Connection reuse/metadata caching | deferred | C`telegram.rs` (`http_client`), `crates/zeroclaw-providers/src/reliable.rs`, R`agent/turn/tool_specs.rs` | Existing client reuse inspected; schema byte telemetry added, no setup benchmark | No new pooling/cache introduced. Need connection-setup measurements, registry generation invalidation and account/catalog expiry before further optimization. |
-| 15. Scheduler occurrence durability | prerequisite-only | R`cron/store.rs`, R`cron/scheduler.rs`, `tests/component/cron_delivery_cli.rs` | Existing retry/quarantine tests plus `notification_evidence_is_independent_of_execution_and_best_effort`, `notification_without_ack_is_uncertain_and_suppression_is_not_delivery`, `recovery_preserves_execution_and_acknowledgements_and_quarantines_lost_ack`, and transactional recovery fault test; current evidence in `atomic/` | Stable (job_id,next_run) claims persist execution separately from typed notification evidence. Best-effort failure cannot become submitted; failed execution can retain a confirmed notification. Missing handler is typed not-started; adapters without positive acknowledgement remain possibly-applied. Recovery atomically quarantines locked jobs and preserves completed execution/acknowledgements; backward occurrence transitions are refused. Manual-run durable claims, notification receipt IDs/operator APIs, orphaned submitting occurrences after one-shot deletion, and per-job missed-run policies remain incomplete. No retry or reconciliation-reset path was added. |
+| 15. Scheduler occurrence durability | prerequisite-only | R`cron/store.rs`, R`cron/scheduler.rs`, `crates/zeroclaw-config/src/schema.rs`, `tests/component/cron_delivery_cli.rs` | Existing typed notification/quarantine cases plus `deleted_one_shot_recovery_quarantines_only_unfinished_notifications`, `startup_policies_partition_jobs_and_preserve_quarantine_after_resync`, `missed_run_checkpoint_failure_rolls_back_schedule_and_disposition`, `missed_run_policy_cannot_overwrite_claim_or_newer_schedule`; evidence in `orphan-recovery/` | Stable occurrence claims and independent typed notification states persist in the cron database. Recovery includes deleted one-shots, retains confirmed outcomes, and preserves terminal timestamps. Declarative jobs select catch_up_once/skip/reconcile from canonical config; imperative jobs inherit the global policy. Skip/reconcile atomically checkpoint the occurrence and schedule without claiming execution happened. Config resync preserves quarantines and completed one-shots. Startup recovery/storage failure stops polling; blocking startup SQLite runs off async workers. Manual tool/gateway/RPC triggers re-read durable state and reject known quarantine without executing, notifying, or erasing evidence; concurrent manual claims remain incomplete. Manual-run durable claims, imperative per-job overrides, notification receipt IDs/operator APIs, and deterministic reconciliation remain incomplete. Requires a new binary/restart; no live config or database was changed. |
 | 16. Graceful restart/readiness | prerequisite-only | C`orchestrator/mod.rs`, C`orchestrator/turn_journal.rs`, R`control_plane/boot.rs`, R`control_plane/authority.rs`, R`control_plane/reaper.rs` | Actual dispatcher reopen test; queued sender-policy refusal; hard abort and cancelled-admission tests; live-other-boot ownership regression | Queued supported text resumes once after policy revalidation; unsafe/unsupported reconstruction explicitly fails; active/received work quarantines. Listener cancellation follows dispatcher exit. Full gateway/listener/scheduler/delegate coordinated shutdown and connector readiness remain incomplete. No live restart performed. |
 | 17. Atomic state/config writes | prerequisite-only | `crates/zeroclaw-config/src/schema.rs`, `crates/zeroclaw-config/src/comment_writer.rs`, `src/main.rs`, `crates/zeroclaw-gateway/src/api_config.rs`, R`control_plane/task_store_sqlite.rs` | 1,507 config and 490 gateway tests passed in `atomic/config-gateway-tests.log`; five new annotation/candidate fault tests in `comment_writer.rs`; all eight comment-writer integration cases and the gateway concurrent-annotation regression passed in `atomic/final-workspace-tests.log`; existing post-replace-sync tests; control-plane migration/reopen tests | Annotations now share typed saves' atomic temp/sync/rename path. Invalid TOML is refused before filesystem mutation without leaking parser excerpts; temp files are private from creation. Rename failure no longer copies an older backup over the live destination. Post-rename sync uncertainty retains the backup without rolling back committed values. Gateway owns read/modify serialization; cross-process writers still need coordination. See the concrete remaining-writer inventory below. Requires a new binary; no schema or credential change. |
 | 18. End-to-end traceability | prerequisite-only | C`orchestrator/turn_journal.rs`, C`orchestrator/mod.rs`, R`agent/turn/mod.rs`, R`agent/turn/tool_specs.rs`, C`telegram/delivery.rs` | Lifecycle tests assert ordered durable audit events; dispatcher reuses journal trace ID; chunk receipts and schema telemetry inspected | Supervised inbound ID is the runtime trace ID. Canonical task_turn_events records state/time/response bytes without bodies. Gateway/delegate/scheduler IDs and complete phase-latency/terminal metrics are not yet unified. No full content in new ingress metrics. |
@@ -123,7 +123,68 @@ and P = `tools/zeroclaw-personal-ops/`. These are path prefixes, not new owners.
 
 ## Validation ledger
 
-### Current atomic config and scheduler milestone (September 7)
+### Scheduler recovery and missed-run continuation (September 7)
+
+The current workspace suite passed **15,431 tests, 0 failed, 24 ignored** in
+345.19 seconds. It includes 198 runtime cron cases: 83 scheduler and 78 store
+cases, plus other cron modules. The configuration round-trip test passed as
+well. The 10 Telegram faults, 167 provider reliability cases, 47 control-plane
+cases, 6 channel-journal cases, and schema/output budget regressions passed in
+the same run. Evidence: `orphan-recovery/workspace-tests.log`, its `.counts.json`,
+and `orphan-recovery/focused-evidence.json`.
+
+The initial policy-only focused run had 196 passes and one invalid test fixture
+that attempted public creation of a past one-shot. The test now creates a valid
+future schedule and advances the supplied startup time. Its focused rerun passed
+197 tests. The subsequent manual quarantine guard and regression are included
+in the final workspace's 198 cron passes. The earlier orphan-only checkpoint
+passed 191 focused tests. All intermediate logs are retained.
+
+Recovery now covers deleted one-shot occurrences, leaving confirmed evidence and
+terminal timestamps intact. Startup skip/reconciliation are atomic schedule and
+occurrence transactions. Config resync cannot resurrect quarantines or completed
+one-shots. Known manual quarantines are rejected even through stale snapshots.
+The new optional policy belongs only to canonical declarative config; imperative
+per-job overrides and concurrent manual claims remain explicitly unfinished.
+
+| Exact command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo fmt --all -- --check` | pass | 4.06 |
+| `cargo check --locked --workspace --all-targets` | pass | 64.94 |
+| `cargo test --locked --workspace --no-fail-fast -- --test-threads=4` | pass | 345.19 |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass | 79.76 |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | blocked: missing generated `web/dist/index.html` | 5.61 |
+| `cargo clippy --locked -p zeroclaw-api -p zeroclaw-infra -p zeroclaw-runtime -p zeroclaw-channels -p zeroclaw-providers -p zeroclaw-log -p zeroclaw-config --all-targets --all-features -- -D warnings` | pass | 115.14 |
+| `cargo build --locked --release --workspace` | pass | 341.47 |
+| `cargo fmt --manifest-path tools/zeroclaw-personal-ops/Cargo.toml -- --check` | pass | 0.12 |
+| `cargo test --locked --manifest-path tools/zeroclaw-personal-ops/Cargo.toml` | pass | 0.93 |
+| `cargo clippy --locked --manifest-path tools/zeroclaw-personal-ops/Cargo.toml --all-targets -- -D warnings` | pass | 0.16 |
+| `cargo build --locked --release --manifest-path tools/zeroclaw-personal-ops/Cargo.toml` | pass | 0.17 |
+
+The format/check rows above preceded the final manual guard; the final source is
+also checked separately in `orphan-recovery/final-validation.jsonl`. The full
+workspace test run, strict Clippy runs and release build include that guard.
+Environment is unchanged: canonical `target/`, `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`; release uses its normal
+profile. Whole-workspace all-features Clippy is blocked by the existing dashboard
+asset prerequisite. The seven affected Rust packages pass all-features Clippy.
+No frontend dependencies or placeholder assets were installed.
+
+The documentation quality gate passed using the cached markdownlint CLI in
+offline mode: `npm_config_offline=true BASE_SHA=uncommitted-checkpoint DOCS_FILES=docs/book/src/architecture/background-work-lifecycle.md bash scripts/ci/docs_quality_gate.sh`. Exact output is in
+`orphan-recovery/docs-quality-final.log`. Only a completed duplicate validation
+driver was removed; `orphan-recovery/cleanup.json` preserves its hash and the
+retained original path. All logs, source snapshots and release artifacts remain.
+
+Final source checks (`orphan-recovery/final-validation.jsonl`):
+
+| Exact command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo fmt --all -- --check` | pass | 4.21 |
+| `cargo check --locked --workspace --all-targets` | pass | 33.99 |
+| `cargo test --locked -p zeroclaw-runtime --lib cron:: -- --test-threads=4` | 198 passed, 0 failed | 42.5 |
+
+### Previous atomic config and scheduler milestone (September 7, `681cefc54`)
 
 The final source passed **15,421 workspace tests, 0 failed, 24 ignored**, plus
 **55 personal-operations tests** using synthetic Messages databases. The five
@@ -458,8 +519,9 @@ do not redo their initial implementation. Finish the remaining boundaries:
 5. Propagate cancellation/deadlines through MCP, spawned subprocesses and cleanup;
    reserve interactive capacity and add exact mutable-resource serialization.
 6. Extend the now-separate typed notification state with receipt IDs/operator
-   queries, orphaned submitting-occurrence recovery after one-shot deletion,
-   per-job missed-run policy, manual-run claims and deterministic reconciliation.
+   queries, imperative per-job policy overrides, manual-run claims and deterministic
+   reconciliation. Deleted one-shot recovery and declarative startup policies are
+   now implemented; preserve their transaction, resync and no-replay tests.
 7. Coordinate admission stop/drain/readiness across gateway, listeners, connectors,
    scheduler and delegates; add full process fault tests using synthetic services.
 8. Instrument missing objectives/readiness, audit raw tracing formatter allocation

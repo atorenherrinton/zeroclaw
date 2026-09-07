@@ -13791,6 +13791,11 @@ pub struct CronJobDecl {
     )]
     #[cfg_attr(feature = "schema-export", schemars(range(min = 1, max = 86400)))]
     pub timeout_secs: Option<u64>,
+    /// Startup policy for a missed occurrence: catch_up_once, skip, or reconcile.
+    /// Omission inherits scheduler.catch_up_on_startup. Read from this declaration;
+    /// never copied into the scheduler database. Applies at scheduler startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missed_run_policy: Option<CronMissedRunPolicy>,
     /// Optional allowlist of tool names for agent jobs. When omitted, scheduler
     /// defaults may still exclude scheduler mutation tools for cron agent jobs.
     #[serde(default)]
@@ -13830,6 +13835,7 @@ impl Default for CronJobDecl {
             enabled: true,
             model: None,
             timeout_secs: None,
+            missed_run_policy: None,
             allowed_tools: None,
             uses_memory: true,
             session_target: None,
@@ -13865,6 +13871,34 @@ mod cron_timeout_tests {
         }
         for value in ["0", "86401", "-1", "1.5", "\"900\""] {
             assert!(toml::from_str::<CronJobDecl>(&format!("timeout_secs = {value}")).is_err());
+        }
+    }
+
+    #[test]
+    fn cron_missed_run_policy_is_optional_typed_and_round_trips() {
+        let absent: CronJobDecl = toml::from_str("").unwrap();
+        assert_eq!(absent.missed_run_policy, None);
+        assert!(
+            !toml::to_string(&absent)
+                .unwrap()
+                .contains("missed_run_policy")
+        );
+        for (value, expected) in [
+            ("catch_up_once", CronMissedRunPolicy::CatchUpOnce),
+            ("skip", CronMissedRunPolicy::Skip),
+            ("reconcile", CronMissedRunPolicy::Reconcile),
+        ] {
+            let declaration: CronJobDecl =
+                toml::from_str(&format!("missed_run_policy = {value:?}")).unwrap();
+            assert_eq!(declaration.missed_run_policy, Some(expected));
+            let round_trip: CronJobDecl =
+                toml::from_str(&toml::to_string(&declaration).unwrap()).unwrap();
+            assert_eq!(round_trip.missed_run_policy, Some(expected));
+        }
+        for value in ["true", "1", "\"retry\"", "\"\""] {
+            assert!(
+                toml::from_str::<CronJobDecl>(&format!("missed_run_policy = {value}")).is_err()
+            );
         }
     }
 
@@ -13905,6 +13939,21 @@ fn deserialize_cron_timeout_secs<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<u64>, D::Error> {
     validate_cron_timeout_secs(Option::<u64>::deserialize(deserializer)?).map_err(de::Error::custom)
+}
+
+/// Startup handling for one overdue occurrence per declarative job.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CronMissedRunPolicy {
+    /// Execute the oldest pending occurrence once, then schedule from completion.
+    CatchUpOnce,
+    /// Record the occurrence as skipped; advance recurring jobs, disable one-shots.
+    Skip,
+    /// Disable the job and preserve a not-started occurrence for operator review.
+    Reconcile,
 }
 
 /// Output format for shell cron job stdout.
