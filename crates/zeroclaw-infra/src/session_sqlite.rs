@@ -98,6 +98,17 @@ impl SqliteSessionBackend {
                 imported_at  TEXT NOT NULL
              );
 
+             CREATE TABLE IF NOT EXISTS channel_delivery_chunks (
+                chunk_key TEXT PRIMARY KEY,
+                response_key TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                receipt TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(response_key, chunk_index)
+             );
+             CREATE INDEX IF NOT EXISTS idx_delivery_response
+                ON channel_delivery_chunks(response_key, chunk_index);
+
              CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
                 session_key, content, content=sessions, content_rowid=id
              );
@@ -760,7 +771,176 @@ impl SqliteSessionBackend {
     }
 }
 
+const HISTORY_PAGE_ROW_SQL: &str = "SELECT id,substr(role,1,32),substr(CAST(content AS BLOB),1,?3),length(CAST(content AS BLOB)),substr(created_at,1,64) FROM sessions WHERE session_key=?1 AND id<?2 ORDER BY id DESC LIMIT 1";
+
 impl SessionBackend for SqliteSessionBackend {
+    fn supports_delivery_journal(&self) -> bool {
+        true
+    }
+
+    fn claim_delivery_chunk(
+        &self,
+        chunk: &zeroclaw_api::delivery::ChunkReceipt,
+    ) -> Result<Option<zeroclaw_api::delivery::ChunkReceipt>> {
+        use zeroclaw_api::delivery::EffectOutcome;
+        anyhow::ensure!(
+            chunk.outcome == EffectOutcome::PossiblyApplied,
+            "claim must be write-ahead possibly_applied"
+        );
+        anyhow::ensure!(
+            chunk.chunk_index < chunk.total_chunks,
+            "invalid chunk index"
+        );
+        let mut conn = self.conn.lock();
+        // FULL is required for write-ahead external-effect claims. Restore the
+        // normal session setting even when the transaction fails.
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT receipt FROM channel_delivery_chunks WHERE chunk_key=?1",
+                    [&chunk.key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let existing = old.map(|s| serde_json::from_str(&s)).transpose()?;
+            if existing.is_none() {
+                tx.execute("INSERT INTO channel_delivery_chunks(chunk_key,response_key,chunk_index,receipt,updated_at) VALUES(?1,?2,?3,?4,?5)", params![chunk.key, chunk.response_key, chunk.chunk_index, serde_json::to_string(chunk)?, Utc::now().to_rfc3339()])?;
+            }
+            tx.commit()?;
+            Ok(existing)
+        })();
+        conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        result
+    }
+
+    fn finish_delivery_chunk(&self, chunk: &zeroclaw_api::delivery::ChunkReceipt) -> Result<()> {
+        use zeroclaw_api::delivery::{ChunkReceipt, EffectOutcome};
+        anyhow::ensure!(
+            chunk.chunk_index < chunk.total_chunks,
+            "invalid chunk index"
+        );
+        anyhow::ensure!(
+            chunk.outcome != EffectOutcome::Confirmed
+                || chunk
+                    .platform_message_id
+                    .as_ref()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 512),
+            "confirmed receipt requires platform acknowledgement"
+        );
+        let mut conn = self.conn.lock();
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let result = (|| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let encoded: String = tx
+                .query_row(
+                    "SELECT receipt FROM channel_delivery_chunks WHERE chunk_key=?1",
+                    [&chunk.key],
+                    |r| r.get(0),
+                )
+                .context("delivery claim missing")?;
+            let old: ChunkReceipt = serde_json::from_str(&encoded)?;
+            anyhow::ensure!(
+                old.response_key == chunk.response_key
+                    && old.chunk_index == chunk.chunk_index
+                    && old.total_chunks == chunk.total_chunks,
+                "delivery receipt identity changed"
+            );
+            anyhow::ensure!(
+                old.outcome == EffectOutcome::PossiblyApplied,
+                "delivery receipt already finalized; reconciliation requires independent evidence"
+            );
+            tx.execute(
+                "UPDATE channel_delivery_chunks SET receipt=?2,updated_at=?3 WHERE chunk_key=?1",
+                params![
+                    chunk.key,
+                    serde_json::to_string(chunk)?,
+                    Utc::now().to_rfc3339()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })();
+        conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+        result
+    }
+
+    fn load_page(
+        &self,
+        session_key: &str,
+        before: Option<i64>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<crate::session_backend::HistoryPage> {
+        use crate::session_backend::{HistoryPage, HistoryRow};
+        anyhow::ensure!((1..=100).contains(&limit), "history limit must be 1..100");
+        anyhow::ensure!(
+            (256..=65536).contains(&max_bytes),
+            "history byte budget must be 256..65536"
+        );
+        anyhow::ensure!(before.is_none_or(|id| id > 0), "invalid history cursor");
+        let conn = self.conn.lock();
+        // Each indexed step receives only the REMAINING byte budget. SQLite
+        // never materializes a full legacy tool row, nor a fresh max_bytes for
+        // every row. A count-only lookahead does not load the next body.
+        let mut stmt = conn.prepare_cached(HISTORY_PAGE_ROW_SQL)?;
+        let mut cursor = before.unwrap_or(i64::MAX);
+        let mut page = HistoryPage {
+            messages: Vec::new(),
+            next_before: None,
+            content_bytes: 0,
+        };
+        while page.messages.len() < limit && page.content_bytes < max_bytes {
+            let remaining = max_bytes - page.content_bytes;
+            let row = stmt
+                .query_row(params![session_key, cursor, remaining], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, usize>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .optional()?;
+            let Some((id, role, bytes, original, created_at)) = row else {
+                break;
+            };
+            let content = match std::str::from_utf8(&bytes) {
+                Ok(s) => s.to_owned(),
+                Err(e) if e.error_len().is_none() && original > bytes.len() => {
+                    std::str::from_utf8(&bytes[..e.valid_up_to()])?.to_owned()
+                }
+                Err(e) => return Err(e.into()),
+            };
+            // Leave this row for the next page if its first scalar cannot fit.
+            if content.is_empty() && original > 0 && !page.messages.is_empty() {
+                break;
+            }
+            page.content_bytes += content.len();
+            cursor = id;
+            page.messages.push(HistoryRow {
+                id,
+                role,
+                created_at,
+                truncated: content.len() < original,
+                content,
+            });
+        }
+        if !page.messages.is_empty()
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_key=?1 AND id<?2)",
+                params![session_key, cursor],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            page.next_before = Some(cursor);
+        }
+        page.messages.reverse();
+        Ok(page)
+    }
+
     fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let conn = self.conn.lock();
         let mut stmt = match conn
@@ -2806,5 +2986,72 @@ mod tests {
         assert_eq!(single.name, from_list.name);
         assert_eq!(single.created_at, from_list.created_at);
         assert_eq!(single.last_activity, from_list.last_activity);
+    }
+}
+
+#[cfg(test)]
+mod bounded_query_plan_tests {
+    use super::*;
+
+    #[test]
+    fn locked_history_is_an_explicit_error_not_empty_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteSessionBackend::new(dir.path()).unwrap();
+        db.conn
+            .lock()
+            .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=10")
+            .unwrap();
+        let lock = Connection::open(dir.path().join("sessions/sessions.db")).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = db.load_page("fixture", None, 20, 1024).unwrap_err();
+        assert!(matches!(error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _)) if code.code == rusqlite::ErrorCode::DatabaseBusy));
+    }
+
+    #[test]
+    fn actual_history_query_uses_session_and_rowid_index_without_sort_or_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SqliteSessionBackend::new(dir.path()).unwrap();
+        let conn = db.conn.lock();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {HISTORY_PAGE_ROW_SQL}"))
+            .unwrap();
+        let details: Vec<String> = stmt
+            .query_map(params!["fixture", 10, 256], |r| r.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(details.len(), 1, "{details:?}");
+        let plan = &details[0];
+        assert!(
+            plan.contains("SEARCH sessions USING INDEX ")
+                && plan.contains("session_key=?")
+                && (plan.contains("rowid<?") || plan.contains("id<?")),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE") && !plan.contains("SCAN"),
+            "{plan}"
+        );
+        let index = plan
+            .split("USING INDEX ")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name, cid FROM pragma_index_xinfo(?1) ORDER BY seqno")
+            .unwrap();
+        let columns: Vec<(Option<String>, i64)> = stmt
+            .query_map([index], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(columns[0].0.as_deref(), Some("session_key"));
+        assert!(
+            columns[1].0.as_deref() == Some("id") || columns[1].1 == -1,
+            "second index column must be explicit id or implicit rowid: {columns:?}"
+        );
     }
 }

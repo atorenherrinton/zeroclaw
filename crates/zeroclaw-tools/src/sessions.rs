@@ -232,8 +232,11 @@ impl Tool for SessionsHistoryTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max messages to return, from most recent (default: 20)"
-                }
+                    "description": "Max messages, newest first selection (1..100, default 20)",
+                    "minimum": 1, "maximum": 100
+                },
+                "before": {"type":"integer", "minimum":1, "description":"Exclusive next_before cursor from the previous page"},
+                "max_bytes": {"type":"integer", "minimum":256, "maximum":65536, "description":"Content byte budget (default 16384); oversized rows explicitly marked truncated"}
             },
             "required": ["session_id"]
         })
@@ -269,35 +272,29 @@ impl Tool for SessionsHistoryTool {
             return Ok(error.into_tool_result());
         }
 
-        #[allow(clippy::cast_possible_truncation)]
-        let limit = args
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(20, |v| v as usize);
-
-        let messages = self.backend.load(session_id);
-
-        if messages.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: format!("No messages found for session '{session_id}'.").into(),
-                error: None,
-            });
-        }
-
-        // Take the last `limit` messages
-        let start = messages.len().saturating_sub(limit);
-        let tail = &messages[start..];
-
-        let mut output = format!(
-            "Session '{}': showing {}/{} messages\n",
-            session_id,
-            tail.len(),
-            messages.len()
-        );
-        for msg in tail {
-            let _ = writeln!(output, "[{}] {}", msg.role, msg.content);
-        }
+        let limit = args.get("limit").map_or(Ok(20), |v| {
+            v.as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| anyhow::Error::msg("invalid history limit"))
+        })?;
+        let max_bytes = args.get("max_bytes").map_or(Ok(16384), |v| {
+            v.as_u64()
+                .and_then(|v| usize::try_from(v).ok())
+                .ok_or_else(|| anyhow::Error::msg("invalid history byte budget"))
+        })?;
+        let before = args
+            .get("before")
+            .map(|v| {
+                v.as_i64()
+                    .ok_or_else(|| anyhow::Error::msg("invalid history cursor"))
+            })
+            .transpose()?;
+        let backend = Arc::clone(&self.backend);
+        let key = session_id.to_owned();
+        let page =
+            tokio::task::spawn_blocking(move || backend.load_page(&key, before, limit, max_bytes))
+                .await??;
+        let output = serde_json::to_string(&page)?;
 
         Ok(ToolResult {
             success: true,
@@ -977,47 +974,62 @@ mod tests {
         assert!(tool.parameters_schema()["properties"]["limit"].is_object());
     }
 
+    fn history_backend() -> (TempDir, Arc<dyn SessionBackend>) {
+        let tmp = TempDir::new().unwrap();
+        let store = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+        store
+            .append("telegram__alice", &ChatMessage::user("Hello from Alice"))
+            .unwrap();
+        store
+            .append(
+                "telegram__alice",
+                &ChatMessage::assistant("Hi Alice, how can I help?"),
+            )
+            .unwrap();
+        (tmp, Arc::new(store))
+    }
+
     // ── SessionsHistoryTool tests ───────────────────────────────────
 
     #[tokio::test]
     async fn history_empty_session() {
-        let (_tmp, backend) = test_backend();
+        let (_tmp, backend) = history_backend();
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "nonexistent"}))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("No messages found"));
+        assert!(result.output.contains("\"messages\":[]"));
     }
 
     #[tokio::test]
     async fn history_returns_messages() {
-        let (_tmp, backend) = seeded_backend();
+        let (_tmp, backend) = history_backend();
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "telegram__alice"}))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("showing 2/2 messages"));
-        assert!(result.output.contains("[user] Hello from Alice"));
-        assert!(result.output.contains("[assistant] Hi Alice"));
+        assert!(result.output.contains("\"truncated\":false"));
+        assert!(result.output.contains("Hello from Alice"));
+        assert!(result.output.contains("Hi Alice"));
     }
 
     #[tokio::test]
     async fn history_respects_limit() {
-        let (_tmp, backend) = seeded_backend();
+        let (_tmp, backend) = history_backend();
         let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "telegram__alice", "limit": 1}))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("showing 1/2 messages"));
+        assert!(result.output.contains("\"next_before\":2"));
         // Should show only the last message
-        assert!(result.output.contains("[assistant]"));
-        assert!(!result.output.contains("[user] Hello from Alice"));
+        assert!(result.output.contains("assistant"));
+        assert!(!result.output.contains("Hello from Alice"));
     }
 
     #[tokio::test]

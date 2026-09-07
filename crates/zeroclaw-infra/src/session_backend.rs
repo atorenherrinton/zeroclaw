@@ -65,9 +65,56 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Byte-bounded diagnostic history page. Cursor is an exclusive row ID in the
+/// requested session, never an offset; concurrent appends cannot shift pages.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryRow {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryPage {
+    pub messages: Vec<HistoryRow>,
+    pub next_before: Option<i64>,
+    pub content_bytes: usize,
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    fn supports_delivery_journal(&self) -> bool {
+        false
+    }
+
+    fn claim_delivery_chunk(
+        &self,
+        _chunk: &zeroclaw_api::delivery::ChunkReceipt,
+    ) -> anyhow::Result<Option<zeroclaw_api::delivery::ChunkReceipt>> {
+        anyhow::bail!("session backend does not support durable delivery claims")
+    }
+
+    fn finish_delivery_chunk(
+        &self,
+        _chunk: &zeroclaw_api::delivery::ChunkReceipt,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("session backend does not support durable delivery receipts")
+    }
+
+    /// Bounded, fallible history read. Unsupported backends must not silently
+    /// fall back to loading an entire conversation or disguise an error as empty.
+    fn load_page(
+        &self,
+        _session_key: &str,
+        _before: Option<i64>,
+        _limit: usize,
+        _max_bytes: usize,
+    ) -> anyhow::Result<HistoryPage> {
+        anyhow::bail!("bounded history is unsupported by this session backend")
+    }
+
     /// Load all messages for a session. Returns empty vec if session doesn't exist.
     fn load(&self, session_key: &str) -> Vec<ChatMessage>;
 

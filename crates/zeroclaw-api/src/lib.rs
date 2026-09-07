@@ -4,6 +4,7 @@ pub mod agent;
 pub mod attribution;
 pub mod channel;
 pub mod conversation;
+pub mod delivery;
 pub mod elicitation;
 pub mod hook;
 pub mod ingress;
