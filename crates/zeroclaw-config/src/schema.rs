@@ -12644,7 +12644,7 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_log_persistence() -> LogPersistence {
-    LogPersistence::Rolling
+    LogPersistence::Rotating
 }
 
 fn default_log_persistence_path() -> String {
@@ -12655,9 +12655,9 @@ fn default_log_persistence_max_entries() -> usize {
     200
 }
 
-/// Size rotation off by default; operators opt in with an explicit byte budget.
+/// Bound append-oriented archives without rewriting the active file per event.
 fn default_log_persistence_max_bytes() -> u64 {
-    0
+    16 * 1024 * 1024
 }
 
 /// Daily rotation is on by default so `rotating` mode produces day-scoped
@@ -27733,7 +27733,7 @@ log_tool_io = "off"
         // Rotation knobs are serde-defaulted, so existing configs that omit them
         // still parse and pick up the documented defaults.
         let defaults: ObservabilityConfig = toml::from_str("backend = \"none\"").unwrap();
-        assert_eq!(defaults.log_persistence_max_bytes, 0);
+        assert_eq!(defaults.log_persistence_max_bytes, 16 * 1024 * 1024);
         assert!(defaults.log_persistence_rotate_daily);
         assert_eq!(defaults.log_persistence_retention_max_files, 7);
         assert_eq!(defaults.log_persistence_retention_max_age_days, 0);
@@ -27775,7 +27775,7 @@ log_tool_io = "off"
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, ObservabilityBackend::None);
-        assert_eq!(o.log_persistence, LogPersistence::Rolling);
+        assert_eq!(o.log_persistence, LogPersistence::Rotating);
         assert_eq!(o.log_persistence_path, "state/runtime-trace.jsonl");
         assert_eq!(o.log_persistence_max_entries, 200);
         assert_eq!(o.log_tool_io, LogToolIo::Redacted);
@@ -28472,7 +28472,7 @@ auto_save = true
         assert_eq!(parsed.observability.backend, ObservabilityBackend::Log);
         assert_eq!(
             parsed.observability.log_persistence,
-            LogPersistence::Rolling
+            LogPersistence::Rotating
         );
         let default_profile = parsed.risk_profiles.get("default").unwrap();
         assert_eq!(default_profile.level, AutonomyLevel::Full);
@@ -28514,7 +28514,7 @@ default_temperature = 0.7
         assert_eq!(parsed.observability.backend, ObservabilityBackend::None);
         assert_eq!(
             parsed.observability.log_persistence,
-            LogPersistence::Rolling
+            LogPersistence::Rotating
         );
         // Migration synthesizes risk_profiles.default from the legacy
         // [autonomy] block; assert against the named entry rather than a

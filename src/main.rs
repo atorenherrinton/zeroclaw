@@ -4027,7 +4027,11 @@ fn main() -> Result<()> {
         unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
-    async_main(command)
+    let result = async_main(command);
+    // The Tokio runtime has finished; drain the independent log writer before
+    // the OS tears down its thread. Preserve the command error if both fail.
+    let flushed = zeroclaw_log::flush(std::time::Duration::from_secs(5));
+    result.and(flushed)
 }
 
 /// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is

@@ -446,7 +446,11 @@ pub fn active_log_path() -> Option<PathBuf> {
         .map(|s| s.policy.path.clone())
 }
 
-pub fn flush_for_test() -> Result<()> {
+/// Drain accepted records and sync the active file before a normal process exit.
+/// The caller waits at most `budget`; a stuck disk/worker cannot hang shutdown.
+/// Call after producers stop, outside async workers. This does not restart or
+/// replace the writer, and cannot resurrect events previously dropped by backpressure.
+pub fn flush(budget: Duration) -> Result<()> {
     let Some(state) = current_state() else {
         return Ok(());
     };
@@ -456,14 +460,46 @@ pub fn flush_for_test() -> Result<()> {
     if state.worker_dead.load(Ordering::Acquire) {
         anyhow::bail!("log writer worker is not running");
     }
-    let (ack_tx, ack_rx) = sync_channel(0);
-    state
-        .tx
-        .send(WriterJob::Flush(ack_tx))
-        .map_err(|_| anyhow::anyhow!("log writer worker disconnected before flush request"))?;
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .ok_or_else(|| anyhow::Error::msg("log flush deadline overflow"))?;
+    // Buffered acknowledgement also lets the worker finish if our deadline
+    // expires after the flush was queued.
+    let (ack_tx, ack_rx) = sync_channel(1);
+    let mut request = WriterJob::Flush(ack_tx);
+    loop {
+        match state.tx.try_send(request) {
+            Ok(()) => break,
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(anyhow::Error::msg(
+                    "log writer worker disconnected before flush request",
+                ));
+            }
+            Err(TrySendError::Full(pending)) => request = pending,
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "log flush deadline exceeded while queueing"
+        );
+        thread::sleep(remaining.min(Duration::from_millis(1)));
+    }
     ack_rx
-        .recv()
-        .context("log writer worker disconnected before reporting flush result")?
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|error| {
+            anyhow::Error::msg(match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    "log flush deadline exceeded waiting for sync"
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    "log writer worker disconnected before reporting flush result"
+                }
+            })
+        })?
+}
+
+pub fn flush_for_test() -> Result<()> {
+    flush(Duration::from_secs(5))
 }
 
 /// Resolved LLM-request-payload capture policy + the truncate cap, for the
@@ -493,7 +529,16 @@ pub fn llm_request_payload_policy() -> Option<(LlmRequestPayloadPolicy, usize)> 
 /// (the schema migration tool, tests) can invoke it too, but production
 /// code should go through the macro so the `tracing::event!` carries the
 /// correct `file:line` source info.
-pub fn record_event(event: LogEvent) {
+pub fn record_event(mut event: LogEvent) {
+    // Direct emitters and raw tracing converge here. Bound content before the
+    // observer, broadcast, serialization and disk-queue copies are created.
+    event.attributes = crate::event::bounded_event_attributes(event.attributes);
+    event.ephemeral_attributes = crate::event::bounded_event_attributes(event.ephemeral_attributes);
+    if let Some(message) = &mut event.message
+        && message.len() > 4096
+    {
+        *message = format!("[log message omitted: {} bytes]", message.len());
+    }
     // `serde(skip)` on `ephemeral_attributes` keeps this value — the one
     // that reaches disk — free of broadcast-only secrets.
     let value = match serde_json::to_value(&event) {
@@ -991,6 +1036,29 @@ mod tests {
     }
 
     #[test]
+    fn exit_flush_is_bounded_for_full_queue_and_unresponsive_worker() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        for fill_queue in [false, true] {
+            let (tx, rx) = sync_channel(1);
+            if fill_queue {
+                tx.send(WriterJob::Write(serde_json::json!({}))).unwrap();
+            }
+            install_test_state(
+                detached_enabled_policy(tmp.path()),
+                tx,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let start = Instant::now();
+            let error = flush(Duration::from_millis(15)).unwrap_err();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(error.to_string().contains("deadline exceeded"));
+            slot().write().take();
+            drop(rx);
+        }
+    }
+
+    #[test]
     fn flush_without_writer_is_noop() {
         let _guard = WRITER_TEST_LOCK.lock();
         shutdown_current_writer(SHUTDOWN_WARN_AFTER);
@@ -1196,6 +1264,31 @@ mod tests {
             "credential-free frame must not be marked: {plain}"
         );
 
+        crate::broadcast::clear_broadcast_hook();
+    }
+
+    #[test]
+    fn direct_events_are_bounded_before_broadcast_and_persistence() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        init_from_config(&LogConfig::default(), tmp.path());
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        crate::broadcast::set_broadcast_hook(tx);
+        let mut event = LogEvent::new(Severity::Info, "fixture", EventCategory::Tool);
+        event.message = Some("private-body".repeat(5000));
+        event.attributes = serde_json::json!({"trace_id":"fixture-trace", "outcome":"uncertain", "body":"private-body".repeat(5000)});
+        record_event(event);
+        let frame = rx.try_recv().unwrap();
+        let encoded = serde_json::to_string(&frame).unwrap();
+        assert!(encoded.len() < 2048);
+        assert!(!encoded.contains("private-body"));
+        assert_eq!(frame["attributes"]["trace_id"], "fixture-trace");
+        assert_eq!(frame["attributes"]["outcome"], "uncertain");
+        flush_for_test().unwrap();
+        let persisted = fs::read_to_string(runtime_trace_path().unwrap()).unwrap();
+        assert!(!persisted.contains("private-body"));
+        assert!(persisted.contains("fixture-trace"));
         crate::broadcast::clear_broadcast_hook();
     }
 

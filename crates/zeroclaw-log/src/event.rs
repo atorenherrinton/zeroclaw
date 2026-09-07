@@ -467,6 +467,62 @@ pub struct Event {
     pub ephemeral_attrs: Option<Value>,
 }
 
+/// Hard transport cap, applied before an attribute payload reaches tracing,
+/// observers, the broadcast queue, or disk serialization. Counting stops at the
+/// cap; a large body is never cloned into another unbounded serialized string.
+const MAX_EVENT_ATTRIBUTE_BYTES: usize = 16 * 1024;
+pub(crate) fn bounded_event_attributes(value: Value) -> Value {
+    struct BudgetWriter(usize);
+    impl std::io::Write for BudgetWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(std::io::Error::other("event attribute budget exceeded"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    if serde_json::to_writer(BudgetWriter(MAX_EVENT_ATTRIBUTE_BYTES), &value).is_ok() {
+        return value;
+    }
+    // Retain correlation and outcome metadata without retaining any message,
+    // prompt, argument, tool output, or raw error body from the oversized event.
+    let mut metadata = serde_json::Map::new();
+    for key in [
+        "trace_id",
+        "turn_id",
+        "message_id",
+        "tool_call_id",
+        "request_id",
+        "job_id",
+        "phase",
+        "turn_state",
+        "state",
+        "outcome",
+        "delivered",
+        "chunk_index",
+        "total_chunks",
+        "confirmed_chunks",
+        "duration_ms",
+        "model_provider",
+        "model",
+        "tool",
+    ] {
+        if let Some(field) = value.get(key)
+            && !field.is_array()
+            && !field.is_object()
+            && serde_json::to_writer(BudgetWriter(256), field).is_ok()
+        {
+            metadata.insert(key.into(), field.clone());
+        }
+    }
+    metadata.insert("payload_omitted".into(), true.into());
+    Value::Object(metadata)
+}
+
 impl Event {
     #[must_use]
     pub fn new(name: &'static str, action: Action) -> Self {
@@ -501,7 +557,7 @@ impl Event {
 
     #[must_use]
     pub fn with_attrs(mut self, attrs: Value) -> Self {
-        self.attrs = Some(attrs);
+        self.attrs = Some(bounded_event_attributes(attrs));
         self
     }
 
@@ -511,7 +567,7 @@ impl Event {
     /// written to the persisted JSONL trace or served by `/api/logs`.
     #[must_use]
     pub fn with_ephemeral_attrs(mut self, attrs: Value) -> Self {
-        self.ephemeral_attrs = Some(attrs);
+        self.ephemeral_attrs = Some(bounded_event_attributes(attrs));
         self
     }
 
@@ -559,6 +615,32 @@ impl Event {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_events_keep_correlation_and_outcome_without_private_bodies() {
+        let event = Event::new("fixture", Action::Note).with_attrs(serde_json::json!({
+            "trace_id":"turn-fixture","phase":"tool","outcome":"reconciliation_required",
+            "tool_call_id":"write-fixture","output":"private".repeat(10000),
+            "message":"sensitive message"
+        }));
+        let payload = event.attrs_str();
+        assert!(payload.len() <= MAX_EVENT_ATTRIBUTE_BYTES);
+        let value: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["trace_id"], "turn-fixture");
+        assert_eq!(value["outcome"], "reconciliation_required");
+        assert_eq!(value["payload_omitted"], true);
+        assert!(value.get("output").is_none() && value.get("message").is_none());
+    }
+
+    #[test]
+    fn event_budget_counts_json_escaping_and_ephemeral_payloads() {
+        let escaped = serde_json::json!({"body":"\u{0001}".repeat(5000)});
+        let event = Event::new("fixture", Action::Note).with_ephemeral_attrs(escaped);
+        assert!(event.ephemeral_attrs_str().len() <= MAX_EVENT_ATTRIBUTE_BYTES);
+        assert!(event.ephemeral_attrs_str().contains("payload_omitted"));
+        let small = serde_json::json!({"outcome":"confirmed","duration_ms":12});
+        assert_eq!(bounded_event_attributes(small.clone()), small);
+    }
 
     #[test]
     fn severity_round_trip_through_tracing() {

@@ -28,10 +28,10 @@ pub struct LogConfig {
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
-            log_persistence: "rolling".into(),
+            log_persistence: "rotating".into(),
             log_persistence_path: String::new(),
             log_persistence_max_entries: 10_000,
-            log_persistence_max_bytes: 0,
+            log_persistence_max_bytes: 16 * 1024 * 1024,
             log_persistence_rotate_daily: true,
             log_persistence_retention_max_files: 7,
             log_persistence_retention_max_age_days: 0,
