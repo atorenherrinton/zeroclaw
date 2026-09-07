@@ -666,10 +666,13 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
                 && secs.is_finite()
                 && secs >= 0.0
             {
-                let millis = Duration::from_secs_f64(secs).as_millis();
-                if let Ok(value) = u64::try_from(millis) {
-                    return Some(value);
-                }
+                // Untrusted headers must not panic on an enormous finite value.
+                // Saturating preserves a conservative cooldown rather than
+                // treating an out-of-range wait as permission to retry early.
+                let millis = Duration::try_from_secs_f64(secs)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(u128::MAX);
+                return Some(u64::try_from(millis).unwrap_or(u64::MAX));
             }
         }
     }
@@ -1730,8 +1733,9 @@ impl ReliableModelProvider {
     /// Compute backoff duration, respecting Retry-After if present.
     fn compute_backoff(&self, base: u64, err: &anyhow::Error) -> u64 {
         if let Some(retry_after) = parse_retry_after_ms(err) {
-            // Use Retry-After but cap at 30s to avoid indefinite waits
-            retry_after.min(30_000).max(base)
+            // Retry-After is a lower bound, not a suggestion. Parent turn
+            // deadlines bound waiting; shortening it causes rate-limit storms.
+            retry_after.max(base)
         } else {
             base
         }
@@ -1766,7 +1770,7 @@ impl ReliableModelProvider {
     }
 
     fn provider_should_skip_for_cooldown(&self, entry: &ReliableModelProviderEntry) -> bool {
-        self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
+        self.provider_cooldown_active(&entry.cooldown_key)
     }
 
     fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
@@ -1800,14 +1804,21 @@ impl ReliableModelProvider {
 
     fn set_rate_limit_cooldown(&self, cooldown_key: &str, err: &anyhow::Error) -> Duration {
         let cooldown = parse_retry_after_ms(err)
-            .map(|ms| Duration::from_millis(ms.min(60_000)))
+            .map(Duration::from_millis)
             .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
 
         let mut cooldowns = self
             .rate_limit_cooldowns
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        cooldowns.insert(cooldown_key.to_string(), Instant::now() + cooldown);
+        let now = Instant::now();
+        let deadline = now
+            .checked_add(cooldown)
+            .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86400));
+        cooldowns
+            .entry(cooldown_key.to_string())
+            .and_modify(|current| *current = (*current).max(deadline))
+            .or_insert(deadline);
         cooldown
     }
 
@@ -2141,7 +2152,7 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
+                            if rate_limited {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -2432,7 +2443,7 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
+                            if rate_limited {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -2829,7 +2840,7 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
+                            if rate_limited {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -3134,7 +3145,7 @@ impl ModelProvider for ReliableModelProvider {
                                 break;
                             }
 
-                            if rate_limited && self.model_providers.len() > 1 {
+                            if rate_limited {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 final_cause_provider = Some(entry.candidate_name().to_string());
@@ -6996,6 +7007,69 @@ mod tests {
     }
 
     #[test]
+    fn enormous_retry_after_is_conservative_and_never_panics() {
+        let err = anyhow::Error::msg("429 Retry-After: 999999999999999999999999999999999999");
+        assert_eq!(parse_retry_after_ms(&err), Some(u64::MAX));
+        let provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        provider.set_rate_limit_cooldown("fixture", &err);
+        assert!(provider.provider_cooldown_active("fixture"));
+    }
+
+    #[test]
+    fn concurrent_weaker_observations_do_not_shorten_cooldown() {
+        let provider = ReliableModelProvider::new("test", vec![], 0, 500);
+        provider.set_rate_limit_cooldown("fixture", &anyhow::Error::msg("429 Retry-After: 120"));
+        let original = provider.rate_limit_cooldowns.lock().unwrap()["fixture"];
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    provider.set_rate_limit_cooldown(
+                        "fixture",
+                        &anyhow::Error::msg("429 Retry-After: 1"),
+                    );
+                });
+            }
+        });
+        assert_eq!(
+            provider.rate_limit_cooldowns.lock().unwrap()["fixture"],
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn single_provider_cooldown_prevents_a_second_physical_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "unused",
+                    error: "429 Too Many Requests, Retry-After: 120",
+                }),
+            )],
+            0,
+            1,
+        );
+        assert!(
+            provider
+                .simple_chat("fixture", "test", Some(0.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            provider
+                .simple_chat("fixture", "test", Some(0.0))
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn parse_retry_after_missing() {
         let err = anyhow::Error::msg("500 Internal Server Error");
         assert_eq!(parse_retry_after_ms(&err), None);
@@ -7054,10 +7128,10 @@ mod tests {
     }
 
     #[test]
-    fn compute_backoff_caps_at_30s() {
+    fn compute_backoff_does_not_shorten_retry_after() {
         let model_provider = ReliableModelProvider::new("test", vec![], 0, 500);
         let err = anyhow::Error::msg("429 Retry-After: 120");
-        assert_eq!(model_provider.compute_backoff(500, &err), 30_000);
+        assert_eq!(model_provider.compute_backoff(500, &err), 120_000);
     }
 
     #[test]
