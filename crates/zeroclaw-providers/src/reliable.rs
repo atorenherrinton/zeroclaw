@@ -657,6 +657,15 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
     ] {
         if let Some(pos) = lower.find(prefix) {
             let after = &msg[pos + prefix.len()..];
+            let header = after.trim();
+            if let Some(date) = header.get(..29)
+                && let Ok(date) = chrono::DateTime::parse_from_rfc2822(date)
+            {
+                let wait = date
+                    .with_timezone(&chrono::Utc)
+                    .signed_duration_since(chrono::Utc::now());
+                return Some(u64::try_from(wait.num_milliseconds()).unwrap_or(0));
+            }
             let num_str: String = after
                 .trim()
                 .chars()
@@ -677,6 +686,27 @@ fn parse_retry_after_ms(err: &anyhow::Error) -> Option<u64> {
         }
     }
     None
+}
+
+fn record_rate_limit_cooldown(
+    cooldowns: &Mutex<HashMap<String, Instant>>,
+    key: &str,
+    err: &anyhow::Error,
+) -> Duration {
+    let cooldown = parse_retry_after_ms(err)
+        .map(Duration::from_millis)
+        .unwrap_or(ReliableModelProvider::RATE_LIMIT_COOLDOWN);
+    let now = Instant::now();
+    let deadline = now
+        .checked_add(cooldown)
+        .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86400));
+    cooldowns
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(key.to_owned())
+        .and_modify(|current| *current = (*current).max(deadline))
+        .or_insert(deadline);
+    cooldown
 }
 
 fn failure_reason(rate_limited: bool, non_retryable: bool) -> &'static str {
@@ -1663,7 +1693,7 @@ pub struct ReliableModelProvider {
     /// Transient provider cooldowns after retryable rate limits.
     /// Source of truth: live provider 429 / Retry-After evidence observed by
     /// this wrapper. It is intentionally in-memory and per wrapper instance.
-    rate_limit_cooldowns: Mutex<HashMap<String, Instant>>,
+    rate_limit_cooldowns: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 impl ReliableModelProvider {
@@ -1697,7 +1727,7 @@ impl ReliableModelProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
-            rate_limit_cooldowns: Mutex::new(HashMap::new()),
+            rate_limit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
@@ -1803,23 +1833,27 @@ impl ReliableModelProvider {
     }
 
     fn set_rate_limit_cooldown(&self, cooldown_key: &str, err: &anyhow::Error) -> Duration {
-        let cooldown = parse_retry_after_ms(err)
-            .map(Duration::from_millis)
-            .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+        record_rate_limit_cooldown(&self.rate_limit_cooldowns, cooldown_key, err)
+    }
 
-        let mut cooldowns = self
-            .rate_limit_cooldowns
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = Instant::now();
-        let deadline = now
-            .checked_add(cooldown)
-            .unwrap_or_else(|| now + Duration::from_secs(100 * 365 * 86400));
-        cooldowns
-            .entry(cooldown_key.to_string())
-            .and_modify(|current| *current = (*current).max(deadline))
-            .or_insert(deadline);
-        cooldown
+    fn observe_stream_cooldown<T: Send + 'static>(
+        &self,
+        stream: stream::BoxStream<'static, StreamResult<T>>,
+        cooldown_key: &str,
+    ) -> stream::BoxStream<'static, StreamResult<T>> {
+        let cooldowns = Arc::clone(&self.rate_limit_cooldowns);
+        let key = cooldown_key.to_owned();
+        stream
+            .map(move |event| {
+                if let Err(error) = &event {
+                    let error = anyhow::Error::msg(error.to_string());
+                    if is_rate_limited(&error) {
+                        record_rate_limit_cooldown(&cooldowns, &key, &error);
+                    }
+                }
+                event
+            })
+            .boxed()
     }
 
     fn cool_down_rate_limited_provider(
@@ -3301,7 +3335,7 @@ impl ModelProvider for ReliableModelProvider {
             // at Usage would leak a route that never produced an accepted
             // completion to legacy direct callers.
             return stream_with_success_recording(
-                stream,
+                self.observe_stream_cooldown(stream, &entry.cooldown_key),
                 fallback_record,
                 accepted_route,
                 |event| matches!(event, StreamEvent::Final),
@@ -3387,7 +3421,7 @@ impl ModelProvider for ReliableModelProvider {
             );
 
             return stream_with_success_recording(
-                stream,
+                self.observe_stream_cooldown(stream, &entry.cooldown_key),
                 fallback_record,
                 accepted_route,
                 |chunk| chunk.is_final,
@@ -3468,7 +3502,7 @@ impl ModelProvider for ReliableModelProvider {
             );
 
             return stream_with_success_recording(
-                stream,
+                self.observe_stream_cooldown(stream, &entry.cooldown_key),
                 fallback_record,
                 accepted_route,
                 |chunk| chunk.is_final,
@@ -6993,6 +7027,45 @@ mod tests {
     }
 
     // ── New tests: Retry-After parsing ──
+
+    #[test]
+    fn retry_after_http_date_is_a_full_cooldown() {
+        let date =
+            (chrono::Utc::now() + chrono::Duration::minutes(5)).format("%a, %d %b %Y %H:%M:%S GMT");
+        let error = anyhow::Error::msg(format!("429 Retry-After: {date}"));
+        let wait = parse_retry_after_ms(&error).unwrap();
+        assert!((298_000..=300_000).contains(&wait));
+        assert_eq!(
+            parse_retry_after_ms(&anyhow::Error::msg(
+                "Retry-After: Sun, 06 Nov 1994 08:49:37 GMT"
+            )),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_rate_limit_updates_the_shared_cooldown_without_replaying() {
+        let provider = ReliableModelProvider::new("fixture", vec![], 0, 1);
+        let source = stream::iter(vec![Err::<StreamChunk, _>(
+            super::super::traits::StreamError::ModelProvider(
+                "429 Too Many Requests, Retry-After: 120".into(),
+            ),
+        )])
+        .boxed();
+        let results = provider
+            .observe_stream_cooldown(source, "fixture")
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+        assert!(provider.provider_cooldown_active("fixture"));
+        let before = provider.rate_limit_cooldowns.lock().unwrap()["fixture"];
+        provider.set_rate_limit_cooldown("fixture", &anyhow::Error::msg("429 Retry-After: 1"));
+        assert_eq!(
+            provider.rate_limit_cooldowns.lock().unwrap()["fixture"],
+            before
+        );
+    }
 
     #[test]
     fn parse_retry_after_integer() {
