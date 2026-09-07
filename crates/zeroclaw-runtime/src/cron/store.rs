@@ -413,7 +413,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                      allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
              ORDER BY next_run ASC",
         )?;
 
@@ -464,7 +464,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
                      allowed_tools, source, uses_memory, agent_alias, shell_output_format
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL
+             WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
              ORDER BY next_run ASC",
         )?;
 
@@ -812,13 +812,43 @@ pub fn skip_missed_run(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Re
 
 pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bool> {
     with_initialized_connection(config, |conn| {
-        let claimed = conn
-            .execute(
-                "UPDATE cron_jobs SET locked_at = ?1 WHERE id = ?2 AND locked_at IS NULL",
-                params![now.to_rfc3339(), job_id],
-            )
-            .context("Failed to claim cron job for execution")?;
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let tx = conn.unchecked_transaction()?;
+        let claimed=tx.execute("UPDATE cron_jobs SET locked_at=?1 WHERE id=?2 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
+            AND NOT EXISTS(SELECT 1 FROM cron_occurrences o WHERE o.job_id=cron_jobs.id AND o.scheduled_at=cron_jobs.next_run AND o.execution_state!='claimed')",
+            params![now.to_rfc3339(),job_id])?;
+        if claimed == 1 {
+            tx.execute("INSERT OR IGNORE INTO cron_occurrences(job_id,scheduled_at,execution_state,updated_at) SELECT id,next_run,'claimed',?2 FROM cron_jobs WHERE id=?1",params![job_id,now.to_rfc3339()])?;
+        }
+        tx.commit()?;
         Ok(claimed == 1)
+    })
+}
+
+/// Stable scheduled occurrence identity is (job_id, next_run), not attempt time.
+/// Retained independently of auto-deleted jobs so delivery evidence survives.
+pub(crate) fn checkpoint_occurrence(
+    config: &Config,
+    job: &CronJob,
+    execution: &str,
+    delivery: &str,
+    output: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        ["running", "confirmed", "possibly_applied"].contains(&execution),
+        "invalid occurrence execution state"
+    );
+    anyhow::ensure!(
+        ["not_started", "submitting", "submitted", "uncertain"].contains(&delivery),
+        "invalid occurrence delivery state"
+    );
+    with_initialized_connection(config, |conn| {
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let output = output.map(|s| &s[..s.floor_char_boundary(MAX_CRON_OUTPUT_BYTES)]);
+        let changed=conn.execute("UPDATE cron_occurrences SET execution_state=?3,delivery_state=?4,output=COALESCE(?5,output),updated_at=?6 WHERE job_id=?1 AND scheduled_at=?2",
+            params![job.id,job.next_run.to_rfc3339(),execution,delivery,output,Utc::now().to_rfc3339()])?;
+        anyhow::ensure!(changed == 1, "scheduled occurrence claim missing");
+        Ok(())
     })
 }
 
@@ -833,10 +863,14 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
+/// An interrupted occurrence may have produced external effects. Release the
+/// process-local lock but quarantine the job; a config reload cannot erase the
+/// durable uncertainty gate. Reconciliation is required, never automatic replay.
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
+            "UPDATE cron_jobs SET locked_at = NULL, enabled = 0, last_status = 'uncertain'
+             WHERE locked_at IS NOT NULL",
             [],
         )
         .context("Failed to clear stale cron job locks")
@@ -1758,6 +1792,16 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             duration_ms INTEGER,
             FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS cron_occurrences (
+            job_id TEXT NOT NULL,
+            scheduled_at TEXT NOT NULL,
+            execution_state TEXT NOT NULL,
+            delivery_state TEXT NOT NULL DEFAULT 'not_started',
+            output TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(job_id, scheduled_at)
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_occurrences_pending ON cron_occurrences(delivery_state, updated_at);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
@@ -2143,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_stale_locks_releases_in_flight_locks() {
+    fn clear_stale_locks_quarantines_interrupted_work() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let job = add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
@@ -2158,11 +2202,17 @@ mod tests {
             1,
             "the one in-flight lock should be cleared"
         );
-        assert_eq!(
-            due_jobs(&config, now).unwrap().len(),
-            1,
-            "after clearing the stale lock the job is eligible again"
-        );
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(all_overdue_jobs(&config, now).unwrap().is_empty());
+        assert!(!claim_job(&config, &job.id, now).unwrap());
+        // Re-enabling configuration must not erase the uncertainty gate.
+        with_initialized_connection(&config, |conn| {
+            conn.execute("UPDATE cron_jobs SET enabled=1 WHERE id=?1", [&job.id])?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(!claim_job(&config, &job.id, now).unwrap());
         assert_eq!(
             clear_stale_locks(&config).unwrap(),
             0,
@@ -4270,5 +4320,32 @@ schedule = { kind = "every", every_ms = 300000 }
         // it for API/admin visibility, but execution won't pick it up).
         let job = get_job(&config, "orphan-decl").unwrap();
         assert_eq!(job.source, "declarative");
+    }
+    #[test]
+    fn occurrence_survives_job_deletion_and_blocks_same_occurrence_replay() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo fixture").unwrap();
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        checkpoint_occurrence(&config, &job, "running", "not_started", None).unwrap();
+        release_job(&config, &job.id).unwrap();
+        assert!(
+            !claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "releasing lock cannot replay a started occurrence"
+        );
+        checkpoint_occurrence(
+            &config,
+            &job,
+            "confirmed",
+            "submitting",
+            Some("fixture output"),
+        )
+        .unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute("DELETE FROM cron_jobs WHERE id=?1",[&job.id])?;
+            let row:(String,String,String)=conn.query_row("SELECT execution_state,delivery_state,output FROM cron_occurrences WHERE job_id=?1",[&job.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert_eq!(row,("confirmed".into(),"submitting".into(),"fixture output".into()));
+            Ok(())
+        }).unwrap();
     }
 }

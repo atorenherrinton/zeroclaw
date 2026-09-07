@@ -653,7 +653,21 @@ async fn execute_job_with_retry(
     let runtime = runtime.or(owned_runtime.as_deref());
 
     let mut last_output = String::new();
-    let retries = config.reliability.scheduler_retries;
+    // A failed agent/shell attempt may already have changed external state.
+    // Only an explicit, enforced allowlist of known stateless reads permits
+    // retry. None means unrestricted, not read-only. Never inspect output prose
+    // or trust a connector's self-description to authorize replay.
+    let read_only = matches!(job.job_type, JobType::Agent)
+        && job.allowed_tools.as_ref().is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|name| crate::agent::tool_execution::is_stateless_read_tool(name))
+        });
+    let retries = if read_only {
+        config.reliability.scheduler_retries
+    } else {
+        0
+    };
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
@@ -793,6 +807,15 @@ async fn execute_and_persist_job(
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
+    if let Err(error) =
+        super::store::checkpoint_occurrence(config, job, "running", "not_started", None)
+    {
+        return (
+            job.id.clone(),
+            false,
+            format!("occurrence checkpoint failed before execution: {error}"),
+        );
+    }
     let span = zeroclaw_log::attribution_span!(job);
     let (success, output) = Box::pin(execute_job_with_retry(
         config,
@@ -805,6 +828,24 @@ async fn execute_and_persist_job(
     .instrument(span)
     .await;
     let finished_at = Utc::now();
+    let execution = if success {
+        "confirmed"
+    } else {
+        "possibly_applied"
+    };
+    // Save execution evidence before attempting a notification. A crash after
+    // submission must never restart the job just to regenerate that notification.
+    if let Err(error) =
+        super::store::checkpoint_occurrence(config, job, execution, "submitting", Some(&output))
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_attrs(serde_json::json!({"error":error.to_string()})),
+            "Refusing notification without occurrence checkpoint"
+        );
+        return (job.id.clone(), false, output);
+    }
     let success = Box::pin(persist_job_result(
         config,
         job,
@@ -814,6 +855,24 @@ async fn execute_and_persist_job(
         finished_at,
     ))
     .await;
+
+    // Unit channel results can prove submission only. A failed persistence or
+    // send leaves uncertainty, never permission to rerun this occurrence.
+    if let Err(error) = super::store::checkpoint_occurrence(
+        config,
+        job,
+        execution,
+        if success { "submitted" } else { "uncertain" },
+        None,
+    ) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_attrs(serde_json::json!({"error":error.to_string()})),
+            "Occurrence delivery checkpoint failed"
+        );
+        return (job.id.clone(), false, output);
+    }
 
     // Release the in-flight lock claimed during selection (`claim_due_jobs`) now
     // that the run (and its reschedule/disable/delete in `persist_job_result`) is
@@ -2331,7 +2390,7 @@ mod tests {
 
     #[tokio::test]
     #[cfg(not(target_os = "windows"))]
-    async fn execute_job_with_retry_recovers_after_first_failure() {
+    async fn execute_job_with_retry_does_not_replay_possibly_applied_shell() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
@@ -2360,8 +2419,9 @@ mod tests {
             false,
         ))
         .await;
-        assert!(success);
-        assert!(output.contains("recovered"));
+        assert!(!success);
+        assert!(!output.contains("recovered"));
+        assert!(config.data_dir.join("retry-ok.flag").exists());
     }
 
     #[tokio::test]
@@ -3381,7 +3441,8 @@ mod tests {
     async fn broadcast_sends_cron_result_on_success() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
-        let job = test_job("echo broadcast-ok");
+        let job = cron::add_job(&config, "test-agent", "* * * * *", "echo broadcast-ok").unwrap();
+        let job_id = job.id.clone();
         // Bind the synthetic test job to test-agent so process_due_jobs's
         // owning-agent lookup succeeds (jobs without an owner are skipped).
         config
@@ -3395,11 +3456,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
         let event_tx: EventBroadcast = Some(tx);
 
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
 
         let event = rx.try_recv().expect("should receive a broadcast event");
         assert_eq!(event["type"], "cron_result");
-        assert_eq!(event["job_id"], "test-job");
+        assert_eq!(event["job_id"], job_id);
         assert_eq!(event["success"], true);
         assert!(event["output"].as_str().unwrap().contains("broadcast-ok"));
         assert!(event["timestamp"].as_str().is_some());
