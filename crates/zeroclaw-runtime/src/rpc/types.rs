@@ -559,6 +559,8 @@ rpc_type! {
         pub command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub prompt: Option<String>,
+        #[serde(default, deserialize_with = "crate::cron::deserialize_policy_patch", skip_serializing_if = "Option::is_none")]
+        pub missed_run_policy: Option<Option<zeroclaw_config::schema::CronMissedRunPolicy>>,
     }
 }
 

@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use zeroclaw_config::schema::CronShellOutputFormat;
+use zeroclaw_config::schema::{CronMissedRunPolicy, CronShellOutputFormat};
 
 pub fn deserialize_maybe_stringified<T: serde::de::DeserializeOwned>(
     v: &serde_json::Value,
@@ -185,6 +185,10 @@ pub struct CronJob {
     /// the config; imperative jobs read it from the stored field in the DB.
     #[serde(default)]
     pub shell_output_format: CronShellOutputFormat,
+    /// Imperative jobs own this override in the cron row; declarative jobs
+    /// resolve it from current config. None inherits the scheduler default.
+    #[serde(default)]
+    pub missed_run_policy: Option<CronMissedRunPolicy>,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
@@ -217,6 +221,20 @@ pub struct CronJobPatch {
     pub allowed_tools: Option<Vec<String>>,
     pub uses_memory: Option<bool>,
     pub shell_output_format: Option<CronShellOutputFormat>,
+    /// Omission preserves the override; explicit null restores inheritance.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_policy_patch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub missed_run_policy: Option<Option<CronMissedRunPolicy>>,
+}
+
+/// Preserve the distinction between an omitted patch and an explicit null.
+pub fn deserialize_policy_patch<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<CronMissedRunPolicy>>, D::Error> {
+    Option::<CronMissedRunPolicy>::deserialize(deserializer).map(Some)
 }
 
 impl ::zeroclaw_api::attribution::Attributable for CronJob {

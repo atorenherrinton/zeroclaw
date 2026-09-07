@@ -586,3 +586,62 @@ fn cron_delivery_accepts_negative_telegram_chat_id() {
         "the message must not advertise an escape hatch that does not work:\n{equals_stderr}"
     );
 }
+
+#[test]
+fn imperative_policy_cli_update_reopens_and_restores_inheritance() {
+    use zeroclaw_config::schema::CronMissedRunPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.toml"), CONFIG_TOML).unwrap();
+    let add = run(
+        dir.path(),
+        &[
+            "cron",
+            "add",
+            "*/5 * * * *",
+            "--agent",
+            "default",
+            "echo synthetic",
+        ],
+    );
+    assert_ok(&add, "create synthetic job");
+    let id = job_id_from(&add);
+    let original = stored_job(dir.path(), &id);
+    for (arg, expected) in [
+        ("reconcile", Some(CronMissedRunPolicy::Reconcile)),
+        ("skip", Some(CronMissedRunPolicy::Skip)),
+        ("catch_up_once", Some(CronMissedRunPolicy::CatchUpOnce)),
+        ("inherit", None),
+    ] {
+        let result = run(
+            dir.path(),
+            &[
+                "cron",
+                "update",
+                &id,
+                "--agent",
+                "default",
+                "--missed-run-policy",
+                arg,
+            ],
+        );
+        assert_ok(&result, "patch startup policy");
+        let updated = stored_job(dir.path(), &id);
+        assert_eq!(updated.missed_run_policy, expected);
+        assert_eq!(updated.next_run, original.next_run);
+        assert_eq!(updated.last_status, None);
+    }
+    let invalid = run(
+        dir.path(),
+        &[
+            "cron",
+            "update",
+            &id,
+            "--agent",
+            "default",
+            "--missed-run-policy",
+            "retry",
+        ],
+    );
+    assert!(!invalid.status.success());
+    assert_eq!(stored_job(dir.path(), &id).missed_run_policy, None);
+}

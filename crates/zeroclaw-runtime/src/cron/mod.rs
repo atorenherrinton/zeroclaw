@@ -25,7 +25,7 @@ pub use store::{
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    deserialize_maybe_stringified,
+    deserialize_maybe_stringified, deserialize_policy_patch,
 };
 
 /// Channel names exposed by the cron tool schemas. Actual runtime delivery is

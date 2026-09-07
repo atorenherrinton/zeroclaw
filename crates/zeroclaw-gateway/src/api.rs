@@ -165,6 +165,12 @@ pub struct CronPatchBody {
     /// Only applied to shell-type jobs.
     #[serde(default)]
     pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
+    /// Omission preserves the override; null restores the scheduler default.
+    #[serde(
+        default,
+        deserialize_with = "zeroclaw_runtime::cron::deserialize_policy_patch"
+    )]
+    pub missed_run_policy: Option<Option<zeroclaw_config::schema::CronMissedRunPolicy>>,
 }
 
 enum CronTimezonePatch {
@@ -705,6 +711,7 @@ pub async fn handle_api_cron_patch(
         enabled,
         uses_memory,
         shell_output_format,
+        missed_run_policy,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -797,6 +804,7 @@ pub async fn handle_api_cron_patch(
         enabled,
         uses_memory,
         shell_output_format,
+        missed_run_policy,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -3480,6 +3488,102 @@ pub(crate) mod tests {
                 .requirements
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
+        );
+    }
+
+    #[tokio::test]
+    async fn imperative_policy_http_route_authentication_patch_and_validation() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &config,
+            "test-agent",
+            None,
+            zeroclaw_runtime::cron::Schedule::Every { every_ms: 60000 },
+            "echo synthetic",
+            None,
+            true,
+        )
+        .unwrap();
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(true, &["synthetic-policy-token".into()]));
+        let app = axum::Router::new()
+            .route(
+                "/api/cron/{id}",
+                axum::routing::patch(handle_api_cron_patch),
+            )
+            .with_state(state);
+        for (body, authenticated, expected, policy) in [
+            (
+                serde_json::json!({"missed_run_policy":"reconcile"}),
+                false,
+                StatusCode::UNAUTHORIZED,
+                serde_json::Value::Null,
+            ),
+            (
+                serde_json::json!({"missed_run_policy":"reconcile"}),
+                true,
+                StatusCode::OK,
+                serde_json::json!("reconcile"),
+            ),
+            (
+                serde_json::json!({"name":"renamed"}),
+                true,
+                StatusCode::OK,
+                serde_json::json!("reconcile"),
+            ),
+            (
+                serde_json::json!({"missed_run_policy":"retry"}),
+                true,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                serde_json::json!("reconcile"),
+            ),
+            (
+                serde_json::json!({"missed_run_policy":null}),
+                true,
+                StatusCode::OK,
+                serde_json::Value::Null,
+            ),
+        ] {
+            let mut request = axum::http::Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/cron/{}", job.id))
+                .header("content-type", "application/json");
+            if authenticated {
+                request = request.header("authorization", "Bearer synthetic-policy-token");
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(axum::body::Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                assert_eq!(
+                    response_json(response).await["job"]["missed_run_policy"],
+                    policy
+                );
+            }
+            let stored = zeroclaw_runtime::cron::get_job(&config, &job.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(stored.missed_run_policy).unwrap(),
+                policy
+            );
+            assert_eq!(stored.next_run, job.next_run);
+        }
+        assert!(
+            zeroclaw_runtime::cron::list_runs(&config, &job.id, 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

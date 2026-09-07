@@ -7,11 +7,13 @@ use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
 use uuid::Uuid;
-use zeroclaw_config::schema::{Config, CronShellOutputFormat};
+use zeroclaw_config::schema::{Config, CronMissedRunPolicy, CronShellOutputFormat};
 
 pub(crate) const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 mod manual;
 mod occurrences;
+#[cfg(test)]
+mod policy_tests;
 pub(crate) use manual::{
     DuplicateManualReceipt, ManualAdmissionError, checkpoint_manual_execution,
     claim_manual_run_with_key, finish_manual_run,
@@ -208,7 +210,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format, missed_run_policy
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -217,7 +219,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut jobs = Vec::new();
         for row in rows {
             let mut job = row?;
-            resolve_declarative_shell_output_format(config, &mut job);
+            resolve_declarative_policy(config, &mut job);
             jobs.push(job);
         }
         Ok(jobs)
@@ -231,7 +233,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     let mut job = get_job_raw(config, job_id)?;
-    resolve_declarative_shell_output_format(config, &mut job);
+    resolve_declarative_policy(config, &mut job);
     Ok(job)
 }
 
@@ -250,7 +252,7 @@ fn read_job_row(conn: &Connection, job_id: &str) -> Result<CronJob> {
     match conn.query_row(
         "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
          enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-         allowed_tools, source, uses_memory, agent_alias, shell_output_format FROM cron_jobs WHERE id=?1",
+         allowed_tools, source, uses_memory, agent_alias, shell_output_format, missed_run_policy FROM cron_jobs WHERE id=?1",
         [job_id], map_cron_job_row,
     ) {
         Ok(job) => Ok(job),
@@ -359,14 +361,14 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format, missed_run_policy
              FROM cron_jobs WHERE agent_alias = ?1 ORDER BY next_run ASC",
         )?;
         let rows = stmt.query_map(params![agent_alias], map_cron_job_row)?;
         let mut jobs = Vec::new();
         for row in rows {
             let mut job = row?;
-            resolve_declarative_shell_output_format(config, &mut job);
+            resolve_declarative_policy(config, &mut job);
             jobs.push(job);
         }
         Ok(jobs)
@@ -415,7 +417,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format, missed_run_policy
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
              ORDER BY next_run ASC",
@@ -440,7 +442,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
                         );
                         continue;
                     }
-                    resolve_declarative_shell_output_format(config, &mut job);
+                    resolve_declarative_policy(config, &mut job);
                     jobs.push(job);
                 }
                 Err(e) => ::zeroclaw_log::record!(
@@ -466,7 +468,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                      enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format, missed_run_policy
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1 AND locked_at IS NULL AND COALESCE(last_status,'') != 'uncertain'
              ORDER BY next_run ASC",
@@ -491,7 +493,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
                         );
                         continue;
                     }
-                    resolve_declarative_shell_output_format(config, &mut job);
+                    resolve_declarative_policy(config, &mut job);
                     jobs.push(job);
                 }
                 Err(e) => ::zeroclaw_log::record!(
@@ -537,102 +539,121 @@ fn update_job_inner(
     owner: Option<&str>,
     patch: CronJobPatch,
 ) -> Result<CronJob> {
+    // Hold a writer transaction across the raw read and update so a patch
+    // cannot overwrite a concurrent schedule, policy, or ownership change.
     // Start from the raw DB row, not the config-resolved `get_job()` view:
     // for a declarative job, `shell_output_format` isn't DB-owned, so an
     // unrelated patch (e.g. toggling `enabled`) must not re-persist the
     // resolved config value into the column and recreate a second owner.
-    let mut job = get_job_raw(config, job_id)?;
-    let mut schedule_changed = false;
+    with_initialized_connection(config, |connection| {
+        connection.execute_batch("PRAGMA synchronous=FULL")?;
+        let conn = rusqlite::Transaction::new_unchecked(
+            connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let mut job = read_job_row(&conn, job_id)?;
+        if owner.is_some_and(|alias| alias != job.agent_alias) {
+            anyhow::bail!("Cron job '{job_id}' not found");
+        }
+        let mut schedule_changed = false;
 
-    if let Some(schedule) = patch.schedule {
-        validate_schedule(&schedule, Utc::now())?;
-        job.schedule = schedule;
-        job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        schedule_changed = true;
-    }
-    if let Some(command) = patch.command {
-        job.command = command;
-    }
-    if let Some(prompt) = patch.prompt {
-        job.prompt = Some(prompt);
-    }
-    if let Some(name) = patch.name {
-        job.name = Some(name);
-    }
-    if let Some(enabled) = patch.enabled {
-        job.enabled = enabled;
-    }
-    if let Some(delivery) = patch.delivery {
-        // A declarative job's delivery is owned by `[cron.<id>].delivery` in
-        // config.toml. Writing it here would appear to succeed and then be
-        // silently reverted by `sync_declarative_jobs` on the next daemon
-        // start, which rewrites every declarative column from the config.
-        // Reject at this boundary rather than persist a value the next sync
-        // discards, matching how `shell_output_format` is handled below.
-        //
-        // Ownership is checked before shape: a declarative job rejects any
-        // delivery patch, so reporting a missing recipient first would imply
-        // that correcting it would let the write through.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
+        if let Some(schedule) = patch.schedule {
+            validate_schedule(&schedule, Utc::now())?;
+            job.schedule = schedule;
+            job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
+            schedule_changed = true;
+        }
+        if let Some(command) = patch.command {
+            job.command = command;
+        }
+        if let Some(prompt) = patch.prompt {
+            job.prompt = Some(prompt);
+        }
+        if let Some(name) = patch.name {
+            job.name = Some(name);
+        }
+        if let Some(enabled) = patch.enabled {
+            job.enabled = enabled;
+        }
+        if let Some(delivery) = patch.delivery {
+            // A declarative job's delivery is owned by `[cron.<id>].delivery` in
+            // config.toml. Writing it here would appear to succeed and then be
+            // silently reverted by `sync_declarative_jobs` on the next daemon
+            // start, which rewrites every declarative column from the config.
+            // Reject at this boundary rather than persist a value the next sync
+            // discards, matching how `shell_output_format` is handled below.
+            //
+            // Ownership is checked before shape: a declarative job rejects any
+            // delivery patch, so reporting a missing recipient first would imply
+            // that correcting it would let the write through.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': delivery is owned by [cron.{job_id}].delivery in \
                  config.toml for a declarative job, not the database. Edit the config \
                  and restart the daemon."
-            );
+                );
+            }
+            // Match add_*_job: announce delivery must include channel + to.
+            validate_delivery_config(Some(&delivery))?;
+            job.delivery = delivery;
         }
-        // Match add_*_job: announce delivery must include channel + to.
-        validate_delivery_config(Some(&delivery))?;
-        job.delivery = delivery;
-    }
-    if let Some(model) = patch.model {
-        job.model = Some(model);
-    }
-    if let Some(target) = patch.session_target {
-        job.session_target = target;
-    }
-    if let Some(delete_after_run) = patch.delete_after_run {
-        job.delete_after_run = delete_after_run;
-    }
-    if let Some(allowed_tools) = patch.allowed_tools {
-        // Empty list means "clear the allowlist" (all tools available),
-        // not "allow zero tools".
-        if allowed_tools.is_empty() {
-            job.allowed_tools = None;
-        } else {
-            job.allowed_tools = Some(allowed_tools);
+        if let Some(model) = patch.model {
+            job.model = Some(model);
         }
-    }
-    if let Some(uses_memory) = patch.uses_memory {
-        job.uses_memory = uses_memory;
-    }
-    if let Some(shell_output_format) = patch.shell_output_format {
-        // Config-owned (declarative) and non-shell (agent) jobs never store
-        // this field: the gateway API already rejects both cases, but this
-        // is the core boundary every caller of `update_job` goes through,
-        // so it must reject them too rather than silently ignoring or
-        // persisting a value execution never consumes.
-        if job.source == "declarative" {
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
+        if let Some(target) = patch.session_target {
+            job.session_target = target;
+        }
+        if let Some(delete_after_run) = patch.delete_after_run {
+            job.delete_after_run = delete_after_run;
+        }
+        if let Some(allowed_tools) = patch.allowed_tools {
+            // Empty list means "clear the allowlist" (all tools available),
+            // not "allow zero tools".
+            if allowed_tools.is_empty() {
+                job.allowed_tools = None;
+            } else {
+                job.allowed_tools = Some(allowed_tools);
+            }
+        }
+        if let Some(uses_memory) = patch.uses_memory {
+            job.uses_memory = uses_memory;
+        }
+        if let Some(shell_output_format) = patch.shell_output_format {
+            // Config-owned (declarative) and non-shell (agent) jobs never store
+            // this field: the gateway API already rejects both cases, but this
+            // is the core boundary every caller of `update_job` goes through,
+            // so it must reject them too rather than silently ignoring or
+            // persisting a value execution never consumes.
+            if job.source == "declarative" {
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is owned by config.toml for a \
                  declarative job, not the database"
-            );
+                );
+            }
+            if job.job_type != JobType::Shell {
+                let job_type: &str = job.job_type.into();
+                anyhow::bail!(
+                    "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
+                );
+            }
+            job.shell_output_format = shell_output_format;
         }
-        if job.job_type != JobType::Shell {
-            let job_type: &str = job.job_type.into();
-            anyhow::bail!(
-                "Cron job '{job_id}': shell_output_format is shell-only and cannot be set on a '{job_type}' job"
-            );
+
+        if let Some(policy) = patch.missed_run_policy {
+            if job.source == "declarative" {
+                anyhow::bail!(crate::i18n::get_required_cli_string(
+                    "cron-missed-run-policy-config-owned"
+                ));
+            }
+            job.missed_run_policy = policy;
         }
-        job.shell_output_format = shell_output_format;
-    }
 
-    if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
-    }
+        if schedule_changed {
+            job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        }
 
-    with_initialized_connection(config, |conn| {
         // Declarative jobs don't own `shell_output_format` — the config is the
-        // canonical source, and `resolve_declarative_shell_output_format()` overlays
+        // canonical source, and `resolve_declarative_policy()` overlays
         // it on every read. Writing the synthesized (Wrapped) value back into the
         // column during an unrelated patch would overwrite whatever was stored
         // there (NULL, garbage, or a future value) with a value the DB doesn't
@@ -642,7 +663,7 @@ fn update_job_inner(
             conn.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                     session_target = ?7, model = ?8, enabled = CASE WHEN last_status='uncertain' THEN 0 ELSE ?9 END, delivery = ?10, delete_after_run = ?11,
                      allowed_tools = ?12, next_run = ?13, uses_memory = ?14
                  WHERE id = ?15 AND (?16 IS NULL OR agent_alias = ?16)",
                 params![
@@ -668,9 +689,10 @@ fn update_job_inner(
             conn.execute(
                 "UPDATE cron_jobs
                  SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
-                     session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15
-                 WHERE id = ?16 AND (?17 IS NULL OR agent_alias = ?17)",
+                     session_target = ?7, model = ?8, enabled = CASE WHEN last_status='uncertain' THEN 0 ELSE ?9 END, delivery = ?10, delete_after_run = ?11,
+                     allowed_tools = ?12, next_run = ?13, uses_memory = ?14, shell_output_format = ?15,
+                     missed_run_policy = ?16
+                 WHERE id = ?17 AND (?18 IS NULL OR agent_alias = ?18)",
                 params![
                     job.expression,
                     job.command,
@@ -690,6 +712,7 @@ fn update_job_inner(
                         CronShellOutputFormat::Wrapped => "wrapped",
                         CronShellOutputFormat::Raw => "raw",
                     },
+                    encode_missed_run_policy(job.missed_run_policy),
                     job.id,
                     owner,
                 ],
@@ -697,15 +720,17 @@ fn update_job_inner(
         }
         .context("Failed to update cron job")?;
 
-        // Zero rows means the guard matched nothing: the job moved to another
-        // owner between the read above and this write.
+        // Retain the owner guard at the mutation boundary.
         if changed == 0 {
             anyhow::bail!("Cron job '{job_id}' not found");
         }
-        Ok(())
-    })?;
-
-    get_job(config, job_id)
+        // Return the committed snapshot while ownership is still protected by
+        // the writer transaction, rather than re-reading a reassigned job.
+        let mut updated = read_job_row(&conn, job_id)?;
+        resolve_declarative_policy(config, &mut updated);
+        conn.commit()?;
+        Ok(updated)
+    })
 }
 
 pub fn record_last_run(
@@ -826,6 +851,8 @@ fn checkpoint_missed_run(
                  last_status=?5, last_output=?6
              WHERE id=?1 AND next_run=?2 AND next_run<=?7 AND enabled=1
                  AND locked_at IS NULL AND COALESCE(last_status,'')!='uncertain'
+                 AND COALESCE(source,'imperative')=?8 AND agent_alias=?9
+                 AND (source='declarative' OR missed_run_policy IS ?10)
                  AND NOT EXISTS (SELECT 1 FROM cron_occurrences
                      WHERE job_id=?1 AND scheduled_at=?2)",
             params![
@@ -835,7 +862,10 @@ fn checkpoint_missed_run(
                 !reconcile && !one_shot,
                 if reconcile { "uncertain" } else { "skipped" },
                 reason,
-                now.to_rfc3339()
+                now.to_rfc3339(),
+                job.source,
+                job.agent_alias,
+                encode_missed_run_policy(job.missed_run_policy),
             ],
         )?;
         anyhow::ensure!(
@@ -1197,6 +1227,14 @@ fn sql_conversion_error(err: anyhow::Error) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(err.into())
 }
 
+fn encode_missed_run_policy(policy: Option<CronMissedRunPolicy>) -> Option<&'static str> {
+    policy.map(|policy| match policy {
+        CronMissedRunPolicy::CatchUpOnce => "catch_up_once",
+        CronMissedRunPolicy::Skip => "skip",
+        CronMissedRunPolicy::Reconcile => "reconcile",
+    })
+}
+
 fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let expression: String = row.get(1)?;
     let schedule_raw: Option<String> = row.get(3)?;
@@ -1214,7 +1252,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let uses_memory: Option<i64> = row.get(19)?;
     let agent_alias: Option<String> = row.get(20)?;
     // Declarative jobs never own this column — sync_declarative_jobs skips it
-    // and resolve_declarative_shell_output_format() overwrites from config.
+    // and resolve_declarative_policy() overwrites from config.
     // Skip reading column 21 entirely for declarative rows: the source
     // ownership is already determined, and attempting a typed String read
     // on a non-owned BLOB shadow would fail before the ownership branch
@@ -1224,6 +1262,17 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     } else {
         let raw: Option<String> = row.get(21)?;
         decode_shell_output_format(raw.as_deref()).map_err(sql_conversion_error)?
+    };
+
+    let missed_run_policy = if source.as_deref() == Some("declarative") {
+        None
+    } else {
+        let raw: Option<String> = row.get(22)?;
+        raw.map(|value| {
+            serde_json::from_value::<CronMissedRunPolicy>(serde_json::Value::String(value))
+        })
+        .transpose()
+        .map_err(|error| sql_conversion_error(error.into()))?
     };
 
     Ok(CronJob {
@@ -1245,6 +1294,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         source: source.unwrap_or_else(|| "imperative".to_string()),
         uses_memory: uses_memory != Some(0),
         shell_output_format,
+        missed_run_policy,
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
@@ -1258,13 +1308,13 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     })
 }
 
-/// For declarative jobs, resolve `shell_output_format` from the canonical
-/// config source instead of the DB column (which stays at the default).
-fn resolve_declarative_shell_output_format(config: &Config, job: &mut CronJob) {
+/// Resolve declarative policy from config; never read or persist its DB shadows.
+fn resolve_declarative_policy(config: &Config, job: &mut CronJob) {
     if job.source == "declarative"
         && let Some(decl) = config.cron.get(&job.id)
     {
         job.shell_output_format = decl.shell_output_format.clone();
+        job.missed_run_policy = decl.missed_run_policy;
     }
 }
 
@@ -1901,6 +1951,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "locked_at", "TEXT")?;
     // Binds a manual invocation to its lock; ordinary release cannot unlock it.
     add_column_if_missing(conn, "lock_owner", "TEXT")?;
+    add_column_if_missing(conn, "missed_run_policy", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",
@@ -3928,6 +3979,7 @@ schedule = { kind = "every", every_ms = 300000 }
             uses_memory: false,
             source: "imperative".to_string(),
             shell_output_format: CronShellOutputFormat::default(),
+            missed_run_policy: None,
             created_at: now,
             next_run: next_run_for_schedule(schedule, now).unwrap_or(now),
             last_run: None,

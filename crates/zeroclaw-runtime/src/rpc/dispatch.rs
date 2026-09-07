@@ -3071,6 +3071,7 @@ impl RpcDispatcher {
             command: req.command,
             prompt: req.prompt,
             name: req.name,
+            missed_run_policy: req.missed_run_policy,
             ..Default::default()
         };
         let job = crate::cron::update_job(&config, &req.id, patch)
@@ -8754,6 +8755,63 @@ mod tests {
                 .iter()
                 .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
             "under-deadline response must not contain the timeout warning"
+        );
+    }
+
+    #[tokio::test]
+    async fn imperative_policy_rpc_authenticated_patch_roundtrip() {
+        Box::pin(imperative_policy_rpc_scenario()).await;
+    }
+
+    async fn imperative_policy_rpc_scenario() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let job =
+            crate::cron::add_job(&config, "test-agent", "* * * * *", "echo synthetic").unwrap();
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        *dispatcher.ctx.config.write() = config.clone();
+        for (policy, authenticated, expected) in [
+            (json!("skip"), false, None),
+            (json!("skip"), true, Some(json!("skip"))),
+            (json!(null), true, Some(json!(null))),
+        ] {
+            dispatcher.authenticated = authenticated;
+            let request = json!({"jsonrpc":"2.0","id":1,"method":"cron/patch","params":{
+                "id":job.id,"agent":"test-agent","missed_run_policy":policy
+            }})
+            .to_string();
+            Box::pin(dispatcher.process_line_for_test(&request)).await;
+            let response: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(
+                    response["result"]["missed_run_policy"], expected,
+                    "{response}"
+                );
+                assert_eq!(
+                    serde_json::to_value(
+                        crate::cron::get_job(&config, &job.id)
+                            .unwrap()
+                            .missed_run_policy
+                    )
+                    .unwrap(),
+                    expected
+                );
+            } else {
+                assert_eq!(response["error"]["code"], AUTH_REQUIRED);
+            }
+        }
+        assert!(
+            dispatcher
+                .handle_cron_patch(
+                    &json!({"id":job.id,"agent":"test-agent","missed_run_policy":"retry"})
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            crate::cron::list_runs(&config, &job.id, 10)
+                .unwrap()
+                .is_empty()
         );
     }
 

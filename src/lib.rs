@@ -887,6 +887,10 @@ Examples:
         /// If false, disable memory recall for this agent cron job (default: true).
         #[arg(long)]
         uses_memory: Option<bool>,
+        /// Startup handling of overdue work; inherit restores the scheduler default.
+        #[arg(long, value_parser = ["catch_up_once", "skip", "reconcile", "inherit"])]
+        #[serde(default)]
+        missed_run_policy: Option<String>,
         /// Delivery of the job's output to a channel (see `--channel` / `--to`).
         #[command(flatten)]
         #[serde(default)]

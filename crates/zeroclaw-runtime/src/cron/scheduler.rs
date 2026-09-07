@@ -589,6 +589,11 @@ fn missed_run_policy(config: &Config, job: &CronJob) -> CronMissedRunPolicy {
     {
         return policy;
     }
+    if job.source != "declarative"
+        && let Some(policy) = job.missed_run_policy
+    {
+        return policy;
+    }
     if config.scheduler.catch_up_on_startup {
         CronMissedRunPolicy::CatchUpOnce
     } else {
@@ -1729,6 +1734,7 @@ mod tests {
             uses_memory: true,
             source: "imperative".into(),
             shell_output_format: CronShellOutputFormat::default(),
+            missed_run_policy: None,
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
@@ -3971,6 +3977,66 @@ mod tests {
                 expected,
                 "an alias collision cannot borrow config"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn imperative_policy_startup_partitions_and_never_resets_review() {
+        for catch_up in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let mut config = test_config(&tmp).await;
+            config.scheduler.catch_up_on_startup = catch_up;
+            let now = Utc::now();
+            let mut jobs = Vec::new();
+            for policy in ["catch_up_once", "skip", "reconcile"] {
+                let job = cron::add_job(
+                    &config,
+                    "test-agent",
+                    "* * * * *",
+                    "echo synthetic-never-executed",
+                )
+                .unwrap();
+                let patch = serde_json::from_value(serde_json::json!({"missed_run_policy":policy}))
+                    .unwrap();
+                cron::update_job(&config, &job.id, patch).unwrap();
+                jobs.push(job);
+            }
+            let conn = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+            conn.execute(
+                "UPDATE cron_jobs SET next_run=?1",
+                [(now - ChronoDuration::hours(1)).to_rfc3339()],
+            )
+            .unwrap();
+            let ready = prepare_startup_jobs(&config, now).unwrap();
+            assert_eq!(
+                ready.iter().map(|job| &job.id).collect::<Vec<_>>(),
+                vec![&jobs[0].id]
+            );
+            let skipped = cron::get_job(&config, &jobs[1].id).unwrap();
+            assert_eq!(skipped.last_status.as_deref(), Some("skipped"));
+            assert!(skipped.next_run > now);
+            let reviewed = cron::get_job(&config, &jobs[2].id).unwrap();
+            assert_eq!(reviewed.last_status.as_deref(), Some("uncertain"));
+            assert!(!reviewed.enabled);
+            cron::update_job(
+                &config,
+                &reviewed.id,
+                serde_json::from_value(
+                    serde_json::json!({"enabled":true,"missed_run_policy":"catch_up_once"}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            clear_stale_locks(&config).unwrap();
+            let again = prepare_startup_jobs(&config, now).unwrap();
+            assert_eq!(
+                again.iter().map(|job| &job.id).collect::<Vec<_>>(),
+                vec![&jobs[0].id]
+            );
+            assert!(!cron::get_job(&config, &reviewed.id).unwrap().enabled);
+            for job in &jobs {
+                assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
+            }
         }
     }
 

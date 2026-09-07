@@ -568,7 +568,7 @@ cli-cron-added-oneshot = ✅ Added one-shot cron job {$id}
 cli-cron-added-interval-agent = ✅ Added interval agent cron job {$id}
 cli-cron-added-interval = ✅ Added interval cron job {$id}
 cli-cron-updated = ✅ Updated cron job {$id}
-cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
+cli-cron-update-no-field = At least one of --expression, --tz, --command, --name, --allowed-tool, --uses-memory, --missed-run-policy, or a delivery flag (--channel, --to, --thread, --best-effort, --no-best-effort) must be provided
 cli-cron-removed = ✅ Removed cron job {$id}
 cli-cron-paused = ⏸️  Paused cron job {$id}
 cli-cron-resumed = ▶️  Resumed cron job {$id}
@@ -1270,3 +1270,5 @@ cron-manual-receipt-unavailable = The saved cron receipt could not be read. A pr
 
 cron-occurrences-invalid-query = Invalid occurrence query. Use a nonempty job ID, a limit from 1 to 100, and either an exact occurrence ID or a before cursor. IDs must be at most 512 bytes without control characters.
 cron-occurrences-storage-unavailable = Cron occurrence storage is unavailable or invalid; no empty-history result can be established.
+
+cron-missed-run-policy-config-owned = This job’s missed-run policy is owned by its cron declaration in config.toml. Edit the declaration to change it.

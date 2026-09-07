@@ -55,6 +55,28 @@ entry. Omit `category` when checking for collisions across categories.
 Without `key`, existing list/search behavior and preview truncation are unchanged.
 This is a read capability, not an atomic create-if-absent or compare-and-swap API.
 
+## Cron missed-run policy patches
+
+Authenticated `PATCH /api/cron/{id}` and RPC `cron/patch` accept
+`missed_run_policy` for imperative jobs: `catch_up_once`, `skip`, or `reconcile`.
+Omission preserves the stored override; explicit `null` restores the global
+`scheduler.catch_up_on_startup` default. Job responses include the optional
+policy. Declarative jobs resolve this value from their config declaration and
+reject database patches to it.
+
+The agent tool `cron_update` accepts the same field inside `patch`, subject to
+its existing owner and mutation policy checks. The CLI equivalent is
+`zeroclaw cron update <id> --agent <owner> --missed-run-policy <value>`; use
+`inherit` to clear an override. Newly created imperative jobs inherit the global
+default until patched. Updates govern subsequent startup admission; they do not
+cancel or change already admitted work.
+
+Policy patches do not run jobs, alter receipts, release claims, or reset
+quarantine. An uncertain job remains disabled even when the same patch requests
+`enabled: true`. Startup disposition refuses stale policy or owner snapshots.
+See [Background work lifecycle](../architecture/background-work-lifecycle.md)
+for the three policies and recovery semantics.
+
 ## Cron occurrence receipts
 
 `GET /api/cron/{id}/occurrences` and RPC `cron/occurrences` expose read-only

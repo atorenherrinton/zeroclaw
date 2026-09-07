@@ -76,7 +76,7 @@ pub(crate) fn claim_manual_run_with_key(
         conn.execute_batch("PRAGMA synchronous=FULL")?;
         let tx = conn.unchecked_transaction()?;
         let mut current = read_job_row(&tx, &expected.id)?;
-        resolve_declarative_shell_output_format(config, &mut current);
+        resolve_declarative_policy(config, &mut current);
         if current.agent_alias != expected.agent_alias {
             return Err(ManualAdmissionError::Changed.into());
         }

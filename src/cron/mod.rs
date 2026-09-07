@@ -562,6 +562,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             name,
             allowed_tools,
             uses_memory,
+            missed_run_policy,
             delivery,
         } => {
             require_configured_agent(config, &agent_alias)?;
@@ -572,6 +573,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 && name.is_none()
                 && allowed_tools.is_empty()
                 && uses_memory.is_none()
+                && missed_run_policy.is_none()
                 && !delivery_requested
             {
                 bail!("{}", get_required_cli_string("cli-cron-update-no-field"));
@@ -633,6 +635,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 }
             }
 
+            let missed_run_policy = missed_run_policy
+                .map(|value| {
+                    if value == "inherit" {
+                        Ok(None)
+                    } else {
+                        serde_json::from_value(serde_json::Value::String(value)).map(Some)
+                    }
+                })
+                .transpose()?;
             let patch = CronJobPatch {
                 schedule,
                 command,
@@ -643,6 +654,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     Some(allowed_tools)
                 },
                 uses_memory,
+                missed_run_policy,
                 delivery,
                 ..CronJobPatch::default()
             };
@@ -876,6 +888,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -927,6 +940,7 @@ mod tests {
         // path must reject it rather than persist an unroutable delivery.
         let result = handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id,
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -983,6 +997,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1047,6 +1062,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1104,6 +1120,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1164,6 +1181,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1250,6 +1268,7 @@ mod tests {
 
         let result = handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1307,6 +1326,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,
@@ -1368,6 +1388,7 @@ mod tests {
 
         handle_command(
             crate::CronCommands::Update {
+                missed_run_policy: None,
                 id: id.clone(),
                 agent_alias: "test-agent".into(),
                 expression: None,

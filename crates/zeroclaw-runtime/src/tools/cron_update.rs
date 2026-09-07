@@ -103,6 +103,11 @@ impl Tool for CronUpdateTool {
                             "type": "string",
                             "description": "New human-readable name for the job"
                         },
+                        "missed_run_policy": {
+                            "type": ["string", "null"],
+                            "enum": ["catch_up_once", "skip", "reconcile", null],
+                            "description": "Startup policy for an imperative job. Null restores the scheduler default; omission preserves the override. Changing policy never clears quarantine. Declarative jobs use config.toml."
+                        },
                         "enabled": {
                             "type": "boolean",
                             "description": "Enable or disable the job without deleting it"
@@ -349,6 +354,42 @@ mod tests {
         Arc::new(
             SecurityPolicy::for_agent(cfg, TEST_AGENT).expect("test-agent has resolvable profiles"),
         )
+    }
+
+    #[tokio::test]
+    async fn imperative_policy_tool_preserves_omission_clears_null_and_rejects_other_owner() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo synthetic").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        for (patch, expected) in [
+            (json!({"missed_run_policy":"reconcile"}), json!("reconcile")),
+            (json!({"name":"renamed"}), json!("reconcile")),
+            (json!({"missed_run_policy":null}), serde_json::Value::Null),
+        ] {
+            let result = tool
+                .execute(json!({"job_id":job.id,"patch":patch}))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+            let output: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+            assert_eq!(output["missed_run_policy"], expected);
+        }
+        let invalid = tool
+            .execute(json!({"job_id":job.id,"patch":{"missed_run_policy":"retry"}}))
+            .await
+            .unwrap();
+        assert!(!invalid.success);
+        let other = other_agents_job(&cfg);
+        let denied = tool
+            .execute(json!({"job_id":other.id,"patch":{"missed_run_policy":"catch_up_once"}}))
+            .await
+            .unwrap();
+        assert!(!denied.success);
+        assert_eq!(
+            cron::get_job(&cfg, &other.id).unwrap().missed_run_policy,
+            None
+        );
     }
 
     #[tokio::test]
