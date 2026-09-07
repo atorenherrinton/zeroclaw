@@ -72,6 +72,16 @@ pub struct DeliverySummary {
     pub confirmed_chunks: usize,
     pub total_chunks: usize,
 }
+impl DeliverySummary {
+    /// Unit/HTTP success and empty or inconsistent summaries cannot confirm a
+    /// replacement. Adapters create this projection from positive chunk receipts.
+    pub fn is_fully_confirmed(&self) -> bool {
+        self.outcome == EffectOutcome::Confirmed
+            && self.total_chunks > 0
+            && self.confirmed_chunks == self.total_chunks
+    }
+}
+
 tokio::task_local! {
     pub static SUMMARY: std::sync::Mutex<Option<DeliverySummary>>;
 }

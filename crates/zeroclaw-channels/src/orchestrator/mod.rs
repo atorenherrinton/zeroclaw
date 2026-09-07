@@ -7800,13 +7800,7 @@ async fn process_channel_message_body(
                 // Whether the agent's reply reached a channel — gates the
                 // `fire_message_sent` observer hook below.
                 let reply_delivered = if is_redirect {
-                    // Routing redirects to a different channel: cancel any in-progress
-                    // draft on the originating channel before delivering elsewhere.
-                    if let (Some(orig_ch), Some(draft_id)) =
-                        (target_channel.as_ref(), draft_message_id.as_deref())
-                    {
-                        let _ = orig_ch.cancel_draft(&msg.reply_target, draft_id).await;
-                    }
+                    // Keep the original draft until every replacement chunk is acknowledged.
                     let suppress = suppress_voice_override.unwrap_or(false);
                     let mut send_msg = SendMessage::new(&delivered_response, &delivery_recipient)
                         .in_thread(msg.thread_ts.clone());
@@ -7817,12 +7811,9 @@ async fn process_channel_message_body(
                     }
                     channel.send_final(&send_msg).await.is_ok()
                 } else if let Some(ref draft_id) = draft_message_id {
-                    // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send_final() so force_voice
-                    // reaches the channel's voice path (finalize_draft has no
-                    // force_voice concept).
+                    // Force-voice uses send_final while preserving the visible draft.
+                    // An adapter without positive voice receipts cannot retire it.
                     if force_voice_override {
-                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
                             .send_final(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
@@ -7903,11 +7894,9 @@ async fn process_channel_message_body(
                     "Channel final submission completed; consult per-chunk receipts for platform confirmation");
                 let summary = delivery;
                 let confirmed = reply_delivered
-                    && summary.as_ref().is_some_and(|s| {
-                        s.outcome == zeroclaw_api::delivery::EffectOutcome::Confirmed
-                            && s.total_chunks > 0
-                            && s.total_chunks == s.confirmed_chunks
-                    });
+                    && summary
+                        .as_ref()
+                        .is_some_and(zeroclaw_api::delivery::DeliverySummary::is_fully_confirmed);
                 let status = if confirmed {
                     TaskStatus::Delivered
                 } else if summary.as_ref().is_some_and(|s| s.confirmed_chunks > 0) {
@@ -7917,6 +7906,18 @@ async fn process_channel_message_body(
                 };
                 if !turn_journal::checkpoint(status, None, confirmed).await {
                     return;
+                }
+                if (is_redirect || force_voice_override)
+                    && let (Some(origin), Some(draft_id)) =
+                        (target_channel.as_ref(), draft_message_id.as_deref())
+                {
+                    retire_superseded_draft(
+                        origin.as_ref(),
+                        &msg.reply_target,
+                        draft_id,
+                        summary.as_ref().filter(|_| reply_delivered),
+                    )
+                    .await;
                 }
                 if reply_delivered && let Some(hooks) = ctx.hooks.as_ref() {
                     hooks
@@ -8002,9 +8003,6 @@ async fn process_channel_message_body(
                     "channel_message_error"
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(draft_id) = draft_message_id.as_deref() {
-                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                    }
                     let _ = channel
                         .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                         .await;
@@ -8069,12 +8067,6 @@ async fn process_channel_message_body(
                 }
                 if let Some(channel) = target_channel.as_ref() {
                     let user_msg = channel_user_error_message(&e, &safe_error);
-                    // Cancel any in-progress draft (don't finalize it with the
-                    // error text, which would trigger TTS on the error message)
-                    // then deliver the error as a plain suppressed send.
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                    }
                     let _ = channel
                         .send(&SendMessage::reply_to(&msg, user_msg).suppress_voice())
                         .await;
@@ -8116,14 +8108,11 @@ async fn process_channel_message_body(
             );
             if let Some(channel) = target_channel.as_ref() {
                 // Localized error text (master) delivered with suppress_voice
-                // (RFCerror-path fix): cancel the draft, then send as
+                // Preserve the draft and send the notice as
                 // text so a timeout notice is never read aloud on a voice peer.
                 let error_text = zeroclaw_runtime::i18n::get_required_cli_string(
                     "channel-runtime-request-timeout",
                 );
-                if let Some(draft_id) = draft_message_id.as_deref() {
-                    let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
-                }
                 let _ = channel
                     .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                     .await;
@@ -8190,6 +8179,37 @@ async fn reserve_worker(
         completion_guard: CompleteInFlightOnDrop(completion),
     }
 }
+/// Cleanup is optional; preserving a redundant draft is safer than losing the
+/// only visible answer. Unit success alone is not a positive acknowledgement.
+async fn retire_superseded_draft(
+    channel: &dyn Channel,
+    recipient: &str,
+    draft_id: &str,
+    summary: Option<&zeroclaw_api::delivery::DeliverySummary>,
+) {
+    if !summary.is_some_and(zeroclaw_api::delivery::DeliverySummary::is_fully_confirmed) {
+        return;
+    }
+    let result = zeroclaw_api::deadline::run_inherited_phase(
+        zeroclaw_api::deadline::Phase::Delivery,
+        async {
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                channel.cancel_draft(recipient, draft_id),
+            )
+            .await?
+        },
+    )
+    .await;
+    if result.is_err() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+            "Confirmed replacement retained; superseded draft cleanup incomplete"
+        );
+    }
+}
+
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: ChannelMessage,
@@ -18593,7 +18613,48 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
-    async fn process_channel_message_turn_error_cancels_the_draft() {
+    async fn replacement_draft_cleanup_requires_positive_confirmation() {
+        let channel = DraftRecordingChannel::new(false, false);
+        use zeroclaw_api::delivery::{DeliverySummary, EffectOutcome};
+        retire_superseded_draft(&channel, "fixture", "draft-1", None).await;
+        for outcome in [
+            EffectOutcome::NotStarted,
+            EffectOutcome::ConfirmedFailed,
+            EffectOutcome::PartiallyApplied,
+            EffectOutcome::PossiblyApplied,
+            EffectOutcome::ReconciliationRequired,
+        ] {
+            let summary = DeliverySummary {
+                outcome,
+                total_chunks: 2,
+                confirmed_chunks: 1,
+            };
+            retire_superseded_draft(&channel, "fixture", "draft-1", Some(&summary)).await;
+            assert!(channel.cancelled_drafts.lock().await.is_empty());
+        }
+        for (total_chunks, confirmed_chunks) in [(0, 0), (2, 1), (1, 2)] {
+            let summary = DeliverySummary {
+                outcome: EffectOutcome::Confirmed,
+                total_chunks,
+                confirmed_chunks,
+            };
+            retire_superseded_draft(&channel, "fixture", "draft-1", Some(&summary)).await;
+            assert!(channel.cancelled_drafts.lock().await.is_empty());
+        }
+        let summary = DeliverySummary {
+            outcome: EffectOutcome::Confirmed,
+            total_chunks: 2,
+            confirmed_chunks: 2,
+        };
+        retire_superseded_draft(&channel, "fixture", "draft-1", Some(&summary)).await;
+        assert_eq!(
+            *channel.cancelled_drafts.lock().await,
+            vec!["fixture:draft-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_turn_error_preserves_the_draft() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
@@ -18610,8 +18671,8 @@ api_key = "anthropic-key"
         process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
 
         assert!(
-            !channel_impl.cancelled_drafts.lock().await.is_empty(),
-            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
+            channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a failed turn must preserve any partial output already shown"
         );
         let events = channel_impl.lifecycle_events.lock().await.clone();
         assert!(
