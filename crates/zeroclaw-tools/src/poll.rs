@@ -445,8 +445,6 @@ mod tests {
         }
     }
 
-    use zeroclaw_api::channel::ChannelMessage;
-
     struct StubChannel {
         name: String,
         sent: Arc<RwLock<Vec<String>>>,
@@ -483,10 +481,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -763,10 +758,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -835,10 +827,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         // request_choice and request_multi_choice intentionally NOT overridden:
@@ -1017,10 +1006,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             anyhow::bail!("listen not supported")
         }
 

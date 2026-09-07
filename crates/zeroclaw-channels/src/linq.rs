@@ -369,7 +369,7 @@ impl Channel for LinqChannel {
         anyhow::bail!("API error: {status}");
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // Linq uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /linq endpoint.
         ::zeroclaw_log::record!(

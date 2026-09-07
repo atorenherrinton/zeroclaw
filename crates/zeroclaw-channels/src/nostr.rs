@@ -158,7 +158,7 @@ impl Channel for NostrChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let listen_start = Timestamp::now();
 
         // Subscribe to both NIP-04 (kind 4) and NIP-17/gift-wrap (kind 1059).

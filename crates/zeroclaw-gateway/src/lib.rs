@@ -9225,10 +9225,7 @@ path = "{trigger_path}"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }

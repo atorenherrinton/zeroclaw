@@ -4,7 +4,7 @@ use crate::ask_user::ChannelMapHandle;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
@@ -389,7 +389,7 @@ impl Tool for EscalateToHumanTool {
 
         if wait_for_response {
             // Block and wait for human response (same pattern as ask_user)
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
             let timeout = std::time::Duration::from_secs(timeout_secs);
 
             let listen_channel = Arc::clone(&channel);
@@ -478,10 +478,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             // Never sends anything — simulates no user response
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             Ok(())
@@ -527,11 +524,8 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
-            let msg = ChannelMessage {
+        async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
+            let msg = zeroclaw_api::channel::ChannelMessage {
                 id: "resp_1".to_string(),
                 sender: "human".to_string(),
                 reply_target: "human".to_string(),
@@ -783,10 +777,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             anyhow::bail!("listen not supported")
         }
 
@@ -887,10 +878,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             anyhow::bail!("listen not supported")
         }
 

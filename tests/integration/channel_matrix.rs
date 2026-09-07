@@ -124,7 +124,7 @@ impl Channel for MatrixTestChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         tx.send(ChannelMessage {
             id: "matrix_test_1".into(),
             sender: "matrix_sender".into(),
@@ -315,7 +315,7 @@ async fn trait_listen_produces_well_formed_message() {
     let ch = MatrixTestChannel::new("test_chan");
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-    ch.listen(tx).await.unwrap();
+    ch.listen(tx.into()).await.unwrap();
     let msg = rx.recv().await.expect("should receive message");
 
     assert_eq!(msg.id, "matrix_test_1");
@@ -1296,7 +1296,7 @@ async fn multi_channel_listen_produces_channel_tagged_messages() {
 
     for ch in &channels {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        ch.listen(tx).await.unwrap();
+        ch.listen(tx.into()).await.unwrap();
         let msg = rx.recv().await.expect("should receive message");
         assert_eq!(
             msg.channel,
@@ -1370,7 +1370,7 @@ impl Channel for MinimalChannel {
         Ok(())
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -1433,7 +1433,7 @@ async fn full_conversation_lifecycle() {
 
     // 1. Listen for incoming message
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    ch.listen(tx).await.unwrap();
+    ch.listen(tx.into()).await.unwrap();
     let incoming = rx.recv().await.unwrap();
 
     // 2. Start typing indicator

@@ -1,6 +1,6 @@
 //! The single SQLite-backed [`TaskRegistry`] — EPIC A's durable index.
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
@@ -11,10 +11,10 @@ use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 9;
 
 pub struct SqliteTaskStore {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SqliteTaskStore {
@@ -35,6 +35,11 @@ impl SqliteTaskStore {
     }
 
     fn init(conn: Connection) -> Result<Self> {
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            version <= CONTROL_PLANE_SCHEMA_VERSION,
+            "unsupported future control-plane schema"
+        );
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
@@ -63,6 +68,10 @@ impl SqliteTaskStore {
                  output          TEXT,
                  error           TEXT
              );
+             CREATE TABLE IF NOT EXISTS task_inputs (
+                 task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                 input TEXT NOT NULL
+             );
              CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
              CREATE INDEX IF NOT EXISTS idx_tasks_agent  ON tasks(agent);
              CREATE INDEX IF NOT EXISTS idx_tasks_agent_kind_started
@@ -71,7 +80,7 @@ impl SqliteTaskStore {
         .context("create control-plane base schema")?;
         migrate_schema(&conn).context("migrate control-plane schema")?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 
@@ -99,23 +108,40 @@ impl SqliteTaskStore {
     }
 }
 
+fn record_turn_event(
+    conn: &Connection,
+    id: &str,
+    state: TaskStatus,
+    delivered: bool,
+    response_bytes: usize,
+) -> Result<()> {
+    conn.execute("INSERT INTO task_turn_events(task_id,state,recorded_at,delivered,response_bytes) VALUES(?1,?2,?3,?4,?5)",
+        params![id, status_to_db(state), chrono::Utc::now().to_rfc3339(), delivered, response_bytes as i64])?;
+    Ok(())
+}
+
 fn migrate_schema(conn: &Connection) -> Result<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
-    goal::migrate_schema(conn, version)?;
-    if version > CONTROL_PLANE_SCHEMA_VERSION {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
-                ::serde_json::json!({
-                    "db_version": version,
-                    "known_version": CONTROL_PLANE_SCHEMA_VERSION,
-                })
-            ),
-            "control-plane DB was created by a newer schema version"
-        );
+    let tx = conn.unchecked_transaction()?;
+    goal::migrate_schema(&tx, version)?;
+    if version < 8 {
+        tx.execute_batch("PRAGMA user_version=8")?;
     }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS task_turn_events (
+        sequence INTEGER PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        state TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        delivered INTEGER NOT NULL,
+        response_bytes INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_turn_events_task ON task_turn_events(task_id, sequence);
+    PRAGMA user_version=9;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -274,7 +300,7 @@ fn update_task_status_record(
                 error  = COALESCE(?3, error),
                 finished_at = COALESCE(?4, finished_at)
           WHERE id = ?5
-            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            AND status NOT IN ('completed','delivered','failed','cancelled','lost','timed_out','partially_delivered','uncertain')",
         params![status_to_db(status), output, error, finished_at, id],
     )
     .context("update task status")
@@ -292,7 +318,7 @@ fn claim_task_owner_record(
                 owner_boot_id = ?2,
                 heartbeat_at = NULL
           WHERE id = ?3
-            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            AND status NOT IN ('completed','delivered','failed','cancelled','lost','timed_out','partially_delivered','uncertain')",
         params![owner_pid as i64, owner_boot_id, id],
     )
     .context("claim task owner")
@@ -301,23 +327,174 @@ fn claim_task_owner_record(
 #[async_trait::async_trait]
 impl TaskRegistry for SqliteTaskStore {
     async fn create(&self, rec: TaskRecord) -> Result<()> {
-        let conn = self.conn.lock();
-        insert_task_record(&conn, rec)?;
-        Ok(())
+        let connection = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.lock();
+            insert_task_record(&conn, rec)?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn admit_channel_turn(&self, rec: TaskRecord, input: String) -> Result<bool> {
+        anyhow::ensure!(
+            rec.kind == TaskKind::ChannelTurn
+                && rec.status == TaskStatus::Received
+                && !rec.id.is_empty()
+                && input.len() <= 1024 * 1024,
+            "invalid channel turn checkpoint"
+        );
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock();
+            conn.execute_batch("PRAGMA synchronous=FULL")?;
+            let result = (|| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1)",
+                    [&rec.id],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    return Ok(false);
+                }
+                let id = rec.id.clone();
+                insert_task_record(&tx, rec)?;
+                record_turn_event(&tx, &id, TaskStatus::Received, false, 0)?;
+                tx.execute(
+                    "INSERT INTO task_inputs(task_id,input) VALUES(?1,?2)",
+                    params![id, input],
+                )?;
+                tx.commit()?;
+                Ok(true)
+            })();
+            conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+            result
+        })
+        .await?
+    }
+
+    async fn take_recoverable_channel_turns(&self, boot_id: &str) -> Result<Vec<(String, String)>> {
+        let connection = Arc::clone(&self.conn);
+        let boot_id = boot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = connection.lock();
+            conn.execute_batch("PRAGMA synchronous=FULL")?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let rows: Vec<(String,String)> = {
+                let mut stmt = tx.prepare("SELECT t.id,i.input FROM tasks t JOIN task_inputs i ON i.task_id=t.id WHERE t.kind='channel_turn' AND t.status='queued' AND t.error='restart_pending' AND t.owner_boot_id=?1 ORDER BY (SELECT MIN(sequence) FROM task_turn_events e WHERE e.task_id=t.id) LIMIT 16")?;
+                stmt.query_map([&boot_id], |r| Ok((r.get(0)?,r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+            };
+            for (id, _) in &rows {
+                tx.execute("UPDATE tasks SET status='received', error=NULL WHERE id=?1", [id])?;
+                record_turn_event(&tx,id,TaskStatus::Received,false,0)?;
+            }
+            tx.commit()?;
+            Ok(rows)
+        }).await?
+    }
+
+    async fn assign_channel_turn(&self, id: &str, agent: &str, boot_id: &str) -> Result<()> {
+        let connection = Arc::clone(&self.conn);
+        let (id, agent, boot_id) = (id.to_owned(), agent.to_owned(), boot_id.to_owned());
+        tokio::task::spawn_blocking(move || {
+            let conn = connection.lock();
+            let changed = conn.execute("UPDATE tasks SET agent=?2 WHERE id=?1 AND kind='channel_turn' AND status='received' AND owner_boot_id=?3", params![id, agent, boot_id])?;
+            anyhow::ensure!(changed == 1, "channel turn is no longer available for routing");
+            Ok(())
+        }).await?
+    }
+
+    async fn checkpoint_channel_turn(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        output: Option<String>,
+        delivered: bool,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            delivered == (status == TaskStatus::Delivered),
+            "invalid confirmed delivery state"
+        );
+        anyhow::ensure!(
+            output.as_ref().is_none_or(|s| s.len() <= 1024 * 1024),
+            "channel response checkpoint too large"
+        );
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = conn.lock();
+            conn.execute_batch("PRAGMA synchronous=FULL")?;
+            let result = (|| {
+                let tx =
+                    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let (kind, previous): (String, String) =
+                    tx.query_row("SELECT kind,status FROM tasks WHERE id=?1", [&id], |r| {
+                        Ok((r.get(0)?, r.get(1)?))
+                    })?;
+                anyhow::ensure!(kind == "channel_turn", "checkpoint requires channel turn");
+                let previous = status_from_db(&previous)?;
+                anyhow::ensure!(
+                    previous.permits_channel_transition(status),
+                    "illegal channel turn transition: {previous:?} -> {status:?}"
+                );
+                let response_bytes = output.as_ref().map_or(0, String::len);
+                record_turn_event(&tx, &id, status, delivered, response_bytes)?;
+                anyhow::ensure!(
+                    update_task_status_record(&tx, &id, status, output, None)? == 1,
+                    "channel turn already terminal"
+                );
+                tx.execute(
+                    "UPDATE tasks SET delivered=?2 WHERE id=?1",
+                    params![id, delivered],
+                )?;
+                tx.commit()?;
+                Ok(())
+            })();
+            conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+            result
+        })
+        .await?
+    }
+
+    async fn channel_turn_input(&self, id: &str) -> Result<Option<String>> {
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            Ok(conn
+                .lock()
+                .query_row(
+                    "SELECT input FROM task_inputs WHERE task_id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .await?
     }
 
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> Result<()> {
-        let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock();
-        // Only the heart-beating owner refreshes; prevents a stale boot from
-        // resurrecting liveness it does not own.
-        conn.execute(
-            "UPDATE tasks SET heartbeat_at = ?1
+        let connection = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        let owner_boot_id = owner_boot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let id = id.as_str();
+            let owner_boot_id = owner_boot_id.as_str();
+
+            let now = chrono::Utc::now().to_rfc3339();
+            let conn = connection.lock();
+            // Only the heart-beating owner refreshes; prevents a stale boot from
+            // resurrecting liveness it does not own.
+            conn.execute(
+                "UPDATE tasks SET heartbeat_at = ?1
              WHERE id = ?2 AND owner_boot_id = ?3",
-            params![now, id, owner_boot_id],
-        )
-        .context("heartbeat task")?;
-        Ok(())
+                params![now, id, owner_boot_id],
+            )
+            .context("heartbeat task")?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn update_status(
@@ -327,55 +504,105 @@ impl TaskRegistry for SqliteTaskStore {
         output: Option<String>,
         error: Option<String>,
     ) -> Result<()> {
-        let conn = self.conn.lock();
-        update_task_status_record(&conn, id, status, output, error)?;
-        Ok(())
+        let connection = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let id = id.as_str();
+
+            let conn = connection.lock();
+            let kind: Option<String> = conn
+                .query_row("SELECT kind FROM tasks WHERE id=?1", [id], |r| r.get(0))
+                .optional()?;
+            anyhow::ensure!(
+                kind.as_deref() != Some("channel_turn"),
+                "channel lifecycle requires a durable checkpoint"
+            );
+            update_task_status_record(&conn, id, status, output, error)?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
-        let conn = self.conn.lock();
-        claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
-        Ok(())
+        let connection = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        let owner_boot_id = owner_boot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let id = id.as_str();
+            let owner_boot_id = owner_boot_id.as_str();
+
+            let conn = connection.lock();
+            claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn get(&self, id: &str) -> Result<Option<TaskRecord>> {
-        let conn = self.conn.lock();
-        let rec = conn
-            .query_row(
-                "SELECT * FROM tasks WHERE id = ?1",
-                params![id],
-                row_to_record,
-            )
-            .optional()
-            .context("get task")?;
-        Ok(rec)
+        let connection = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let id = id.as_str();
+
+            let conn = connection.lock();
+            let rec = conn
+                .query_row(
+                    "SELECT * FROM tasks WHERE id = ?1",
+                    params![id],
+                    row_to_record,
+                )
+                .optional()
+                .context("get task")?;
+            Ok(rec)
+        })
+        .await?
     }
 
     async fn list_running(&self) -> Result<Vec<TaskRecord>> {
-        let conn = self.conn.lock();
+        let connection = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+
+        let conn = connection.lock();
         let mut stmt = conn
-            .prepare("SELECT * FROM tasks WHERE status = 'running'")
+            .prepare("SELECT * FROM tasks WHERE status IN ('received','queued','running','waiting_on_tool','response_ready','submitting')")
             .context("prepare list_running")?;
         let rows = stmt
             .query_map([], row_to_record)
             .context("query list_running")?;
         Ok(collect_skipping_bad_rows(rows))
+        }).await?
     }
 
     async fn list_by_agent(&self, agent: &str) -> Result<Vec<TaskRecord>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare("SELECT * FROM tasks WHERE agent = ?1 ORDER BY started_at DESC")
-            .context("prepare list_by_agent")?;
-        let rows = stmt
-            .query_map(params![agent], row_to_record)
-            .context("query list_by_agent")?;
-        Ok(collect_skipping_bad_rows(rows))
+        let connection = Arc::clone(&self.conn);
+        let agent = agent.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let agent = agent.as_str();
+
+            let conn = connection.lock();
+            let mut stmt = conn
+                .prepare("SELECT * FROM tasks WHERE agent = ?1 ORDER BY started_at DESC")
+                .context("prepare list_by_agent")?;
+            let rows = stmt
+                .query_map(params![agent], row_to_record)
+                .context("query list_by_agent")?;
+            Ok(collect_skipping_bad_rows(rows))
+        })
+        .await?
     }
 
     async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
-        let conn = self.conn.lock();
-        let rec = conn
+        let connection = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        let now_boot_id = now_boot_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let id = id.as_str();
+            let now_boot_id = now_boot_id.as_str();
+
+        let mut conn = connection.lock();
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rec = tx
             .query_row(
                 "SELECT * FROM tasks WHERE id = ?1",
                 params![id],
@@ -389,13 +616,17 @@ impl TaskRegistry for SqliteTaskStore {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE tasks SET status = 'lost', finished_at = ?1
-              WHERE id = ?2 AND status = 'running'",
-            params![now, id],
-        )
-        .context("reconcile: mark lost")?;
+        if rec.kind == TaskKind::ChannelTurn {
+            let safe_queued = rec.status == TaskStatus::Queued;
+            let state = if safe_queued { TaskStatus::Queued } else { TaskStatus::Uncertain };
+            tx.execute("UPDATE tasks SET status=?2,owner_boot_id=?3,owner_pid=?4,error=?5,finished_at=?6 WHERE id=?1", params![id,status_to_db(state),now_boot_id,std::process::id(),if safe_queued { "restart_pending" } else { "restart_reconciliation_required" },if safe_queued { None } else { Some(&now) }])?;
+            record_turn_event(&tx,id,state,false,0)?;
+        } else {
+            tx.execute("UPDATE tasks SET status='lost',finished_at=?2 WHERE id=?1", params![id,now])?;
+        }
+        tx.commit()?;
         Ok(true)
+        }).await?
     }
 }
 
@@ -421,6 +652,130 @@ mod tests {
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn channel_lifecycle_is_atomic_ordered_and_acknowledged() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("turn", "fixture", 0, "old");
+        task.kind = TaskKind::ChannelTurn;
+        task.status = TaskStatus::Received;
+        assert!(
+            store
+                .admit_channel_turn(task.clone(), "private input".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .admit_channel_turn(task, "replacement".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .checkpoint_channel_turn("turn", TaskStatus::Delivered, None, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .update_status("turn", TaskStatus::Completed, None, None)
+                .await
+                .is_err()
+        );
+        for state in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::WaitingOnTool,
+            TaskStatus::Running,
+            TaskStatus::ResponseReady,
+            TaskStatus::Submitting,
+        ] {
+            store
+                .checkpoint_channel_turn("turn", state, None, false)
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .checkpoint_channel_turn("turn", TaskStatus::Delivered, None, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .checkpoint_channel_turn("turn", TaskStatus::Running, None, false)
+                .await
+                .is_err()
+        );
+        store
+            .checkpoint_channel_turn("turn", TaskStatus::Delivered, Some("response".into()), true)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .checkpoint_channel_turn("turn", TaskStatus::Uncertain, None, false)
+                .await
+                .is_err()
+        );
+        let record = store.get("turn").await.unwrap().unwrap();
+        assert!(record.delivered && record.finished_at.is_some());
+        assert_eq!(record.status, TaskStatus::Delivered);
+        assert_eq!(
+            store.channel_turn_input("turn").await.unwrap().as_deref(),
+            Some("private input")
+        );
+        let conn = store.conn.lock();
+        let events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM task_turn_events WHERE task_id='turn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            events, 8,
+            "rejected and duplicate changes must not create events"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_v7_migration_preserves_legacy_tasks_and_is_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        store
+            .create(rec("legacy", "fixture", 0, "old"))
+            .await
+            .unwrap();
+        store
+            .conn
+            .lock()
+            .execute_batch(
+                "DROP TABLE task_turn_events; DROP TABLE task_inputs; PRAGMA user_version=7;",
+            )
+            .unwrap();
+        drop(store);
+        for _ in 0..2 {
+            let store = SqliteTaskStore::new(dir.path()).unwrap();
+            assert_eq!(
+                store.get("legacy").await.unwrap().unwrap().status,
+                TaskStatus::Running
+            );
+            let version: i64 = store
+                .conn
+                .lock()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 9);
+        }
+    }
+
+    #[test]
+    fn future_schema_is_rejected_before_modification() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version=10;").unwrap();
+        assert!(SqliteTaskStore::init(conn).is_err());
     }
 
     #[tokio::test]

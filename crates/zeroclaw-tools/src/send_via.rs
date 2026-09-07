@@ -531,7 +531,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
-    use zeroclaw_api::channel::ChannelMessage;
+
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
 
     struct StubChannel {
@@ -566,10 +566,7 @@ mod tests {
             self.sent.write().push(message.clone());
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }

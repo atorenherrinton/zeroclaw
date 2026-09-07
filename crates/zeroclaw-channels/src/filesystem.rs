@@ -6,9 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_config::schema::FilesystemConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
 use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
@@ -51,7 +50,7 @@ impl FilesystemChannel {
         &self.alias
     }
 
-    async fn watch_and_dispatch(&self, tx: &mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn watch_and_dispatch(&self, tx: &zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self);
         self.watch_and_dispatch_inner(tx).instrument(span).await
@@ -74,7 +73,7 @@ impl FilesystemChannel {
 
     async fn watch_and_dispatch_inner(
         &self,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> anyhow::Result<()> {
         let config = &self.config;
         config.validate()?;
@@ -120,7 +119,7 @@ impl FilesystemChannel {
     async fn dispatch_loop(
         &self,
         mut raw_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         include: &[glob::Pattern],
         exclude: &[glob::Pattern],
     ) -> anyhow::Result<()> {
@@ -214,7 +213,7 @@ impl Channel for FilesystemChannel {
         false
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         self.watch_and_dispatch(&tx).await
     }
 
@@ -918,8 +917,8 @@ mod tests {
             "fs-idle-cancel",
         );
 
-        let (tx, rx) = mpsc::channel(1);
-        let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx.into()).await });
 
         // Close the supervisor side while the watcher is completely idle.
         drop(rx);
@@ -956,7 +955,7 @@ mod tests {
             .unwrap();
         drop(raw_tx);
 
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(1);
         let include = compile_globs(&[]).unwrap();
         let exclude = compile_globs(&[]).unwrap();
         tokio::time::timeout(
@@ -994,7 +993,7 @@ mod tests {
             audit: Arc::new(SopAuditLogger::new(memory)),
         });
 
-        let (probe_tx, _probe_rx) = mpsc::channel(1);
+        let (probe_tx, _probe_rx) = zeroclaw_api::inbound::channel(1);
         let err = channel
             .watch_and_dispatch(&probe_tx)
             .await

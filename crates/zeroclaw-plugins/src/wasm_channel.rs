@@ -401,7 +401,7 @@ impl Channel for WasmChannel {
         )
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         const INITIAL_BACKOFF: Duration = Duration::from_millis(50);
         const MAX_BACKOFF: Duration = Duration::from_millis(500);
         let mut backoff = INITIAL_BACKOFF;

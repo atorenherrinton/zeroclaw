@@ -16,6 +16,20 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+fn bounded_observer_text(text: &str) -> String {
+    // Reject oversized bodies before scrubbing/allocation. Cutting a secret at
+    // the byte boundary could prevent redaction from recognizing it.
+    const LIMIT: usize = 4096;
+    if text.len() > LIMIT {
+        return format!("[observer payload omitted: {} bytes]", text.len());
+    }
+    let scrubbed = scrub_credentials(text);
+    if scrubbed.len() > LIMIT {
+        return "[observer payload omitted after redaction]".into();
+    }
+    scrubbed
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -91,8 +105,8 @@ fn unavailable_tool_outcome(
         tool_call_id: tool_call_id_owned,
         duration,
         success: false,
-        arguments: Some(full_args.to_string()),
-        result: Some(scrub_credentials(&reason)),
+        arguments: Some(bounded_observer_text(full_args)),
+        result: Some(bounded_observer_text(&reason)),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -168,7 +182,7 @@ pub(crate) async fn execute_one_tool(
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(full_args.clone()),
+        arguments: Some(bounded_observer_text(&full_args)),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -226,8 +240,8 @@ pub(crate) async fn execute_one_tool(
             tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
-            arguments: Some(full_args.clone()),
-            result: Some(scrub_credentials(&reason)),
+            arguments: Some(bounded_observer_text(&full_args)),
+            result: Some(bounded_observer_text(&reason)),
             channel: Some(meta.channel_name.to_string()),
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
             parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -273,7 +287,7 @@ pub(crate) async fn execute_one_tool(
             .with_attrs(::serde_json::json!({
                 "tool": call_name,
                 "tool_call_id": tool_call_id,
-                "input": call_arguments,
+                "input": bounded_observer_text(&full_args),
             })),
         format!("tool call: {call_name}")
     );
@@ -297,9 +311,11 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
-    let tool_future = tool
-        .execute(call_arguments.clone())
-        .instrument(tool_span.clone());
+    let tool_future = zeroclaw_api::deadline::run_inherited_phase(
+        zeroclaw_api::deadline::Phase::Tool,
+        tool.execute(call_arguments.clone())
+            .instrument(tool_span.clone()),
+    );
     let execute = async {
         if let Some(token) = cancellation_token {
             tokio::select! {
@@ -334,8 +350,8 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
-                            "output": r.output,
+                            "input": bounded_observer_text(&full_args),
+                            "output": bounded_observer_text(&r.output),
                         })),
                         format!("tool result: {call_name}")
                     );
@@ -349,9 +365,9 @@ pub(crate) async fn execute_one_tool(
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,
                                 "tool_call_id": tool_call_id,
-                                "input": call_arguments,
-                                "error": r.error.clone().unwrap_or_default(),
-                                "output": r.output,
+                                "input": bounded_observer_text(&full_args),
+                                "error": bounded_observer_text(r.error.as_deref().unwrap_or_default()),
+                                "output": bounded_observer_text(&r.output),
                             })),
                         format!("tool failed: {call_name}")
                     );
@@ -370,8 +386,8 @@ pub(crate) async fn execute_one_tool(
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: true,
-                        arguments: Some(full_args.clone()),
-                        result: Some(scrub_credentials(normalized_output)),
+                        arguments: Some(bounded_observer_text(&full_args)),
+                        result: Some(bounded_observer_text(normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -398,8 +414,8 @@ pub(crate) async fn execute_one_tool(
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
-                        arguments: Some(full_args.clone()),
-                        result: Some(scrub_credentials(&reason)),
+                        arguments: Some(bounded_observer_text(&full_args)),
+                        result: Some(bounded_observer_text(&reason)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -417,6 +433,13 @@ pub(crate) async fn execute_one_tool(
                 }
             }
             Err(e) => {
+                // These carry durable/phase evidence. Flattening them would let
+                // recovery treat uncertain delivery as an ordinary retryable error.
+                if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
+                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                {
+                    return Err(e);
+                }
                 let duration = start.elapsed();
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -427,8 +450,8 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": call_arguments,
-                            "error": format!("{e:?}"),
+                            "input": bounded_observer_text(&full_args),
+                            "error": bounded_observer_text(&format!("{e:?}")),
                         })),
                     format!("tool error: {call_name}")
                 );
@@ -443,8 +466,8 @@ pub(crate) async fn execute_one_tool(
                     tool_call_id: tool_call_id_owned.clone(),
                     duration,
                     success: false,
-                    arguments: Some(full_args.clone()),
-                    result: Some(scrub_credentials(&reason)),
+                    arguments: Some(bounded_observer_text(&full_args)),
+                    result: Some(bounded_observer_text(&reason)),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
                     parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -470,7 +493,7 @@ pub(crate) async fn execute_one_tool(
             .send(TurnEvent::ToolResult {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
-                output: scrub_credentials(&out.output),
+                output: bounded_observer_text(&out.output),
                 artifact: out
                     .output_data
                     .as_ref()
@@ -528,7 +551,26 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
-    true
+    // Autonomy/approval does not establish independence. Until connectors
+    // declare trusted resource keys, only known stateless reads may overlap.
+    // In particular GUI sessions, shell commands and external writes serialize.
+    tool_calls
+        .iter()
+        .all(|call| is_stateless_read_tool(&call.name))
+}
+
+pub fn is_stateless_read_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "file_read"
+            | "glob_search"
+            | "content_search"
+            | "memory_recall"
+            | "web_search_tool"
+            | "web_fetch"
+            | "sessions_history"
+            | "sessions_list"
+    )
 }
 
 // ── Parallel execution ───────────────────────────────────────────────────
@@ -559,7 +601,13 @@ pub(crate) async fn execute_tools_parallel(
         })
         .collect();
 
-    let results = futures_util::future::join_all(futures).await;
+    use futures_util::StreamExt;
+    // Futures stay in this task (preserving security/route task-locals) and
+    // results keep call order, but at most four external reads run at once.
+    let results: Vec<_> = futures_util::stream::iter(futures)
+        .buffered(4)
+        .collect()
+        .await;
     let mut slots = Vec::with_capacity(results.len());
     for result in results {
         match result {
@@ -614,6 +662,19 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observer_caps_before_redaction_and_never_exposes_a_cut_secret() {
+        let text = format!("{}Bearer private-token", "😀".repeat(1023));
+        let bounded = super::bounded_observer_text(&text);
+        assert!(bounded.len() < 100);
+        assert!(!bounded.contains("private-token"));
+        assert!(bounded.contains("omitted"));
+        assert_eq!(
+            super::bounded_observer_text("small safe result"),
+            "small safe result"
+        );
+    }
+
     use super::{
         ToolDispatchContext, execute_one_tool, is_security_policy_failure, resolved_tool_provenance,
     };
@@ -704,11 +765,82 @@ mod tests {
             _args: serde_json::Value,
         ) -> anyhow::Result<crate::tools::ToolResult> {
             self.invocations.fetch_add(1, Ordering::SeqCst);
+            if self.name == "fixture_delivery_error" {
+                return Err(zeroclaw_api::delivery::DeliveryFailure {
+                    outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+                    chunk_index: 1,
+                    total_chunks: 2,
+                    confirmed_chunks: 1,
+                }
+                .into());
+            }
+            if self.name == "fixture_timeout_error" {
+                return Err(zeroclaw_api::deadline::DeadlineExceeded {
+                    phase: zeroclaw_api::deadline::Phase::Tool,
+                    started: true,
+                }
+                .into());
+            }
             Ok(crate::tools::ToolResult {
                 success: true,
                 output: "executed via poisoned lock recovery".into(),
                 error: None,
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn structured_delivery_and_deadline_errors_never_enter_string_recovery() {
+        for name in ["fixture_delivery_error", "fixture_timeout_error"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    CountingTool::new(name, calls.clone()),
+                )]);
+            let meta = crate::agent::turn::TurnMeta {
+                parent_agent_alias: None,
+                agent_alias: None,
+                turn_id: "fixture",
+                channel_name: "fixture",
+            };
+            let error = execute_one_tool(
+                name,
+                serde_json::json!({}),
+                Some("fixture-call"),
+                ToolDispatchContext {
+                    tools_registry: &registry,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &meta,
+                &NoopObserver,
+                None,
+                None,
+                None,
+            )
+            .await
+            .err()
+            .expect("typed failure must escape ordinary retry recovery");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if name == "fixture_delivery_error" {
+                let evidence = error
+                    .downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+                    .unwrap();
+                assert_eq!(evidence.confirmed_chunks, 1);
+                assert_eq!(
+                    evidence.outcome,
+                    zeroclaw_api::delivery::EffectOutcome::PossiblyApplied
+                );
+            } else {
+                assert_eq!(
+                    error
+                        .downcast_ref::<zeroclaw_api::deadline::DeadlineExceeded>()
+                        .unwrap()
+                        .phase,
+                    zeroclaw_api::deadline::Phase::Tool
+                );
+            }
         }
     }
 
@@ -965,7 +1097,7 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_batch_with_unknown_tool_runs_in_parallel() {
+    fn full_autonomy_does_not_make_unknown_operations_independent() {
         // Under `Full` autonomy, no tool requires approval — `needs_approval`
         // returns false for every name. The control case extends to a batch
         // whose names would otherwise be unknown to supervised profile.
@@ -980,8 +1112,8 @@ mod tests {
             parsed_tool_call("anything"),
         ];
         assert!(
-            should_execute_tools_in_parallel(&batch, Some(&mgr)),
-            "full autonomy never prompts, so parallel execution is allowed"
+            !should_execute_tools_in_parallel(&batch, Some(&mgr)),
+            "approval bypass does not permit conflicting writes to race"
         );
     }
 

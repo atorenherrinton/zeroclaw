@@ -377,7 +377,7 @@ impl Channel for BlueskyChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Initial auth
         self.create_session().await?;
 

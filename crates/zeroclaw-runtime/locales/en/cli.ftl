@@ -1254,3 +1254,5 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+channel-runtime-admission-refused = ⚠️ This request was not started because the work queue or durable storage is unavailable. Please wait before submitting a new request.

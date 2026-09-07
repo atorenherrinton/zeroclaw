@@ -5,6 +5,8 @@ pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
+mod turn_journal;
+use zeroclaw_api::turn::{TaskStatus, TurnJournal};
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
 
@@ -558,7 +560,6 @@ struct ChannelRuntimeContext {
     pacing: zeroclaw_config::schema::PacingConfig,
     max_tool_result_chars: usize,
     context_token_budget: usize,
-    debouncer: Arc<zeroclaw_infra::debounce::MessageDebouncer>,
     /// HMAC receipt generator. `Some` when `[agent.resolved.tool_receipts] enabled = true`.
     /// Threaded into `run_tool_call_loop` so `tool_execution::execute_one_tool`
     /// can sign each result.
@@ -613,10 +614,21 @@ impl InFlightTaskCompletion {
     }
 
     async fn wait(&self) {
-        if self.done.load(Ordering::Acquire) {
-            return;
+        // Register before checking the flag; notify_waiters does not retain a
+        // permit for a waiter created after completion.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.done.load(Ordering::Acquire) {
+            notified.await;
         }
-        self.notify.notified().await;
+    }
+}
+
+struct CompleteInFlightOnDrop(Arc<InFlightTaskCompletion>);
+impl Drop for CompleteInFlightOnDrop {
+    fn drop(&mut self) {
+        self.0.mark_done();
     }
 }
 
@@ -732,6 +744,7 @@ fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
     }
 }
 
+#[cfg(test)]
 fn interruption_scope_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     match (msg.conversation_scope, msg.interruption_scope_id.as_deref()) {
         (zeroclaw_api::channel::ChannelConversationScope::ReplyTarget, Some(scope)) => {
@@ -4843,7 +4856,7 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
-    tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     cancel: tokio_util::sync::CancellationToken,
@@ -4906,7 +4919,7 @@ fn mark_listener_health(ch: &dyn Channel, component: &str) {
 fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
-    tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
@@ -5315,7 +5328,7 @@ impl Channel for ApprovalTypingChannel {
         self.inner.send(message).await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         self.inner.listen(tx).await
     }
 
@@ -6268,7 +6281,7 @@ async fn process_channel_message_body(
                 "message_id": msg.id,
                 "reply_target": msg.reply_target,
                 "thread_ts": msg.thread_ts,
-                "content": msg.content,
+                "content_bytes": msg.content.len(),
                 "attachments_count": msg.attachments.len(),
                 "passive_context": msg.passive_context,
             })
@@ -7184,7 +7197,8 @@ async fn process_channel_message_body(
     if matrix_single_message_streaming {
         loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
     }
-    let turn_id = uuid::Uuid::new_v4().to_string();
+    let turn_id =
+        zeroclaw_api::turn::trace_id().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
     // /api/events/history) for channel-originated turns — mirroring the CLI
@@ -7537,17 +7551,9 @@ async fn process_channel_message_body(
                     })),
                 "channel_message_cancelled"
             );
-            if let (Some(channel), Some(draft_id)) =
-                (target_channel.as_ref(), draft_message_id.as_deref())
-                && let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await
-            {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    &format!("Failed to cancel draft on {}", channel.name())
-                );
-            }
+            // A cancelled tool may have applied an external effect. Preserve
+            // the visible draft and receipts, and quarantine instead of replay.
+            turn_journal::checkpoint(TaskStatus::Uncertain, None, false).await;
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
             // ── Hook: on_message_sending (modifying) ─────────
@@ -7728,6 +7734,16 @@ async fn process_channel_message_body(
                 None
             };
 
+            if !turn_journal::checkpoint(
+                TaskStatus::ResponseReady,
+                Some(delivered_response.clone()),
+                false,
+            )
+            .await
+            {
+                return;
+            }
+
             // Read the last routing instruction set by `send_via` this turn from
             // the per-turn handle scoped into TURN_ROUTING around the loop above.
             let turn_route = turn_routing
@@ -7772,6 +7788,9 @@ async fn process_channel_message_body(
             };
 
             if let Some(channel) = delivery_channel.as_ref() {
+                if !turn_journal::checkpoint(TaskStatus::Submitting, None, false).await {
+                    return;
+                }
                 // A prior tool/progress send is not evidence for this final response.
                 let _ = zeroclaw_api::delivery::take_summary();
                 let is_redirect = turn_route
@@ -7882,6 +7901,23 @@ async fn process_channel_message_body(
                         .with_duration(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
                         .with_attrs(serde_json::json!({"message_id":msg.id,"submission_ok":reply_delivered,"response_bytes":delivered_response.len(),"delivery":delivery})),
                     "Channel final submission completed; consult per-chunk receipts for platform confirmation");
+                let summary = delivery;
+                let confirmed = reply_delivered
+                    && summary.as_ref().is_some_and(|s| {
+                        s.outcome == zeroclaw_api::delivery::EffectOutcome::Confirmed
+                            && s.total_chunks > 0
+                            && s.total_chunks == s.confirmed_chunks
+                    });
+                let status = if confirmed {
+                    TaskStatus::Delivered
+                } else if summary.as_ref().is_some_and(|s| s.confirmed_chunks > 0) {
+                    TaskStatus::PartiallyDelivered
+                } else {
+                    TaskStatus::Uncertain
+                };
+                if !turn_journal::checkpoint(status, None, confirmed).await {
+                    return;
+                }
                 if reply_delivered && let Some(hooks) = ctx.hooks.as_ref() {
                     hooks
                         .fire_message_sent(&msg.channel, &msg.reply_target, &delivered_response)
@@ -7910,6 +7946,7 @@ async fn process_channel_message_body(
             }
         }
         LlmExecutionResult::Completed(Ok(Err(e))) => {
+            turn_journal::checkpoint(TaskStatus::Uncertain, None, false).await;
             if zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e)
                 || cancellation_token.is_cancelled()
             {
@@ -7934,17 +7971,8 @@ async fn process_channel_message_body(
                         })),
                     "channel_message_cancelled"
                 );
-                if let (Some(channel), Some(draft_id)) =
-                    (target_channel.as_ref(), draft_message_id.as_deref())
-                    && let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await
-                {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                        &format!("Failed to cancel draft on {}", channel.name())
-                    );
-                }
+                // Both cancellation paths must retain visible partial output.
+                // cancel_draft is destructive (Telegram deletes the message).
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
@@ -8054,6 +8082,7 @@ async fn process_channel_message_body(
             }
         }
         LlmExecutionResult::Completed(Err(_)) => {
+            turn_journal::checkpoint(TaskStatus::Uncertain, None, false).await;
             let timeout_msg = format!(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
@@ -8119,64 +8148,131 @@ async fn process_channel_message_body(
     }
 }
 
-/// Shared worker body extracted so both the normal path and the debounce path
-/// can reuse the same in-flight tracking / cancellation / process logic.
+/// Reservations are registered by the single intake loop before spawning. OS
+/// task scheduling can therefore never reorder conversation admission.
+struct WorkerReservation {
+    scope: String,
+    state: InFlightSenderTaskState,
+    previous: Option<InFlightSenderTaskState>,
+    completion_guard: CompleteInFlightOnDrop,
+}
+async fn reserve_worker(
+    ctx: &ChannelRuntimeContext,
+    msg: &ChannelMessage,
+    in_flight: &tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>,
+    sequence: &AtomicU64,
+) -> WorkerReservation {
+    let scope = runtime_conversation_history_key(ctx, msg);
+    let mut active = in_flight.lock().await;
+    let previous = active.get(&scope).cloned();
+    let interrupt = ctx
+        .interrupt_on_new_message
+        .enabled_for_channel(&msg.channel);
+    let cancellation = match &previous {
+        Some(old) if interrupt => {
+            old.cancellation.cancel();
+            CancellationToken::new()
+        }
+        Some(old) if !old.cancellation.is_cancelled() => old.cancellation.clone(),
+        _ => CancellationToken::new(),
+    };
+    let completion = Arc::new(InFlightTaskCompletion::new());
+    let state = InFlightSenderTaskState {
+        task_id: sequence.fetch_add(1, Ordering::Relaxed),
+        cancellation,
+        completion: Arc::clone(&completion),
+    };
+    active.insert(scope.clone(), state.clone());
+    WorkerReservation {
+        scope,
+        state,
+        previous,
+        completion_guard: CompleteInFlightOnDrop(completion),
+    }
+}
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
-    msg: zeroclaw_api::channel::ChannelMessage,
+    msg: ChannelMessage,
     in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
-    task_sequence: Arc<AtomicU64>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    reservation: WorkerReservation,
+    semaphore: Arc<tokio::sync::Semaphore>,
+    queue_permit: tokio::sync::OwnedSemaphorePermit,
+    journal: Option<Arc<turn_journal::ChannelTurnJournal>>,
 ) {
-    let _permit = permit;
-    let interrupt_enabled = ctx
-        .interrupt_on_new_message
-        .enabled_for_channel(msg.channel.as_str());
-    let sender_scope_key = interruption_scope_key(&msg);
-    let cancellation_token = CancellationToken::new();
-    let completion = Arc::new(InFlightTaskCompletion::new());
-    let task_id = task_sequence.fetch_add(1, Ordering::Relaxed);
-
-    let register_in_flight = msg.channel != "cli" && !msg.passive_context;
-
-    if register_in_flight {
-        let previous = {
-            let mut active = in_flight.lock().await;
-            active.insert(
-                sender_scope_key.clone(),
-                InFlightSenderTaskState {
-                    task_id,
-                    cancellation: cancellation_token.clone(),
-                    completion: Arc::clone(&completion),
-                },
-            )
+    let _abort_checkpoint = turn_journal::WorkerCheckpointGuard(journal.clone());
+    let _queue_permit = queue_permit;
+    let WorkerReservation {
+        scope,
+        state,
+        previous,
+        completion_guard,
+    } = reservation;
+    let _completion_guard = completion_guard;
+    // Cancellation of a queued successor must still wait for its predecessor;
+    // otherwise a third turn could overtake the still-executing first one.
+    if let Some(previous) = previous {
+        previous.completion.wait().await;
+    }
+    let run = async {
+        if state.cancellation.is_cancelled() {
+            turn_journal::checkpoint(TaskStatus::Cancelled, None, false).await;
+            return;
+        }
+        let _permit = tokio::select! {
+            biased;
+            () = state.cancellation.cancelled() => {
+                turn_journal::checkpoint(TaskStatus::Cancelled, None, false).await;
+                return;
+            }
+            permit = semaphore.acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    turn_journal::checkpoint(TaskStatus::Failed, None, false).await;
+                    return;
+                }
+            }
         };
-
-        if interrupt_enabled && let Some(previous) = previous {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"sender": msg.sender})),
-                "interrupting previous in-flight request for sender"
-            );
-            previous.cancellation.cancel();
-            previous.completion.wait().await;
+        if !turn_journal::checkpoint(TaskStatus::Running, None, false).await {
+            return;
         }
-    }
-
-    process_channel_message(ctx, msg, cancellation_token).await;
-
-    if register_in_flight {
-        let mut active = in_flight.lock().await;
-        if active
-            .get(&sender_scope_key)
-            .is_some_and(|state| state.task_id == task_id)
-        {
-            active.remove(&sender_scope_key);
+        let deadline = zeroclaw_api::deadline::bounded_by_parent(Duration::from_secs(
+            ctx.message_timeout_secs.max(1),
+        ));
+        let outcome = zeroclaw_api::deadline::PARENT
+            .scope(
+                Some(deadline),
+                zeroclaw_api::deadline::run_inherited(async {
+                    process_channel_message(ctx, msg, state.cancellation.clone()).await;
+                    Ok(())
+                }),
+            )
+            .await;
+        if outcome.is_err() {
+            state.cancellation.cancel();
+            turn_journal::checkpoint(TaskStatus::Uncertain, None, false).await;
         }
+    };
+    let scoped = journal
+        .as_ref()
+        .map(|j| Arc::clone(j) as Arc<dyn TurnJournal>);
+    zeroclaw_api::turn::JOURNAL.scope(scoped, run).await;
+    if let Some(journal) = journal
+        && let Err(error) = journal.finish_if_unresolved().await
+    {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_attrs(serde_json::json!({"error":error.to_string()})),
+            "Unresolved channel turn checkpoint failed"
+        );
     }
-
-    completion.mark_done();
+    let mut active = in_flight.lock().await;
+    if active
+        .get(&scope)
+        .is_some_and(|old| old.task_id == state.task_id)
+    {
+        active.remove(&scope);
+    }
 }
 
 #[derive(Clone)]
@@ -8674,6 +8770,7 @@ fn channel_sop_target(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<Str
 /// Resolve effective debounce window: a per-channel override with a positive
 /// value wins, otherwise falls back to the global default from `ChannelsConfig`.
 /// A per-channel value of `0` is treated as unset (falls back to global).
+#[cfg(test)]
 fn resolve_effective_debounce_window(
     global_ms: u64,
     channel: &str,
@@ -8691,12 +8788,49 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+async fn notify_admission_refused(ctx: &ChannelRuntimeContext, msg: &ChannelMessage) {
+    if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, msg) {
+        let notice = SendMessage::reply_to(
+            msg,
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-admission-refused"),
+        )
+        .suppress_voice();
+        // One bounded attempt only; failure is logged, never replayed.
+        let result = tokio::time::timeout(Duration::from_secs(5), channel.send(&notice)).await;
+        if !matches!(result, Ok(Ok(()))) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                "Admission refusal notice unconfirmed"
+            );
+        }
+    }
+}
+
 async fn run_message_dispatch_loop(
-    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    rx: tokio::sync::mpsc::Receiver<ChannelMessage>,
     router: AgentRouter,
     max_in_flight_messages: usize,
 ) {
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages));
+    run_message_dispatch_loop_supervised(
+        rx,
+        router,
+        max_in_flight_messages,
+        zeroclaw_runtime::control_plane::control_plane().cloned(),
+    )
+    .await;
+}
+
+async fn run_message_dispatch_loop_supervised(
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
+    router: AgentRouter,
+    max_in_flight_messages: usize,
+    plane: Option<zeroclaw_runtime::control_plane::ControlPlaneHandle>,
+) {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight_messages.max(1)));
+    let queue_slots = Arc::new(tokio::sync::Semaphore::new(
+        max_in_flight_messages.max(1).saturating_mul(8),
+    ));
     let mut workers = tokio::task::JoinSet::new();
     let in_flight_by_sender = Arc::new(tokio::sync::Mutex::new(HashMap::<
         String,
@@ -8704,7 +8838,97 @@ async fn run_message_dispatch_loop(
     >::new()));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = rx.recv().await {
+    let mut recovered = std::collections::VecDeque::new();
+    let mut recovery_drained = false;
+    loop {
+        if recovered.is_empty() && !recovery_drained {
+            if let Some(plane) = plane.as_ref() {
+                match plane
+                    .store
+                    .take_recoverable_channel_turns(&plane.boot_id)
+                    .await
+                {
+                    Ok(rows) => {
+                        recovery_drained = rows.is_empty();
+                        recovered.extend(rows);
+                    }
+                    Err(error) => {
+                        zeroclaw_runtime::health::mark_component_error(
+                            "channels",
+                            "durable queue recovery failed",
+                        );
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error":error.to_string()})),
+                            "Durable queue recovery failed; stopping admission"
+                        );
+                        break;
+                    }
+                }
+            } else {
+                recovery_drained = true;
+            }
+        }
+        let (msg, recovering) = if let Some((id, input)) = recovered.pop_front() {
+            match turn_journal::restore_message(&id, &input) {
+                Ok(msg) => {
+                    let allowed = router
+                        .resolve(&msg)
+                        .and_then(|ctx| {
+                            find_channel_for_message(&ctx.channels_by_name, &msg).cloned()
+                        })
+                        .is_some_and(|channel| channel.permits_queued_recovery(&msg));
+                    if !allowed {
+                        if let Some(plane) = plane.as_ref() {
+                            let _ = plane.store.checkpoint_channel_turn(&id, TaskStatus::Failed, Some("queued recovery refused by current channel policy; no execution started".into()), false).await;
+                        }
+                        continue;
+                    }
+                    (msg, true)
+                }
+                Err(_) => {
+                    if let Some(plane) = plane.as_ref() {
+                        let _ = plane.store.checkpoint_channel_turn(&id, TaskStatus::Failed, Some("queued transport cannot be reconstructed safely; no execution started".into()), false).await;
+                    }
+                    continue;
+                }
+            }
+        } else {
+            let Some(msg) = rx.recv().await else {
+                break;
+            };
+            (msg, false)
+        };
+        // Never coalesce accepted identities into one lossy debounce message.
+        // Admission commits before a worker can execute or wait on capacity.
+        let journal = if !msg.passive_context {
+            if let Some(plane) = plane.as_ref() {
+                match turn_journal::ChannelTurnJournal::received(plane, &msg).await {
+                    Ok(Some(journal)) => Some(journal),
+                    Ok(None) => continue,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_attrs(serde_json::json!({"error":error.to_string()})),
+                            "Inbound admission failed; refusing execution"
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // Gate answers (button-click markers / `approve <ref>` text replies)
         // resolve a PARKED run and must never start one, so they are consumed
         // BEFORE agent ownership lookup. A configured approval route may be
@@ -8716,7 +8940,7 @@ async fn run_message_dispatch_loop(
             .as_ref()
             .cloned()
             .or_else(|| router.by_agent.values().next().cloned());
-        if let Some(gate_ctx) = gate_ctx {
+        if !recovering && let Some(gate_ctx) = gate_ctx {
             let gate_channel = find_channel_for_message(&gate_ctx.channels_by_name, &msg).cloned();
             let gate_channel_route_keys = gate_channel
                 .as_ref()
@@ -8746,29 +8970,38 @@ async fn run_message_dispatch_loop(
             )
             .await
             {
+                if let Some(journal) = &journal {
+                    let _ = journal.checkpoint(TaskStatus::Uncertain, None, false).await;
+                }
                 continue;
             }
         }
 
         let Some(ctx) = router.resolve(&msg) else {
             ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"channel_alias": msg.channel_alias, "sender": msg.sender})), "dropping inbound message: no agent owns this channel");
+            if let Some(journal) = &journal {
+                let _ = journal.checkpoint(TaskStatus::Failed, None, false).await;
+            }
             continue;
         };
 
         // Gate answers were already considered against the global approval
         // channel registry above. The remaining path only dispatches events and
         // ordinary messages to an agent-owned runtime.
-        if dispatch_channel_sop_event(&router, &msg).await {
+        if !recovering && dispatch_channel_sop_event(&router, &msg).await {
+            if let Some(journal) = &journal {
+                let _ = journal.checkpoint(TaskStatus::Uncertain, None, false).await;
+            }
             continue;
         }
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
-        if msg.channel != "cli" && is_stop_command(&msg.content) {
-            let scope_key = interruption_scope_key(&msg);
+        if !recovering && msg.channel != "cli" && is_stop_command(&msg.content) {
+            let scope_key = runtime_conversation_history_key(&ctx, &msg);
             let previous = {
-                let mut active = in_flight_by_sender.lock().await;
-                active.remove(&scope_key)
+                let active = in_flight_by_sender.lock().await;
+                active.get(&scope_key).cloned()
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
@@ -8779,9 +9012,7 @@ async fn run_message_dispatch_loop(
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
                 let send_msg = stop_reply_message(&msg, reply);
-                zeroclaw_spawn::spawn!(async move {
-                    let _ = channel.send(&send_msg).await;
-                });
+                let _ = tokio::time::timeout(Duration::from_secs(5), channel.send(&send_msg)).await;
             } else {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -8790,89 +9021,69 @@ async fn run_message_dispatch_loop(
                     "stop command: no registered channel found for reply"
                 );
             }
+            if let Some(journal) = &journal {
+                let _ = journal.checkpoint(TaskStatus::Uncertain, None, false).await;
+            }
             continue;
         }
 
-        if zeroclaw_api::conversation::deliver(&msg) {
+        if !recovering && zeroclaw_api::conversation::deliver(&msg) {
+            if let Some(journal) = &journal {
+                let _ = journal.checkpoint(TaskStatus::Uncertain, None, false).await;
+            }
             continue;
         }
 
-        // ── Debounce: accumulate rapid messages per sender ──────────
-        // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
-            let debounce_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
-
-            // Resolve effective debounce window: per-channel override wins,
-            // otherwise falls back to the global default from ChannelsConfig.
-            // A per-channel value of 0 is treated as unset (falls back to global).
-            let debounce_window = resolve_effective_debounce_window(
-                ctx.prompt_config.channels.debounce_ms,
-                &msg.channel,
-                msg.channel_alias.as_deref(),
-                &ctx.prompt_config.channels.telegram,
-            );
-
-            match ctx
-                .debouncer
-                .debounce_with_window(&debounce_key, &msg.content, debounce_window)
-                .await
-            {
-                zeroclaw_infra::debounce::DebounceResult::Pending(rx) => {
-                    // Spawn a lightweight task that waits for the debounce window
-                    // to expire, then feeds the combined message through the normal
-                    // worker path below.
-                    let debounce_ctx = Arc::clone(&ctx);
-                    let debounce_in_flight = Arc::clone(&in_flight_by_sender);
-                    let debounce_semaphore = Arc::clone(&semaphore);
-                    let debounce_task_seq = Arc::clone(&task_sequence);
-                    let mut debounce_msg = msg;
-                    workers.spawn(async move {
-                        let combined = match rx.await {
-                            Ok(combined) => combined,
-                            Err(_) => {
-                                // Receiver dropped — a newer message superseded this one.
-                                return;
-                            }
-                        };
-                        debounce_msg.content = combined;
-                        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": debounce_msg.channel, "sender": debounce_msg.sender})), "Debounced message ready — dispatching combined message");
-
-                        let permit = match debounce_semaphore.acquire_owned().await {
-                            Ok(permit) => permit,
-                            Err(_) => return,
-                        };
-
-                        dispatch_worker(
-                            debounce_ctx,
-                            debounce_msg,
-                            debounce_in_flight,
-                            debounce_task_seq,
-                            permit,
+        if let Some(journal) = &journal
+            && journal.assign(&ctx.agent_alias).await.is_err()
+        {
+            let _ = journal.checkpoint(TaskStatus::Failed, None, false).await;
+            continue;
+        }
+        let queue_permit = match Arc::clone(&queue_slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Some(journal) = journal {
+                    let _ = journal
+                        .checkpoint(
+                            TaskStatus::Failed,
+                            Some("admission queue capacity exceeded; no execution started".into()),
+                            false,
                         )
                         .await;
-                    });
-                    continue;
                 }
-                zeroclaw_infra::debounce::DebounceResult::Passthrough(content) => {
-                    let mut m = msg;
-                    m.content = content;
-                    m
-                }
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "Channel queue capacity exceeded; rejected before execution"
+                );
+                notify_admission_refused(&ctx, &msg).await;
+                continue;
             }
-        } else {
-            msg
         };
-
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
+        if let Some(journal) = &journal
+            && journal
+                .checkpoint(TaskStatus::Queued, None, false)
+                .await
+                .is_err()
+        {
+            continue;
+        }
+        let reservation = reserve_worker(&ctx, &msg, &in_flight_by_sender, &task_sequence).await;
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
-        let task_sequence = Arc::clone(&task_sequence);
+        let semaphore = Arc::clone(&semaphore);
         workers.spawn(async move {
-            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
+            dispatch_worker(
+                worker_ctx,
+                msg,
+                in_flight,
+                reservation,
+                semaphore,
+                queue_permit,
+                journal,
+            )
+            .await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -12436,6 +12647,11 @@ pub async fn start_channels(
 ) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     let config: Config = config_arc.read().clone();
+    if zeroclaw_runtime::control_plane::control_plane().is_none() {
+        let plane =
+            zeroclaw_runtime::control_plane::ControlPlaneHandle::start(&config.data_dir).await?;
+        zeroclaw_runtime::control_plane::init_control_plane(plane);
+    }
     let any_agent_provider_resolves = config
         .agents
         .iter()
@@ -12942,7 +13158,10 @@ pub async fn start_channels(
                 .channel_max_backoff_secs
                 .max(DEFAULT_CHANNEL_MAX_BACKOFF_SECS);
 
-            let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(100);
+            let (tx, rx) = zeroclaw_api::inbound::channel(100);
+            let plane = zeroclaw_runtime::control_plane::control_plane()
+                .ok_or_else(|| anyhow::Error::msg("channel admission requires control plane"))?;
+            let tx = tx.with_admission(Arc::new(turn_journal::ChannelAdmission(plane.clone())));
 
             for cc in &configured_channels {
                 listener_handles.push(spawn_supervised_listener(
@@ -13086,9 +13305,7 @@ pub async fn start_channels(
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.resolved.max_tool_result_chars,
             context_token_budget: agent.resolved.max_context_tokens,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::from_millis(config.channels.debounce_ms),
-            )),
+
             receipt_generator: if agent.resolved.tool_receipts.enabled {
                 Some(zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new())
             } else {
@@ -13199,6 +13416,7 @@ pub async fn start_channels(
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
     run_message_dispatch_loop(rx, router, max_in_flight).await;
+    cancel.cancel();
 
     for h in listener_handles {
         let _ = h.await;
@@ -13641,9 +13859,7 @@ fn concurrent_persist_lock_serialization() {
         pacing: zeroclaw_config::schema::PacingConfig::default(),
         max_tool_result_chars: 0,
         context_token_budget: 0,
-        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-            Duration::ZERO,
-        )),
+
         receipt_generator: None,
         show_receipts_in_response: false,
         last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -14648,10 +14864,7 @@ pub(crate) mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -14904,10 +15117,7 @@ temperature = 0.3
         async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -14943,10 +15153,7 @@ temperature = 0.3
         async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -15293,9 +15500,7 @@ temperature = 0.3
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -15332,7 +15537,7 @@ temperature = 0.3
         let listener_webhook = Arc::clone(&webhook);
         let task = zeroclaw_spawn::spawn!(async move {
             listener_webhook
-                .listen_with_listener(listener, tx)
+                .listen_with_listener(listener, tx.into())
                 .await
                 .ok();
         });
@@ -16253,9 +16458,7 @@ temperature = 0.3
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -16727,9 +16930,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -16826,9 +17027,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -16943,9 +17142,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -17064,9 +17261,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -17300,10 +17495,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -17487,10 +17679,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17528,10 +17717,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17569,10 +17755,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17663,10 +17846,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17701,10 +17881,7 @@ api_key = "anthropic-key"
             anyhow::bail!("send boom")
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -17720,10 +17897,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17754,10 +17928,7 @@ api_key = "anthropic-key"
             self.send(message).await
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17894,6 +18065,10 @@ api_key = "anthropic-key"
             "test-channel"
         }
 
+        fn permits_queued_recovery(&self, msg: &ChannelMessage) -> bool {
+            msg.sender == "recovery-fixture"
+        }
+
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent_messages
                 .lock()
@@ -17907,10 +18082,7 @@ api_key = "anthropic-key"
             self.send(message).await
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -17975,10 +18147,7 @@ api_key = "anthropic-key"
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -18111,9 +18280,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -18219,9 +18386,7 @@ api_key = "anthropic-key"
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -18390,7 +18555,7 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
-    async fn process_channel_message_cancellation_cancels_the_draft() {
+    async fn process_channel_message_cancellation_preserves_the_draft() {
         let token = CancellationToken::new();
         let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -18408,8 +18573,8 @@ api_key = "anthropic-key"
         process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
 
         assert!(
-            !channel_impl.cancelled_drafts.lock().await.is_empty(),
-            "a cancelled turn must cancel its draft so terminal cleanup runs"
+            channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "cancellation must preserve already visible partial output"
         );
         assert!(
             channel_impl.finalized_messages.lock().await.is_empty(),
@@ -20621,9 +20786,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -20710,9 +20873,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -20834,9 +20995,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -20954,9 +21113,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: Some(
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
@@ -21113,9 +21270,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: Some(
                 zeroclaw_runtime::agent::tool_receipts::ReceiptGenerator::new(),
             ),
@@ -21236,9 +21391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -21382,9 +21535,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -21514,9 +21665,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -21631,9 +21780,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -21766,9 +21913,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -21925,9 +22070,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -22108,9 +22251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -22593,9 +22734,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -22711,9 +22850,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -22833,9 +22970,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23200,9 +23335,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23212,7 +23345,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        let (tx, rx) = zeroclaw_api::inbound::channel(4);
         tx.send(zeroclaw_api::channel::ChannelMessage {
             id: "1".to_string(),
             sender: "alice".to_string(),
@@ -23346,9 +23479,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23358,7 +23489,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let (tx, rx) = zeroclaw_api::inbound::channel(8);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
@@ -23507,9 +23638,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23519,7 +23648,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let (tx, rx) = zeroclaw_api::inbound::channel(8);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
@@ -23671,9 +23800,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23683,7 +23810,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let (tx, rx) = zeroclaw_api::inbound::channel(8);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-1".to_string(),
@@ -23825,9 +23952,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -23837,7 +23962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let (tx, rx) = zeroclaw_api::inbound::channel(8);
         let send_task = zeroclaw_spawn::spawn!(async move {
             tx.send(zeroclaw_api::channel::ChannelMessage {
                 id: "msg-a".to_string(),
@@ -23961,9 +24086,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -24447,9 +24570,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -24576,9 +24697,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -24709,9 +24828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -24834,9 +24951,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -24959,9 +25074,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -25268,10 +25381,7 @@ BTC is currently around $65,000 based on latest tool output."#
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn add_reaction(
@@ -25371,9 +25481,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -28038,9 +28146,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -28219,9 +28325,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -28739,9 +28843,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -29229,9 +29331,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -29383,9 +29483,7 @@ BTC is currently around $65,000 based on latest tool output."#
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -30843,10 +30941,7 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
@@ -30884,10 +30979,7 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             anyhow::bail!("listen boom")
         }
@@ -30926,10 +31018,7 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
@@ -30946,10 +31035,7 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if let Some(err) = self.err.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 return Err(err);
@@ -30984,10 +31070,7 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
@@ -31018,7 +31101,7 @@ This is an example JSON object for profile settings."#;
         let handle = spawn_supervised_listener(
             Arc::clone(&configured[0].channel),
             configured[0].alias.clone(),
-            tx,
+            tx.into(),
             1,
             1,
             cancel.clone(),
@@ -31068,10 +31151,7 @@ This is an example JSON object for profile settings."#;
                 Ok(())
             }
 
-            async fn listen(
-                &self,
-                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-            ) -> anyhow::Result<()> {
+            async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
                 Ok(())
             }
         }
@@ -31102,7 +31182,7 @@ This is an example JSON object for profile settings."#;
             calls: Arc::clone(&calls),
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
@@ -31139,7 +31219,7 @@ This is an example JSON object for profile settings."#;
         let probes = Arc::clone(&inner.probes);
         let channel: Arc<dyn Channel> = inner;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31193,7 +31273,7 @@ This is an example JSON object for profile settings."#;
         let observations = Arc::clone(&inner.observations);
         let channel: Arc<dyn Channel> = inner;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31245,7 +31325,7 @@ This is an example JSON object for profile settings."#;
         let observations = Arc::clone(&inner.observations);
         let channel: Arc<dyn Channel> = inner;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31284,7 +31364,7 @@ This is an example JSON object for profile settings."#;
         ));
         let channel: Arc<dyn Channel> = inner;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31342,7 +31422,7 @@ This is an example JSON object for profile settings."#;
             Some(ListenerHealth::Healthy),
         ));
         let first: Arc<dyn Channel> = healthy;
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let first_cancel = tokio_util::sync::CancellationToken::new();
         let first_handle = spawn_supervised_listener_with_health_interval(
             first,
@@ -31379,7 +31459,7 @@ This is an example JSON object for profile settings."#;
             Some(ListenerHealth::Pending),
         ));
         let second: Arc<dyn Channel> = pending;
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let second_cancel = tokio_util::sync::CancellationToken::new();
         let second_handle = spawn_supervised_listener_with_health_interval(
             second,
@@ -31445,7 +31525,7 @@ This is an example JSON object for profile settings."#;
             "non-zero pacing must actually produce the wrapper"
         );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             paced,
@@ -31501,7 +31581,7 @@ This is an example JSON object for profile settings."#;
         let reporter = Arc::clone(&inner);
         let channel: Arc<dyn Channel> = inner;
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31554,7 +31634,7 @@ This is an example JSON object for profile settings."#;
             calls: Arc::clone(&calls),
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener_with_health_interval(
             channel,
@@ -31604,7 +31684,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let component_name = format!("channel:{}", channel.name());
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
@@ -31642,7 +31722,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let component_name = format!("channel:{}", channel.name());
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
@@ -31685,7 +31765,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let component_name = format!("channel:{}", channel.name());
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
 
@@ -31728,10 +31808,8 @@ This is an example JSON object for profile settings."#;
             calls: Arc::clone(&healthy_calls),
         });
 
-        let (failing_tx, failing_rx) =
-            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
-        let (healthy_tx, healthy_rx) =
-            tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let (failing_tx, failing_rx) = zeroclaw_api::inbound::channel(1);
+        let (healthy_tx, healthy_rx) = zeroclaw_api::inbound::channel(1);
         let cancel = tokio_util::sync::CancellationToken::new();
         let failing_handle =
             spawn_supervised_listener(failing_channel, None, failing_tx, 1, 1, cancel.clone());
@@ -32481,9 +32559,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -32598,9 +32674,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -32759,9 +32833,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 50000,
             context_token_budget: 128_000,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                std::time::Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -33024,9 +33096,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -33179,9 +33249,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -33326,9 +33394,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -33493,9 +33559,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -34060,9 +34124,7 @@ This is an example JSON object for profile settings."#;
             pacing: zeroclaw_config::schema::PacingConfig::default(),
             max_tool_result_chars: 0,
             context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
+
             receipt_generator: None,
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
@@ -34072,7 +34134,7 @@ This is an example JSON object for profile settings."#;
             sop_audit: None,
         });
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
+        let (tx, rx) = zeroclaw_api::inbound::channel(8);
         let send_task = zeroclaw_spawn::spawn!(async move {
             // Two messages from same sender but in different Slack threads —
             // they must NOT cancel each other.
@@ -36718,6 +36780,245 @@ Done."#;
                 !dispatch_test_channel_sop_gate(&router, &msg, None).await,
                 "ordinary chat must fall through: {content:?}"
             );
+        }
+    }
+    #[tokio::test]
+    async fn supervised_dispatch_recovers_safe_queue_once_and_quarantines_active_work() {
+        use zeroclaw_runtime::control_plane::ControlPlaneHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let old = ControlPlaneHandle::start_with_boot_id(dir.path(), "old".into())
+            .await
+            .unwrap();
+        let channel = Arc::new(RecordingChannel::default());
+        let mut agent_config = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent_config.precheck.enabled = false;
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            agent_config,
+            "test-provider",
+            None,
+        );
+        let mut ids = Vec::new();
+        for (id, sender, running) in [
+            ("safe-first", "recovery-fixture", false),
+            ("safe-second", "recovery-fixture", false),
+            ("revoked", "revoked-fixture", false),
+            ("uncertain", "recovery-fixture", true),
+        ] {
+            let msg = ChannelMessage {
+                id: id.into(),
+                sender: sender.into(),
+                reply_target: "room".into(),
+                channel: "test-channel".into(),
+                content: "Explain a hash table".into(),
+                ..Default::default()
+            };
+            let journal = turn_journal::ChannelTurnJournal::admit(&old, &ctx.agent_alias, &msg)
+                .await
+                .unwrap()
+                .unwrap();
+            ids.push(journal.trace_id().unwrap().to_owned());
+            journal
+                .checkpoint(TaskStatus::Queued, None, false)
+                .await
+                .unwrap();
+            if running {
+                journal
+                    .checkpoint(TaskStatus::Running, None, false)
+                    .await
+                    .unwrap();
+            }
+        }
+        let fixture_db = rusqlite::Connection::open(dir.path().join("control_plane.db")).unwrap();
+        fixture_db
+            .execute("UPDATE tasks SET owner_pid=0 WHERE owner_boot_id='old'", [])
+            .unwrap();
+        drop(fixture_db);
+        let next = ControlPlaneHandle::start_with_boot_id(dir.path(), "new".into())
+            .await
+            .unwrap();
+        let (tx, rx) = zeroclaw_api::inbound::channel(4);
+        drop(tx);
+        run_message_dispatch_loop_supervised(rx, AgentRouter::single(ctx), 2, Some(next.clone()))
+            .await;
+        let evidence = {
+            let conn = rusqlite::Connection::open(dir.path().join("control_plane.db")).unwrap();
+            let mut stmt = conn.prepare("SELECT status,output,COALESCE(error,'') || ' events=' || (SELECT GROUP_CONCAT(state) FROM task_turn_events e WHERE e.task_id=tasks.id) FROM tasks ORDER BY started_at").unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            channel.final_send_calls.load(Ordering::SeqCst),
+            2,
+            "only safe queued turns may execute: {evidence:?}; messages={:?}",
+            channel.sent_messages.lock().await
+        );
+        for (index, id) in ids.iter().enumerate() {
+            let state = next.store.get(id).await.unwrap().unwrap().status;
+            assert_eq!(
+                state,
+                if index == 2 {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Uncertain
+                },
+                "unacknowledged fake channel success remains uncertain"
+            );
+        }
+        assert!(
+            next.store
+                .take_recoverable_channel_turns("new")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_worker_waiting_for_capacity_reaches_durable_terminal_state() {
+        use zeroclaw_runtime::control_plane::ControlPlaneHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let plane = ControlPlaneHandle::start_with_boot_id(dir.path(), "fixture".into())
+            .await
+            .unwrap();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let msg = ChannelMessage {
+            id: "queued".into(),
+            channel: "test-channel".into(),
+            ..Default::default()
+        };
+        let journal = turn_journal::ChannelTurnJournal::admit(&plane, &ctx.agent_alias, &msg)
+            .await
+            .unwrap()
+            .unwrap();
+        let id = journal.trace_id().unwrap().to_owned();
+        journal
+            .checkpoint(TaskStatus::Queued, None, false)
+            .await
+            .unwrap();
+        let active = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let reservation = reserve_worker(&ctx, &msg, &active, &AtomicU64::new(1)).await;
+        let cancel = reservation.state.cancellation.clone();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let queue = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let task = zeroclaw_spawn::spawn!(dispatch_worker(
+            ctx,
+            msg,
+            active,
+            reservation,
+            semaphore,
+            queue,
+            Some(journal),
+        ));
+        tokio::task::yield_now().await;
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plane.store.get(&id).await.unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn reservations_are_fifo_before_spawn_and_cancel_the_entire_queued_chain() {
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            Arc::new(RecordingChannel::default()),
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let active = tokio::sync::Mutex::new(HashMap::new());
+        let sequence = AtomicU64::new(1);
+        let msg = ChannelMessage {
+            id: "first".into(),
+            sender: "fixture".into(),
+            reply_target: "room-a".into(),
+            channel: "test-channel".into(),
+            ..Default::default()
+        };
+        let first = reserve_worker(&ctx, &msg, &active, &sequence).await;
+        let second = reserve_worker(&ctx, &msg, &active, &sequence).await;
+        let other = reserve_worker(
+            &ctx,
+            &ChannelMessage {
+                reply_target: "room-b".into(),
+                ..msg.clone()
+            },
+            &active,
+            &sequence,
+        )
+        .await;
+        assert!(first.previous.is_none());
+        assert!(
+            other.previous.is_none(),
+            "independent conversation must not wait"
+        );
+        assert_eq!(
+            second.previous.as_ref().unwrap().task_id,
+            first.state.task_id
+        );
+        second.state.cancellation.cancel();
+        assert!(
+            first.state.cancellation.is_cancelled(),
+            "/stop cancels active and queued work"
+        );
+        let completed = Arc::clone(&second.state.completion);
+        let task = zeroclaw_spawn::spawn!(async move {
+            second.previous.as_ref().unwrap().completion.wait().await;
+            drop(second);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !completed.done.load(Ordering::Acquire),
+            "cancelled successor still waits for predecessor"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(completed.done.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn completion_notification_is_safe_before_and_during_wait_registration() {
+        for _ in 0..100 {
+            let done = Arc::new(InFlightTaskCompletion::new());
+            let waiter = Arc::clone(&done);
+            let task = zeroclaw_spawn::spawn!(async move {
+                waiter.wait().await;
+            });
+            done.mark_done();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            done.wait().await;
         }
     }
 }

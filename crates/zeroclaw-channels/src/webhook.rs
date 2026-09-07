@@ -139,7 +139,7 @@ impl WebhookChannel {
     pub(crate) async fn listen_with_listener(
         &self,
         listener: tokio::net::TcpListener,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: zeroclaw_api::inbound::Sender,
     ) -> Result<()> {
         let state = Arc::new(WebhookState {
             tx,
@@ -299,7 +299,7 @@ enum AttemptOutcome {
 // ---------------------------------------------------------------------------
 
 struct WebhookState {
-    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
     secret: Option<String>,
     counter: Arc<AtomicU64>,
     alias: String,
@@ -486,7 +486,7 @@ impl Channel for WebhookChannel {
         anyhow::bail!("webhook send exhausted retries without a terminal result")
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Fail-fast: a webhook with no secret accepts *all* incoming requests,
         // including unauthenticated ones.  Refuse to start so the operator is
         // forced to configure a secret.
@@ -821,7 +821,7 @@ mod tests {
     async fn listen_requires_secret() {
         let ch = make_channel(); // no secret
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let err = ch.listen(tx).await.unwrap_err();
+        let err = ch.listen(tx.into()).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("requires a `secret`"),
@@ -868,7 +868,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let jh = zeroclaw_spawn::spawn!(async move {
-            ch.listen_with_listener(listener, tx).await.ok();
+            ch.listen_with_listener(listener, tx.into()).await.ok();
         });
         // Give the server a moment to begin accepting connections.
         tokio::time::sleep(Duration::from_millis(20)).await;

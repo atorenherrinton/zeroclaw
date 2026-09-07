@@ -356,7 +356,7 @@ pub struct WhatsAppWebChannel {
     /// Client handle for sending messages and typing indicators
     client: Arc<Mutex<Option<Arc<whatsapp_rust::Client>>>>,
     /// Message sender channel
-    tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
+    tx: Arc<Mutex<Option<zeroclaw_api::inbound::Sender>>>,
     /// Voice transcription (STT) config
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
@@ -406,7 +406,7 @@ struct SenderAllowlistResolution {
 #[cfg(feature = "whatsapp-web")]
 #[derive(Clone)]
 struct WhatsAppInboundContext {
-    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
     alias: Arc<String>,
     peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
@@ -1649,7 +1649,7 @@ impl WhatsAppWebChannel {
 
     #[cfg(feature = "whatsapp-web")]
     async fn send_inbound_channel_message(
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         alias: &str,
         sender: &str,
         reply_target: String,
@@ -2683,7 +2683,7 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Store the sender channel for incoming messages
         *self.tx.lock() = Some(tx.clone());
 
@@ -3340,7 +3340,7 @@ impl Channel for WhatsAppWebChannel {
         ));
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         anyhow::bail!(i18n::get_required_cli_string(
             "channel-whatsapp-web-feature-missing-error"
         ));
@@ -4258,7 +4258,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
-            tx,
+            tx: tx.into(),
             alias: Arc::new("persistent-lid-test".to_string()),
             peer_resolver: Arc::new(|| vec!["+15551234567".to_string()]),
             allowed_groups_resolver: Arc::new(Vec::new),
@@ -4398,35 +4398,34 @@ mod tests {
             )
         };
 
-        let context_for =
-            |mode: &Mode, policy: &Policy, tx: tokio::sync::mpsc::Sender<ChannelMessage>| {
-                WhatsAppInboundContext {
-                    tx,
-                    alias: Arc::new("both-modes-policy".to_string()),
-                    peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
-                    allowed_groups_resolver: Arc::new(Vec::new),
-                    mode: mode.clone(),
-                    dm_policy: policy.clone(),
-                    group_policy: policy.clone(),
-                    self_chat_mode: false,
-                    mention_only: false,
-                    passive_group_context: false,
-                    bot_phone: Arc::new(Mutex::new(None)),
-                    bot_lid: Arc::new(Mutex::new(None)),
-                    dm_mention_patterns: Arc::new(Vec::new()),
-                    group_mention_patterns: Arc::new(Vec::new()),
-                    transcription_config: None,
-                    transcription_manager: None,
-                    voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-                }
-            };
+        let context_for = |mode: &Mode, policy: &Policy, tx: zeroclaw_api::inbound::Sender| {
+            WhatsAppInboundContext {
+                tx,
+                alias: Arc::new("both-modes-policy".to_string()),
+                peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
+                allowed_groups_resolver: Arc::new(Vec::new),
+                mode: mode.clone(),
+                dm_policy: policy.clone(),
+                group_policy: policy.clone(),
+                self_chat_mode: false,
+                mention_only: false,
+                passive_group_context: false,
+                bot_phone: Arc::new(Mutex::new(None)),
+                bot_lid: Arc::new(Mutex::new(None)),
+                dm_mention_patterns: Arc::new(Vec::new()),
+                group_mention_patterns: Arc::new(Vec::new()),
+                transcription_config: None,
+                transcription_manager: None,
+                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            }
+        };
 
         for mode in [Mode::Business, Mode::Personal] {
             for is_group in [false, true] {
                 // `allowlist` (the default) must reject an unlisted sender under
                 // either mode.
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-                let context = context_for(&mode, &Policy::Allowlist, tx);
+                let context = context_for(&mode, &Policy::Allowlist, tx.into());
 
                 let unlisted = event(UNKNOWN, is_group);
                 WhatsAppWebChannel::handle_inbound_message_event(&unlisted, &client, &context)
@@ -4457,7 +4456,7 @@ mod tests {
                 // row that proves the policy is consulted at all rather than the
                 // allowlist doing all the work.
                 let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-                let context = context_for(&mode, &Policy::Ignore, tx);
+                let context = context_for(&mode, &Policy::Ignore, tx.into());
                 let listed = event(ALLOWED, is_group);
                 WhatsAppWebChannel::handle_inbound_message_event(&listed, &client, &context).await;
                 assert!(
@@ -4529,31 +4528,30 @@ mod tests {
             )
         };
 
-        let context_for =
-            |mode: Mode, tx: tokio::sync::mpsc::Sender<ChannelMessage>| WhatsAppInboundContext {
-                tx,
-                alias: Arc::new("self-chat-policy".to_string()),
-                peer_resolver: Arc::new(Vec::new),
-                allowed_groups_resolver: Arc::new(Vec::new),
-                mode,
-                dm_policy: Policy::Allowlist,
-                group_policy: Policy::Allowlist,
-                self_chat_mode: true,
-                mention_only: false,
-                passive_group_context: false,
-                bot_phone: Arc::new(Mutex::new(None)),
-                bot_lid: Arc::new(Mutex::new(None)),
-                dm_mention_patterns: Arc::new(Vec::new()),
-                group_mention_patterns: Arc::new(Vec::new()),
-                transcription_config: None,
-                transcription_manager: None,
-                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            };
+        let context_for = |mode: Mode, tx: zeroclaw_api::inbound::Sender| WhatsAppInboundContext {
+            tx,
+            alias: Arc::new("self-chat-policy".to_string()),
+            peer_resolver: Arc::new(Vec::new),
+            allowed_groups_resolver: Arc::new(Vec::new),
+            mode,
+            dm_policy: Policy::Allowlist,
+            group_policy: Policy::Allowlist,
+            self_chat_mode: true,
+            mention_only: false,
+            passive_group_context: false,
+            bot_phone: Arc::new(Mutex::new(None)),
+            bot_lid: Arc::new(Mutex::new(None)),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
+            transcription_config: None,
+            transcription_manager: None,
+            voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        };
 
         // Personal mode: the operator's own self-chat is admitted even though
         // the allowlist is empty.
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let context = context_for(Mode::Personal, tx);
+        let context = context_for(Mode::Personal, tx.into());
         let event = self_chat_event();
         WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context).await;
         let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -4565,7 +4563,7 @@ mod tests {
         // Business mode: the same message takes the policy path, and the
         // allowlist is empty, so it is refused.
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let context = context_for(Mode::Business, tx);
+        let context = context_for(Mode::Business, tx.into());
         let event = self_chat_event();
         WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context).await;
         assert!(
@@ -5743,7 +5741,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
-            tx,
+            tx: tx.into(),
             alias: Arc::new(alias.to_string()),
             peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
             allowed_groups_resolver: Arc::new(Vec::new),
@@ -5859,7 +5857,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let context = WhatsAppInboundContext {
-            tx,
+            tx: tx.into(),
             alias: Arc::new(alias.to_string()),
             peer_resolver: Arc::new(|| vec![format!("+{SENDER_PHONE}")]),
             allowed_groups_resolver: Arc::new(Vec::new),

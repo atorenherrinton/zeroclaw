@@ -7,7 +7,7 @@ use std::sync::Arc;
 use crate::agent::agent::{RoutedApproval, resolve_routed_approval};
 use crate::tools::PerToolChannelHandle;
 use zeroclaw_api::channel::{
-    AttributedApprovalResponse, Channel, ChannelApprovalRequest, ChannelMessage, SendMessage,
+    AttributedApprovalResponse, Channel, ChannelApprovalRequest, SendMessage,
 };
 
 pub(crate) struct AskUserApprovalBridge {
@@ -43,7 +43,7 @@ impl Channel for AskUserApprovalBridge {
         Ok(())
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -162,10 +162,7 @@ mod tests {
         async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn request_approval(
@@ -213,10 +210,7 @@ mod tests {
         async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn request_approval_attributed(

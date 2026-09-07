@@ -73,7 +73,7 @@ struct BotInfo {
 // ---------------------------------------------------------------------------
 
 struct LineState {
-    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
     channel_secret: String,
     bot_user_id: String,
     dm_policy: LineDmPolicy,
@@ -1091,7 +1091,7 @@ impl LineChannel {
         &self,
         listener: tokio::net::TcpListener,
         bot_user_id: String,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: zeroclaw_api::inbound::Sender,
     ) -> anyhow::Result<()> {
         let state = Arc::new(LineState {
             tx,
@@ -1167,7 +1167,7 @@ impl Channel for LineChannel {
         self.send_push(&message.recipient, &message.content).await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let bot_info = self.fetch_bot_info().await?;
         *self.sender_icon.write() = bot_info.picture_url;
         ::zeroclaw_log::record!(
@@ -1360,7 +1360,9 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let bot_id = bot_user_id.to_string();
         let jh = zeroclaw_spawn::spawn!(async move {
-            ch.listen_with_listener(listener, bot_id, tx).await.ok();
+            ch.listen_with_listener(listener, bot_id, tx.into())
+                .await
+                .ok();
         });
         // Give the server a moment to begin accepting connections.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2723,7 +2725,7 @@ mod tests {
         let sender_icon = Arc::clone(&ch.sender_icon);
 
         let abort = zeroclaw_spawn::spawn!(async move {
-            ch.listen(tx).await.ok();
+            ch.listen(tx.into()).await.ok();
         })
         .abort_handle();
 

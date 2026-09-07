@@ -403,11 +403,13 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             p.exec.max_tool_result_chars
         };
     }
-    zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
+    zeroclaw_api::deadline::run_inherited(
+        zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
         // Keep the task-local wrapper from embedding the turn engine's large
         // state machine in another stack-resident future.
-        .scope(context, Box::pin(run_tool_call_loop_inner(p)))
-        .await
+        .scope(context, Box::pin(run_tool_call_loop_inner(p))),
+    )
+    .await
 }
 
 async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
@@ -762,6 +764,16 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             tools_registry,
             excluded_tools,
             activated_tools,
+            if iteration == 0 {
+                turn_state
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .map(|m| m.content.as_str())
+            } else {
+                None
+            },
         )?;
 
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
@@ -919,14 +931,17 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
-        } = call_provider(
-            &ctx,
-            active_model_provider,
-            provider_request_model,
-            &provider_request_messages,
-            request_tools,
-            should_consume_provider_stream,
-            iteration,
+        } = zeroclaw_api::deadline::run_inherited_phase(
+            zeroclaw_api::deadline::Phase::Provider,
+            call_provider(
+                &ctx,
+                active_model_provider,
+                provider_request_model,
+                &provider_request_messages,
+                request_tools,
+                should_consume_provider_stream,
+                iteration,
+            ),
         )
         .await?;
 
@@ -1101,6 +1116,13 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
+        // Reject pathological batches before any tool is launched. This also
+        // bounds receipt/pairing metadata independently from payload bytes.
+        anyhow::ensure!(
+            tool_calls.len() <= zeroclaw_tools::output_budget::MAX_BATCH_CALLS,
+            "provider tool batch exceeds the bounded execution limit"
+        );
+
         // Earlier physical leaves are rejected routing/retry work. The final
         // accepted response remains settled by `record_accepted_chat_response`
         // so only it updates context-window telemetry.
@@ -1187,6 +1209,9 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             }
             return Ok(accumulated_display_text);
         }
+
+        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::WaitingOnTool, None, false)
+            .await?;
 
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
@@ -1363,6 +1388,24 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     };
                     events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
                 }
+            }
+        }
+
+        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
+            .await?;
+        let payload_budget = zeroclaw_tools::output_budget::per_result_budget(
+            max_tool_result_chars,
+            ordered_results.len(),
+        );
+        for (_, _, outcome) in ordered_results.iter_mut().flatten() {
+            let original_bytes = outcome.output.len();
+            outcome.output =
+                zeroclaw_tools::output_budget::bound_output(&outcome.output, payload_budget);
+            if outcome.output.len() < original_bytes {
+                ::zeroclaw_log::record!(INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(serde_json::json!({"trace_id":turn_id,"original_bytes":original_bytes,"context_bytes":outcome.output.len(),"phase":"tool_output_budget"})),
+                    "Tool context payload bounded");
             }
         }
 

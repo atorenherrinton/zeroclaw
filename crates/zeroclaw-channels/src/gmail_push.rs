@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -157,7 +157,7 @@ pub struct GmailPushChannel {
     http: Client,
     last_history_id: Arc<Mutex<u64>>,
     /// Sender half injected by the gateway to forward webhook-received messages.
-    pub tx: Arc<Mutex<Option<mpsc::Sender<ChannelMessage>>>>,
+    pub tx: Arc<Mutex<Option<zeroclaw_api::inbound::Sender>>>,
 }
 
 impl GmailPushChannel {
@@ -620,7 +620,7 @@ impl Channel for GmailPushChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Store the sender for webhook-driven message dispatch
         {
             let mut tx_guard = self.tx.lock().await;

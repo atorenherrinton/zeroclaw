@@ -4,8 +4,7 @@ use crate::irc::{IrcChannel, IrcChannelConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 
 const TWITCH_IRC_HOST: &str = "irc.chat.twitch.tv";
 const TWITCH_IRC_PORT: u16 = 6697;
@@ -74,8 +73,8 @@ impl Channel for TwitchChannel {
         self.inner.send(message).await
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let (inner_tx, mut inner_rx) = mpsc::channel::<ChannelMessage>(FORWARD_BUFFER);
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
+        let (inner_tx, mut inner_rx) = zeroclaw_api::inbound::channel(FORWARD_BUFFER);
         let inner = self.inner.clone();
         let listen_task = zeroclaw_spawn::spawn!(async move { inner.listen(inner_tx).await });
 

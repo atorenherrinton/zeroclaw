@@ -217,7 +217,7 @@ impl Channel for VoiceWakeChannel {
         false
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let self_alias = self.alias.clone();
         let config = self.config.clone();
         let transcription_manager = self.build_transcription_manager()?;

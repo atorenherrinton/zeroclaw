@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use directories::UserDirs;
 use rusqlite::{Connection, OpenFlags};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
@@ -183,7 +182,7 @@ end tell"#
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),

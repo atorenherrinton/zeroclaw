@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 
@@ -625,7 +625,7 @@ impl EmailChannel {
         }
     }
 
-    async fn listen_with_reconnect(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen_with_reconnect(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(60);
 
@@ -655,7 +655,7 @@ impl EmailChannel {
 
     /// Run a single IMAP session. Probes server capabilities and dispatches
     /// to the IDLE or polling inner loop.
-    async fn run_session(&self, tx: &mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn run_session(&self, tx: &zeroclaw_api::inbound::Sender) -> Result<()> {
         let mut session = self.connect_imap().await?;
         let mailbox = session.select(&self.config.imap_folder).await?;
         let uid_validity = mailbox.uid_validity;
@@ -718,7 +718,7 @@ impl EmailChannel {
     async fn run_idle_inner(
         &self,
         mut session: ImapSession,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         mut uid_threshold: u32,
         uid_validity: Option<u32>,
     ) -> Result<()> {
@@ -758,7 +758,7 @@ impl EmailChannel {
     async fn run_poll_inner(
         &self,
         mut session: ImapSession,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         poll_interval: Duration,
         mut uid_threshold: u32,
         uid_validity: Option<u32>,
@@ -777,7 +777,7 @@ impl EmailChannel {
     async fn dispatch_email(
         &self,
         email: ParsedEmail,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> Result<bool> {
         if !self.is_sender_allowed(&email.sender) {
             ::zeroclaw_log::record!(
@@ -831,7 +831,7 @@ impl EmailChannel {
     async fn process_new(
         &self,
         session: &mut ImapSession,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         uid_threshold: u32,
         uid_validity: Option<u32>,
     ) -> Result<u32> {
@@ -1036,7 +1036,7 @@ impl Channel for EmailChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -1796,7 +1796,7 @@ mod tests {
               hello",
         );
         let email = channel.build_parsed_email(&parsed, 42, Some(1234));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
 
         let ok = channel.dispatch_email(email, &tx).await.unwrap();
         assert!(ok);
@@ -1828,7 +1828,7 @@ mod tests {
               hello",
         );
         let email = channel.build_parsed_email(&parsed, 42, Some(1234));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
 
         channel.dispatch_email(email, &tx).await.unwrap();
 
@@ -1851,7 +1851,7 @@ mod tests {
               hello",
         );
         let email = channel.build_parsed_email(&parsed, 42, Some(1234));
-        let (tx, mut rx) = mpsc::channel(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
 
         channel.dispatch_email(email, &tx).await.unwrap();
 

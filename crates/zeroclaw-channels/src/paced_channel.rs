@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    ProgressEvent, RoomCreationOptions, SendMessage, ToolProgressEvent,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, DraftProgress, ProgressEvent,
+    RoomCreationOptions, SendMessage, ToolProgressEvent,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -71,7 +71,10 @@ struct PendingSend {
     /// One-shot back-channel for delivering the eventual send result to
     /// the caller. The caller awaits this so a paced `send()` still
     /// returns the inner channel's result rather than swallowing it.
-    reply: oneshot::Sender<Result<()>>,
+    reply: oneshot::Sender<(Result<()>, Option<zeroclaw_api::delivery::DeliverySummary>)>,
+    journal: Option<Arc<dyn zeroclaw_api::delivery::DeliveryJournal>>,
+    route: Option<zeroclaw_api::conversation::ConversationRoute>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 /// Per-recipient pacing state.
@@ -93,8 +96,8 @@ pub struct PacedChannel {
     inner: Arc<dyn Channel>,
     min_interval: Duration,
     queue_depth: usize,
-    /// Per-recipient state. `tokio::sync::Mutex` so the worker can hold
-    /// the lock across `.await` while draining.
+    /// Per-recipient state. The worker releases the mutex before waiting
+    /// on the pacing floor or adapter.
     recipients: Arc<Mutex<RecipientMap>>,
 }
 
@@ -125,12 +128,12 @@ impl RecipientMap {
             return;
         }
         // `iter()` walks the recipients to find the smallest `last_touched`.
-        // Idle rows (no queue, no running worker) are preferred; an active
-        // row only loses its slot if every other row is even more recent.
+        // Only idle rows may be evicted. Active queues retain their worker
+        // and receipts until the operation finishes or is cancelled.
         let victim = self
             .inner
             .iter()
-            .filter(|(_, s)| s.queue.is_empty() && !s.worker_running && !s.in_flight)
+            .filter(|(_, s)| s.queue.is_empty() && !s.worker_running)
             .min_by_key(|(_, s)| s.last_touched)
             .map(|(k, _)| k.clone());
         if let Some(key) = victim {
@@ -173,141 +176,169 @@ impl PacedChannel {
     }
 
     async fn paced_dispatch(&self, op: PacedOp) -> Result<()> {
-        let recipient_key = op.recipient().to_string();
-
-        let decision: (Option<PacedOp>, Option<oneshot::Receiver<Result<()>>>, bool) = {
+        let recipient_key = op.recipient().to_owned();
+        let (tx, rx) = oneshot::channel();
+        let spawn = {
             let mut map = self.recipients.lock().await;
-            map.evict_if_over_cap();
-            let now = Instant::now();
+            if !map.inner.contains_key(&recipient_key) {
+                map.evict_if_over_cap();
+                if map.inner.len() >= PACING_RECIPIENT_CAP {
+                    return Err(pacing_refused());
+                }
+            }
             let touch = map.touch();
             let state = map
                 .inner
                 .entry(recipient_key.clone())
                 .or_insert(RecipientState {
-                    next_allowed_at: now,
+                    next_allowed_at: Instant::now(),
                     queue: VecDeque::new(),
                     worker_running: false,
                     in_flight: false,
                     last_touched: touch,
                 });
             state.last_touched = touch;
-
-            if state.queue.is_empty()
-                && !state.worker_running
-                && !state.in_flight
-                && now >= state.next_allowed_at
-            {
-                state.next_allowed_at = now + self.min_interval;
-                state.in_flight = true;
-                (Some(op), None, false)
-            } else if state.queue.len() >= self.queue_depth {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject,)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "channel_alias": self.inner.alias(),
-                            "recipient": redact_recipient(&recipient_key),
-                            "queue_depth": state.queue.len(),
-                            "queue_max": self.queue_depth,
-                            "dropped_chars": op.payload_chars(),
-                        })),
-                    "paced channel queue full: dropping newest outbound message"
-                );
-                (None, None, false)
-            } else {
-                let (tx, rx) = oneshot::channel();
-                state.queue.push_back(PendingSend { op, reply: tx });
-                let spawn = !state.worker_running;
-                if spawn {
-                    state.worker_running = true;
-                }
-                (None, Some(rx), spawn)
+            if state.queue.len() + usize::from(state.in_flight) >= self.queue_depth {
+                ::zeroclaw_log::record!(WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_attrs(serde_json::json!({"channel_alias":self.inner.alias(),
+                            "recipient":redact_recipient(&recipient_key),"queue_depth":state.queue.len(),
+                            "dropped_chars":op.payload_chars(),"outcome":"not_started"})),
+                    "Paced channel queue full; refusing submission");
+                return Err(pacing_refused());
             }
-        };
-
-        let (immediate, awaited, spawn_worker) = decision;
-        if let Some(op) = immediate {
-            let result = op.dispatch(&self.inner).await;
-            // Clear the in-flight marker under the lock. Sends that arrived
-            // during this dispatch enqueued behind it (the `in_flight` gate);
-            // hand them to a drain worker so they still observe the floor.
-            let spawn = {
-                let mut map = self.recipients.lock().await;
-                if let Some(state) = map.inner.get_mut(&recipient_key) {
-                    state.in_flight = false;
-                    let needs_worker = !state.queue.is_empty() && !state.worker_running;
-                    if needs_worker {
-                        state.worker_running = true;
-                    }
-                    needs_worker
-                } else {
-                    false
-                }
-            };
-            if spawn {
-                self.spawn_drain_worker(recipient_key);
-            }
-            return result;
-        }
-        if let Some(rx) = awaited {
-            if spawn_worker {
-                self.spawn_drain_worker(recipient_key);
-            }
-            return rx.await.unwrap_or_else(|_| {
-                Err(anyhow::Error::msg(
-                    "paced channel worker dropped before send completed",
-                ))
+            state.queue.push_back(PendingSend {
+                op,
+                reply: tx,
+                journal: zeroclaw_api::delivery::current_journal(),
+                route: zeroclaw_api::conversation::current(),
+                deadline: zeroclaw_api::deadline::current(),
             });
+            let spawn = !state.worker_running;
+            state.worker_running = true;
+            spawn
+        };
+        if spawn {
+            self.spawn_drain_worker(recipient_key);
         }
-        Ok(())
+        let (result, summary) = zeroclaw_api::deadline::run_inherited_phase(
+            zeroclaw_api::deadline::Phase::Delivery,
+            async {
+                rx.await.map_err(|_| {
+                    anyhow::Error::new(zeroclaw_api::delivery::DeliveryFailure {
+                        outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+                        chunk_index: 0,
+                        total_chunks: 1,
+                        confirmed_chunks: 0,
+                    })
+                })
+            },
+        )
+        .await
+        .map_err(pacing_timeout_context)?;
+        if let Some(summary) = summary {
+            zeroclaw_api::delivery::record_summary(summary);
+        }
+        result
     }
 
-    /// Spawn the worker that drains a recipient's queue at the floor rate.
-    /// One worker per recipient — re-entry is prevented by the
-    /// `worker_running` flag held under the same lock that enqueues.
+    /// Exactly one worker per recipient. Caller cancellation drops the receipt
+    /// receiver, cancelling both the pacing wait and an in-flight operation.
+    /// Each queued operation carries its own canonical context, never the first
+    /// caller's task-local state. Positive acknowledgements return to that caller.
     fn spawn_drain_worker(&self, recipient: String) {
         let recipients = Arc::clone(&self.recipients);
         let inner = Arc::clone(&self.inner);
         let min_interval = self.min_interval;
         zeroclaw_spawn::spawn!(async move {
             loop {
-                // Wait until the floor has elapsed for this recipient.
-                let sleep_for = {
-                    let map = recipients.lock().await;
-                    let Some(state) = map.inner.get(&recipient) else {
-                        return;
-                    };
-                    state
-                        .next_allowed_at
-                        .saturating_duration_since(Instant::now())
-                };
-                if !sleep_for.is_zero() {
-                    tokio::time::sleep(sleep_for).await;
-                }
-
-                // Pop the next pending send, release the lock before
-                // awaiting the actual wire call. Re-stamp the floor based
-                // on when we dispatched.
-                let pending = {
+                let (pending, sleep_for) = {
                     let mut map = recipients.lock().await;
                     let Some(state) = map.inner.get_mut(&recipient) else {
                         return;
                     };
-                    if state.queue.is_empty() {
+                    let Some(pending) = state.queue.pop_front() else {
                         state.worker_running = false;
                         return;
-                    }
-                    state.next_allowed_at = Instant::now() + min_interval;
-                    state.queue.pop_front()
+                    };
+                    state.in_flight = true;
+                    (
+                        pending,
+                        state
+                            .next_allowed_at
+                            .saturating_duration_since(Instant::now()),
+                    )
                 };
-                if let Some(PendingSend { op, reply }) = pending {
-                    let result = op.dispatch(&inner).await;
+                let PendingSend {
+                    op,
+                    mut reply,
+                    journal,
+                    route,
+                    deadline,
+                } = pending;
+                if reply.is_closed() {
+                    if let Some(state) = recipients.lock().await.inner.get_mut(&recipient) {
+                        state.in_flight = false;
+                    }
+                    continue;
+                }
+                let dispatch = zeroclaw_api::deadline::PARENT.scope(deadline,
+                    zeroclaw_api::delivery::JOURNAL.scope(journal,
+                        zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(route,
+                            zeroclaw_api::delivery::SUMMARY.scope(std::sync::Mutex::new(None), async {
+                                let result = zeroclaw_api::deadline::run_inherited_phase(
+                                    zeroclaw_api::deadline::Phase::Delivery, async {
+                                        if !sleep_for.is_zero() { tokio::time::sleep(sleep_for).await; }
+                                        if let Some(state) = recipients.lock().await.inner.get_mut(&recipient) {
+                                            state.next_allowed_at = Instant::now() + min_interval;
+                                        }
+                                        // A faulty adapter must not poison this recipient's queue.
+                                        use futures_util::FutureExt;
+                                        std::panic::AssertUnwindSafe(op.dispatch(&inner)).catch_unwind().await
+                                            .unwrap_or_else(|_| Err(anyhow::Error::new(zeroclaw_api::delivery::DeliveryFailure {
+                                                outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+                                                chunk_index: 0, total_chunks: 1, confirmed_chunks: 0,
+                                            })))
+                                    }).await;
+                                (result.map_err(pacing_timeout_context), zeroclaw_api::delivery::take_summary())
+                            }))));
+                let outcome = tokio::select! {
+                    biased;
+                    () = reply.closed() => None,
+                    result = dispatch => Some(result),
+                };
+                if let Some(state) = recipients.lock().await.inner.get_mut(&recipient) {
+                    state.in_flight = false;
+                }
+                if let Some(result) = outcome {
                     let _ = reply.send(result);
                 }
             }
         });
     }
+}
+
+fn pacing_timeout_context(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<zeroclaw_api::deadline::DeadlineExceeded>() {
+        error.context(zeroclaw_api::delivery::DeliveryFailure {
+            outcome: zeroclaw_api::delivery::EffectOutcome::PossiblyApplied,
+            chunk_index: 0,
+            total_chunks: 1,
+            confirmed_chunks: 0,
+        })
+    } else {
+        error
+    }
+}
+
+fn pacing_refused() -> anyhow::Error {
+    zeroclaw_api::delivery::DeliveryFailure {
+        outcome: zeroclaw_api::delivery::EffectOutcome::NotStarted,
+        chunk_index: 0,
+        total_chunks: 1,
+        confirmed_chunks: 0,
+    }
+    .into()
 }
 
 /// Redact a recipient identifier for log surfaces. The privacy contract
@@ -339,7 +370,11 @@ impl Channel for PacedChannel {
             .await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    fn permits_queued_recovery(&self, msg: &zeroclaw_api::channel::ChannelMessage) -> bool {
+        self.inner.permits_queued_recovery(msg)
+    }
+
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         self.inner.listen(tx).await
     }
 
@@ -596,7 +631,20 @@ mod tests {
         fn name(&self) -> &str {
             "counting"
         }
-        async fn send(&self, _message: &SendMessage) -> Result<()> {
+        async fn send(&self, message: &SendMessage) -> Result<()> {
+            if message.content == "assert-context" {
+                assert!(zeroclaw_api::delivery::current_journal().is_some());
+                assert!(zeroclaw_api::deadline::current().is_some());
+                assert_eq!(
+                    zeroclaw_api::conversation::current().unwrap().recipient,
+                    "fixture"
+                );
+                zeroclaw_api::delivery::record_summary(zeroclaw_api::delivery::DeliverySummary {
+                    outcome: zeroclaw_api::delivery::EffectOutcome::Confirmed,
+                    confirmed_chunks: 1,
+                    total_chunks: 1,
+                });
+            }
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -604,7 +652,7 @@ mod tests {
             self.final_sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
             Ok(())
         }
         fn supports_draft_updates(&self) -> bool {
@@ -646,7 +694,7 @@ mod tests {
         async fn send(&self, _message: &SendMessage) -> Result<()> {
             Ok(())
         }
-        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
             Ok(())
         }
         async fn update_draft_progress(
@@ -704,7 +752,7 @@ mod tests {
         async fn send(&self, _message: &SendMessage) -> Result<()> {
             Ok(())
         }
-        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
             Ok(())
         }
         async fn create_room(&self, options: &RoomCreationOptions) -> Result<String> {
@@ -827,7 +875,117 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queue_overflow_drops_newest_and_warns() {
+    async fn queued_send_carries_its_journal_deadline_and_positive_acknowledgement() {
+        struct Journal;
+        #[async_trait]
+        impl zeroclaw_api::delivery::DeliveryJournal for Journal {
+            async fn claim(
+                &self,
+                _: zeroclaw_api::delivery::ChunkReceipt,
+            ) -> Result<Option<zeroclaw_api::delivery::ChunkReceipt>> {
+                Ok(None)
+            }
+            async fn finish(&self, _: zeroclaw_api::delivery::ChunkReceipt) -> Result<()> {
+                Ok(())
+            }
+        }
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = PacedChannel::wrap(
+            counting.clone(),
+            &PacingFixture {
+                interval_secs: 1,
+                depth: 4,
+            },
+        );
+        paced
+            .send(&SendMessage::new("first", "fixture"))
+            .await
+            .unwrap();
+        let route = zeroclaw_api::conversation::ConversationRoute {
+            channel: "fixture".into(),
+            recipient: "fixture".into(),
+            sender: "fixture".into(),
+            thread: None,
+            reply_to: "fixture-inbound".into(),
+        };
+        zeroclaw_api::delivery::SUMMARY
+            .scope(
+                std::sync::Mutex::new(None),
+                zeroclaw_api::delivery::JOURNAL.scope(
+                    Some(Arc::new(Journal) as Arc<dyn zeroclaw_api::delivery::DeliveryJournal>),
+                    zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
+                        Some(route),
+                        zeroclaw_api::deadline::PARENT.scope(
+                            Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+                            async {
+                                paced
+                                    .send(&SendMessage::new("assert-context", "fixture"))
+                                    .await
+                                    .unwrap();
+                                let ack = zeroclaw_api::delivery::take_summary().unwrap();
+                                assert_eq!(
+                                    ack.outcome,
+                                    zeroclaw_api::delivery::EffectOutcome::Confirmed
+                                );
+                                assert_eq!(ack.confirmed_chunks, 1);
+                            },
+                        ),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(counting.sends.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn expired_or_cancelled_paced_send_never_reaches_the_adapter_later() {
+        let counting = Arc::new(CountingChannel {
+            sends: AtomicUsize::new(0),
+            final_sends: AtomicUsize::new(0),
+            finalize_drafts: AtomicUsize::new(0),
+        });
+        let paced = PacedChannel::wrap(
+            counting.clone(),
+            &PacingFixture {
+                interval_secs: 1,
+                depth: 4,
+            },
+        );
+        paced
+            .send(&SendMessage::new("first", "fixture"))
+            .await
+            .unwrap();
+        let error = zeroclaw_api::deadline::PARENT
+            .scope(
+                Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+                paced.send(&SendMessage::new("expired", "fixture")),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<zeroclaw_api::delivery::DeliveryFailure>());
+        assert!(error.is::<zeroclaw_api::deadline::DeadlineExceeded>());
+        let other = paced.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            other.send(&SendMessage::new("cancelled", "fixture")).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(counting.sends.load(Ordering::SeqCst), 1);
+        paced
+            .send(&SendMessage::new("next", "fixture"))
+            .await
+            .unwrap();
+        assert_eq!(counting.sends.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_returns_typed_non_submission() {
         let counting = Arc::new(CountingChannel {
             sends: AtomicUsize::new(0),
             final_sends: AtomicUsize::new(0),
@@ -840,8 +998,7 @@ mod tests {
         };
         let paced = PacedChannel::wrap(inner, &cfg);
         // First send fires immediately and starts the floor (next allowed
-        // ~1s out). It also takes no path through the queue, so the worker
-        // is not yet spawned.
+        // ~1s out). The idle recipient worker exits after acknowledging it.
         paced
             .send(&SendMessage::new("first", "alice"))
             .await
@@ -864,11 +1021,18 @@ mod tests {
         // lock acquire and into the queue. 50ms is well inside the 1s
         // pacing floor so the worker hasn't drained anything yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        // The third lands while the queue is full → drop + WARN, returns Ok.
-        paced
+        // The third lands while the queue is full; it cannot claim success.
+        let error = paced
             .send(&SendMessage::new("overflow", "alice"))
             .await
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+                .unwrap()
+                .outcome,
+            zeroclaw_api::delivery::EffectOutcome::NotStarted
+        );
         // Allow the workers to drain at the 1s floor.
         let (a, b) = tokio::join!(h_a, h_b);
         a.unwrap().unwrap();
@@ -1073,6 +1237,7 @@ mod tests {
     struct GatedChannel {
         sends: AtomicUsize,
         gate: tokio::sync::Semaphore,
+        entered: tokio::sync::Notify,
     }
 
     impl Attributable for GatedChannel {
@@ -1090,15 +1255,52 @@ mod tests {
             "gated"
         }
         async fn send(&self, _message: &SendMessage) -> Result<()> {
+            self.entered.notify_one();
             // Block until the test grants a permit, then count the send.
             let permit = self.gate.acquire().await.unwrap();
             permit.forget();
             self.sends.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
-        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_active_send_drops_adapter_work_and_unblocks_recipient() {
+        let gated = Arc::new(GatedChannel {
+            sends: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+            entered: tokio::sync::Notify::new(),
+        });
+        let paced = PacedChannel::wrap(
+            gated.clone(),
+            &PacingFixture {
+                interval_secs: 1,
+                depth: 4,
+            },
+        );
+        let first = paced.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            first.send(&SendMessage::new("cancelled", "fixture")).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), gated.entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // Only the next operation may consume this permit. A detached first
+        // send would consume it and leave the second send permanently blocked.
+        gated.gate.add_permits(1);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            paced.send(&SendMessage::new("next", "fixture")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(gated.sends.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1106,10 +1308,11 @@ mod tests {
         let gated = Arc::new(GatedChannel {
             sends: AtomicUsize::new(0),
             gate: tokio::sync::Semaphore::new(0),
+            entered: tokio::sync::Notify::new(),
         });
         let inner: Arc<dyn Channel> = gated.clone();
         // Sub-second floor: by the time the second send arrives the floor has
-        // already elapsed, so only the `in_flight` marker — not the floor —
+        // already elapsed, so only the single recipient worker — not the floor —
         // can keep the second send off the immediate path.
         let cfg = PacingFixture {
             interval_secs: 1,

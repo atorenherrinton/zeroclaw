@@ -967,7 +967,7 @@ impl Channel for WhatsAppChannel {
         Ok(Some(attributed))
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // WhatsApp uses webhooks (push-based), not polling.
         // Messages are received via the gateway's /whatsapp endpoint.
         // This method keeps the channel "alive" but doesn't actively poll.

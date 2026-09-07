@@ -1031,9 +1031,7 @@ mod tests {
     use super::*;
     use parking_lot::{Mutex, RwLock};
     use std::collections::HashMap;
-    use zeroclaw_api::channel::{
-        Channel, ChannelMessage, ForgeApiRequest, ForgeApiResponse, SendMessage,
-    };
+    use zeroclaw_api::channel::{Channel, ForgeApiRequest, ForgeApiResponse, SendMessage};
 
     struct ForgeMock {
         last: Mutex<Option<ForgeApiRequest>>,
@@ -1070,10 +1068,7 @@ mod tests {
         async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn forge_request(

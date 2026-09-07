@@ -32,13 +32,22 @@ pub(crate) fn build_iteration_tool_specs(
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
+    intent: Option<&str>,
 ) -> Result<IterationToolSpecs> {
+    let discovery_available = tools_registry.iter().any(|tool| {
+        tool.name() == "tool_search" && !excluded_tools.iter().any(|name| name == "tool_search")
+    });
     // Rebuild tool_specs each iteration so newly activated deferred tools appear.
     let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
         .filter(|tool| {
             crate::tools::model_may_invoke_tool(tool.name())
                 && !excluded_tools.iter().any(|ex| ex == tool.name())
+                && zeroclaw_tools::schema_selection::relevant(
+                    tool.name(),
+                    intent,
+                    discovery_available,
+                )
         })
         .map(|tool| tool.spec())
         .collect();
@@ -59,6 +68,11 @@ pub(crate) fn build_iteration_tool_specs(
         for spec in activated_tools.tool_specs() {
             if crate::tools::model_may_invoke_tool(&spec.name)
                 && !excluded_tools.iter().any(|ex| ex == &spec.name)
+                && zeroclaw_tools::schema_selection::relevant(
+                    &spec.name,
+                    intent,
+                    discovery_available,
+                )
             {
                 tool_specs.push(spec);
             }
@@ -73,6 +87,10 @@ pub(crate) fn build_iteration_tool_specs(
         .native_tool_calling
         && !tool_specs.is_empty();
 
+    ::zeroclaw_log::record!(DEBUG,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(serde_json::json!({"tool_schema_count":tool_specs.len(),"tool_schema_bytes":serde_json::to_vec(&tool_specs)?.len()})),
+        "Intent/deferred tool schema assembly budget");
     Ok(IterationToolSpecs {
         tool_specs,
         known_tool_names,
@@ -236,6 +254,7 @@ mod tests {
             &[],
             &[],
             Some(&activated),
+            None,
         )
         .expect("poisoned activated-tools lock should recover for read");
         assert!(
@@ -256,7 +275,7 @@ mod tests {
         ];
 
         let specs =
-            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &tools, &[], None)
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &tools, &[], None, None)
                 .expect("tool specs should build");
 
         assert!(specs.tool_specs.iter().any(|spec| spec.name == "shell"));
@@ -268,9 +287,15 @@ mod tests {
     fn iteration_tool_specs_recomputes_native_mode_for_active_provider() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let tool = Box::new(CountingTool::new("read_file", invocations));
-        let mut specs =
-            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &[tool], &[], None)
-                .expect("native provider with tools should build specs");
+        let mut specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &[tool],
+            &[],
+            None,
+            None,
+        )
+        .expect("native provider with tools should build specs");
         assert!(specs.use_native_tools);
 
         specs.refresh_native_tool_mode(&PromptToolsProvider, "test-model");

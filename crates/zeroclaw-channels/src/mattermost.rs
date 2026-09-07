@@ -745,7 +745,7 @@ impl Channel for MattermostChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         match self.listen_mode {
             MattermostListenMode::Polling => self.listen_polling(tx).await,
             MattermostListenMode::Websocket => self.listen_websocket(tx).await,
@@ -826,7 +826,7 @@ impl Channel for MattermostChannel {
 }
 
 impl MattermostChannel {
-    async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen_polling(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Resolve auth up front so misconfiguration fails fast at listen-time.
         let initial_token = self.token().await?.to_string();
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
@@ -921,7 +921,7 @@ impl MattermostChannel {
         }
     }
 
-    async fn listen_websocket(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen_websocket(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let token = self.token().await?.to_string();
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
         let auto_discover = self.scoped_channel_ids().is_none();
@@ -1151,7 +1151,7 @@ impl MattermostChannel {
         last_create_at: i64,
         channel_id: &str,
         is_direct: bool,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> bool {
         let effective_text = if post
             .get("message")
@@ -1190,7 +1190,7 @@ impl MattermostChannel {
         bot_username: &str,
         bootstrap_ms: i64,
         cursors: &mut HashMap<String, i64>,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> bool {
         let cursor = *cursors.entry(target.id.clone()).or_insert(bootstrap_ms);
 

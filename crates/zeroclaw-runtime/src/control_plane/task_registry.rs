@@ -14,43 +14,12 @@ pub enum TaskKind {
     Goal,
     /// Peer inbox task.
     PeerInbox,
+    /// Accepted channel turn, supervised by the same registry as delegates.
+    ChannelTurn,
     // EPIC E: RemoteTurn
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    /// Task is currently eligible to execute or already executing.
-    Running,
-    /// Task is intentionally stopped but resumable.
-    Paused,
-    /// Task finished successfully.
-    Completed,
-    /// Task ended with an error.
-    Failed,
-    /// Task was intentionally cancelled.
-    Cancelled,
-    /// Written by the reaper/recovery sweep from OUTSIDE the task body — the state
-    /// today's enum literally cannot represent (task-lifecycle-supervision gap).
-    Lost,
-    /// Heartbeat exceeded its grace window / the task passed `max_runtime`.
-    TimedOut,
-}
-
-impl TaskStatus {
-    /// A task is terminal once it can no longer transition. The reaper only
-    /// reconciles non-terminal records.
-    pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            TaskStatus::Completed
-                | TaskStatus::Failed
-                | TaskStatus::Cancelled
-                | TaskStatus::Lost
-                | TaskStatus::TimedOut
-        )
-    }
-}
+pub use zeroclaw_api::turn::TaskStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
@@ -107,6 +76,41 @@ pub struct TaskRecord {
 pub trait TaskRegistry: Send + Sync {
     /// Register a new unit of work. Idempotent on `rec.id`.
     async fn create(&self, rec: TaskRecord) -> anyhow::Result<()>;
+    /// Atomic durable admission and input checkpoint. False is a duplicate,
+    /// never permission to replay an unfinished or uncertain external effect.
+    async fn admit_channel_turn(&self, _rec: TaskRecord, _input: String) -> anyhow::Result<bool> {
+        anyhow::bail!("channel turn admission unavailable")
+    }
+    /// Bounded recovery of queued turns that provably never started execution.
+    /// Other phases are quarantined. The current router must revalidate policy.
+    async fn take_recoverable_channel_turns(
+        &self,
+        _boot_id: &str,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        anyhow::bail!("channel recovery unavailable")
+    }
+    /// Bind routing after admission, before execution, using the current router.
+    async fn assign_channel_turn(
+        &self,
+        _id: &str,
+        _agent: &str,
+        _boot_id: &str,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("channel routing assignment unavailable")
+    }
+    async fn checkpoint_channel_turn(
+        &self,
+        _id: &str,
+        _status: TaskStatus,
+        _output: Option<String>,
+        _delivered: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("channel turn checkpoint unavailable")
+    }
+    /// Operator-only recovery evidence, not an instruction or permission to replay.
+    async fn channel_turn_input(&self, _id: &str) -> anyhow::Result<Option<String>> {
+        anyhow::bail!("channel turn input unavailable")
+    }
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;
     /// Transition `id` to `status`, optionally recording terminal output/error.

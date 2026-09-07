@@ -367,7 +367,7 @@ impl Channel for NotionChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Detect status property type
         match self.detect_status_type().await {
             Ok(st) => {

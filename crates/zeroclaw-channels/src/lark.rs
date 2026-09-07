@@ -773,7 +773,7 @@ pub struct LarkChannel {
 struct LarkHttpAppState {
     verification_token: String,
     channel: Arc<LarkChannel>,
-    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    tx: zeroclaw_api::inbound::Sender,
 }
 
 fn lark_webhook_auth_configured(verification_token: &str, encrypt_key: Option<&str>) -> bool {
@@ -1415,7 +1415,7 @@ impl LarkChannel {
     /// WS long-connection event loop.  Returns Ok(()) when the connection closes
     /// (the caller reconnects).
     #[allow(clippy::too_many_lines)]
-    async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen_ws(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
         let (wss_url, client_config) = self.get_ws_endpoint().await?;
         let service_id = wss_url
@@ -2915,7 +2915,7 @@ impl Channel for LarkChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         use zeroclaw_config::schema::LarkReceiveMode;
         match self.receive_mode {
             LarkReceiveMode::Websocket => self.listen_ws(tx).await,
@@ -3886,10 +3886,7 @@ impl LarkChannel {
 impl LarkChannel {
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
-    pub async fn listen_http(
-        &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    pub async fn listen_http(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         if !lark_webhook_auth_configured(&self.verification_token, self.encrypt_key.as_deref()) {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -4312,7 +4309,7 @@ mod tests {
             State(LarkHttpAppState {
                 verification_token: verification_token.to_string(),
                 channel: Arc::new(make_channel()),
-                tx,
+                tx: tx.into(),
             }),
             axum::http::HeaderMap::new(),
             axum::body::Bytes::from(serde_json::to_vec(&payload).unwrap()),
@@ -6634,7 +6631,7 @@ mod tests {
         let state = LarkHttpAppState {
             verification_token: "test_verification_token".to_string(),
             channel: Arc::clone(&channel),
-            tx,
+            tx: tx.into(),
         };
         let envelope = |approval_id: &str, responder: &str, destination: &str, decision: &str| {
             serde_json::json!({

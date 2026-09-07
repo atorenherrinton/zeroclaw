@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
-use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, oneshot};
 
 use matrix_sdk::{
     Client,
@@ -29,8 +29,8 @@ use matrix_sdk::{
 };
 
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, DraftProgress,
-    DraftProgressKind, RoomCreationOptions, RoomVisibility, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, DraftProgress, DraftProgressKind,
+    RoomCreationOptions, RoomVisibility, SendMessage,
 };
 use zeroclaw_config::schema::{MatrixConfig, MatrixStreamMode};
 use zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER;
@@ -2055,7 +2055,7 @@ mod inbound {
         },
     };
     use serde_json::Value as JsonValue;
-    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
     use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
@@ -2074,7 +2074,7 @@ mod inbound {
         pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         pub transcription: Option<super::TranscriptionResolver>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
-        pub tx: mpsc::Sender<ChannelMessage>,
+        pub tx: zeroclaw_api::inbound::Sender,
         pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
@@ -4444,7 +4444,7 @@ impl Channel for MatrixChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let client = self.ensure_client().await?.clone();
         let user_id = client
             .user_id()
@@ -5579,7 +5579,7 @@ mod tests {
         fn handler_ctx(
             stt_url: &str,
             workspace: &std::path::Path,
-            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            tx: zeroclaw_api::inbound::Sender,
         ) -> HandlerCtx {
             HandlerCtx {
                 config: Arc::new(MatrixConfig::default()),
@@ -5684,7 +5684,7 @@ mod tests {
             let ctx = handler_ctx(
                 &format!("{}/v1/transcribe", stt.uri()),
                 workspace.path(),
-                tx,
+                tx.into(),
             );
 
             // The production handlers, registered exactly as `run_sync_loop`
@@ -5758,7 +5758,7 @@ mod tests {
             let ctx = handler_ctx(
                 &format!("{}/v1/transcribe", stt.uri()),
                 workspace.path(),
-                tx,
+                tx.into(),
             );
 
             let _guards = register_event_handlers(&client, &ctx);
@@ -5832,7 +5832,7 @@ mod tests {
             let ctx = handler_ctx(
                 &format!("{}/v1/transcribe", stt.uri()),
                 workspace.path(),
-                tx,
+                tx.into(),
             );
 
             let _guards = register_event_handlers(&client, &ctx);
@@ -5885,9 +5885,7 @@ mod tests {
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
-        fn mention_only_handler_ctx(
-            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> HandlerCtx {
+        fn mention_only_handler_ctx(tx: zeroclaw_api::inbound::Sender) -> HandlerCtx {
             let mut ctx = handler_ctx(
                 "http://127.0.0.1:9/v1/transcribe",
                 std::path::Path::new("/tmp"),
@@ -5963,7 +5961,7 @@ mod tests {
             mount_parent_event(&matrix, parent, 1).await;
 
             let (tx, mut rx) = mpsc::channel(4);
-            let ctx = mention_only_handler_ctx(tx);
+            let ctx = mention_only_handler_ctx(tx.into());
             let _guards = register_event_handlers(&client, &ctx);
 
             let json = plain_reply_event(
@@ -5999,7 +5997,7 @@ mod tests {
             mount_parent_event(&matrix, parent, 1).await;
 
             let (tx, mut rx) = mpsc::channel(4);
-            let ctx = mention_only_handler_ctx(tx);
+            let ctx = mention_only_handler_ctx(tx.into());
             let _guards = register_event_handlers(&client, &ctx);
 
             let json = plain_reply_event(
@@ -6043,7 +6041,7 @@ mod tests {
             let mut ctx = handler_ctx(
                 &format!("{}/v1/transcribe", stt.uri()),
                 workspace.path(),
-                tx,
+                tx.into(),
             );
             let mut config = (*ctx.config).clone();
             config.mention_only = true;
@@ -6086,7 +6084,7 @@ mod tests {
                 peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
                 transcription: None,
                 workspace_dir: None,
-                tx,
+                tx: tx.into(),
                 pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
                 threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
                 bot_user_id: user_id!("@bot:localhost").to_owned(),
@@ -6866,7 +6864,7 @@ mod tests {
                 peer_resolver: Arc::clone(&channel.peer_resolver),
                 transcription: channel.transcription.clone(),
                 workspace_dir: channel.workspace_dir.clone(),
-                tx,
+                tx: tx.into(),
                 pending_approvals: Arc::clone(&channel.pending_approvals),
                 threads_seen: Arc::clone(&channel.threads_seen),
                 bot_user_id: bot_user_id.clone(),

@@ -3916,7 +3916,7 @@ impl SlackChannel {
     async fn handle_socket_mode_interactive(
         &self,
         envelope: &serde_json::Value,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         bot_user_id: &str,
     ) -> bool {
         if let Some((token, response, responder, channel)) =
@@ -4083,7 +4083,7 @@ impl SlackChannel {
 
     async fn listen_socket_mode(
         &self,
-        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: zeroclaw_api::inbound::Sender,
         bot_user_id: &str,
         scoped_channels: Option<Vec<String>>,
     ) -> anyhow::Result<()> {
@@ -5606,7 +5606,7 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // Cache the bot user id on the struct so `self_handle` (sync,
         // called by the orchestrator's self-loop guard on every inbound)
         // resolves without an additional `auth.test` round-trip.
@@ -8963,7 +8963,7 @@ mod tests {
         }
 
         let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
-        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+        let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx.into()).await });
 
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(6), approved_rx)
@@ -9039,7 +9039,7 @@ mod tests {
             );
         }
 
-        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut inbound_rx) = zeroclaw_api::inbound::channel(4);
         let envelopes = [
             serde_json::json!({
                 "type": "interactive",

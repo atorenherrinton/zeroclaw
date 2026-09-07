@@ -10,7 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_channels::paced_channel::PacedChannel;
 use zeroclaw_config::schema::HasReplyPacing;
 
@@ -63,7 +63,7 @@ impl Channel for RecordingChannel {
         self.sends.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         Ok(())
     }
 }
@@ -139,7 +139,7 @@ async fn telegram_shape_pacing_floor_holds_between_consecutive_sends() {
 }
 
 #[tokio::test]
-async fn whatsapp_web_shape_queue_overflow_drops_newest() {
+async fn whatsapp_web_shape_queue_overflow_reports_non_submission() {
     let events: Arc<Mutex<Vec<(String, String, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
     let counting = Arc::new(RecordingChannel {
         alias: "whatsapp_web_test",
@@ -166,11 +166,18 @@ async fn whatsapp_web_shape_queue_overflow_drops_newest() {
     let h_b =
         zeroclaw_spawn::spawn!(async move { paced_b.send(&SendMessage::new("b", jid)).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // Overflow — queue is full (depth=2). Drop newest, returns Ok.
-    paced
+    // Overflow is a typed refusal; it cannot claim successful delivery.
+    let error = paced
         .send(&SendMessage::new("overflow", jid))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+            .unwrap()
+            .outcome,
+        zeroclaw_api::delivery::EffectOutcome::NotStarted
+    );
     let (a, b) = tokio::join!(h_a, h_b);
     a.unwrap().unwrap();
     b.unwrap().unwrap();

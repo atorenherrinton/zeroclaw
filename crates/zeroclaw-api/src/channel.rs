@@ -727,7 +727,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 
     /// Start listening for incoming messages (long-running)
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+    async fn listen(&self, tx: crate::inbound::Sender) -> anyhow::Result<()>;
+
+    /// Revalidate a durable queued transport message against CURRENT policy.
+    /// Default closed: adapters without a maintained validator require operator recovery.
+    fn permits_queued_recovery(&self, _message: &ChannelMessage) -> bool {
+        false
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -1254,10 +1260,7 @@ mod tests {
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: crate::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         fn self_handle(&self) -> Option<String> {

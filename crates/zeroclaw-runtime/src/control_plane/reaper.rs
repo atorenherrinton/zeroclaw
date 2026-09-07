@@ -88,6 +88,12 @@ pub async fn sweep(
             if let Some(beat) = rec.heartbeat_at.as_deref()
                 && age_secs(beat, now).is_some_and(|age| age > max_runtime_secs)
             {
+                if rec.kind == super::task_registry::TaskKind::ChannelTurn {
+                    store
+                        .checkpoint_channel_turn(&rec.id, TaskStatus::Uncertain, None, false)
+                        .await?;
+                    continue;
+                }
                 store
                     .update_status(
                         &rec.id,

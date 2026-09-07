@@ -70,6 +70,7 @@ pub mod model_routing_config;
 pub mod node_capabilities;
 pub mod notion_tool;
 pub mod opencode_cli;
+pub mod output_budget;
 pub mod pipeline;
 pub mod poll;
 pub mod project_intel;
@@ -138,3 +139,5 @@ mod memory_tool_names_guard {
         );
     }
 }
+
+pub mod schema_selection;

@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 // Use tokio_rustls's re-export of rustls types
@@ -416,7 +416,7 @@ impl Channel for IrcChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let mut current_nick = self.nickname.clone();
         ::zeroclaw_log::record!(
             INFO,

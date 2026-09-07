@@ -67,7 +67,7 @@ impl Channel for TestChannel {
         Ok(())
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // System tests drive the agent via turn() rather than channel listen,
         // so this is a no-op. For channel-driven tests, messages are injected
         // via the MPSC sender directly.

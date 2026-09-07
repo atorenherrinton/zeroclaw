@@ -5,8 +5,7 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 
 pub use zeroclaw_config::scattered_types::ClawdTalkConfig;
 
@@ -300,7 +299,7 @@ impl Channel for ClawdTalkChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // ClawdTalk listens for incoming calls via webhooks
         // This would typically be handled by the gateway module
         // For now, we signal that this channel is ready and wait indefinitely

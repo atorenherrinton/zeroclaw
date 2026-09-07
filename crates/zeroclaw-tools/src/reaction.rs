@@ -207,7 +207,7 @@ impl Tool for ReactionTool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use zeroclaw_api::channel::{ChannelMessage, SendMessage};
+    use zeroclaw_api::channel::SendMessage;
 
     struct MockChannel {
         reaction_added: AtomicBool,
@@ -257,10 +257,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 

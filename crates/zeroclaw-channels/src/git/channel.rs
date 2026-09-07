@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_config::schema::GitConfig;
 
 use super::events::{self, EventFilter, GitEvent};
@@ -282,7 +282,7 @@ impl GitChannel {
         filter: &EventFilter<'_>,
         plan: &TransportPlan,
         state: &mut PollState,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> Result<bool, GitChannelError> {
         let repo_key = repo.to_string();
         let mut batch: Vec<GitEvent> = Vec::new();
@@ -349,7 +349,7 @@ impl GitChannel {
         &self,
         event: GitEvent,
         filter: &EventFilter<'_>,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> bool {
         let msg = match router::resolve_route(event.event_type(), &self.cfg.events) {
             RouteAction::Ignore => return true,
@@ -455,7 +455,7 @@ impl Channel for GitChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let (mention_handle, bot_login) = self.ensure_identity().await?;
         let repos = self.resolve_repos().await?;
         let interval = Duration::from_secs(self.cfg.poll_interval_secs.max(MIN_POLL_INTERVAL_SECS));
@@ -983,7 +983,7 @@ mod tests {
             let plan = default_plan();
             let mut state = PollState::new(now - chrono::Duration::hours(1));
             let repo = RepoRef::parse("octo/repo").unwrap();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             let keep = ch
                 .poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
@@ -1005,7 +1005,7 @@ mod tests {
 
             // Second tick: same fixtures come back from the mock, but the
             // dedup set drops them — nothing is re-forwarded.
-            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            let (tx2, mut rx2) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
                 .await
                 .unwrap();
@@ -1054,7 +1054,7 @@ mod tests {
             let filter = test_filter();
             let mut state = PollState::new(now - chrono::Duration::hours(1));
             let repo = RepoRef::parse("octo/repo").unwrap();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
                 .unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
 
             // Tick 1: comment arrives via the targeted endpoint AND the
             // feed — delivered exactly once.
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
                 .unwrap();
@@ -1149,7 +1149,7 @@ mod tests {
 
             // Tick 2: the stored ETag is sent and the feed answers 304
             // (the wiremock `.expect(1)` counters pin one 200 + one 304).
-            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            let (tx2, mut rx2) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
                 .await
                 .unwrap();
@@ -1220,7 +1220,7 @@ mod tests {
 
             // Tick 1: nothing surfaced; the cursor holds at the pending
             // run's creation time instead of skipping past it.
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
                 .unwrap();
@@ -1232,7 +1232,7 @@ mod tests {
             );
 
             // Tick 2: the completion is picked up.
-            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            let (tx2, mut rx2) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
                 .await
                 .unwrap();
@@ -1261,7 +1261,7 @@ mod tests {
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
             let repo = RepoRef::parse("octo/repo").unwrap();
-            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let (tx, _rx) = zeroclaw_api::inbound::channel(8);
             // The listen loop logs this and keeps polling other repos/ticks.
             let err = ch
                 .poll_repo(&repo, &filter, &plan, &mut state, &tx)
@@ -1334,7 +1334,7 @@ mod tests {
             let plan = default_plan();
             let mut state = PollState::new(chrono::Utc::now());
             let repo = RepoRef::parse("octo/repo").unwrap();
-            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let (tx, _rx) = zeroclaw_api::inbound::channel(8);
 
             let err = ch
                 .poll_repo(&repo, &filter, &plan, &mut state, &tx)
@@ -1384,7 +1384,7 @@ mod tests {
             let repo = RepoRef::parse("octo/repo").unwrap();
 
             // First tick errors on the Comments stream.
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             let err = ch
                 .poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
@@ -1406,7 +1406,7 @@ mod tests {
                 .await;
             mount_empty(&server, "/repos/octo/repo/issues/comments").await;
 
-            let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+            let (tx2, mut rx2) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx2)
                 .await
                 .unwrap();
@@ -1463,7 +1463,7 @@ mod tests {
             let plan = default_plan();
             let mut state = PollState::new(now - chrono::Duration::hours(1));
             let repo = RepoRef::parse("octo/repo").unwrap();
-            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let (tx, mut rx) = zeroclaw_api::inbound::channel(8);
             ch.poll_repo(&repo, &filter, &plan, &mut state, &tx)
                 .await
                 .unwrap();

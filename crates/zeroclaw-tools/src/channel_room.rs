@@ -333,7 +333,7 @@ mod tests {
     use parking_lot::RwLock;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use zeroclaw_api::channel::{ChannelMessage, SendMessage};
+    use zeroclaw_api::channel::SendMessage;
 
     struct MockChannel {
         created: AtomicUsize,
@@ -383,10 +383,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 

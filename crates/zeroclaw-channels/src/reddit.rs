@@ -331,7 +331,7 @@ impl Channel for RedditChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         // Initial auth
         self.refresh_access_token().await?;
 

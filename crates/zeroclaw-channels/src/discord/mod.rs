@@ -1927,7 +1927,7 @@ impl Channel for DiscordChannel {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let bot_user_id = Self::bot_user_id_from_token(&self.bot_token).unwrap_or_default();
         let mut had_ready = false;
 

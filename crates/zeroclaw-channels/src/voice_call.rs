@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -283,7 +283,7 @@ impl VoiceCallChannel {
         &self,
         call_id: &str,
         from_number: &str,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> Result<()> {
         let record = CallRecord {
             call_id: call_id.to_string(),
@@ -436,7 +436,7 @@ impl Channel for VoiceCallChannel {
         Ok(())
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         let port = self.config.webhook_port;
         let active_calls = self.active_calls.clone();
         let _tx = tx.clone();
@@ -643,7 +643,7 @@ mod tests {
     #[tokio::test]
     async fn handle_inbound_call_creates_record() {
         let channel = VoiceCallChannel::new("testbot", test_config());
-        let (tx, mut rx) = mpsc::channel(10);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(10);
 
         channel
             .handle_inbound_call("call-123", "+15559876543", &tx)
@@ -666,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn handle_status_update_transitions_state() {
         let channel = VoiceCallChannel::new("testbot", test_config());
-        let (tx, _rx) = mpsc::channel(10);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(10);
 
         channel
             .handle_inbound_call("call-456", "+15559876543", &tx)
@@ -694,7 +694,7 @@ mod tests {
     #[tokio::test]
     async fn add_transcript_entry_records_entries() {
         let channel = VoiceCallChannel::new("testbot", test_config());
-        let (tx, _rx) = mpsc::channel(10);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(10);
 
         channel
             .handle_inbound_call("call-789", "+15559876543", &tx)
@@ -718,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn save_transcript_creates_file() {
         let channel = VoiceCallChannel::new("testbot", test_config());
-        let (tx, _rx) = mpsc::channel(10);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(10);
         let workspace = tempfile::tempdir().unwrap();
 
         channel
@@ -756,7 +756,7 @@ mod tests {
     #[tokio::test]
     async fn active_calls_lists_all() {
         let channel = VoiceCallChannel::new("testbot", test_config());
-        let (tx, _rx) = mpsc::channel(10);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(10);
 
         channel
             .handle_inbound_call("call-a", "+15551111111", &tx)
@@ -829,7 +829,7 @@ mod tests {
         let mut config = test_config();
         config.transcription_logging = false;
         let channel = VoiceCallChannel::new("testbot", config);
-        let (tx, _rx) = mpsc::channel(10);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(10);
         let workspace = tempfile::tempdir().unwrap();
 
         channel

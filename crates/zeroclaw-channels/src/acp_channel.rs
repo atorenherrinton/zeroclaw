@@ -5,7 +5,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, SendMessage,
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -304,7 +304,7 @@ impl Channel for AcpChannel {
         Ok(())
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         anyhow::bail!(
             "AcpChannel.listen is not supported (free-form ask_user awaits ACP elicitation Phase 2)"
         )
@@ -648,7 +648,7 @@ mod tests {
             ElicitationCapabilities::default(),
         );
         let (tx, _) = mpsc::channel(1);
-        let res = ch.listen(tx).await;
+        let res = ch.listen(tx.into()).await;
         assert!(res.is_err());
     }
 

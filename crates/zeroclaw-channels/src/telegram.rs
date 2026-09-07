@@ -3978,7 +3978,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     async fn process_update(
         &self,
         update: &serde_json::Value,
-        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
         offset: &mut i64,
         transient_retry: &mut Option<(i64, u32)>,
     ) -> UpdateOutcome {
@@ -4477,7 +4477,18 @@ impl Channel for TelegramChannel {
         self.send_text_chunks(&content, chat_id, thread_id).await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    fn permits_queued_recovery(&self, msg: &ChannelMessage) -> bool {
+        msg.channel == "telegram"
+            && msg.channel_alias.as_deref() == Some(self.alias.as_str())
+            && self.is_user_allowed(&msg.sender)
+            // Group mention/reply evidence is not retained in the transport
+            // checkpoint. Fail closed when CURRENT policy requires it.
+            && !(self.mention_only && msg.reply_target.starts_with('-'))
+            && msg.attachments.is_empty()
+            && msg.internal_sop_event.is_none()
+    }
+
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let mut offset: i64 = 0;
         // Single-slot transient-retry tracker: (update_id, attempts so far).
         // One slot is sufficient because a transient failure via
@@ -5219,6 +5230,36 @@ mod tests {
     }
 
     #[test]
+    fn queued_recovery_rechecks_current_allowlist_and_group_activation_policy() {
+        let mut ch = TelegramChannel::new(
+            "fake-token".into(),
+            "fixture",
+            Arc::new(|| vec!["42".into()]),
+            false,
+        );
+        let mut msg = ChannelMessage {
+            id: "fixture".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("fixture".into()),
+            sender: "42".into(),
+            reply_target: "42".into(),
+            ..Default::default()
+        };
+        assert!(ch.permits_queued_recovery(&msg));
+        msg.sender = "revoked".into();
+        assert!(!ch.permits_queued_recovery(&msg));
+        msg.sender = "42".into();
+        msg.reply_target = "-100:3".into();
+        assert!(ch.permits_queued_recovery(&msg));
+        ch.mention_only = true;
+        assert!(!ch.permits_queued_recovery(&msg));
+        msg.reply_target = "42".into();
+        assert!(ch.permits_queued_recovery(&msg));
+        msg.channel_alias = Some("different".into());
+        assert!(!ch.permits_queued_recovery(&msg));
+    }
+
+    #[test]
     fn telegram_channel_name() {
         let mention_only = false;
         let ch = TelegramChannel::new(
@@ -5705,7 +5746,7 @@ mod tests {
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let _ = tokio::time::timeout(Duration::from_millis(500), channel.listen(tx)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), channel.listen(tx.into())).await;
 
         assert_eq!(
             channel.listener_health(),
@@ -5754,7 +5795,7 @@ mod tests {
         // any deadline short enough to keep the test quick. The listen branch
         // never finishes on its own, so the watcher is what ends the select.
         let observed = tokio::select! {
-            _ = channel.listen(tx) => channel.listener_health(),
+            _ = channel.listen(tx.into()) => channel.listener_health(),
             health = async {
                 for _ in 0..500 {
                     let health = channel.listener_health();
@@ -8469,7 +8510,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -8534,7 +8575,7 @@ mod tests {
         .with_api_base(mock_server.uri());
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let handle = zeroclaw_spawn::spawn!(async move { ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { ch.listen(tx.into()).await });
 
         let first = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -8606,7 +8647,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -8700,7 +8741,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         let first_message = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -8815,7 +8856,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -8909,7 +8950,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
@@ -9048,7 +9089,7 @@ mod tests {
 
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         // A callback is terminal for inbound processing, so the offset must
         // advance past the whole batch; waiting on that also guarantees every
@@ -9408,7 +9449,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         // The update behind the permanently rejected one must arrive.
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
@@ -9481,7 +9522,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         // The update is retried, not skipped, and eventually delivered.
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
@@ -9567,7 +9608,7 @@ mod tests {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let listen_ch = ch.clone();
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         // The update must survive the 408s and arrive after recovery.
         let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
@@ -9957,7 +9998,7 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let listen_ch = Arc::clone(&ch);
-        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx.into()).await });
 
         telegram_expect_main_loop_offset(
             &mock_server,
@@ -12023,7 +12064,7 @@ mod tests {
         let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1);
         let listener = channel.clone();
         let listener_task =
-            zeroclaw_spawn::spawn!(async move { listener.listen(message_tx).await });
+            zeroclaw_spawn::spawn!(async move { listener.listen(message_tx.into()).await });
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -12398,7 +12439,7 @@ mod tests {
             },
         );
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(4);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(4);
         let mut offset = 0i64;
         let mut transient_retry = None;
         let update = serde_json::json!({
@@ -12865,7 +12906,7 @@ mod tests {
         assert_eq!(body["message_thread_id"], "7");
         assert_eq!(body["reply_parameters"]["message_id"], 66);
         let data = body["reply_markup"]["inline_keyboard"][1][0]["callback_data"].clone();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(4);
         let mut offset = 0;
         let mut retry = None;
         for sender in [9999, 1001] {

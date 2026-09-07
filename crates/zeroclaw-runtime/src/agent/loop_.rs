@@ -3488,7 +3488,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use zeroclaw_api::channel::{
-        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, SendMessage,
     };
     use zeroclaw_providers::{ChatMessage, ToolCall};
     use zeroclaw_tool_call_parser::parse_tool_calls;
@@ -3557,10 +3557,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -5021,10 +5018,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -5070,10 +5064,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
 
@@ -6998,7 +6989,7 @@ mod tests {
     }
 
     #[test]
-    fn should_execute_tools_in_parallel_returns_true_when_cli_has_no_interactive_approvals() {
+    fn should_execute_tools_in_parallel_serializes_unclassified_shell_and_http_effects() {
         let calls = vec![
             ParsedToolCall {
                 name: "shell".to_string(),
@@ -7017,7 +7008,7 @@ mod tests {
         };
         let approval_mgr = ApprovalManager::from_risk_profile(&approval_cfg);
 
-        assert!(should_execute_tools_in_parallel(
+        assert!(!should_execute_tools_in_parallel(
             &calls,
             Some(&approval_mgr)
         ));

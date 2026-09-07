@@ -12,7 +12,7 @@ use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::{
     ApprovalSource, AttributedApprovalResponse, Channel, ChannelApprovalRequest,
-    ChannelApprovalResponse, ChannelMessage, SendMessage,
+    ChannelApprovalResponse, SendMessage,
 };
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
@@ -80,7 +80,7 @@ impl Channel for WsApprovalChannel {
         false
     }
 
-    async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         // The gateway WS path does not act as a message source for the
         // channel orchestrator; turns are driven directly by the WS
         // handler loop. Listen is a no-op for this transport.

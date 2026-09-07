@@ -608,10 +608,7 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn request_approval(
@@ -1773,10 +1770,7 @@ impl zeroclaw_api::channel::Channel for RecordingApprovalChannel {
     async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn listen(
-        &self,
-        _tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         Ok(())
     }
     async fn request_approval(

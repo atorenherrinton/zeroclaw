@@ -555,7 +555,6 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
     use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
-    use zeroclaw_api::channel::ChannelMessage;
 
     // ── pure build_delivery / parse_approval_route ───────────────
 
@@ -737,10 +736,7 @@ mod tests {
             self.sent.lock().unwrap().push(message.clone());
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -764,10 +760,7 @@ mod tests {
         async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         fn supports_outbound_send(&self) -> bool {

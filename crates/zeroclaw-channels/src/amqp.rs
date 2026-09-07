@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use portable_atomic::{AtomicU64, Ordering};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
 
 use futures_util::StreamExt;
 use lapin::{
@@ -149,7 +148,7 @@ impl AmqpChannel {
         // The broker's `redelivered` flag: only a confirmed redelivery coalesces, so a
         // FRESH delivery reusing a message-id is never coalesced/ACKed away.
         redelivered: bool,
-        tx: &mpsc::Sender<ChannelMessage>,
+        tx: &zeroclaw_api::inbound::Sender,
     ) -> DeliveryOutcome {
         let routes_sop = matches!(
             self.dispatch,
@@ -441,7 +440,7 @@ impl Channel for AmqpChannel {
         false
     }
 
-    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         let (_conn, mut consumer) = self.establish_consumer().await?;
 
         zeroclaw_runtime::health::mark_component_ok("amqp");
@@ -795,7 +794,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         )
         .expect("sop_and_agent_loop with handles constructs");
 
-        let (tx, rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, rx) = zeroclaw_api::inbound::channel(1);
         drop(rx);
 
         let outcome = ch
@@ -822,7 +821,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
         )
         .expect("sop_and_agent_loop with handles constructs");
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         let outcome = ch
             .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
             .await;
@@ -843,7 +842,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("sop-only channel with handles constructs");
-        let (tx, _rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(1);
 
         // A second matching delivery is backpressured (slot full). route_delivery must
         // report Deferred so the listener nacks/requeues it, rather than acking the
@@ -869,7 +868,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("sop-only channel with handles constructs");
-        let (tx, _rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(1);
 
         let outcome = ch
             .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)
@@ -1055,7 +1054,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("sop channel constructs");
-        let (tx, _rx) = mpsc::channel::<ChannelMessage>(4);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(4);
         let body = br#"{"name":"curl"}"#;
 
         // Fresh m1 starts a run.
@@ -1102,7 +1101,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("sop channel constructs");
-        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(8);
         let body = br#"{"name":"curl"}"#;
 
         // Same id, both FRESH (redelivered = false) -> both start.
@@ -1134,7 +1133,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("sop channel constructs");
-        let (tx, _rx) = mpsc::channel::<ChannelMessage>(8);
+        let (tx, _rx) = zeroclaw_api::inbound::channel(8);
         let body = br#"{"name":"curl"}"#;
 
         for (mid, redelivered) in [
@@ -1171,7 +1170,7 @@ tr7J6RKtO4OsZS/2KoYL8M+o
             Some(audit),
         )
         .expect("combined channel constructs");
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(4);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(4);
 
         let outcome = ch
             .route_delivery("anitya.update", br#"{"name":"curl"}"#, None, false, &tx)

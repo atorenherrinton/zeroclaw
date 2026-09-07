@@ -11,34 +11,33 @@ fn is_authoritative_with_pid_liveness(
     current_boot_id: &str,
     pid_is_alive: impl Fn(u32) -> bool,
 ) -> bool {
-    // Fail-closed: an UNSTAMPED record (empty owner_boot_id) is never reclaimed by the
-    // boot-mismatch path — otherwise a live task mid-create (record written before the
-    // boot id is stamped) would be reaped by its own daemon. It is only reclaimable if
-    // its owner pid is provably dead (handled below).
-    if !rec.owner_boot_id.is_empty() && rec.owner_boot_id != current_boot_id {
-        // Different, non-empty boot id ⇒ prior-boot orphan ⇒ safe to reclaim.
-        return true;
-    }
-    // Same boot (or unstamped): only reclaim if the owning process is actually gone.
+    // A different boot ID is not proof that its process exited: standalone
+    // channels and a daemon can share the data directory. Never reclaim a live
+    // owner. PID reuse can delay recovery; that is safer than duplicate effects.
+    let _ = current_boot_id;
     !pid_is_alive(rec.owner_pid)
 }
 
-/// Best-effort liveness check for `pid`. On Linux we consult `/proc/<pid>`; on other
-/// platforms we conservatively assume the process is alive (never reclaim a
-/// same-boot task we cannot prove is dead).
+/// A zero signal only probes liveness; it never delivers a signal. Permission
+/// denial and unknown errors are conservatively treated as a live owner.
 fn pid_is_alive(pid: u32) -> bool {
     if pid == 0 {
-        // Unset owner — treat as not-alive so an un-stamped record is reclaimable.
         return false;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: positive PID, signal 0, no pointers or process mutation.
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
-        let _ = pid;
-        true // conservative: do not reclaim what we cannot prove dead
+        true
     }
 }
 
@@ -69,8 +68,23 @@ mod tests {
 
     #[test]
     fn prior_boot_is_reclaimable() {
-        // Different boot id ⇒ orphan ⇒ authoritative regardless of pid.
+        // An exited process is reclaimable regardless of boot ID.
         assert!(is_authoritative(&rec(999_999, "boot-OLD"), "boot-NEW"));
+    }
+
+    #[test]
+    fn different_boot_with_live_owner_is_never_reclaimed() {
+        assert!(!is_authoritative(&rec(std::process::id(), "old"), "new"));
+        assert!(!is_authoritative_with_pid_liveness(
+            &rec(42, "old"),
+            "new",
+            |_| true
+        ));
+        assert!(is_authoritative_with_pid_liveness(
+            &rec(42, "old"),
+            "new",
+            |_| false
+        ));
     }
 
     #[test]

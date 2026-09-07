@@ -376,10 +376,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             // Never sends anything — simulates no user response
             tokio::time::sleep(std::time::Duration::from_secs(600)).await;
             Ok(())
@@ -434,10 +431,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             panic!("ask_user must use existing ingress, not start a second listener")
         }
     }
@@ -692,10 +686,7 @@ mod tests {
             Ok(())
         }
 
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             *self.listen_called.lock() = true;
             // Mirrors RpcApprovalChannel / AcpChannel: listen ends without a
             // message. If ask_user falls through here, rx.recv() hangs.

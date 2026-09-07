@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, SendMessage,
 };
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
@@ -82,7 +82,7 @@ impl Channel for RpcApprovalChannel {
         false
     }
 
-    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         anyhow::bail!("RpcApprovalChannel.listen is not supported")
     }
 

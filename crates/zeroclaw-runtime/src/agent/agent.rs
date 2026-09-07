@@ -245,10 +245,7 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -3281,7 +3278,7 @@ impl Agent {
         );
 
         let listen_handle = zeroclaw_spawn::spawn!(async move {
-            let _ = zeroclaw_api::channel::Channel::listen(&*cli, tx).await;
+            let _ = zeroclaw_api::channel::Channel::listen(&*cli, tx.into()).await;
         });
 
         while let Some(msg) = rx.recv().await {
@@ -12073,10 +12070,7 @@ mod approval_route_tests {
         async fn send(&self, _m: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn listen(
-            &self,
-            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
             Ok(())
         }
         async fn request_approval(

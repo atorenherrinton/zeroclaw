@@ -28,7 +28,9 @@ impl ControlPlaneHandle {
     /// As [`Self::start`] but with a caller-supplied `boot_id` — lets `DaemonRegistry`
     /// reuse a process-stable run-id across reloads instead of a fresh UUID.
     pub async fn start_with_boot_id(data_dir: &Path, boot_id: String) -> Result<Self> {
-        let store: Arc<dyn TaskRegistry> = Arc::new(SqliteTaskStore::new(data_dir)?);
+        let data_dir = data_dir.to_owned();
+        let store: Arc<dyn TaskRegistry> =
+            Arc::new(tokio::task::spawn_blocking(move || SqliteTaskStore::new(&data_dir)).await??);
         let reclaimed = reaper::recovery_pass(store.as_ref(), &boot_id).await?;
         if reclaimed > 0 {
             ::zeroclaw_log::record!(

@@ -624,7 +624,7 @@ impl WeComWsChannel {
     // ── WS message dispatch ──────────────────────────────────────────
 
     /// Returns `true` if the caller should trigger reconnection.
-    async fn handle_ws_message(&self, frame: Value, tx: &mpsc::Sender<ChannelMessage>) -> bool {
+    async fn handle_ws_message(&self, frame: Value, tx: &zeroclaw_api::inbound::Sender) -> bool {
         if self.maybe_handle_command_response(&frame).await {
             return false;
         }
@@ -650,7 +650,7 @@ impl WeComWsChannel {
 
     // ── Message callback handling ────────────────────────────────────
 
-    async fn handle_msg_callback(&self, frame: Value, tx: &mpsc::Sender<ChannelMessage>) {
+    async fn handle_msg_callback(&self, frame: Value, tx: &zeroclaw_api::inbound::Sender) {
         let req_id = frame
             .get("headers")
             .and_then(|h| h.get("req_id"))
@@ -1545,7 +1545,7 @@ impl Channel for WeComWsChannel {
             .await
     }
 
-    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+    async fn listen(&self, tx: zeroclaw_api::inbound::Sender) -> Result<()> {
         wecom_log_info!(
             "[wecom_ws] starting WebSocket listener (bot_id={})",
             self.bot_id
@@ -3510,7 +3510,7 @@ mod tests {
             .await
             .insert("req-ack".to_string(), waiter);
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         let should_reconnect = channel
             .handle_ws_message(
                 serde_json::json!({
@@ -3542,7 +3542,7 @@ mod tests {
         let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(1);
         *channel.ws_tx.lock().await = Some(ws_tx);
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         channel
             .handle_msg_callback(
                 serde_json::json!({
@@ -3580,7 +3580,7 @@ mod tests {
         config.allowed_users = vec!["zeroclaw_user".to_string()];
         let channel = WeComWsChannel::new(&config, Path::new("/tmp")).unwrap();
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         tx.send(ChannelMessage::new(
             "prefill-clear",
             "tester",
@@ -3662,7 +3662,7 @@ mod tests {
             content
         });
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         channel
             .handle_msg_callback(
                 serde_json::json!({
@@ -3701,7 +3701,7 @@ mod tests {
         let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
         *channel.ws_tx.lock().await = Some(ws_tx);
 
-        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(1);
+        let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
         let should_reconnect = tokio::time::timeout(
             Duration::from_millis(100),
             channel.handle_ws_message(

@@ -55,13 +55,18 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
 async fn scope_delegate_session_key<F>(
     session_key: Option<String>,
     route: Option<zeroclaw_api::conversation::ConversationRoute>,
+    deadline: Option<tokio::time::Instant>,
     future: F,
 ) -> F::Output
 where
     F: std::future::Future,
 {
-    zeroclaw_api::conversation::ACTIVE_CONVERSATION
-        .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future))
+    zeroclaw_api::deadline::PARENT
+        .scope(
+            deadline,
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION
+                .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future)),
+        )
         .await
 }
 
@@ -1256,9 +1261,11 @@ impl DelegateTool {
     ) -> anyhow::Result<ToolResult> {
         // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
         let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
-            let result = self
-                .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
-                .await;
+            let result = zeroclaw_api::deadline::run_inherited_phase(
+                zeroclaw_api::deadline::Phase::Delegate,
+                self.execute_sync_with_admission_inner(agent_name, prompt, args, admission),
+            )
+            .await;
             let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
             (result, fallback)
         })
@@ -1672,10 +1679,11 @@ impl DelegateTool {
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
+        let parent_deadline = zeroclaw_api::deadline::current();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, parent_route, async move {
+            scope_delegate_session_key(parent_session_key, parent_route, parent_deadline, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1892,6 +1900,7 @@ impl DelegateTool {
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
+        let parent_deadline = zeroclaw_api::deadline::current();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1952,14 +1961,19 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, route, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
-                            })
-                            .await
-                    })
+                    let result = scope_delegate_session_key(
+                        session_key,
+                        route,
+                        parent_deadline,
+                        async move {
+                            crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                .scope(receipt_scope, async move {
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                                        .await
+                                })
+                                .await
+                        },
+                    )
                     .await;
                     (agent_name_for_return, result)
                 }
@@ -2837,75 +2851,86 @@ impl DelegateTool {
         let turn_id = uuid::Uuid::new_v4().to_string();
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
+        use futures_util::FutureExt;
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
-            run_tool_call_loop(ToolLoop {
-                sop_reassembly: None,
-                exec: ResolvedAgentExecution::resolve(
-                    ResolvedModelAccess {
-                        model_provider,
-                        provider_name: provider_type,
-                        model,
-                        temperature: effective_temperature,
-                    },
-                    ResolvedIo {
-                        tools_registry: &sub_tools,
-                        observer: &noop_observer,
-                        silent: true,
-                        approval: approval_manager.as_ref(),
-                        multimodal_config: &self.multimodal_config,
-                        // Full config so the delegated sub-agent's vision route
-                        // resolves the configured `vision_model_provider`'s alias
-                        // options (the `vision` override, endpoint URI, credentials),
-                        // exactly as the parent turn does. `None` only on the
-                        // configless test builder (`root_config` unset).
-                        config: self.root_config.as_deref(),
-                        hooks: None,
-                        // Thread the target's deferred-MCP activated set so `tool_search`
-                        // can activate the target's deferred tools mid-turn (Some only for
-                        // an independent target with granted deferred-MCP bundles).
-                        activated_tools: sub_activated.as_ref(),
-                        model_switch_callback: None,
-                        receipt_generator,
-                    },
-                    ResolvedRuntimeKnobs {
-                        max_tool_iterations: loop_runtime.max_tool_iterations,
-                        excluded_tools: &[],
-                        dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &pacing,
-                        strict_tool_parsing: loop_runtime.strict_tool_parsing,
-                        parallel_tools: loop_runtime.parallel_tools,
-                        max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &loop_knobs,
-                    },
-                ),
-                history: &mut history,
-                channel_name: "delegate",
-                channel_reply_target: None,
-                cancellation_token: Some(self.cancellation_token.child_token()),
-                on_delta: None,
-                shared_budget: None,
-                // TODO thread from parent in future
-                channel: None,
-                collected_receipts,
-                event_tx: None,
-                steering: None,
-                new_messages_out: None,
-                image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Per-transport
-                // stamping lands in a later phase.
-                memory: None,
-                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
-                agent_alias: Some(agent_name),
-                parent_agent_alias: None,
-                turn_id: &turn_id,
-            })
-            .instrument(::zeroclaw_log::attribution_span!(
-                &crate::agent::AgentAttribution(agent_name)
-            )),
+            // The child has its own delegate task record. Its tool phases must
+            // never transition the synchronous parent's channel-turn journal.
+            zeroclaw_api::turn::JOURNAL
+                .scope(
+                    None,
+                    run_tool_call_loop(ToolLoop {
+                        sop_reassembly: None,
+                        exec: ResolvedAgentExecution::resolve(
+                            ResolvedModelAccess {
+                                model_provider,
+                                provider_name: provider_type,
+                                model,
+                                temperature: effective_temperature,
+                            },
+                            ResolvedIo {
+                                tools_registry: &sub_tools,
+                                observer: &noop_observer,
+                                silent: true,
+                                approval: approval_manager.as_ref(),
+                                multimodal_config: &self.multimodal_config,
+                                // Full config so the delegated sub-agent's vision route
+                                // resolves the configured `vision_model_provider`'s alias
+                                // options (the `vision` override, endpoint URI, credentials),
+                                // exactly as the parent turn does. `None` only on the
+                                // configless test builder (`root_config` unset).
+                                config: self.root_config.as_deref(),
+                                hooks: None,
+                                // Thread the target's deferred-MCP activated set so `tool_search`
+                                // can activate the target's deferred tools mid-turn (Some only for
+                                // an independent target with granted deferred-MCP bundles).
+                                activated_tools: sub_activated.as_ref(),
+                                model_switch_callback: None,
+                                receipt_generator,
+                            },
+                            ResolvedRuntimeKnobs {
+                                max_tool_iterations: loop_runtime.max_tool_iterations,
+                                excluded_tools: &[],
+                                dedup_exempt_tools: tool_policy
+                                    .excluded_tools
+                                    .as_deref()
+                                    .unwrap_or(&[]),
+                                pacing: &pacing,
+                                strict_tool_parsing: loop_runtime.strict_tool_parsing,
+                                parallel_tools: loop_runtime.parallel_tools,
+                                max_tool_result_chars: loop_runtime.max_tool_result_chars,
+                                // Keep delegate subagent context pruning aligned with top-level
+                                // agents instead of preserving the old disabled-by-zero path.
+                                context_token_budget: loop_runtime.max_context_tokens,
+                                knobs: &loop_knobs,
+                            },
+                        ),
+                        history: &mut history,
+                        channel_name: "delegate",
+                        channel_reply_target: None,
+                        cancellation_token: Some(self.cancellation_token.child_token()),
+                        on_delta: None,
+                        shared_budget: None,
+                        // TODO thread from parent in future
+                        channel: None,
+                        collected_receipts,
+                        event_tx: None,
+                        steering: None,
+                        new_messages_out: None,
+                        image_cache: None,
+                        // Phase 1: stamp Internal/Trusted. Per-transport
+                        // stamping lands in a later phase.
+                        memory: None,
+                        ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+                        agent_alias: Some(agent_name),
+                        parent_agent_alias: None,
+                        turn_id: &turn_id,
+                    })
+                    .boxed(),
+                )
+                .instrument(::zeroclaw_log::attribution_span!(
+                    &crate::agent::AgentAttribution(agent_name)
+                )),
         );
         let result = match thinking_params {
             Some(params) => {
@@ -2930,6 +2955,12 @@ impl DelegateTool {
                 .into(),
                 error: None,
             }),
+            Ok(Err(e))
+                if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
+                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>() =>
+            {
+                Err(e)
+            }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -5613,26 +5644,53 @@ mod tests {
             collector: Arc::clone(&collector),
         };
 
+        struct ParentJournal;
+        #[async_trait]
+        impl zeroclaw_api::turn::TurnJournal for ParentJournal {
+            fn trace_id(&self) -> Option<&str> {
+                Some("parent-turn")
+            }
+            async fn checkpoint(
+                &self,
+                _: zeroclaw_api::turn::TaskStatus,
+                _: Option<String>,
+                _: bool,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("delegate must not checkpoint its parent's channel turn")
+            }
+        }
         let model_provider = OneToolThenFinalModelProvider;
-        let result = TOOL_LOOP_RECEIPT_CONTEXT
-            .scope(Some(scope), async {
-                tool.execute_agentic(
-                    "agentic",
-                    &config,
-                    "test-provider",
-                    "test-model",
-                    &model_provider,
-                    "run",
-                    Some(0.2),
-                )
-                .await
-            })
-            .await
-            .unwrap();
+        let result = zeroclaw_api::turn::JOURNAL
+            .scope(
+                Some(Arc::new(ParentJournal) as Arc<dyn zeroclaw_api::turn::TurnJournal>),
+                async {
+                    let result = TOOL_LOOP_RECEIPT_CONTEXT
+                        .scope(Some(scope), async {
+                            tool.execute_agentic(
+                                "agentic",
+                                &config,
+                                "test-provider",
+                                "test-model",
+                                &model_provider,
+                                "run",
+                                Some(0.2),
+                            )
+                            .await
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        zeroclaw_api::turn::trace_id().as_deref(),
+                        Some("parent-turn")
+                    );
+                    result
+                },
+            )
+            .await;
 
         assert!(
             result.success,
-            "delegate sub-loop must complete: {result:?}"
+            "delegate sub-loop must complete without changing its parent journal: {result:?}"
         );
         let receipts = collector.lock().unwrap();
         assert_eq!(
@@ -5657,6 +5715,7 @@ mod tests {
                     scope_delegate_session_key(
                         session_key,
                         zeroclaw_api::conversation::current(),
+                        zeroclaw_api::deadline::current(),
                         async { current_tool_loop_session_key() },
                     )
                     .await
