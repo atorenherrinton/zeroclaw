@@ -578,6 +578,14 @@ rpc_type! {
 }
 
 rpc_type! {
+    pub struct CronOccurrencesParams {
+        pub id: String,
+        #[serde(flatten)]
+        pub query: crate::cron::OccurrenceQuery,
+    }
+}
+
+rpc_type! {
     pub struct CronRunsResult {
         pub runs: Vec<CronRun>,
     }

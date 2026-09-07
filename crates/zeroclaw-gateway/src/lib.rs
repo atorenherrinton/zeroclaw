@@ -1825,6 +1825,7 @@ pub async fn run_gateway(
             delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
         )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
+        .route("/api/cron/{id}/occurrences", get(api::handle_api_cron_occurrences))
         // Note: `/api/cron/{id}/run` is registered on a separate router below
         // with a longer TimeoutLayer — manual cron triggers run the job
         // synchronously and routinely exceed the 30s gateway-wide default.

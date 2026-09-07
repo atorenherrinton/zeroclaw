@@ -11,10 +11,12 @@ use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 pub(crate) const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 mod manual;
+mod occurrences;
 pub(crate) use manual::{
     DuplicateManualReceipt, ManualAdmissionError, checkpoint_manual_execution,
     claim_manual_run_with_key, finish_manual_run,
 };
+pub use occurrences::{OccurrencePage, OccurrenceQuery, OccurrenceReadError, read_occurrences};
 
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 

@@ -55,6 +55,54 @@ entry. Omit `category` when checking for collisions across categories.
 Without `key`, existing list/search behavior and preview truncation are unchanged.
 This is a read capability, not an atomic create-if-absent or compare-and-swap API.
 
+## Cron occurrence receipts
+
+`GET /api/cron/{id}/occurrences` and RPC `cron/occurrences` expose read-only
+operator evidence from the existing cron database, including receipts whose
+one-shot job has been deleted. HTTP uses the same pairing/bearer gate as other
+cron endpoints (including the existing explicitly disabled-pairing mode); RPC
+requires its authenticated connection. These are administrative surfaces, not
+agent-scoped tools. They cannot reset a quarantine or authorize replay.
+
+RPC parameters include `id`; both surfaces accept:
+
+| Parameter | Meaning |
+| --- | --- |
+| `limit` | Default 20, minimum 1, maximum 100 receipts. |
+| `before` | Exclusive occurrence-identity cursor from `next_before`. |
+| `occurrence_id` | Exact receipt identity; cannot be combined with `before`. |
+| `include_output` | Default `false`. Explicitly request bounded stored output. |
+
+IDs and cursors must contain 1–512 UTF-8 bytes without control characters.
+Responses contain `storage_present`, `occurrences`, and `next_before`. A missing
+database returns `storage_present: false`; an existing empty result returns
+`true`. Unavailable, locked, outdated, or malformed storage returns HTTP 503 or
+an RPC internal error, never an empty-history claim. Invalid query bounds return
+HTTP 400 or RPC invalid-parameters errors. Reads do not create or migrate the
+cron schema and run blocking SQLite work away from async workers.
+
+Receipts include immutable occurrence identity, bounded raw execution/delivery
+states, typed `execution_outcome` and `delivery_outcome`, and `updated_at`.
+Unknown states and an unacknowledged submission require reconciliation. Delivery
+`not_requested` maps to a null outcome; it is distinct from `not_started`.
+Every receipt reports `retry_allowed: false`. This view supplies stored evidence,
+not proof of platform acceptance or an automatic reconciliation operation.
+
+Output is omitted by default. `output_bytes` is the stored byte count; explicitly
+requested output is a UTF-8-safe prefix of at most 8 KiB, with
+`output_truncated` indicating a shortened prefix. Each encoded page is at most
+64 KiB before any RPC transport envelope. Byte limits can shorten a page below
+`limit`; follow `next_before` until null. No output body enters new logs or errors.
+The endpoint creates no extra payload archive or retention policy.
+
+Pagination uses descending identity order, **not chronological order**: manual
+IDs and scheduled timestamps coexist. Updates to receipt state do not move its
+cursor. Each request sees a live database view, not a snapshot spanning requests;
+new identities ahead of the cursor require a fresh listing. Retained rows behind
+the cursor remain available on subsequent pages. Use exact identity lookup when
+checking a particular invocation. Old binaries do not expose these read APIs;
+using them requires the verified new binary and an owner-managed restart.
+
 ## Per-property CRUD
 
 | Method | Path | Purpose |

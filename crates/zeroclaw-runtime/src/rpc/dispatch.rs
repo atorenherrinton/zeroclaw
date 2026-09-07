@@ -104,6 +104,7 @@ pub enum Method {
     CronPatch,
     CronDelete,
     CronRuns,
+    CronOccurrences,
     CronTrigger,
     CronSettings,
 
@@ -225,6 +226,7 @@ impl Method {
         (Method::CronPatch, "cron/patch"),
         (Method::CronDelete, "cron/delete"),
         (Method::CronRuns, "cron/runs"),
+        (Method::CronOccurrences, "cron/occurrences"),
         (Method::CronTrigger, "cron/trigger"),
         (Method::CronSettings, "cron/settings"),
         // Config
@@ -847,6 +849,7 @@ impl RpcDispatcher {
             Method::CronPatch => self.handle_cron_patch(&req.params).await,
             Method::CronDelete => self.handle_cron_delete(&req.params).await,
             Method::CronRuns => self.handle_cron_runs(&req.params).await,
+            Method::CronOccurrences => self.handle_cron_occurrences(&req.params).await,
             Method::CronTrigger => self.handle_cron_trigger(&req.params).await,
             Method::CronSettings => self.handle_cron_settings(&req.params).await,
 
@@ -3093,6 +3096,23 @@ impl RpcDispatcher {
         let runs = crate::cron::list_runs(&config, &req.id, limit)
             .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Cron runs failed: {e}")))?;
         to_result(CronRunsResult { runs })
+    }
+
+    async fn handle_cron_occurrences(&self, params: &Value) -> RpcResult {
+        let req: CronOccurrencesParams = parse_params(params)?;
+        let config = self.ctx.config.read().clone();
+        let page = crate::cron::read_occurrences(&config, req.id, req.query)
+            .await
+            .map_err(|error| {
+                rpc_err(
+                    match error {
+                        crate::cron::OccurrenceReadError::InvalidQuery => INVALID_PARAMS,
+                        crate::cron::OccurrenceReadError::StorageUnavailable => INTERNAL_ERROR,
+                    },
+                    error.to_string(),
+                )
+            })?;
+        to_result(page)
     }
 
     async fn handle_cron_trigger(&self, params: &Value) -> RpcResult {
@@ -8735,6 +8755,58 @@ mod tests {
                 .any(|r| r.get("message").and_then(|m| m.as_str()) == Some(warning.as_str())),
             "under-deadline response must not contain the timeout warning"
         );
+    }
+
+    #[tokio::test]
+    async fn cron_occurrences_rpc_authentication_validation_and_deleted_receipt() {
+        // Config and the full dispatcher have large debug-build futures. Keep
+        // the boundary scenario on the heap, as with the frame-dispatch tests.
+        Box::pin(cron_occurrences_rpc_scenario()).await;
+    }
+
+    async fn cron_occurrences_rpc_scenario() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        *dispatcher.ctx.config.write() = config.clone();
+        dispatcher.authenticated = false;
+        let request = json!({"jsonrpc":"2.0", "id":1, "method":"cron/occurrences", "params":{"id":"deleted-job"}}).to_string();
+        Box::pin(dispatcher.process_line_for_test(&request)).await;
+        let rejected: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(rejected["error"]["code"], AUTH_REQUIRED);
+        assert!(!config.data_dir.join("cron/jobs.db").exists());
+        dispatcher.authenticated = true;
+        Box::pin(dispatcher.process_line_for_test(&request)).await;
+        let empty: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(empty["result"]["storage_present"], false);
+        let invalid = dispatcher
+            .handle_cron_occurrences(&json!({"id":"deleted-job", "limit":0}))
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, INVALID_PARAMS);
+        std::fs::create_dir_all(config.data_dir.join("cron")).unwrap();
+        let conn = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+        conn.execute_batch("CREATE TABLE cron_occurrences (job_id TEXT, scheduled_at TEXT, execution_state TEXT, delivery_state TEXT, output TEXT, updated_at TEXT, PRIMARY KEY(job_id,scheduled_at)); INSERT INTO cron_occurrences VALUES ('deleted-job','receipt','confirmed','possibly_applied','private fixture','2026-01-01T00:00:00Z');").unwrap();
+        Box::pin(dispatcher.process_line_for_test(&request)).await;
+        let value: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        let receipt = &value["result"]["occurrences"][0];
+        assert_eq!(receipt["occurrence_id"], "receipt");
+        assert_eq!(receipt["delivery_outcome"], "possibly_applied");
+        assert!(receipt.get("output").is_none());
+        assert_eq!(receipt["retry_allowed"], false);
+        let exact = dispatcher
+            .handle_cron_occurrences(
+                &json!({"id":"deleted-job", "occurrence_id":"receipt", "include_output":true}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact["occurrences"][0]["output"], "private fixture");
+        conn.execute_batch("DROP TABLE cron_occurrences").unwrap();
+        let unavailable = dispatcher
+            .handle_cron_occurrences(&json!({"id":"deleted-job"}))
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.code, INTERNAL_ERROR);
     }
 
     #[tokio::test]

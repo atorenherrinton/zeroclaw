@@ -1267,3 +1267,6 @@ cron-manual-invalid-request-id = A cron request ID must contain 1 to 128 printab
 cron-manual-request-id-description = Stable ID for this invocation. Reuse it when checking an interrupted request; an existing occurrence is returned without execution. Use a new ID only for a genuinely new owner request.
 
 cron-manual-receipt-unavailable = The saved cron receipt could not be read. A prior execution may have occurred; reconcile the original invocation before requesting new work.
+
+cron-occurrences-invalid-query = Invalid occurrence query. Use a nonempty job ID, a limit from 1 to 100, and either an exact occurrence ID or a before cursor. IDs must be at most 512 bytes without control characters.
+cron-occurrences-storage-unavailable = Cron occurrence storage is unavailable or invalid; no empty-history result can be established.

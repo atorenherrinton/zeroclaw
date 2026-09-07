@@ -595,6 +595,37 @@ pub async fn handle_api_cron_runs(
     }
 }
 
+/// GET /api/cron/:id/occurrences — read durable receipts, including deleted jobs.
+pub async fn handle_api_cron_occurrences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<zeroclaw_runtime::cron::OccurrenceQuery>,
+) -> impl IntoResponse {
+    if let Err(error) = require_auth(&state, &headers) {
+        return error.into_response();
+    }
+    let config = state.config.read().clone();
+    match zeroclaw_runtime::cron::read_occurrences(&config, id, query).await {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => {
+            let status = match error {
+                zeroclaw_runtime::cron::OccurrenceReadError::InvalidQuery => {
+                    StatusCode::BAD_REQUEST
+                }
+                zeroclaw_runtime::cron::OccurrenceReadError::StorageUnavailable => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            };
+            (
+                status,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// POST /api/cron/:id/run — trigger a cron job manually
 pub async fn handle_api_cron_run(
     State(state): State<AppState>,
@@ -3450,6 +3481,118 @@ pub(crate) mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[tokio::test]
+    async fn cron_occurrences_http_authentication_and_storage_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        let mut state = test_state(config.clone());
+        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        let response = handle_api_cron_occurrences(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("deleted-job".into()),
+            Query(Default::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!config.data_dir.exists());
+        state.pairing = Arc::new(PairingGuard::new(false, &[]));
+        let response = handle_api_cron_occurrences(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("deleted-job".into()),
+            Query(Default::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_json(response).await["storage_present"], false);
+        let response = handle_api_cron_occurrences(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("deleted-job".into()),
+            Query(zeroclaw_runtime::cron::OccurrenceQuery {
+                limit: Some(101),
+                ..Default::default()
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        std::fs::create_dir_all(config.data_dir.join("cron")).unwrap();
+        std::fs::write(config.data_dir.join("cron/jobs.db"), b"invalid database").unwrap();
+        let response = handle_api_cron_occurrences(
+            State(state),
+            HeaderMap::new(),
+            Path("deleted-job".into()),
+            Query(Default::default()),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = response_json(response).await.to_string();
+        assert!(!error.contains(tmp.path().to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn cron_occurrences_http_route_pages_deleted_receipts_privately() {
+        use tower::ServiceExt;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(config.data_dir.join("cron")).unwrap();
+        let conn = rusqlite::Connection::open(config.data_dir.join("cron/jobs.db")).unwrap();
+        conn.execute_batch("CREATE TABLE cron_occurrences (job_id TEXT, scheduled_at TEXT, execution_state TEXT, delivery_state TEXT, output TEXT, updated_at TEXT, PRIMARY KEY(job_id,scheduled_at)); INSERT INTO cron_occurrences VALUES ('deleted-job','b','confirmed','possibly_applied','private fixture','2026-01-01T00:00:00Z'), ('deleted-job','a','confirmed','confirmed','older fixture','2026-01-01T00:00:00Z');").unwrap();
+        let app = axum::Router::new()
+            .route(
+                "/api/cron/{id}/occurrences",
+                axum::routing::get(handle_api_cron_occurrences),
+            )
+            .with_state(test_state(config));
+        for (query, expected, output, cursor) in [
+            ("?limit=1", "b", None, Some("b")),
+            ("?limit=1&before=b", "a", None, None),
+            (
+                "?occurrence_id=b&include_output=true",
+                "b",
+                Some("private fixture"),
+                None,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(format!("/api/cron/deleted-job/occurrences{query}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["occurrences"][0]["occurrence_id"], expected);
+            assert_eq!(value["occurrences"][0]["output"].as_str(), output);
+            assert_eq!(value["next_before"].as_str(), cursor);
+        }
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/api/cron/deleted-job/occurrences?include_output=maybe")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
