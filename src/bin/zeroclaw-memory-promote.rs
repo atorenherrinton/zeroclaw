@@ -97,6 +97,7 @@ async fn main() {
         std::process::exit(124);
     });
     if run().await.is_err() {
+        // i18n-exempt: stable machine-readable failure code; excludes private memory content.
         eprintln!("memory_promotion_failed");
         std::process::exit(1);
     }

@@ -347,6 +347,7 @@ async fn classify_target_metadata(install: PathBuf, overlay_path: PathBuf) -> Sa
 async fn main() {
     // No tracing/log subscriber is initialized. Panic and normal failure output
     // are static, so even native errors containing the adapter token stay private.
+    // i18n-exempt: stable machine-readable failure code; must not interpolate native errors.
     std::panic::set_hook(Box::new(|_| eprintln!("native_verification_panicked")));
     // Match the real CLI's process-level TLS initialization. Both transitive TLS
     // provider features may be present, so rustls cannot safely choose one itself.
@@ -355,16 +356,19 @@ async fn main() {
         .install_default()
         .is_err()
     {
+        // i18n-exempt: stable machine-readable verifier status, not localized prose.
         eprintln!("native_crypto_provider_initialization_failed");
         std::process::exit(2);
     }
     #[cfg(not(feature = "agent-runtime"))]
     {
+        // i18n-exempt: stable machine-readable verifier status, not localized prose.
         eprintln!("native_verification_requires_agent_runtime_feature");
         std::process::exit(2);
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() != 2 && !(args.len() == 3 && args[2] == "--classify-targets") {
+        // i18n-exempt: stable machine-readable verifier status, not localized prose.
         eprintln!("native_verification_arguments_invalid");
         std::process::exit(2);
     }
