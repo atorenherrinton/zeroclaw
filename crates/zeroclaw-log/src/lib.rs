@@ -1,5 +1,6 @@
 //! Unified log emission surface for the ZeroClaw workspace.
 
+mod bounded_format;
 pub mod broadcast;
 pub mod chain;
 pub mod config;
@@ -9,6 +10,7 @@ mod log_bridge;
 pub mod migrate;
 pub mod observer_bridge;
 pub mod reader;
+mod rewrite_temp;
 mod subscriber;
 pub mod tool_io;
 pub mod writer;

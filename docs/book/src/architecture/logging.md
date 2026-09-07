@@ -231,6 +231,34 @@ The on-disk JSON shape (`LogEvent` in `event.rs`):
 
 Do not use Observer output or SSE delivery to prove that every canonical event was retained. Conversely, do not assume a row absent from JSONL was never emitted: it may have reached live broadcast, and the Observer bridge when bound, before the persistence queue dropped or failed it.
 
+## Formatting budgets and rewrite cleanup
+
+The logger bounds raw tracing values while formatting, before allocating a full
+message or Debug/error body. Captured values and span strings have a 4 KiB
+ceiling, including a truncation marker. Structured attribute transport has a
+32 KiB input ceiling so the existing 16 KiB JSON attribute envelope passes
+unchanged. Malformed or oversized transport records `payload_omitted`; it does
+not imply an empty successful operation. Error-source traversal stops after
+32 sources, including cyclic chains. The canonical writer still applies its
+existing message and attribute limits before broadcast, Observer and disk copies.
+
+Verbose terminal events, including nested span text, have a 16 KiB ceiling.
+Repeated span updates share a 16 KiB cached-field budget. Truncation keeps UTF-8
+boundaries and leaves the next event on a new line; ephemeral credentials remain
+excluded. Timestamp and level coloring follow the configured formatter, while
+bounded field text uses plain formatting. These limits bound logger-owned
+output; they cannot preempt arbitrary work or allocations inside a custom
+`Debug`/`Display` implementation or a value already built by a caller.
+
+Migration and rolling trim share one private, exclusive temporary-file owner.
+A failed read, write, sync or rename removes that owner's uncommitted file;
+creation collisions preserve the existing file. After rename, directory-sync
+failure is reported without rolling back committed bytes or replaying writes.
+Cleanup failure is reported. A hard process kill can still leave a private
+file: there is no startup sweep without proof that a file's writer is inactive.
+Legacy rolling reads and migration remain bounded by individual input line
+size, rather than by a byte ceiling. They do not read the entire file at once.
+
 ## Reader cursors belong to one active file
 
 `GET /api/logs` resolves the writer's current active path and calls `reader::load_page`. The reader scans that one JSONL file, keeps the newest matching window, and returns events newest first. It does not merge rotated archives.
@@ -261,9 +289,9 @@ Age and count retention run only after rotation. They do not sweep continuously,
 
 ## Schema migration is an active-file rewrite
 
-When persistence is enabled and the active path exists, `writer::init_from_config` runs `migrate::migrate_legacy_jsonl_in_place` before starting the disk worker. The migrator streams non-empty rows through a temporary file, converts legacy rows with `timestamp` but no `@timestamp`, preserves already-current rows, skips malformed JSON with a warning, syncs the temporary file, and atomically renames it over the active path.
+When persistence is enabled and the active path exists, `writer::init_from_config` runs `migrate::migrate_legacy_jsonl_in_place` before starting the disk worker. The migrator streams rows through a temporary file, converts legacy rows with `timestamp` but no `@timestamp`, preserves already-current and malformed rows, syncs the temporary file, and atomically renames it over the active path.
 
-Migration is best-effort. Its cheap schema check stops at the first non-empty row. Migration runs when that row is malformed or has `timestamp` without `@timestamp`; any other parseable JSON is treated as current, even when it is an unknown or invalid schema, so later legacy rows can remain unmigrated. If migration returns an error, initialization warns and continues, so later v2 appends can coexist with old rows that the v2 reader cannot deserialize. Rotated archives are not migrated.
+Migration is best-effort. Its schema check scans for recognized legacy rows throughout the active file, including mixed-schema files. Malformed rows are preserved as opaque bytes; migration does not repair them. If migration returns an error, initialization warns and continues, so later v2 appends can coexist with old rows that the v2 reader cannot deserialize. Rotated archives are not migrated.
 
 `LogEvent` is the schema source of truth. For each schema change, assess migration compatibility, active-file deserialization, HTTP and RPC serialization/consumers, and the architecture and operator documentation; update only the boundaries whose behavior or compatibility changes. The RPC log surfaces live in `crates/zeroclaw-runtime/src/rpc/types.rs` and `dispatch.rs`. A migration that replaces the active file invalidates byte-offset cursors, while an additive compatible change that does not rewrite existing bytes does not.
 

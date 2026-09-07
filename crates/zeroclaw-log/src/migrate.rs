@@ -1,9 +1,9 @@
 //! One-shot, streaming, in-place migration from schema_version 1 rows
 //! to schema_version 2.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -24,7 +24,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     ));
-    let (out_file, mut temp_cleanup) = create_migration_temp(&tmp)?;
+    let (out_file, temp_cleanup) = crate::rewrite_temp::create(&tmp)?;
     let mut out = BufWriter::new(out_file);
 
     let in_file =
@@ -86,27 +86,7 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         .sync_all()
         .context("fsync migrated file")?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "renaming migration temp {} → {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
-    temp_cleanup.disarm();
-    if let Err(err) = sync_parent_directory(path) {
-        tracing::warn!(
-            target: "zeroclaw_log",
-            error = ?err,
-            path = %path.display(),
-            "log: migration committed but parent directory sync failed"
-        );
-    }
+    temp_cleanup.commit(path)?;
 
     if migrated > 0 {
         tracing::info!(
@@ -118,43 +98,6 @@ pub fn migrate_legacy_jsonl_in_place(path: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-struct MigrationTempCleanup {
-    path: PathBuf,
-    armed: bool,
-}
-
-fn create_migration_temp(path: &Path) -> Result<(File, MigrationTempCleanup)> {
-    let mut opts = OpenOptions::new();
-    opts.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts
-        .open(path)
-        .with_context(|| format!("creating migration temp {}", path.display()))?;
-    Ok((file, MigrationTempCleanup::new(path.to_path_buf())))
-}
-
-impl MigrationTempCleanup {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for MigrationTempCleanup {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 fn file_needs_migration(path: &Path) -> Result<bool> {
@@ -205,23 +148,6 @@ fn line_ending(line: &[u8]) -> &'static [u8] {
     } else {
         b""
     }
-}
-
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        File::open(parent)
-            .with_context(|| format!("opening log directory for fsync: {}", parent.display()))?
-            .sync_all()
-            .with_context(|| format!("fsync log directory after migrate: {}", parent.display()))?;
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
 }
 
 fn is_legacy_shape(v: &Value) -> bool {
@@ -329,6 +255,7 @@ fn category_for_action(action: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     fn write_jsonl(path: &Path, lines: &[&str]) {
@@ -480,34 +407,6 @@ mod tests {
         let migrated: Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(migrated["id"], "legacy");
         assert_eq!(migrated["schema_version"], LogEvent::SCHEMA_VERSION);
-    }
-
-    #[test]
-    fn temp_cleanup_removes_only_uncommitted_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("migration.tmp");
-        fs::write(&path, "pending").unwrap();
-        {
-            let _cleanup = MigrationTempCleanup::new(path.clone());
-        }
-        assert!(!path.exists(), "uncommitted temp file must be removed");
-
-        fs::write(&path, "committed").unwrap();
-        {
-            let mut cleanup = MigrationTempCleanup::new(path.clone());
-            cleanup.disarm();
-        }
-        assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
-    }
-
-    #[test]
-    fn temp_creation_collision_preserves_existing_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("migration.tmp");
-        fs::write(&path, "owned elsewhere").unwrap();
-
-        assert!(create_migration_temp(&path).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "owned elsewhere");
     }
 
     #[test]

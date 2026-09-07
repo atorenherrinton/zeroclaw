@@ -7,10 +7,10 @@ the shape of the events, and how to query them.
 
 ## Config (`[observability]`)
 
-Defaults: `log_persistence = "rolling"`, `log_persistence_max_entries = 200`,
+Defaults: `log_persistence = "rotating"`, `log_persistence_max_entries = 200`,
 `log_tool_io = "redacted"`, `log_tool_io_truncate_bytes = 40960`,
 `log_llm_request_payload = "off"`. A fresh
-install produces a 200-event rolling JSONL at
+install produces a size-rotating JSONL (16 MiB active-file threshold) at
 `~/.zeroclaw/data/state/runtime-trace.jsonl`, and the dashboard's Logs page
 works without further configuration.
 
@@ -18,13 +18,18 @@ works without further configuration.
 
 Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, when bound, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.
 
+Raw tracing capture and verbose terminal output are bounded during formatting;
+oversized values carry a truncation marker. See [formatting budgets and rewrite
+cleanup](../architecture/logging.md#formatting-budgets-and-rewrite-cleanup) for
+limits and the remaining hard-kill temporary-file cleanup boundary.
+
 ### Archive rotation (`log_persistence = "rotating"`)
 
 `rotating` applies no entry-count trim to events accepted by the background writer, like `full`, but ZeroClaw manages the active file: it is rotated to a timestamped archive on a size and/or daily boundary, and old archives are pruned by count and age. This differs from `rolling`, which trims old entries out of the active file; rotated events are preserved in archive files for later diagnostics.
 
 | Key | Default | Effect |
 | --- | --- | --- |
-| `log_persistence_max_bytes` | `0` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
+| `log_persistence_max_bytes` | `16777216` | Rotate once an append leaves the active file at or above this many bytes. `0` disables size rotation. |
 | `log_persistence_rotate_daily` | `true` | Before the first event of a new UTC day, archive a file whose last write fell on an earlier day. |
 | `log_persistence_retention_max_files` | `7` | Keep at most this many archives; after a rotation the oldest beyond the cap are deleted. `0` keeps all. |
 | `log_persistence_retention_max_age_days` | `0` | Delete archives older than this many days after a rotation. `0` disables age-based cleanup. |

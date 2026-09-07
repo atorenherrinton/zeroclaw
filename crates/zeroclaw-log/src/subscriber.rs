@@ -3,6 +3,8 @@
 //! formatter and the `LogCaptureLayer` wiring so the rest of the
 //! workspace never names a `tracing` or `tracing_subscriber` type.
 
+use std::fmt::Write as _;
+
 use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::EnvFilter;
@@ -14,6 +16,7 @@ use tracing_subscriber::fmt::format::{DefaultVisitor, Writer};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::bounded_format::{self, BoundedWriter, TERMINAL_BYTES};
 use crate::event::ZeroclawAttribution;
 use crate::layer::{F_EPHEMERAL_ATTRS, LogCaptureLayer};
 
@@ -144,14 +147,42 @@ struct RedactEphemeralFields;
 impl<'writer> FormatFields<'writer> for RedactEphemeralFields {
     fn format_fields<R: RecordFields>(
         &self,
-        writer: Writer<'writer>,
+        mut writer: Writer<'writer>,
         fields: R,
     ) -> std::fmt::Result {
+        let mut bounded = BoundedWriter::new(&mut writer, TERMINAL_BYTES);
         let mut visitor = RedactEphemeralVisitor {
-            inner: DefaultVisitor::new(writer, true),
+            inner: DefaultVisitor::new(Writer::new(&mut bounded), true),
         };
         fields.record(&mut visitor);
-        visitor.inner.finish()
+        let result = visitor.inner.finish();
+        bounded.finish(result)
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut fmt::FormattedFields<Self>,
+        fields: &tracing::span::Record<'_>,
+    ) -> std::fmt::Result {
+        // tracing's default appends forever as span.record() is called.
+        let remaining = TERMINAL_BYTES.saturating_sub(current.fields.len());
+        if remaining < 64 {
+            if remaining >= bounded_format::TRUNCATED.len()
+                && !current.fields.ends_with(bounded_format::TRUNCATED)
+            {
+                current.fields.push_str(bounded_format::TRUNCATED);
+            }
+            return Ok(());
+        }
+        let mut writer = current.as_writer();
+        let mut bounded = BoundedWriter::new(&mut writer, remaining);
+        bounded.write_char(' ')?;
+        let mut visitor = RedactEphemeralVisitor {
+            inner: DefaultVisitor::new(Writer::new(&mut bounded), true),
+        };
+        fields.record(&mut visitor);
+        let result = visitor.inner.finish();
+        bounded.finish(result)
     }
 }
 
@@ -193,7 +224,10 @@ impl Visit for RedactEphemeralVisitor<'_> {
         if Self::is_ephemeral(field) {
             return;
         }
-        self.inner.record_error(field, value);
+        self.inner.record_debug(
+            field,
+            &tracing::field::display(bounded_format::error(value)),
+        );
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
@@ -283,8 +317,21 @@ where
             channel
         });
         let label = label.as_deref().unwrap_or("system");
-        write!(writer, "[{label}] ")?;
-        self.inner.format_event(ctx, writer, event)
+        let ansi = writer.has_ansi_escapes();
+        let mut bounded = BoundedWriter::new(&mut writer, TERMINAL_BYTES - 1);
+        let result = (|| {
+            write!(bounded, "[{label}] ")?;
+            self.inner
+                .clone()
+                .with_ansi(ansi)
+                .format_event(ctx, Writer::new(&mut bounded), event)
+        })();
+        let truncated = bounded.is_truncated();
+        bounded.finish(result)?;
+        if truncated {
+            writer.write_char('\n')?;
+        }
+        Ok(())
     }
 }
 
@@ -316,6 +363,69 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             BufGuard(self.0.clone())
         }
+    }
+
+    #[test]
+    fn oversized_terminal_event_is_bounded_and_next_event_has_its_own_line() {
+        let buf = BufMakeWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .fmt_fields(RedactEphemeralFields)
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .event_format(AgentAliasFormatter::new()),
+        );
+        let huge = "🦀".repeat(200_000) + "PRIVATE_TAIL";
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(zc_ephemeral_attrs = "PAIRING_SECRET", "{huge}");
+            tracing::info!("next event");
+        });
+        let bytes = buf.0.lock().unwrap();
+        let output = std::str::from_utf8(&bytes).unwrap();
+        assert!(!output.contains("PAIRING_SECRET"));
+        assert!(!output.contains("PRIVATE_TAIL"));
+        assert!(!output.contains("Unable to format"));
+        let lines: Vec<_> = output.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].len() < TERMINAL_BYTES);
+        assert!(lines[0].contains("log value truncated"));
+        assert!(lines[1].contains("next event"));
+    }
+
+    #[test]
+    fn repeated_span_updates_and_nested_span_output_are_bounded() {
+        let buf = BufMakeWriter::default();
+        let subscriber = tracing_subscriber::registry().with(
+            fmt::layer()
+                .fmt_fields(RedactEphemeralFields)
+                .with_writer(buf.clone())
+                .with_ansi(false)
+                .event_format(AgentAliasFormatter::new()),
+        );
+        let dispatch = tracing::Dispatch::new(subscriber);
+        tracing::dispatcher::with_default(&dispatch, || {
+            let span = tracing::info_span!("long_lived", value = tracing::field::Empty);
+            for _ in 0..10_000 {
+                span.record("value", "progress");
+            }
+            let registry = dispatch
+                .downcast_ref::<tracing_subscriber::Registry>()
+                .unwrap();
+            let stored = registry.span(&span.id().unwrap()).unwrap();
+            let extensions = stored.extensions();
+            let cached = extensions
+                .get::<fmt::FormattedFields<RedactEphemeralFields>>()
+                .unwrap();
+            assert!(cached.fields.len() <= TERMINAL_BYTES);
+            assert!(cached.fields.ends_with(bounded_format::TRUNCATED));
+            drop(extensions);
+            let _first = span.enter();
+            let _second = tracing::info_span!("nested", value = %"x".repeat(30_000)).entered();
+            tracing::info!("nested event");
+        });
+        let bytes = buf.0.lock().unwrap();
+        assert!(bytes.len() <= TERMINAL_BYTES);
+        assert!(std::str::from_utf8(&bytes).unwrap().ends_with('\n'));
     }
 
     #[test]

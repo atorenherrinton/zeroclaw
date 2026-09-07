@@ -116,12 +116,74 @@ and P = `tools/zeroclaw-personal-ops/`. These are path prefixes, not new owners.
 | 18. End-to-end traceability | prerequisite-only | C`orchestrator/turn_journal.rs`, C`orchestrator/mod.rs`, R`agent/turn/mod.rs`, R`agent/turn/tool_specs.rs`, C`telegram/delivery.rs` | Lifecycle tests assert ordered durable audit events; dispatcher reuses journal trace ID; chunk receipts and schema telemetry inspected | Supervised inbound ID is the runtime trace ID. Canonical task_turn_events records state/time/response bytes without bodies. Gateway/delegate/scheduler IDs and complete phase-latency/terminal metrics are not yet unified. No full content in new ingress metrics. |
 | 19. Reliability objectives | deferred | C`orchestrator/mod.rs`, R`observability/prometheus.rs`, R`observability/runtime_trace.rs`, `crates/zeroclaw-log/src/broadcast.rs` (existing) | No new objective aggregation tests or deployed dashboard | Missing unanswered/duplicate/uncertain age/recovery/first-visible p50-p95 series and separate schedule execution/delivery rates. Instrument bounded metadata before claiming objectives. |
 | 20. Connector/worker readiness | deferred | R`control_plane/reaper.rs`, R`daemon/mod.rs`, R`daemon/registry.rs`, R`health/mod.rs` (existing) | No end-to-end readiness test in inherited diff | No aggregate oldest queued/uncertain, scheduler lag, stopped workers, dropped events or connector readiness surface. Process liveness is insufficient. |
-| 21. Bounded/rotating logs | prerequisite-only | R`agent/tool_execution.rs`, `src/main.rs`, `crates/zeroclaw-config/src/schema.rs`, `crates/zeroclaw-log/src/config.rs`, `crates/zeroclaw-log/src/event.rs`, `crates/zeroclaw-log/src/writer.rs` | 1,502 config and 123 log tests passed in `current-tests.log`; Unicode/secret-boundary observer test; event JSON-escaping budget tests; `direct_events_are_bounded_before_broadcast_and_persistence` | New defaults use existing append-oriented rotating 16 MiB storage. Event attributes cap at 16 KiB with correlation/outcome preservation, direct log messages at 4 KiB, observer bodies at 4 KiB before redaction. Central writer bounds before observer/broadcast/disk copies. Normal CLI exit drains/syncs accepted logs with a 5-second limit; full-queue/dead-worker timeout tests cover the wait. Raw tracing formatter allocation, explicit rolling configs, and abandoned-temp cleanup remain to address. |
+| 21. Bounded/rotating logs | prerequisite-only | R`agent/tool_execution.rs`, `src/main.rs`, `crates/zeroclaw-config/src/schema.rs`, `crates/zeroclaw-log/src/config.rs`, `crates/zeroclaw-log/src/event.rs`, `crates/zeroclaw-log/src/writer.rs`  `crates/zeroclaw-log/src/bounded_format.rs`, `crates/zeroclaw-log/src/layer.rs`, `crates/zeroclaw-log/src/subscriber.rs`, `crates/zeroclaw-log/src/rewrite_temp.rs`, `crates/zeroclaw-log/src/migrate.rs` | 1,502 config and 123 log tests passed in `current-tests.log`; Unicode/secret-boundary observer test; event JSON-escaping budget tests; `direct_events_are_bounded_before_broadcast_and_persistence`  Latest: 136 logger tests and the complete workspace gate pass in `logging-bounds/`; synthetic allocation probe, repeated-span cache, Unicode, broadcast/disk correlation, collision/symlink, failed rewrite and post-rename sync cases. | New defaults use existing append-oriented rotating 16 MiB storage. Event attributes cap at 16 KiB with correlation/outcome preservation, direct log messages at 4 KiB, observer bodies at 4 KiB before redaction. Central writer bounds before observer/broadcast/disk copies. Normal CLI exit drains/syncs accepted logs with a 5-second limit; full-queue/dead-worker timeout tests cover the wait. Raw capture and terminal formatting now stop at byte budgets, including repeated span updates and cyclic error sources; migration and rolling rewrites share private temp ownership and failure cleanup. Explicit rolling line-size bounds and hard-kill abandoned-temp cleanup remain. See the logging-bounds validation entry. |
 | 22. Replay/fault tests | prerequisite-only | C`telegram/delivery/tests.rs`, C`orchestrator/turn_journal.rs`, C`orchestrator/mod.rs`, I`tests/bounded_history_delivery.rs`, P`src/imessage_history/tests.rs` | 10 Telegram faults; 7 infra regressions; 11 synthetic Messages cases; actual dispatcher safe-queue recovery, rejected policy, duplicate ingress, cancellation after durable admission, hard abort and wake-up race tests | Faults use local fake services and synthetic SQLite. Whole-process termination with real subprocess/MCP children and gateway ingress still need integration coverage. No real Messages history or outbound messages used. |
 | 23. SQLite maintenance | prerequisite-only | I`src/session_sqlite.rs`, I`src/session_delivery.rs`, T`sessions.rs`, P`src/imessage_history.rs` | 232 infrastructure unit tests, 7 cursor/claim regressions, 55 personal-ops tests passed; runtime full-history behavior remains unchanged | Bounded diagnostic reads and blocking adapters present. Most legacy history APIs still mask errors, runtime loads full history, low-activity WAL maintenance and raw-payload retention absent. No replacement proposed; measure first. |
 | Adjacent: read-only iMessage history | completed | P`Cargo.toml`, P`src/lib.rs`, P`src/imessage_history.rs`, P`src/imessage_history/tests.rs` | `cargo test --locked --manifest-path tools/zeroclaw-personal-ops/Cargo.toml`: 55 passed, including 11 synthetic history cases, 0 failed; strict Clippy and release build passed (`manual-claims/`: 0.89 s / 0.15 s / 0.16 s) | Exact GUID/ID, RFC3339 ≤31-day window, cursor, output byte caps, attachments metadata only. Attributed-body-only text explicitly unavailable. Outgoing sender attribution is explicit (self, no recipient mislabeling); corrupt text and oversized identity metadata fail explicitly. SQLite permission errors other than AUTH/PERM may still be classified storage_unavailable; no failure becomes no_results. No real Messages DB read; installation and policy registration remain separate owner actions. |
 
 ## Validation ledger
+
+### Logging formatter and rewrite cleanup continuation
+
+The existing logger now bounds raw values while formatting: 4 KiB captured
+fields and span strings, 32 KiB structured transport (preserving the canonical
+16 KiB attributes envelope), and 16 KiB terminal events and cached span fields.
+UTF-8 truncation, error chains, terminal line separation, ephemeral redaction,
+correlation fields, broadcast and persisted JSONL are covered by synthetic
+regressions. Timestamp and level coloring remains; bounded fields use plain
+formatting. No event schema, dependency, new ledger or configuration was added.
+
+Migration's existing private create-new temp ownership is shared with rolling
+trim. Read/write/sync/rename failures clean the owned uncommitted file; collisions
+and symlinks are refused. Post-rename directory-sync refusal warns without
+rollback or replay. Hard process kills can still leave a private temp; a safe
+ownership-proven startup sweep and legacy line-size limits remain unfinished.
+Arbitrary formatter internals and allocations already made by callers are not
+preempted by the logger's output sink. Full backlog status remains incomplete.
+
+Final frozen-source validation: **15,476 workspace tests passed,
+0 failed, 24 ignored**, plus **55 personal-operations tests passed**.
+The workspace total excludes 5 embedded child-process summaries using
+`count-tests.py`; logger unit coverage increased from 125 to 136 tests.
+
+| Command | Result | Seconds |
+| --- | --- | ---: |
+| `cargo fmt --all -- --check` | pass | 4.12 |
+| `cargo check --locked --workspace --all-targets` | pass | 59.01 |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass | 71.61 |
+| `cargo test --locked --workspace --no-fail-fast -- --test-threads=4` | pass | 331.35 |
+| `cargo clippy --locked -p zeroclaw-api -p zeroclaw-infra -p zeroclaw-runtime -p zeroclaw-channels -p zeroclaw-providers -p zeroclaw-log -p zeroclaw-config -p zeroclaw-tools --all-targets --all-features -- -D warnings` | pass | 110.27 |
+| `cargo build --locked --release --workspace` | pass | 304.5 |
+| `cargo fmt --manifest-path tools/zeroclaw-personal-ops/Cargo.toml -- --check` | pass | 0.1 |
+| `cargo test --locked --manifest-path tools/zeroclaw-personal-ops/Cargo.toml` | pass | 0.87 |
+| `cargo clippy --locked --manifest-path tools/zeroclaw-personal-ops/Cargo.toml --all-targets -- -D warnings` | pass | 0.15 |
+| `cargo build --locked --release --manifest-path tools/zeroclaw-personal-ops/Cargo.toml` | pass | 0.16 |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | blocked: actual web assets missing | 7.61 |
+| `cargo clippy --locked -p zeroclaw-gateway --all-targets --features a2a,channel-acp-server,channel-email,channel-linq,channel-nextcloud,channel-nostr,channel-wechat,channel-whatsapp-cloud,gateway-voice-duplex,observability-prometheus,plugins-wasm,schema-export,webauthn,whatsapp-web -- -D warnings` | pass | 62.75 |
+| `bash scripts/ci/parallel_runtime_test_gate.sh` | pass | 319.23 |
+
+All commands use the shared target with `CARGO_INCREMENTAL=0`,
+`CARGO_PROFILE_DEV_DEBUG=0`, and `CARGO_PROFILE_TEST_DEBUG=0`.
+Native parallel gate: three full runtime/channel repetitions, 16 harness
+threads, no increased stack override. Whole-workspace all-features Clippy is
+still blocked by missing actual `web/dist/index.html`; the gateway subset excludes
+only `embedded-web`. No placeholder assets or dependency installation were used.
+
+A standalone optimized synthetic allocation probe compares one million Unicode
+formatter writes with the same final-source bounded sink. Unbounded formatting
+produced 4,000,000 output bytes, made 1,000,000 formatter writes and requested a
+largest allocation of 4,194,304 bytes. The bounded sink produced 4,094 bytes,
+stopped after 1,019 writes and requested a largest allocation of 4,096 bytes.
+This is a single-case allocation probe, not a whole-process throughput/RSS claim.
+Its source, compiler, source hashes and raw measurements are in `logging-bounds/`.
+
+Initial compile attempts exposed a private upstream ANSI-builder API and a moved
+unused import; both were fixed. One regression initially asserted a turn ID in
+the attribution object instead of its canonical attributes object; that fixture
+was corrected. A validation run was stopped during test compilation to add the
+existing global logger locks around an injected sync-warning test. All final
+commands above were rerun after that test-isolation fix; earlier evidence remains
+in `before-test-isolation/`. No runtime test failure remains.
 
 ### Imperative missed-run policy continuation
 
@@ -659,7 +721,7 @@ change, or remote push was performed during this task.
 
 Continue from `fix/reliability-completion-20260906` in the isolated `milestone`
 worktree, not from the older preserved checkpoint. Read this 1–23 matrix, the
-original requirements, completion report and the latest `policy-override/` validation logs.
+original requirements, completion report and the latest `logging-bounds/` validation logs.
 Preserve the canonical checkpoint commits and all eight Reminders paths unchanged.
 
 The listener/control-plane lifecycle and migration are now wired and tested;
@@ -685,8 +747,7 @@ do not redo their initial implementation. Finish the remaining boundaries:
    now implemented; preserve their transaction, resync and no-replay tests.
 7. Coordinate admission stop/drain/readiness across gateway, listeners, connectors,
    scheduler and delegates; add full process fault tests using synthetic services.
-8. Instrument missing objectives/readiness, audit raw tracing formatter allocation
-   and abandoned temporary logs, migrate remaining atomic writers, and add measured
+8. Instrument missing objectives/readiness, finish ownership-proven hard-kill log-temp cleanup and legacy line-size limits (raw tracing allocation and failed-rewrite cleanup are now bounded/tested), migrate remaining atomic writers, and add measured
    low-activity SQLite checkpoint/retention behavior and bounded runtime history.
 
 Do not add a competing turn database, lossy compactor, or uncertain-write retry

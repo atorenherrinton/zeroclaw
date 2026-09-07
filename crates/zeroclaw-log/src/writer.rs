@@ -703,21 +703,16 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
     ));
 
+    rewrite_tail(&state.policy.path, &tmp, skip)
+}
+
+fn rewrite_tail(path: &Path, tmp: &Path, skip: usize) -> Result<()> {
+    let (out_file, temp_cleanup) = crate::rewrite_temp::create(tmp)?;
     {
-        let mut opts = OpenOptions::new();
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let out_file = opts
-            .open(&tmp)
-            .with_context(|| format!("creating trim temp file {}", tmp.display()))?;
         let mut out = BufWriter::new(out_file);
 
-        let in_file = fs::File::open(&state.policy.path)
-            .with_context(|| format!("opening log for trim: {}", state.policy.path.display()))?;
+        let in_file = fs::File::open(path)
+            .with_context(|| format!("opening log for trim: {}", path.display()))?;
         let reader = BufReader::new(in_file);
 
         let mut index: usize = 0;
@@ -736,22 +731,11 @@ fn trim_to_last_entries(state: &Arc<WorkerState>) -> Result<()> {
         out.flush().context("flushing trim file")?;
         out.into_inner()
             .context("taking trim file out of buf writer")?
-            .sync_data()
+            .sync_all()
             .context("fsync trim file")?;
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-    fs::rename(&tmp, &state.policy.path).with_context(|| {
-        format!(
-            "renaming trim temp {} → {}",
-            tmp.display(),
-            state.policy.path.display()
-        )
-    })?;
+    temp_cleanup.commit(path)?;
 
     Ok(())
 }
@@ -1157,6 +1141,28 @@ mod tests {
             err.to_string(),
             "log writer worker disconnected before reporting flush result"
         );
+    }
+
+    #[test]
+    fn failed_rolling_rewrite_cleans_owned_temp_and_preserves_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("trace.jsonl");
+        let temporary = directory.path().join("trace.tmp.synthetic");
+        // Source-open failure occurs after exclusive temporary-file creation.
+        assert!(rewrite_tail(&source, &temporary, 0).is_err());
+        assert!(!temporary.exists());
+        let invalid_utf8 = b"valid\n\xff\n";
+        std::fs::write(&source, invalid_utf8).unwrap();
+        assert!(rewrite_tail(&source, &temporary, 0).is_err());
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), invalid_utf8);
+        std::fs::write(&temporary, "owned by another writer").unwrap();
+        assert!(rewrite_tail(&source, &temporary, 0).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&temporary).unwrap(),
+            "owned by another writer"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), invalid_utf8);
     }
 
     #[test]

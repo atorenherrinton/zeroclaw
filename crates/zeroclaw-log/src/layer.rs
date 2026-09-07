@@ -3,8 +3,6 @@
 //! routing them to JSONL persistence, the broadcast hook, and the
 //! Observer bridge.
 
-use std::fmt::Write;
-
 use serde_json::{Map as JsonMap, Value};
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Record};
@@ -12,6 +10,7 @@ use tracing::{Event, Id, Subscriber};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
 
+use crate::bounded_format::{self, FIELD_BYTES};
 use crate::event::{
     ATTRIBUTION_FIELDS, COMPOSITE_PREFIXES, EventCategory, EventOutcome, LogEvent, Severity,
     ZeroclawAttribution,
@@ -158,15 +157,15 @@ where
 
         if let Some(attrs_json) = visitor.attrs_json
             && !attrs_json.is_empty()
-            && let Ok(v) = serde_json::from_str::<Value>(&attrs_json)
         {
-            log_event.attributes = v;
+            log_event.attributes = serde_json::from_str::<Value>(&attrs_json)
+                .unwrap_or_else(|_| serde_json::json!({"payload_omitted": true}));
         }
         if let Some(ephemeral_json) = visitor.ephemeral_attrs_json
             && !ephemeral_json.is_empty()
-            && let Ok(v) = serde_json::from_str::<Value>(&ephemeral_json)
         {
-            log_event.ephemeral_attributes = v;
+            log_event.ephemeral_attributes = serde_json::from_str::<Value>(&ephemeral_json)
+                .unwrap_or_else(|_| serde_json::json!({"payload_omitted": true}));
         }
         if !visitor.extra.is_empty() {
             if log_event.attributes.is_null() {
@@ -251,7 +250,10 @@ struct EventCollector {
 
 impl Visit for EventCollector {
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.put(field.name(), Value::String(value.to_string()));
+        self.put(
+            field.name(),
+            Value::String(bounded_format::text(value, field_budget(field))),
+        );
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
@@ -284,19 +286,11 @@ impl Visit for EventCollector {
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        let mut buf = String::new();
-        let _ = write!(&mut buf, "{value}");
-        let mut current = value.source();
-        while let Some(src) = current {
-            let _ = write!(&mut buf, ": {src}");
-            current = src.source();
-        }
-        self.put(field.name(), Value::String(buf));
+        self.put(field.name(), Value::String(bounded_format::error(value)));
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let mut buf = String::new();
-        let _ = write!(&mut buf, "{value:?}");
+        let buf = bounded_format::debug(value, field_budget(field));
         if field.name() == F_MESSAGE {
             self.message = Some(strip_outer_quotes(&buf));
             return;
@@ -431,8 +425,7 @@ impl Visit for AttributionSpanCollector {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let mut buf = String::new();
-        let _ = write!(&mut buf, "{value:?}");
+        let buf = bounded_format::debug(value, field_budget(field));
         let trimmed = strip_outer_quotes(&buf);
         self.put(field.name(), &trimmed);
     }
@@ -441,12 +434,18 @@ impl Visit for AttributionSpanCollector {
 impl AttributionSpanCollector {
     fn put(&mut self, name: &str, value: &str) {
         match name {
-            F_ROLE_FAMILY => self.role_family = Some(value.to_string()),
-            F_ROLE_TYPE => self.role_type = Some(value.to_string()),
-            F_ATTRIB_FIELD => self.attribution_field = Some(value.to_string()),
-            F_COMPOSITE_PREFIX => self.composite_prefix = Some(value.to_string()),
-            F_DEFAULT_CATEGORY => self.default_category = Some(value.to_string()),
-            F_ALIAS => self.alias = Some(value.to_string()),
+            F_ROLE_FAMILY => self.role_family = Some(bounded_format::text(value, FIELD_BYTES)),
+            F_ROLE_TYPE => self.role_type = Some(bounded_format::text(value, FIELD_BYTES)),
+            F_ATTRIB_FIELD => {
+                self.attribution_field = Some(bounded_format::text(value, FIELD_BYTES))
+            }
+            F_COMPOSITE_PREFIX => {
+                self.composite_prefix = Some(bounded_format::text(value, FIELD_BYTES))
+            }
+            F_DEFAULT_CATEGORY => {
+                self.default_category = Some(bounded_format::text(value, FIELD_BYTES))
+            }
+            F_ALIAS => self.alias = Some(bounded_format::text(value, FIELD_BYTES)),
             _ => {}
         }
     }
@@ -529,7 +528,10 @@ impl ScopeSpanCollector {
 
 impl Visit for ScopeSpanCollector {
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.put(field.name(), Value::String(value.to_string()));
+        self.put(
+            field.name(),
+            Value::String(bounded_format::text(value, field_budget(field))),
+        );
     }
 
     fn record_bool(&mut self, field: &Field, value: bool) {
@@ -558,9 +560,15 @@ impl Visit for ScopeSpanCollector {
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let mut buf = String::new();
-        let _ = write!(&mut buf, "{value:?}");
+        let buf = bounded_format::debug(value, field_budget(field));
         self.put(field.name(), Value::String(strip_outer_quotes(&buf)));
+    }
+}
+
+fn field_budget(field: &Field) -> usize {
+    match field.name() {
+        F_ATTRS | F_EPHEMERAL_ATTRS => 32 * 1024,
+        _ => FIELD_BYTES,
     }
 }
 
@@ -612,6 +620,67 @@ mod e2e_tests {
     }
 
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn raw_tracing_is_bounded_before_broadcast_and_disk_with_correlation_intact() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+        let directory = tempfile::tempdir().unwrap();
+        crate::init_from_config(
+            &crate::LogConfig {
+                log_persistence: "full".into(),
+                ..crate::LogConfig::default()
+            },
+            directory.path(),
+        );
+        let mut rx = subscribe_or_install();
+        let subscriber = tracing_subscriber::registry().with(super::LogCaptureLayer);
+        let huge = "🦀".repeat(200_000) + "PRIVATE_TAIL";
+        tracing::subscriber::with_default(subscriber, || {
+            let _scope = tracing::info_span!(target: "zeroclaw_log_internal_scope",
+                "scope", turn_id = "synthetic-turn")
+            .entered();
+            tracing::info!(request_id = "synthetic-request", outcome = "uncertain",
+                payload = %huge, "{huge}");
+            // Malformed or oversized raw transport JSON is visibly omitted.
+            tracing::info!(zc_attrs = %huge, request_id = "synthetic-transport",
+                "oversized raw transport");
+        });
+        crate::flush_for_test().unwrap();
+        let disk = std::fs::read_to_string(crate::runtime_trace_path().unwrap()).unwrap();
+        assert!(!disk.contains("PRIVATE_TAIL"));
+        let rows: Vec<serde_json::Value> = disk
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let raw = rows
+            .iter()
+            .find(|row| row["attributes"]["request_id"] == "synthetic-request")
+            .unwrap();
+        assert_eq!(raw["attributes"]["outcome"], "uncertain");
+        assert_eq!(raw["attributes"]["turn_id"], "synthetic-turn");
+        assert!(raw["message"].as_str().unwrap().len() <= super::FIELD_BYTES);
+        assert!(
+            raw["attributes"]["payload"]
+                .as_str()
+                .unwrap()
+                .contains("log value truncated")
+        );
+        let transport = rows
+            .iter()
+            .find(|row| row["attributes"]["request_id"] == "synthetic-transport")
+            .unwrap();
+        assert_eq!(transport["attributes"]["payload_omitted"], true);
+        let mut found = false;
+        while let Ok(live) = rx.try_recv() {
+            if live["attributes"]["request_id"] == "synthetic-request" {
+                assert_eq!(live, *raw);
+                found = true;
+            }
+        }
+        assert!(found, "bounded captured event must reach live broadcast");
+    }
 
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
