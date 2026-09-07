@@ -15,6 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::delivery::{DeliveryFailure, DeliverySummary, EffectOutcome};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::Config;
 use zeroclaw_config::schema::{CronJobDecl, CronScheduleDecl, CronShellOutputFormat};
@@ -122,6 +123,9 @@ pub struct ManualCronRunResult {
 }
 
 pub struct CronDeliveryOutcome {
+    /// Notification evidence is independent of the legacy combined job status.
+    /// None means delivery was deliberately suppressed or not configured.
+    pub delivery_outcome: Option<EffectOutcome>,
     pub success: bool,
     pub status: String,
     pub output: String,
@@ -130,13 +134,40 @@ pub struct CronDeliveryOutcome {
 pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
+    success: bool,
+    output: String,
+    context: CronDeliveryContext,
+) -> CronDeliveryOutcome {
+    deliver_and_classify_with_handler(config, job, success, output, context, DELIVERY_FN.get())
+        .await
+}
+
+async fn deliver_and_classify_with_handler(
+    config: &Config,
+    job: &CronJob,
     mut success: bool,
     mut output: String,
     context: CronDeliveryContext,
+    handler: Option<&DeliveryFn>,
 ) -> CronDeliveryOutcome {
     let mut status = if success { "ok" } else { "error" }.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
+    let delivery = deliver_if_configured(config, job, &output, handler).await;
+    let delivery_outcome = match &delivery {
+        Ok(outcome) => *outcome,
+        Err(error) => Some(error.downcast_ref::<DeliveryFailure>().map_or(
+            EffectOutcome::PossiblyApplied,
+            |failure| {
+                if failure.confirmed_chunks > 0 && failure.outcome == EffectOutcome::ConfirmedFailed
+                {
+                    EffectOutcome::PartiallyApplied
+                } else {
+                    failure.outcome
+                }
+            },
+        )),
+    };
+    if let Err(e) = delivery {
         // Cron add-time accepts dangling delivery refs (the job's channel
         // may not be provisioned yet); the loudly-logged warn here is
         // the scheduler-side half of that contract. Manual trigger paths
@@ -189,6 +220,7 @@ pub async fn deliver_and_classify_run_result(
     }
 
     CronDeliveryOutcome {
+        delivery_outcome,
         success,
         status,
         output,
@@ -846,7 +878,7 @@ async fn execute_and_persist_job(
         );
         return (job.id.clone(), false, output);
     }
-    let success = Box::pin(persist_job_result(
+    let outcome = Box::pin(persist_job_result(
         config,
         job,
         success,
@@ -856,13 +888,13 @@ async fn execute_and_persist_job(
     ))
     .await;
 
-    // Unit channel results can prove submission only. A failed persistence or
-    // send leaves uncertainty, never permission to rerun this occurrence.
+    // Never infer delivery from the combined execution/best-effort success bit.
+    // Adapters without positive receipts remain possibly applied even on Ok(()).
     if let Err(error) = super::store::checkpoint_occurrence(
         config,
         job,
         execution,
-        if success { "submitted" } else { "uncertain" },
+        occurrence_delivery_state(outcome.delivery_outcome),
         None,
     ) {
         ::zeroclaw_log::record!(
@@ -888,7 +920,7 @@ async fn execute_and_persist_job(
         );
     }
 
-    (job.id.clone(), success, output)
+    (job.id.clone(), outcome.success, output)
 }
 
 async fn run_agent_job(
@@ -1039,7 +1071,7 @@ async fn persist_job_result(
     output: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
-) -> bool {
+) -> CronDeliveryOutcome {
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(
         config,
@@ -1121,7 +1153,18 @@ async fn persist_job_result(
         }
     }
 
-    outcome.success
+    outcome
+}
+
+fn occurrence_delivery_state(outcome: Option<EffectOutcome>) -> &'static str {
+    match outcome {
+        None | Some(EffectOutcome::NotStarted) => "not_started",
+        Some(EffectOutcome::Confirmed) => "confirmed",
+        Some(EffectOutcome::ConfirmedFailed) => "confirmed_failed",
+        Some(EffectOutcome::PartiallyApplied) => "partially_applied",
+        Some(EffectOutcome::PossiblyApplied) => "possibly_applied",
+        Some(EffectOutcome::ReconciliationRequired) => "reconciliation_required",
+    }
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -1159,10 +1202,15 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    handler: Option<&DeliveryFn>,
+) -> Result<Option<EffectOutcome>> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
-        return Ok(());
+        return Ok(None);
     }
 
     if !announce_delivery_decision(output).should_deliver() {
@@ -1173,7 +1221,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .with_attrs(::serde_json::json!({"job_id": job.id})),
             "Cron job returned NO_REPLY sentinel — skipping delivery"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     let channel = delivery.channel.as_deref().ok_or_else(|| {
@@ -1184,7 +1232,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .with_attrs(::serde_json::json!({"field": "channel"})),
             "cron delivery announce refused: required field missing"
         );
-        anyhow::Error::msg("delivery.channel is required for announce mode")
+        notification_not_started().context("delivery.channel is required for announce mode")
     })?;
     let target = delivery.to.as_deref().ok_or_else(|| {
         ::zeroclaw_log::record!(
@@ -1194,7 +1242,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .with_attrs(::serde_json::json!({"field": "to"})),
             "cron delivery announce refused: required field missing"
         );
-        anyhow::Error::msg("delivery.to is required for announce mode")
+        notification_not_started().context("delivery.to is required for announce mode")
     })?;
 
     let route =
@@ -1208,18 +1256,38 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 thread: delivery.thread_id.clone(),
                 reply_to: reply_to.clone(),
             });
-    zeroclaw_api::conversation::ACTIVE_CONVERSATION
-        .scope(
-            route,
-            deliver_announcement(
-                config,
-                channel,
-                target,
-                delivery.thread_id.as_deref(),
-                output,
-            ),
-        )
+    let delivery = zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
+        route,
+        deliver_announcement_with_handler(
+            handler,
+            config,
+            channel,
+            target,
+            delivery.thread_id.as_deref(),
+            output,
+        ),
+    );
+    zeroclaw_api::delivery::SUMMARY
+        .scope(std::sync::Mutex::new(None), async {
+            delivery.await?;
+            Ok(Some(notification_evidence(
+                zeroclaw_api::delivery::take_summary(),
+            )))
+        })
         .await
+}
+
+fn notification_evidence(summary: Option<DeliverySummary>) -> EffectOutcome {
+    match summary {
+        Some(summary) if summary.is_fully_confirmed() => EffectOutcome::Confirmed,
+        Some(summary) if summary.outcome != EffectOutcome::Confirmed => summary.outcome,
+        Some(summary)
+            if summary.confirmed_chunks > 0 && summary.confirmed_chunks < summary.total_chunks =>
+        {
+            EffectOutcome::PartiallyApplied
+        }
+        _ => EffectOutcome::PossiblyApplied,
+    }
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -1252,7 +1320,26 @@ pub async fn deliver_announcement(
     thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
-    if let Some(f) = DELIVERY_FN.get() {
+    deliver_announcement_with_handler(
+        DELIVERY_FN.get(),
+        config,
+        channel,
+        target,
+        thread_id,
+        output,
+    )
+    .await
+}
+
+async fn deliver_announcement_with_handler(
+    handler: Option<&DeliveryFn>,
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+) -> Result<()> {
+    if let Some(f) = handler {
         f(
             config.clone(),
             channel.to_string(),
@@ -1270,8 +1357,18 @@ pub async fn deliver_announcement(
             "Cron delivery skipped: no delivery handler registered \
              (register_delivery_fn was not called by the binary)"
         );
-        Ok(())
+        Err(notification_not_started())
     }
+}
+
+fn notification_not_started() -> anyhow::Error {
+    DeliveryFailure {
+        outcome: EffectOutcome::NotStarted,
+        chunk_index: 0,
+        total_chunks: 1,
+        confirmed_chunks: 0,
+    }
+    .into()
 }
 
 async fn run_job_command_with_runtime(
@@ -2713,7 +2810,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -2732,7 +2829,7 @@ mod tests {
         crate::cron::store::reset_write_connection_count_for_tests(&config);
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
 
-        assert!(success);
+        assert!(success.success);
         assert_eq!(
             crate::cron::store::write_connection_count_for_tests(&config),
             1
@@ -2753,7 +2850,7 @@ mod tests {
             let output = format!("run-{idx}");
 
             let success = persist_job_result(&config, &job, true, &output, started, finished).await;
-            assert!(success);
+            assert!(success.success);
         }
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2790,7 +2887,7 @@ mod tests {
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
 
-        assert!(success);
+        assert!(success.success);
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
 
         let stored = cron::get_job(&config, &job.id).unwrap();
@@ -2823,7 +2920,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
     }
@@ -2851,7 +2948,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
-        assert!(!success);
+        assert!(!success.success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
@@ -2882,7 +2979,7 @@ mod tests {
         crate::cron::store::reset_write_connection_count_for_tests(&config);
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
 
-        assert!(!success);
+        assert!(!success.success);
         assert_eq!(
             crate::cron::store::write_connection_count_for_tests(&config),
             1
@@ -2927,7 +3024,7 @@ mod tests {
         drop(conn);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -2964,7 +3061,7 @@ mod tests {
         drop(conn);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2985,7 +3082,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
     }
@@ -3002,16 +3099,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
-        assert!(!success);
+        assert!(!success.success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.last_status.as_deref(), Some("error"));
     }
 
     #[tokio::test]
-    async fn persist_job_result_delivery_stubbed_succeeds() {
-        // Delivery is stubbed (moved to zeroclaw-channels orchestrator).
-        // This test verifies the stub returns Ok, so persist_job_result succeeds.
+    async fn persist_job_result_unacknowledged_delivery_preserves_execution_status() {
+        register_recording_delivery_fn();
+        // Unit success preserves legacy execution status, but proves no ack.
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let job = cron::add_agent_job(
@@ -3042,7 +3139,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(updated.enabled);
@@ -3071,7 +3168,7 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(updated.enabled);
@@ -3142,7 +3239,7 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
         let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
-        assert!(success);
+        assert!(success.success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
         // to prevent re-execution with a past next_run timestamp.
@@ -3161,7 +3258,11 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert!(
+            deliver_if_configured(&config, &job, "x", DELIVERY_FN.get())
+                .await
+                .is_ok()
+        );
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3215,7 +3316,9 @@ mod tests {
             "NO_REPLY[INFO]: healthy",
         ] {
             let before = DELIVERED.load(SeqCst);
-            deliver_if_configured(&config, &job, quiet).await.unwrap();
+            deliver_if_configured(&config, &job, quiet, DELIVERY_FN.get())
+                .await
+                .unwrap();
             assert_eq!(
                 DELIVERED.load(SeqCst),
                 before,
@@ -3225,7 +3328,7 @@ mod tests {
 
         // Real content must be delivered.
         let before = DELIVERED.load(SeqCst);
-        deliver_if_configured(&config, &job, "All systems nominal")
+        deliver_if_configured(&config, &job, "All systems nominal", DELIVERY_FN.get())
             .await
             .unwrap();
         assert_eq!(
@@ -3240,7 +3343,9 @@ mod tests {
             "NO_REPLY[REFUSE]: policy prevented the check",
         ] {
             let before = DELIVERED.load(SeqCst);
-            deliver_if_configured(&config, &job, visible).await.unwrap();
+            deliver_if_configured(&config, &job, visible, DELIVERY_FN.get())
+                .await
+                .unwrap();
             assert_eq!(
                 DELIVERED.load(SeqCst),
                 before + 1,
@@ -3266,17 +3371,155 @@ mod tests {
         assert!(announce_delivery_decision("NO_REPLY[REFUSE]: blocked by policy").should_deliver());
     }
 
+    fn evidence_handler(outcome: EffectOutcome, fail: bool) -> DeliveryFn {
+        Box::new(move |_, _, _, _, _| {
+            Box::pin(async move {
+                if fail {
+                    return Err(DeliveryFailure {
+                        outcome,
+                        chunk_index: 1,
+                        total_chunks: 2,
+                        confirmed_chunks: 1,
+                    }
+                    .into());
+                }
+                zeroclaw_api::delivery::record_summary(DeliverySummary {
+                    outcome,
+                    confirmed_chunks: 1,
+                    total_chunks: 1,
+                });
+                Ok(())
+            })
+        })
+    }
+
     #[tokio::test]
-    async fn deliver_announcement_returns_ok_when_no_handler_registered() {
-        let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
-        // No registered handler is a runtime-level state, not a delivery
-        // failure. The caller (persist_job_result) should record the job
-        // execution as successful; the missing handler is logged via
-        // tracing::warn for operator visibility.
-        deliver_announcement(&config, "telegram", "chat-id", None, "payload")
-            .await
-            .expect("missing delivery handler should be Ok with a warn log");
+    async fn notification_evidence_is_independent_of_execution_and_best_effort() {
+        let config = Config::default();
+        let job = announce_job();
+        let confirmed = evidence_handler(EffectOutcome::Confirmed, false);
+        let uncertain = evidence_handler(EffectOutcome::ReconciliationRequired, true);
+        // Concurrent calls have separate receipt scopes. A failed execution can
+        // have a confirmed notification; best-effort never confirms a lost ack.
+        let (failed_job, successful_job) = tokio::join!(
+            deliver_and_classify_with_handler(
+                &config,
+                &job,
+                false,
+                "execution failed".into(),
+                CronDeliveryContext::Scheduled,
+                Some(&confirmed)
+            ),
+            deliver_and_classify_with_handler(
+                &config,
+                &job,
+                true,
+                "execution done".into(),
+                CronDeliveryContext::Scheduled,
+                Some(&uncertain)
+            ),
+        );
+        assert!(!failed_job.success);
+        assert_eq!(failed_job.delivery_outcome, Some(EffectOutcome::Confirmed));
+        assert!(
+            successful_job.success,
+            "legacy best-effort status is preserved"
+        );
+        assert_eq!(successful_job.status, "degraded");
+        assert_eq!(
+            successful_job.delivery_outcome,
+            Some(EffectOutcome::ReconciliationRequired)
+        );
+        assert_eq!(
+            occurrence_delivery_state(failed_job.delivery_outcome),
+            "confirmed"
+        );
+        assert_eq!(
+            occurrence_delivery_state(successful_job.delivery_outcome),
+            "reconciliation_required"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_without_ack_is_uncertain_and_suppression_is_not_delivery() {
+        let config = Config::default();
+        let job = announce_job();
+        let unit_handler: DeliveryFn = Box::new(|_, _, _, _, _| Box::pin(async { Ok(()) }));
+        let unacknowledged = deliver_and_classify_with_handler(
+            &config,
+            &job,
+            true,
+            "done".into(),
+            CronDeliveryContext::Scheduled,
+            Some(&unit_handler),
+        )
+        .await;
+        assert_eq!(
+            unacknowledged.delivery_outcome,
+            Some(EffectOutcome::PossiblyApplied)
+        );
+        let suppressed = deliver_and_classify_with_handler(
+            &config,
+            &job,
+            true,
+            "NO_REPLY".into(),
+            CronDeliveryContext::Scheduled,
+            None,
+        )
+        .await;
+        assert_eq!(suppressed.delivery_outcome, None);
+        assert!(suppressed.success);
+        let missing = deliver_and_classify_with_handler(
+            &config,
+            &job,
+            true,
+            "done".into(),
+            CronDeliveryContext::Scheduled,
+            None,
+        )
+        .await;
+        assert_eq!(missing.delivery_outcome, Some(EffectOutcome::NotStarted));
+        assert_eq!(missing.status, "degraded");
+    }
+
+    #[test]
+    fn empty_or_inconsistent_summary_cannot_confirm_notification() {
+        for (confirmed_chunks, total_chunks) in [(0, 0), (0, 1), (2, 1)] {
+            assert_eq!(
+                notification_evidence(Some(DeliverySummary {
+                    outcome: EffectOutcome::Confirmed,
+                    confirmed_chunks,
+                    total_chunks,
+                })),
+                EffectOutcome::PossiblyApplied
+            );
+        }
+        assert_eq!(
+            notification_evidence(Some(DeliverySummary {
+                outcome: EffectOutcome::Confirmed,
+                confirmed_chunks: 1,
+                total_chunks: 2,
+            })),
+            EffectOutcome::PartiallyApplied
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_without_handler_is_typed_not_started() {
+        let error = deliver_announcement_with_handler(
+            None,
+            &Config::default(),
+            "telegram",
+            "synthetic-chat",
+            None,
+            "payload",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DeliveryFailure>().unwrap().outcome,
+            EffectOutcome::NotStarted
+        );
     }
 
     #[test]

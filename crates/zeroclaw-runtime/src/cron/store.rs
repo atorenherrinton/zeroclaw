@@ -839,15 +839,32 @@ pub(crate) fn checkpoint_occurrence(
         "invalid occurrence execution state"
     );
     anyhow::ensure!(
-        ["not_started", "submitting", "submitted", "uncertain"].contains(&delivery),
+        [
+            "not_started",
+            "submitting",
+            "confirmed",
+            "confirmed_failed",
+            "partially_applied",
+            "possibly_applied",
+            "reconciliation_required",
+        ]
+        .contains(&delivery),
         "invalid occurrence delivery state"
     );
     with_initialized_connection(config, |conn| {
         conn.execute_batch("PRAGMA synchronous=FULL")?;
         let output = output.map(|s| &s[..s.floor_char_boundary(MAX_CRON_OUTPUT_BYTES)]);
-        let changed=conn.execute("UPDATE cron_occurrences SET execution_state=?3,delivery_state=?4,output=COALESCE(?5,output),updated_at=?6 WHERE job_id=?1 AND scheduled_at=?2",
+        let changed=conn.execute("UPDATE cron_occurrences SET execution_state=?3,delivery_state=?4,output=COALESCE(?5,output),updated_at=?6 WHERE job_id=?1 AND scheduled_at=?2 AND (
+            (execution_state='claimed' AND ?3='running' AND ?4='not_started') OR
+            (execution_state='running' AND ?3 IN ('confirmed','possibly_applied') AND ?4='submitting') OR
+            (execution_state=?3 AND delivery_state='submitting' AND ?4 NOT IN ('submitting')) OR
+            (execution_state=?3 AND delivery_state=?4 AND (?5 IS NULL OR output=?5))
+        )",
             params![job.id,job.next_run.to_rfc3339(),execution,delivery,output,Utc::now().to_rfc3339()])?;
-        anyhow::ensure!(changed == 1, "scheduled occurrence claim missing");
+        anyhow::ensure!(
+            changed == 1,
+            "scheduled occurrence claim missing or transition refused"
+        );
         Ok(())
     })
 }
@@ -868,12 +885,30 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
 /// durable uncertainty gate. Reconciliation is required, never automatic replay.
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL, enabled = 0, last_status = 'uncertain'
+        conn.execute_batch("PRAGMA synchronous=FULL")?;
+        let tx = conn.unchecked_transaction()?;
+        // Repair occurrence evidence in the same transaction as quarantine.
+        // Completed execution and positive acknowledgements remain facts even
+        // when the process died before releasing the job's lock.
+        tx.execute(
+            "UPDATE cron_occurrences SET
+                execution_state = CASE WHEN execution_state IN ('claimed','running')
+                    THEN 'possibly_applied' ELSE execution_state END,
+                delivery_state = CASE WHEN delivery_state IN ('submitting','submitted','uncertain')
+                    THEN 'reconciliation_required' ELSE delivery_state END,
+                updated_at = ?1
+             WHERE job_id IN (SELECT id FROM cron_jobs WHERE locked_at IS NOT NULL)",
+            [Utc::now().to_rfc3339()],
+        )?;
+        let count = tx
+            .execute(
+                "UPDATE cron_jobs SET locked_at = NULL, enabled = 0, last_status = 'uncertain'
              WHERE locked_at IS NOT NULL",
-            [],
-        )
-        .context("Failed to clear stale cron job locks")
+                [],
+            )
+            .context("Failed to clear stale cron job locks")?;
+        tx.commit()?;
+        Ok(count)
     })?;
     Ok(cleared.unwrap_or(0))
 }
@@ -4321,6 +4356,83 @@ schedule = { kind = "every", every_ms = 300000 }
         let job = get_job(&config, "orphan-decl").unwrap();
         assert_eq!(job.source, "declarative");
     }
+    #[test]
+    fn recovery_preserves_execution_and_acknowledgements_and_quarantines_lost_ack() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        for delivery in [
+            "confirmed",
+            "submitting",
+            "partially_applied",
+            "possibly_applied",
+        ] {
+            let job = add_job(&config, "test-agent", "*/5 * * * *", "echo fixture").unwrap();
+            assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+            checkpoint_occurrence(&config, &job, "running", "not_started", None).unwrap();
+            checkpoint_occurrence(
+                &config,
+                &job,
+                "confirmed",
+                "submitting",
+                Some("receipt fixture"),
+            )
+            .unwrap();
+            if delivery != "submitting" {
+                checkpoint_occurrence(&config, &job, "confirmed", delivery, None).unwrap();
+            }
+            assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+            // A new connection observes durable evidence. Recovery cannot erase
+            // completed work or upgrade unit success to positive delivery.
+            with_read_connection(&config, |conn| {
+                let row: (String, String, String) = conn.query_row(
+                    "SELECT execution_state,delivery_state,output FROM cron_occurrences WHERE job_id=?1",
+                    [&job.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
+                )?;
+                assert_eq!(row.0, "confirmed");
+                assert_eq!(row.1, if delivery == "submitting" { "reconciliation_required" } else { delivery });
+                assert_eq!(row.2, "receipt fixture");
+                Ok(())
+            }).unwrap();
+            assert!(!claim_job(&config, &job.id, Utc::now()).unwrap());
+            assert!(checkpoint_occurrence(&config, &job, "running", "not_started", None).is_err());
+            assert!(checkpoint_occurrence(&config, &job, "confirmed", "submitting", None).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_recovery_rolls_back_occurrence_and_job_changes_together() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "test-agent", "*/5 * * * *", "echo fixture").unwrap();
+        assert!(claim_job(&config, &job.id, Utc::now()).unwrap());
+        checkpoint_occurrence(&config, &job, "running", "not_started", None).unwrap();
+        with_initialized_connection(&config, |conn| {
+            conn.execute_batch("CREATE TRIGGER reject_quarantine BEFORE UPDATE ON cron_jobs BEGIN SELECT RAISE(ABORT, 'synthetic storage failure'); END")?;
+            Ok(())
+        }).unwrap();
+        assert!(clear_stale_locks(&config).is_err());
+        with_read_connection(&config, |conn| {
+            let state: String = conn.query_row(
+                "SELECT execution_state FROM cron_occurrences WHERE job_id=?1",
+                [&job.id],
+                |r| r.get(0),
+            )?;
+            let locked: bool = conn.query_row(
+                "SELECT locked_at IS NOT NULL FROM cron_jobs WHERE id=?1",
+                [&job.id],
+                |r| r.get(0),
+            )?;
+            assert_eq!(state, "running");
+            assert!(locked);
+            conn.execute_batch("DROP TRIGGER reject_quarantine")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(clear_stale_locks(&config).unwrap(), 1);
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(checkpoint_occurrence(&config, &job, "running", "not_started", None).is_err());
+    }
+
     #[test]
     fn occurrence_survives_job_deletion_and_blocks_same_occurrence_replay() {
         let tmp = TempDir::new().unwrap();
