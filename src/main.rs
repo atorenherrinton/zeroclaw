@@ -182,8 +182,8 @@ fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> 
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
-/// `apply_comments`. Best-effort — silently bails on parse errors so a
-/// successful set isn't downgraded to a failure for a metadata problem.
+/// `apply_comments`. An annotation failure is reported explicitly; the already
+/// committed value change is preserved and must not be replayed as a rollback.
 async fn apply_comment_inline(
     config_path: &std::path::Path,
     path: &str,

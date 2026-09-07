@@ -255,17 +255,16 @@ async fn apply_comments_nonexistent_key_is_noop() {
 }
 
 #[tokio::test]
-async fn apply_comments_unparseable_file_is_noop() {
+async fn apply_comments_unparseable_file_reports_error_without_mutation() {
     let (dir, path) = write_temp_config("this is {{{ not valid TOML").await;
     let original = read_config(&path).await;
 
     let outcome =
         apply_comments(&path, &[(String::from("host"), String::from("irrelevant"))]).await;
 
-    assert!(
-        outcome.is_ok(),
-        "apply_comments must return Ok(()) for an unparseable file"
-    );
+    let error = outcome.expect_err("malformed config must not report successful annotation");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(!error.to_string().contains(&original));
 
     let result = read_config(&path).await;
     assert_eq!(

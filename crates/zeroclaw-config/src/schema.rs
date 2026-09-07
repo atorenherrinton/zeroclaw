@@ -23685,8 +23685,9 @@ fn take_post_replace_sync_failure(config_path: &Path) -> bool {
     }
 }
 
-/// Atomic write shared by `save()` and `save_dirty()`.
-async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+/// Atomic write shared by typed config saves and comment-only annotations.
+/// Callers own read/modify serialization (the gateway holds config_write_lock).
+pub(crate) async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
     #[cfg(any(test, feature = "test-helpers"))]
     if take_post_replace_sync_failure(config_path) {
         return write_config_atomically_with_sync(
@@ -23704,6 +23705,12 @@ async fn write_config_atomically_with_sync(
     toml_str: &str,
     post_replace_sync: PostReplaceSync,
 ) -> Result<()> {
+    // Validate before creating a temp file or touching the recovery snapshot.
+    // Suppress parser excerpts: this document may contain private credentials.
+    anyhow::ensure!(
+        toml_str.parse::<toml::Table>().is_ok(),
+        "Refusing invalid config TOML before atomic replacement"
+    );
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -23727,17 +23734,18 @@ async fn write_config_atomically_with_sync(
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
     let backup_path = parent_dir.join(format!("{file_name}.bak"));
 
-    let mut temp_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp_path)
-        .await
-        .with_context(|| {
-            format!(
-                "Failed to create temporary config file: {}",
-                temp_path.display()
-            )
-        })?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    // Protect temporary contents from the moment the inode exists, including
+    // error/cancellation paths that never reach the post-rename hardening.
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut temp_file = options.open(&temp_path).await.with_context(|| {
+        format!(
+            "Failed to create temporary config file: {}",
+            temp_path.display()
+        )
+    })?;
     temp_file
         .write_all(toml_str.as_bytes())
         .await
@@ -23790,11 +23798,8 @@ async fn write_config_atomically_with_sync(
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
         let _ = fs::remove_file(&temp_path).await;
-        if had_existing_config && backup_path.exists() {
-            fs::copy(&backup_path, config_path)
-                .await
-                .context("Failed to restore config backup")?;
-        }
+        // A failed rename did not replace the destination. Copying an older
+        // backup over it could truncate the file or overwrite another writer.
         anyhow::bail!("Failed to atomically replace config file: {e}");
     }
 

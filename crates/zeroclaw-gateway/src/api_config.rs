@@ -2819,7 +2819,7 @@ mod tests {
             axum::Json(PropPutBody {
                 path: "channels.telegram.newbot.bot_token".to_string(),
                 value: serde_json::json!("tok"),
-                comment: None,
+                comment: Some("synthetic concurrent annotation".into()),
             }),
         ));
 
@@ -2848,6 +2848,14 @@ mod tests {
 
         let response = handler_fut.await;
         assert_eq!(response.status(), StatusCode::OK);
+
+        let disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .unwrap();
+        assert!(disk.contains("# synthetic concurrent annotation"));
+        let persisted: toml::Table = disk.parse().unwrap();
+        assert_eq!(persisted["gateway"]["port"].as_integer(), Some(55555));
+        assert!(persisted["channels"]["telegram"].get("newbot").is_some());
 
         let live = state.config.read();
         assert_eq!(
