@@ -1272,3 +1272,13 @@ cron-occurrences-invalid-query = Invalid occurrence query. Use a nonempty job ID
 cron-occurrences-storage-unavailable = Cron occurrence storage is unavailable or invalid; no empty-history result can be established.
 
 cron-missed-run-policy-config-owned = This job’s missed-run policy is owned by its cron declaration in config.toml. Edit the declaration to change it.
+
+# Tool evidence retained after a failed return or an aborted batch.
+turn-tool-failed-with-output =
+    Error: { $reason }
+
+    Tool-reported output from an unsuccessful call; reconcile external effects before retrying:
+    { $output }
+turn-tool-batch-not-started = [not started: the batch stopped before dispatching this call]
+turn-tool-batch-failed = [tool stopped without a normal result; reconcile external effects before retrying: { $reason }]
+turn-tool-batch-cancelled = [cancelled before this tool returned a normal result]

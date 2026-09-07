@@ -203,6 +203,7 @@ pub(crate) async fn emit_tool_result(
             artifact: outcome
                 .output_data
                 .as_ref()
+                .filter(|_| outcome.success)
                 .and_then(ToolArtifact::from_delivered_data),
         })
         .await;
@@ -364,5 +365,21 @@ mod tests {
             }
         }
         assert!(saw_result, "a ToolResult event must be emitted");
+    }
+    #[tokio::test]
+    async fn failed_source_delivery_assertion_never_projects_a_delivered_artifact() {
+        for success in [false, true] {
+            let mut outcome = ok_outcome();
+            outcome.success = success;
+            outcome.output_data = Some(serde_json::json!({
+                "delivered": true, "path": "/synthetic/artifact.txt"
+            }));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            emit_tool_result(&tx, "fixture", "fixture", &outcome).await;
+            let TurnEvent::ToolResult { artifact, .. } = rx.recv().await.unwrap() else {
+                panic!("expected result");
+            };
+            assert_eq!(artifact.is_some(), success);
+        }
     }
 }

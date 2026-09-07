@@ -450,6 +450,7 @@ mod tests {
             }],
             &mut prepared.ordered_results,
             0,
+            true,
         )
         .await;
 

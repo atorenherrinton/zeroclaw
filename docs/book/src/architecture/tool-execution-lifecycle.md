@@ -143,7 +143,13 @@ Otherwise calls run sequentially. Sequential dispatch checks cancellation
 before each call and stops dispatching the tail when cancelled. Parallel
 dispatch can finish some siblings while others are interrupted; completed calls
 keep their real terminal result, and only unfinished calls get an interrupted
-result.
+result. A typed delivery failure or deadline stops the sequential tail without
+replaying it. Parallel dispatch retains every completed sibling in call order.
+Tool-returned cancellation also remains typed and stops the sequential tail.
+Delivery failures take precedence over sibling deadlines/cancellation when the
+batch returns its terminal error; each failed call also gets its own history
+projection. Unstarted sequential calls are distinguished from calls that stopped
+without a normal result.
 
 The ordered result vector keeps one slot per original model call. Preparation
 fills slots for cancelled, denied, replaced, or deduplicated calls; execution
@@ -169,8 +175,8 @@ Manifest-loaded hardware subprocess tools also inherit the parent deadline.
 The child and concurrent pipe readers stay owned by the invocation; cancellation
 cannot detach the direct child. Protocol payloads and stderr retention are
 bounded. The runner retains received output when a later exit check fails, but
-this does not establish generic durable effect receipts or change the runtime's
-failure/history projection. See [Subprocess tool lifecycle](../hardware/adding-boards-and-tools.md#subprocess-tool-lifecycle).
+this does not establish generic durable effect receipts. The runtime preserves
+returned failure text and structured data as described below. See [Subprocess tool lifecycle](../hardware/adding-boards-and-tools.md#subprocess-tool-lifecycle).
 
 ## Results, receipts, and history
 
@@ -185,6 +191,31 @@ Receipts are result evidence. They are not approval decisions, not durable audit
 records, not a chain, and not generated for denied, replaced, blocked, failed,
 or interrupted calls.
 
+Failed `ToolResult` returns retain their source-reported display text alongside
+the error, and move structured `ToolOutput::data` into the existing outcome/SOP
+capture path. A failed return cannot create a delivered artifact merely because
+its source claims `delivered: true`. Custom display text remains the model-facing
+view; structured data is not automatically copied into model history. The new
+failure display bounds the error excerpt at 4 KiB and the accompanying source
+text at 32 KiB before the existing round/history budgets apply. These excerpts
+are source assertions, not proof of confirmed effects or safe replay.
+
+After a batch returns a typed terminal error, completed outcomes reach SOP
+capture, ordered history and the existing HMAC collector before that error is
+returned. They bypass post-execution hooks and draft progress, and terminal
+cards use a nonblocking best-effort send, so stalled auxiliary consumers cannot
+swallow already returned evidence. Completed cards are not emitted twice. The
+post-tool lifecycle checkpoint also runs after history retention, so its storage
+failure cannot erase completed history. Ordinary successful batches retain their
+existing hooks and progress behavior.
+
+This is current-turn retention, not a durable generic effect journal. Abandoning
+the entire turn future before dispatch hands back its batch can still lose its
+in-memory results. External platform receipts, generic delegate/schedule
+propagation, complete encoded aggregate metadata budgets, scoped overflow
+resources and persistence under parent cancellation remain unfinished. No retry
+or additional database is introduced.
+
 After execution:
 
 - observer `ToolCallStart` events carry the tool name, provider tool-call id
@@ -193,7 +224,7 @@ After execution:
   result while repeating the correlation fields needed by span-oriented
   backends;
 - progress streams show start/completion lines with scrubbed failure text;
-- `after_tool_call` hooks run for executed calls;
+- `after_tool_call` hooks run for executed calls in non-terminal batches;
 - results are bounded by `max_tool_result_chars` before they are appended to
   model-visible history;
 - loop-detection uses result content except for configured ignored tools;

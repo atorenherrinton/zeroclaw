@@ -1069,8 +1069,8 @@ async fn safety_net_streaming_tool_results_input_order_and_midbatch_cancel() {
         "synthesized results must cover every call, in input order"
     );
     assert!(
-        results[1].1.contains("interrupted") && results[2].1.contains("interrupted"),
-        "unrun calls must be synthesized as interrupted"
+        results[1].1.contains("not started") && results[2].1.contains("not started"),
+        "unrun calls must be distinguished from interrupted executions"
     );
 }
 
@@ -2109,3 +2109,6 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
         "model-supplied approved=true must be stripped even with no approval gate"
     );
 }
+
+#[path = "failure_evidence.rs"]
+mod failure_evidence;

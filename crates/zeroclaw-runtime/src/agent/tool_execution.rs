@@ -16,7 +16,7 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
-fn bounded_observer_text(text: &str) -> String {
+pub(crate) fn bounded_observer_text(text: &str) -> String {
     // Reject oversized bodies before scrubbing/allocation. Cutting a secret at
     // the byte boundary could prevent redaction from recognizing it.
     const LIMIT: usize = 4096;
@@ -160,7 +160,8 @@ pub enum ToolFailureKind {
     Duplicate,
     /// A hook cancelled the call intentionally.
     HookCancelled,
-    /// The turn was cancelled before a tool result completed.
+    /// The batch stopped before a normal tool result was returned. The
+    /// original typed terminal error is propagated outside ordinary recovery.
     Interrupted,
 }
 
@@ -403,7 +404,24 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or_else(|| r.output.into_string());
+                    let reason = r.error.unwrap_or_else(|| r.output.as_str().to_owned());
+                    // Keep the source's returned evidence even when its later
+                    // exit/status check failed. It is not a delivery acknowledgement.
+                    let output = if !r.output.is_empty() && r.output.as_str() != reason {
+                        let display_reason =
+                            zeroclaw_tools::output_budget::bound_output(&reason, 4096);
+                        let display_output =
+                            zeroclaw_tools::output_budget::bound_output(&r.output, 32768);
+                        crate::i18n::get_required_cli_string_with_args(
+                            "turn-tool-failed-with-output",
+                            &[
+                                ("reason", display_reason.as_str()),
+                                ("output", display_output.as_str()),
+                            ],
+                        )
+                    } else {
+                        format!("Error: {reason}")
+                    };
                     let failure_kind = if is_security_policy_failure(&reason) {
                         ToolFailureKind::PolicyDenied
                     } else {
@@ -422,13 +440,13 @@ pub(crate) async fn execute_one_tool(
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
-                        output: format!("Error: {reason}"),
+                        output,
                         success: false,
                         error_reason: Some(reason),
                         failure_kind: Some(failure_kind),
                         duration,
                         receipt: None,
-                        output_data: None,
+                        output_data: r.output.into_data(),
                     })
                 }
             }
@@ -437,6 +455,7 @@ pub(crate) async fn execute_one_tool(
                 // recovery treat uncertain delivery as an ordinary retryable error.
                 if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
                     || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || is_tool_loop_cancelled(&e)
                 {
                     return Err(e);
                 }
@@ -497,6 +516,7 @@ pub(crate) async fn execute_one_tool(
                 artifact: out
                     .output_data
                     .as_ref()
+                    .filter(|_| out.success)
                     .and_then(ToolArtifact::from_delivered_data),
             })
             .await;
@@ -573,6 +593,15 @@ pub fn is_stateless_read_tool(name: &str) -> bool {
     )
 }
 
+/// Transient ownership handoff from dispatch to the existing ordered history.
+/// Each error stays attached to its call; a later failure cannot erase earlier
+/// results. This is not a durable effect receipt or another execution ledger.
+pub(crate) enum ToolExecutionSlot {
+    Completed(ToolExecutionOutcome),
+    Failed(anyhow::Error),
+    NotStarted,
+}
+
 // ── Parallel execution ───────────────────────────────────────────────────
 
 pub(crate) async fn execute_tools_parallel(
@@ -583,7 +612,7 @@ pub(crate) async fn execute_tools_parallel(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
+) -> Vec<ToolExecutionSlot> {
     let futures: Vec<_> = tool_calls
         .iter()
         .map(|call| {
@@ -608,15 +637,13 @@ pub(crate) async fn execute_tools_parallel(
         .buffered(4)
         .collect()
         .await;
-    let mut slots = Vec::with_capacity(results.len());
-    for result in results {
-        match result {
-            Ok(outcome) => slots.push(Some(outcome)),
-            Err(e) if is_tool_loop_cancelled(&e) => slots.push(None),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(slots)
+    results
+        .into_iter()
+        .map(|result| match result {
+            Ok(outcome) => ToolExecutionSlot::Completed(outcome),
+            Err(error) => ToolExecutionSlot::Failed(error),
+        })
+        .collect()
 }
 
 // ── Sequential execution ─────────────────────────────────────────────────
@@ -629,8 +656,8 @@ pub(crate) async fn execute_tools_sequential(
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
-) -> Result<Vec<Option<ToolExecutionOutcome>>> {
-    let mut slots: Vec<Option<ToolExecutionOutcome>> = Vec::with_capacity(tool_calls.len());
+) -> Vec<ToolExecutionSlot> {
+    let mut slots = Vec::with_capacity(tool_calls.len());
 
     for call in tool_calls {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -650,14 +677,16 @@ pub(crate) async fn execute_tools_sequential(
         .await
         {
             Ok(outcome) => outcome,
-            Err(e) if is_tool_loop_cancelled(&e) => break,
-            Err(e) => return Err(e),
+            Err(error) => {
+                slots.push(ToolExecutionSlot::Failed(error));
+                break;
+            }
         };
-        slots.push(Some(outcome));
+        slots.push(ToolExecutionSlot::Completed(outcome));
     }
 
-    slots.resize_with(tool_calls.len(), || None);
-    Ok(slots)
+    slots.resize_with(tool_calls.len(), || ToolExecutionSlot::NotStarted);
+    slots
 }
 
 #[cfg(test)]

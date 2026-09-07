@@ -4,14 +4,15 @@
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
-use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
 /// Record each executed tool call's outcome (upstream loop body,
 /// post-execution section): one `tool_call_result` log line, the
 /// `after_tool_call` hook, a completion Status to the draft, and the
-/// call's slot in `ordered_results`.
+/// call's slot in `ordered_results`. Terminal batches retain evidence without
+/// awaiting hooks or draft consumers (`publish_auxiliary = false`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
     executable_indices: &[usize],
@@ -20,6 +21,7 @@ pub(crate) async fn record_executed_outcomes(
     executed_outcomes: Vec<ToolExecutionOutcome>,
     ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
     iteration: usize,
+    publish_auxiliary: bool,
 ) {
     for (((idx, call), stream_call), outcome) in executable_indices
         .iter()
@@ -46,13 +48,34 @@ pub(crate) async fn record_executed_outcomes(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
+                    "error_reason": outcome.error_reason.as_deref().map(crate::agent::tool_execution::bounded_observer_text),
+                    "output": crate::agent::tool_execution::bounded_observer_text(&outcome.output),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_result"
         );
 
+        // Capture into the innermost live SOP step scope (no-op otherwise).
+        if crate::sop::executor::step_capture_active() {
+            crate::sop::executor::record_step_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+                outcome.output.clone(),
+                outcome.output_data.clone(),
+                outcome.error_reason.as_deref(),
+                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
+            );
+        }
+
+        let (_, _, outcome) =
+            ordered_results[*idx].insert((call.name.clone(), call.tool_call_id.clone(), outcome));
+        // Completed evidence belongs to ordered history before any auxiliary
+        // async work. A terminal batch skips hooks/draft progress so backpressure
+        // or a stalled hook cannot swallow an already returned result.
+        if !publish_auxiliary {
+            continue;
+        }
         // ── Hook: after_tool_call (void) ─────────────────
         if let Some(hooks) = ctx.hooks {
             let tool_result_obj = crate::tools::ToolResult {
@@ -83,24 +106,12 @@ pub(crate) async fn record_executed_outcomes(
                     tool_provenance: stream_call.tool_provenance,
                     secs,
                     success: outcome.success,
-                    error: outcome.error_reason.as_deref().map(scrub_credentials),
+                    error: outcome
+                        .error_reason
+                        .as_deref()
+                        .map(crate::agent::tool_execution::bounded_observer_text),
                 })
                 .await;
         }
-
-        // Capture into the innermost live SOP step scope (no-op otherwise).
-        if crate::sop::executor::step_capture_active() {
-            crate::sop::executor::record_step_tool_call(
-                &call.name,
-                &call.arguments,
-                outcome.success,
-                outcome.output.clone(),
-                outcome.output_data.clone(),
-                outcome.error_reason.as_deref(),
-                u64::try_from(outcome.duration.as_millis()).unwrap_or(u64::MAX),
-            );
-        }
-
-        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
     }
 }

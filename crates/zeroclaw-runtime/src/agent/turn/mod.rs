@@ -74,7 +74,7 @@ pub(crate) use vision_route::{prepare_messages_for_iteration, resolve_vision_pro
 
 use crate::agent::system_prompt::{NATIVE_TOOLS_TASK_FRAMING, NO_TOOLS_TASK_FRAMING};
 use crate::agent::tool_execution::{
-    ToolDispatchContext, execute_tools_parallel, execute_tools_sequential,
+    ToolDispatchContext, ToolExecutionSlot, execute_tools_parallel, execute_tools_sequential,
     should_execute_tools_in_parallel,
 };
 use crate::security::ingress::{IngressPolicy, ingress_policy};
@@ -1257,7 +1257,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let execution_result =
+        let executed_slots =
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
@@ -1298,15 +1298,10 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 }
             })
             .await;
-        let executed_slots = match execution_result {
-            Ok(slots) => slots,
-            Err(e) if is_tool_loop_cancelled(&e) => {
-                (0..executable_calls.len()).map(|_| None).collect()
-            }
-            Err(e) => return Err(e),
-        };
-
-        let cancelled_mid_batch = executed_slots.iter().any(Option::is_none);
+        let stopped_mid_batch = executed_slots
+            .iter()
+            .any(|slot| !matches!(slot, ToolExecutionSlot::Completed(_)));
+        let mut terminal_error: Option<anyhow::Error> = None;
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -1319,12 +1314,76 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 .zip(executable_calls.iter())
                 .zip(stream_calls),
         ) {
-            if let Some(outcome) = slot {
-                executed_completed_indices.push(call_idx);
-                executed_completed_calls.push(call.clone());
-                executed_completed_stream_calls.push(stream_call);
-                executed_completed_outcomes.push(outcome);
+            let output = match slot {
+                ToolExecutionSlot::Completed(outcome) => {
+                    executed_completed_indices.push(call_idx);
+                    executed_completed_calls.push(call.clone());
+                    executed_completed_stream_calls.push(stream_call);
+                    executed_completed_outcomes.push(outcome);
+                    continue;
+                }
+                ToolExecutionSlot::NotStarted => {
+                    crate::i18n::get_required_cli_string("turn-tool-batch-not-started")
+                }
+                ToolExecutionSlot::Failed(error) => {
+                    let output = if is_tool_loop_cancelled(&error) {
+                        crate::i18n::get_required_cli_string("turn-tool-batch-cancelled")
+                    } else {
+                        // Project typed evidence for history, but return the original
+                        // error after retention. Never send it through ordinary recovery.
+                        let reason = if let Some(e) =
+                            error.downcast_ref::<zeroclaw_api::delivery::DeliveryFailure>()
+                        {
+                            e.to_string()
+                        } else if let Some(e) =
+                            error.downcast_ref::<zeroclaw_api::deadline::DeadlineExceeded>()
+                        {
+                            e.to_string()
+                        } else {
+                            error.to_string()
+                        };
+                        crate::i18n::get_required_cli_string_with_args(
+                            "turn-tool-batch-failed",
+                            &[("reason", reason.as_str())],
+                        )
+                    };
+                    // Effect evidence takes precedence over deadline/cancellation;
+                    // all failed siblings also keep their own history projection.
+                    if terminal_error.as_ref().is_none_or(|previous| {
+                        (is_tool_loop_cancelled(previous) && !is_tool_loop_cancelled(&error))
+                            || (error.is::<zeroclaw_api::delivery::DeliveryFailure>()
+                                && !previous.is::<zeroclaw_api::delivery::DeliveryFailure>())
+                    }) {
+                        terminal_error = Some(error);
+                    }
+                    output
+                }
+            };
+            // No completed result exists for this call. This terminal history
+            // projection is not a success receipt or an ordinary retryable failure.
+            if let Some(tx) = ctx.event_tx {
+                // A failed batch must not wait on presentation backpressure before
+                // recording completed results and returning its original error.
+                let _ = tx.try_send(zeroclaw_api::agent::TurnEvent::ToolResult {
+                    id: events::resolve_tool_call_id(call),
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    artifact: None,
+                });
             }
+            ordered_results[call_idx] = Some((
+                call.name.clone(),
+                call.tool_call_id.clone(),
+                crate::agent::tool_execution::ToolExecutionOutcome {
+                    output,
+                    success: false,
+                    error_reason: None,
+                    failure_kind: Some(crate::agent::tool_execution::ToolFailureKind::Interrupted),
+                    duration: std::time::Duration::ZERO,
+                    receipt: None,
+                    output_data: None,
+                },
+            ));
         }
 
         record_executed_outcomes(
@@ -1335,62 +1394,9 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,
+            !stopped_mid_batch,
         )
         .await;
-        if cancelled_mid_batch {
-            for (idx, call) in tool_calls.iter().enumerate() {
-                if ordered_results[idx].is_none() {
-                    ordered_results[idx] = Some((
-                        call.name.clone(),
-                        call.tool_call_id.clone(),
-                        crate::agent::tool_execution::ToolExecutionOutcome {
-                            output: crate::i18n::get_required_cli_string(
-                                "turn-tool-interrupted-before-result",
-                            ),
-                            success: false,
-                            error_reason: None,
-                            failure_kind: Some(
-                                crate::agent::tool_execution::ToolFailureKind::Interrupted,
-                            ),
-                            duration: std::time::Duration::ZERO,
-                            receipt: None,
-                            output_data: None,
-                        },
-                    ));
-                }
-            }
-            // Close pending cards only for executable calls whose terminal
-            // ToolResult was never emitted by the executor. A parallel call that
-            // completed before the cancellation already emitted its real result;
-            // re-emitting here would flip its card from completed to interrupted.
-            if let Some(tx) = ctx.event_tx {
-                let completed: std::collections::HashSet<usize> =
-                    executed_completed_indices.iter().copied().collect();
-                for (call_idx, call) in executable_indices.iter().zip(executable_calls.iter()) {
-                    if completed.contains(call_idx) {
-                        continue;
-                    }
-                    let call_id = events::resolve_tool_call_id(call);
-                    let interrupted = crate::agent::tool_execution::ToolExecutionOutcome {
-                        output: crate::i18n::get_required_cli_string(
-                            "turn-tool-interrupted-before-result",
-                        ),
-                        success: false,
-                        error_reason: None,
-                        failure_kind: Some(
-                            crate::agent::tool_execution::ToolFailureKind::Interrupted,
-                        ),
-                        duration: std::time::Duration::ZERO,
-                        receipt: None,
-                        output_data: None,
-                    };
-                    events::emit_tool_result(tx, &call_id, &call.name, &interrupted).await;
-                }
-            }
-        }
-
-        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
-            .await?;
         let payload_budget = zeroclaw_tools::output_budget::per_result_budget(
             max_tool_result_chars,
             ordered_results.len(),
@@ -1426,7 +1432,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             turn_id,
         )?;
 
-        if !cancelled_mid_batch && recovery_trigger.is_none() {
+        if !stopped_mid_batch && recovery_trigger.is_none() {
             recovery_trigger = check_identical_output_abort(
                 &detection_relevant_output,
                 loop_started_at,
@@ -1447,9 +1453,15 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
         );
 
-        if cancelled_mid_batch {
+        if let Some(error) = terminal_error {
+            return Err(error);
+        }
+        if stopped_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
+        // Checkpoint failures also leave the completed round in history.
+        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
+            .await?;
 
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {

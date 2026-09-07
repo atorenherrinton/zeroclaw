@@ -7732,7 +7732,7 @@ mod tests {
         );
         assert_eq!(
             cancel_results[0],
-            crate::i18n::get_required_cli_string("turn-tool-interrupted-before-result")
+            crate::i18n::get_required_cli_string("turn-tool-batch-cancelled")
         );
     }
 
