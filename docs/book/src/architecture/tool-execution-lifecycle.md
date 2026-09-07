@@ -150,6 +150,21 @@ fills slots for cancelled, denied, replaced, or deduplicated calls; execution
 fills the remaining slots. This preserves provider history ordering even when
 some calls never execute or when parallel calls finish out of order.
 
+MCP entry points use the canonical `zeroclaw_api::deadline::PARENT` scope.
+Connection setup and tool/resource/prompt operations cannot start after its
+expiry; queued waits and reconnect waits consume the same parent budget. MCP
+wrappers preserve `DeadlineExceeded` for the runtime instead of flattening it
+into an ordinary tool error. Aggregate resource/prompt APIs return `Result` so
+parent expiry cannot masquerade as an empty successful catalog.
+
+Connection recovery remains owned by the MCP client's existing recovery barrier.
+It runs independently after caller cancellation, with a 30-second recovery and
+5-second cleanup ceiling, and never replays an outcome-unknown request. Recovery
+failure or abandonment poisons admission; initialized-notification writes must
+succeed before readiness. Direct-child cleanup is covered by synthetic process
+tests; detached descendants, generic effect receipts and coordinated process
+shutdown remain unfinished. See [MCP](../tools/mcp.md#parent-deadlines-and-recovery).
+
 ## Results, receipts, and history
 
 Successful tool executions normalize empty output to `(no output)`. When

@@ -100,6 +100,7 @@ impl Tool for McpPromptsTool {
                                     }
                                 }
                             }
+                            Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
                             Err(e) => Ok(Self::fail(e.to_string())),
                         }
                     }
@@ -109,7 +110,7 @@ impl Tool for McpPromptsTool {
                          omit `cursor` for an all-server list",
                     )),
                     (None, None) => {
-                        let all = self.registry.list_all_prompts().await;
+                        let all = self.registry.list_all_prompts().await?;
                         let defs: Vec<_> = all.into_iter().map(|(_, def)| def).collect();
                         match serde_json::to_string_pretty(&defs) {
                             Ok(s) => Ok(Self::ok(s)),
@@ -133,6 +134,7 @@ impl Tool for McpPromptsTool {
                             crate::mcp_context::render_prompt_messages(&server, &name, &result);
                         Ok(Self::ok(rendered))
                     }
+                    Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

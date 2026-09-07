@@ -21,6 +21,7 @@ use crate::mcp_transport::{
     McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
     create_shared_transport,
 };
+use zeroclaw_api::deadline::{DeadlineExceeded, Phase, run_inherited_phase};
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Timeout for receiving a response from an MCP server during init/list.
@@ -36,6 +37,10 @@ const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 /// Maximum automatic reconnect attempts when a request is known not to have
 /// been written. Outcome-unknown requests are never replayed.
 const MAX_RECONNECT_ATTEMPTS: u32 = 2;
+
+// Connection cleanup outlives a cancelled request, but cannot run indefinitely.
+const RECOVERY_BUDGET: Duration = Duration::from_secs(30);
+const RECOVERY_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 
 /// Perform the MCP `initialize` + `notifications/initialized` handshake on a
 /// transport. Shared by the initial [`McpServer::connect`] and the
@@ -85,10 +90,15 @@ async fn handshake(
         .unwrap_or_default();
 
     // Notify the server the client is initialized (notifications expect no
-    // response). Best effort — ignore errors.
+    // response). A failed or stalled write cannot establish a ready session.
     let notif = JsonRpcRequest::notification("notifications/initialized", json!({}));
     let notif_lifecycle = McpRequestLifecycle::uncoordinated(epoch);
-    let _ = transport.send_and_recv(&notif, &notif_lifecycle).await;
+    timeout(
+        Duration::from_secs(RECV_TIMEOUT_SECS),
+        transport.send_and_recv(&notif, &notif_lifecycle),
+    )
+    .await
+    .context("MCP initialized notification timed out")??;
 
     Ok(capabilities)
 }
@@ -272,6 +282,21 @@ impl Drop for WriteBarrierArm<'_> {
     }
 }
 
+/// A dropped or panicking recovery must not strand future calls behind a gate
+/// that can never reopen. The existing barrier remains the availability owner.
+struct RecoveryFailureGuard<'a> {
+    recovery: &'a RecoveryBarrier,
+    armed: bool,
+}
+
+impl Drop for RecoveryFailureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.recovery.poison();
+        }
+    }
+}
+
 // ── McpServer ──────────────────────────────────────────────────────────────
 
 /// A live connection to one MCP server (any transport).
@@ -324,6 +349,12 @@ impl Drop for OutcomeUnknownGuard {
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
+        // Admission is nested inside agent/delegate assembly. Keep the
+        // handshake future off those callers' native stacks.
+        run_inherited_phase(Phase::Tool, Box::pin(Self::connect_inner(config))).await
+    }
+
+    async fn connect_inner(config: McpServerConfig) -> Result<Self> {
         // Create transport based on config
         let transport: Arc<dyn SharedMcpTransportConn> =
             Arc::from(create_shared_transport(&config).with_context(|| {
@@ -525,7 +556,16 @@ impl McpServer {
     ) -> tokio::task::JoinHandle<Result<()>> {
         let server = self.clone();
         zeroclaw_spawn::spawn!(async move {
-            let result = server.reestablish(observed_epoch).await;
+            let result = zeroclaw_api::deadline::PARENT
+                .scope(
+                    None,
+                    server.recover_with_budget(
+                        observed_epoch,
+                        RECOVERY_BUDGET,
+                        RECOVERY_CLEANUP_BUDGET,
+                    ),
+                )
+                .await;
             if let Err(error) = &result {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -552,6 +592,37 @@ impl McpServer {
         // Dropping a Tokio JoinHandle detaches the task. Recovery therefore
         // continues even if the request future that initiated it is cancelled.
         drop(self.start_recovery(observed_epoch, operation));
+    }
+
+    async fn recover_with_budget(
+        &self,
+        observed_epoch: u64,
+        recovery_budget: Duration,
+        cleanup_budget: Duration,
+    ) -> Result<()> {
+        // Deliberately independent of the initiating turn's expired deadline:
+        // this repairs connection state, never replays the original operation.
+        let mut failure_guard = RecoveryFailureGuard {
+            recovery: &self.recovery,
+            armed: true,
+        };
+        match timeout(recovery_budget, self.reestablish(observed_epoch)).await {
+            Ok(Ok(())) => {
+                failure_guard.armed = false;
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(elapsed) => {
+                self.recovery.poison();
+                match timeout(cleanup_budget, self.transport.close()).await {
+                    Ok(Ok(())) => Err(elapsed.into()),
+                    Ok(Err(error)) => Err(error.context(elapsed)),
+                    Err(cleanup_elapsed) => {
+                        Err(anyhow::Error::new(cleanup_elapsed).context(elapsed))
+                    }
+                }
+            }
+        }
     }
 
     async fn reestablish(&self, observed_epoch: u64) -> Result<()> {
@@ -730,6 +801,14 @@ impl McpServer {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        run_inherited_phase(Phase::Tool, self.call_tool_inner(tool_name, arguments)).await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let tool_timeout = {
             let inner = self.inner.lock().await;
             inner
@@ -772,6 +851,14 @@ impl McpServer {
         rpc_method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        run_inherited_phase(Phase::Tool, self.dispatch_method_inner(rpc_method, params)).await
+    }
+
+    async fn dispatch_method_inner(
+        &self,
+        rpc_method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         let tool_timeout = {
             let inner = self.inner.lock().await;
             inner
@@ -796,6 +883,10 @@ impl McpServer {
 
     /// `resources/list` — capability-gated.
     pub async fn list_resources(&self, cursor: Option<String>) -> Result<McpResourcesListResult> {
+        run_inherited_phase(Phase::Tool, self.list_resources_inner(cursor)).await
+    }
+
+    async fn list_resources_inner(&self, cursor: Option<String>) -> Result<McpResourcesListResult> {
         {
             let inner = self.inner.lock().await;
             if !inner.capabilities.supports_resources() {
@@ -815,6 +906,10 @@ impl McpServer {
 
     /// `resources/read` — capability-gated.
     pub async fn read_resource(&self, uri: &str) -> Result<McpResourceContents> {
+        run_inherited_phase(Phase::Tool, self.read_resource_inner(uri)).await
+    }
+
+    async fn read_resource_inner(&self, uri: &str) -> Result<McpResourceContents> {
         {
             let inner = self.inner.lock().await;
             if !inner.capabilities.supports_resources() {
@@ -832,6 +927,10 @@ impl McpServer {
 
     /// `prompts/list` — capability-gated.
     pub async fn list_prompts(&self, cursor: Option<String>) -> Result<McpPromptsListResult> {
+        run_inherited_phase(Phase::Tool, self.list_prompts_inner(cursor)).await
+    }
+
+    async fn list_prompts_inner(&self, cursor: Option<String>) -> Result<McpPromptsListResult> {
         {
             let inner = self.inner.lock().await;
             if !inner.capabilities.supports_prompts() {
@@ -851,6 +950,14 @@ impl McpServer {
 
     /// `prompts/get` — capability-gated.
     pub async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<McpGetPromptResult> {
+        run_inherited_phase(Phase::Tool, self.get_prompt_inner(name, arguments)).await
+    }
+
+    async fn get_prompt_inner(
         &self,
         name: &str,
         arguments: serde_json::Value,
@@ -886,8 +993,13 @@ pub struct McpRegistry {
 }
 
 impl McpRegistry {
-    /// Connect to all configured servers. Non-fatal: failures are logged and skipped.
+    /// Connect to configured servers. Ordinary failures are logged and skipped;
+    /// an inherited deadline aborts the aggregate without starting later servers.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
+        run_inherited_phase(Phase::Tool, Box::pin(Self::connect_all_inner(configs))).await
+    }
+
+    async fn connect_all_inner(configs: &[McpServerConfig]) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
@@ -906,6 +1018,7 @@ impl McpRegistry {
                     }
                     servers.push(server);
                 }
+                Err(e) if e.is::<DeadlineExceeded>() => return Err(e),
                 // Non-fatal — log and continue with remaining servers
                 Err(e) => {
                     ::zeroclaw_log::record!(
@@ -1364,28 +1477,42 @@ impl McpRegistry {
     }
 
     /// List resources across all servers that support them. Each entry's uri is
-    /// returned prefixed with `<server>__`. Per-server errors are skipped.
-    pub async fn list_all_resources(&self) -> Vec<(String, crate::mcp_resource::McpResourceDef)> {
-        let mut out = Vec::new();
-        for (name, idx) in &self.server_index {
-            let srv = &self.servers[*idx];
-            if let Ok(list) = srv.list_resources(None).await {
+    /// returned prefixed with `<server>__`. Ordinary per-server errors are skipped;
+    /// an inherited deadline is returned rather than reported as an empty list.
+    pub async fn list_all_resources(
+        &self,
+    ) -> Result<Vec<(String, crate::mcp_resource::McpResourceDef)>> {
+        run_inherited_phase(Phase::Tool, async {
+            let mut out = Vec::new();
+            for (name, idx) in &self.server_index {
+                let srv = &self.servers[*idx];
+                let list = match srv.list_resources(None).await {
+                    Ok(list) => list,
+                    Err(error) if error.is::<DeadlineExceeded>() => return Err(error),
+                    Err(_) => continue,
+                };
                 for mut def in list.resources {
                     let prefixed_uri = format!("{name}__{}", def.uri);
                     def.uri = prefixed_uri.clone();
                     out.push((prefixed_uri, def));
                 }
             }
-        }
-        out
+            Ok(out)
+        })
+        .await
     }
 
     /// List prompts across all servers that support them, prefixed by server.
-    pub async fn list_all_prompts(&self) -> Vec<(String, crate::mcp_prompt::McpPromptDef)> {
-        let mut out = Vec::new();
-        for (name, idx) in &self.server_index {
-            let srv = &self.servers[*idx];
-            if let Ok(list) = srv.list_prompts(None).await {
+    pub async fn list_all_prompts(&self) -> Result<Vec<(String, crate::mcp_prompt::McpPromptDef)>> {
+        run_inherited_phase(Phase::Tool, async {
+            let mut out = Vec::new();
+            for (name, idx) in &self.server_index {
+                let srv = &self.servers[*idx];
+                let list = match srv.list_prompts(None).await {
+                    Ok(list) => list,
+                    Err(error) if error.is::<DeadlineExceeded>() => return Err(error),
+                    Err(_) => continue,
+                };
                 for mut def in list.prompts {
                     // Rewrite the def's name to the prefixed form so the value
                     // emitted by `mcp_prompts list` can be passed straight back
@@ -1395,10 +1522,14 @@ impl McpRegistry {
                     out.push((prefixed, def));
                 }
             }
-        }
-        out
+            Ok(out)
+        })
+        .await
     }
 }
+
+#[cfg(test)]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1513,8 +1644,8 @@ mod tests {
     #[tokio::test]
     async fn registry_list_all_empty_for_empty_registry() {
         let registry = McpRegistry::connect_all(&[]).await.expect("connect_all");
-        assert!(registry.list_all_resources().await.is_empty());
-        assert!(registry.list_all_prompts().await.is_empty());
+        assert!(registry.list_all_resources().await.unwrap().is_empty());
+        assert!(registry.list_all_prompts().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1583,7 +1714,7 @@ mod tests {
         assert_eq!(next.as_deref(), Some("page2"));
 
         // And list_all_prompts must also carry the prefixed name in the def.
-        let all = registry.list_all_prompts().await;
+        let all = registry.list_all_prompts().await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1.name, "remote__summarize");
     }
@@ -1733,7 +1864,7 @@ mod tests {
         }
     }
 
-    fn server_with_transport(
+    pub(super) fn server_with_transport(
         name: &str,
         transport: Arc<dyn SharedMcpTransportConn>,
         timeout_secs: u64,
@@ -2687,6 +2818,59 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn stdio_post_write_cancellation_reaps_rehandshakes_and_never_replays() {
+        assert_stdio_post_write_recovery(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parent_deadline_during_initial_handshake_reaps_stdio_child() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let script = temp.path().join("stalled-init.sh");
+        let pid_file = temp.path().join("child.pid");
+        write_executable_script(
+            &script,
+            br#"#!/bin/sh
+printf '%s\n' "$$" > "$1"
+exec tail -f /dev/null
+"#,
+        );
+        let error = zeroclaw_api::deadline::PARENT
+            .scope(
+                Some(Instant::now() + Duration::from_secs(1)),
+                McpServer::connect(stdio_test_config(
+                    "stalled-init",
+                    &script,
+                    vec![pid_file.display().to_string()],
+                    600,
+                )),
+            )
+            .await
+            .err()
+            .expect("initial handshake must expire");
+        assert!(error.is::<DeadlineExceeded>());
+        let pid = tokio::fs::read_to_string(pid_file)
+            .await
+            .expect("child spawned before expiry")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric pid");
+        timeout(Duration::from_secs(2), async {
+            while process_is_alive(pid) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("expired initial handshake must reap the child");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_parent_deadline_reaps_rehandshakes_and_never_replays() {
+        assert_stdio_post_write_recovery(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_stdio_post_write_recovery(parent_deadline: bool) {
         let temp = tempfile::tempdir().expect("tempdir");
         let script_path = temp.path().join("cancel-mcp.sh");
         let effect_ready = temp.path().join("effect-ready.fifo");
@@ -2742,17 +2926,31 @@ done
         .await
         .expect("connect");
         let call_server = server.clone();
-        let call =
-            zeroclaw_spawn::spawn!(
-                async move { call_server.call_tool("side_effect", json!({})).await }
-            );
+        let call = zeroclaw_spawn::spawn!(async move {
+            let deadline = parent_deadline.then(|| Instant::now() + Duration::from_secs(2));
+            zeroclaw_api::deadline::PARENT
+                .scope(deadline, call_server.call_tool("side_effect", json!({})))
+                .await
+        });
         assert_eq!(read_fifo(&effect_ready).await.trim(), "ready");
-        call.abort();
-        assert!(
-            call.await
-                .expect_err("call must be cancelled")
-                .is_cancelled()
-        );
+        if parent_deadline {
+            let error = call
+                .await
+                .expect("call task")
+                .expect_err("parent must expire");
+            let deadline = error
+                .downcast_ref::<DeadlineExceeded>()
+                .expect("typed deadline");
+            assert_eq!(deadline.phase, Phase::Tool);
+            assert!(deadline.started);
+        } else {
+            call.abort();
+            assert!(
+                call.await
+                    .expect_err("call must be cancelled")
+                    .is_cancelled()
+            );
+        }
         assert_eq!(read_fifo(&recovered).await.trim(), "recovered");
 
         let effects_text = tokio::fs::read_to_string(&effects)

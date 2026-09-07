@@ -99,6 +99,7 @@ impl Tool for McpResourcesTool {
                                     ))),
                                 }
                             }
+                            Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
                             Err(e) => Ok(Self::fail(e.to_string())),
                         }
                     }
@@ -108,7 +109,7 @@ impl Tool for McpResourcesTool {
                          omit `cursor` for an all-server list",
                     )),
                     (None, None) => {
-                        let all = self.registry.list_all_resources().await;
+                        let all = self.registry.list_all_resources().await?;
                         let defs: Vec<_> = all.into_iter().map(|(_, def)| def).collect();
                         match serde_json::to_string_pretty(&defs) {
                             Ok(s) => Ok(Self::ok(s)),
@@ -131,6 +132,7 @@ impl Tool for McpResourcesTool {
                             crate::mcp_context::wrap_resource_contents(&server, &uri, &contents);
                         Ok(Self::ok(wrapped))
                     }
+                    Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

@@ -66,6 +66,35 @@ Per-server fields (`[[mcp.servers]]`), generated from the schema:
 
 `tool_timeout_secs` is an optional per-call timeout; it must be greater than 0 and is capped at 600 seconds.
 
+### Parent deadlines and recovery
+
+MCP connection setup, tool calls, resource reads and prompt queries inherit the
+active turn's monotonic deadline. Waiting for configuration locks, serial
+admission, recovery and capability checks consumes that same budget. An already
+expired parent prevents polling a new operation, including process creation.
+Resources/prompts aggregate queries return a typed deadline error instead of an
+empty success when the parent expires. The tool wrappers preserve this error for
+the existing runtime deadline handler; they do not convert it into retryable text.
+Connection admission futures are boxed at the MCP boundary to bound their native
+stack footprint when embedded in agent/delegate assembly.
+
+Cancellation after a request may have been written remains uncertain. The client
+uses its existing request lifecycle and recovery barrier to repair the connection
+without replaying that request. Detached recovery can outlive the initiating turn
+for at most 30 seconds, followed by at most 5 seconds of cleanup. These are
+connection-maintenance budgets, not permission to continue the cancelled tool.
+A stalled, dropped or failed recovery closes admission through the existing
+barrier. An initialized-notification write must finish successfully before the
+handshake can establish readiness; that write also has a 30-second ceiling.
+
+Synthetic stdio tests verify that deadline expiry during the initial handshake
+reaps the direct child, and that expiry after a tool write reaps and re-handshakes
+without repeating the effect. These tests do not prove termination of detached
+descendants or reversal of remote effects. With no inherited parent, existing
+per-server call limits still apply. Typed external-effect receipts for all MCP
+failures, process-tree containment and process-wide drain/readiness remain
+separate unfinished reliability boundaries.
+
 ### Custom CA trust
 
 For an HTTP or SSE server whose certificate is issued by a private CA, set
