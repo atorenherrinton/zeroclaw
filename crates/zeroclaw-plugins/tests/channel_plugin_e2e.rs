@@ -243,7 +243,7 @@ async fn channel_component_runs_through_host_ingress() {
         ..Default::default()
     });
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (tx, mut rx) = zeroclaw_api::inbound::channel(1);
     let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
     let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
         .await
@@ -351,7 +351,7 @@ async fn warm_channel_resolves_one_rotated_config_revision_at_point_of_use() {
 #[tokio::test]
 async fn channel_listener_stops_when_receiver_closes() {
     let channel = channel("closed").await;
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = zeroclaw_api::inbound::channel(1);
     let listener = zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
 
     drop(rx);
@@ -512,7 +512,7 @@ async fn interrupted_poll_preserves_backlog_but_not_the_dequeued_message() {
     inbound.enqueue(queue_message("kept-1", "first kept"));
     inbound.enqueue(queue_message("kept-2", "second kept"));
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+    let (tx, mut rx) = zeroclaw_api::inbound::channel(2);
     let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
 
     let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
