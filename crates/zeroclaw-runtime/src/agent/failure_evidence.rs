@@ -10,6 +10,7 @@ use zeroclaw_api::delivery::{DeliveryFailure, EffectOutcome};
 enum Mode {
     Success,
     FailedOutput,
+    OversizedData,
     Delivery,
     Deadline,
     Cancel,
@@ -49,6 +50,14 @@ impl Tool for EvidenceTool {
                     "fixture-partial-output",
                 ),
                 error: Some("fixture exit check failed".into()),
+            }),
+            Mode::OversizedData => Ok(ToolResult {
+                success: true,
+                output: ToolOutput::json_with_text(
+                    serde_json::json!({"scope": "fixture-owner", "metadata": "x".repeat(100_000)}),
+                    "fixture-oversized-data",
+                ),
+                error: None,
             }),
             Mode::Delivery => Err(anyhow::Error::new(DeliveryFailure {
                 outcome: EffectOutcome::PossiblyApplied,
@@ -402,5 +411,46 @@ async fn post_execution_checkpoint_failure_keeps_completed_history() {
             .contains("checkpoint unavailable")
     );
     assert_success_retained(&case, 0);
+    assert_eq!(case.remaining_responses, 1);
+}
+
+#[tokio::test]
+async fn oversized_tool_metadata_stops_before_next_provider_call_and_retains_evidence() {
+    let case = run_case(&[Mode::Success, Mode::OversizedData], false, None, None).await;
+    let error = case.result.as_ref().unwrap_err();
+    let evidence = error
+        .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+        .unwrap();
+    assert_eq!(case.calls, vec![1, 1]);
+    assert_eq!(case.remaining_responses, 1);
+    assert_eq!(evidence.results.len(), 2);
+    for slot in &evidence.results {
+        let outcome = &slot.as_ref().unwrap().2;
+        assert!(outcome.success);
+        assert!(outcome.receipt.is_some());
+    }
+    assert_eq!(
+        evidence.results[1]
+            .as_ref()
+            .unwrap()
+            .2
+            .output_data
+            .as_ref()
+            .unwrap()["scope"],
+        "fixture-owner"
+    );
+    assert_eq!(
+        case.history.len(),
+        1,
+        "no partial provider history is appended"
+    );
+}
+
+#[tokio::test]
+async fn output_budget_failure_keeps_original_typed_delivery_failure() {
+    let case = run_case(&[Mode::OversizedData, Mode::Delivery], false, None, None).await;
+    let error = case.result.as_ref().unwrap_err();
+    assert!(error.is::<DeliveryFailure>());
+    assert!(error.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
     assert_eq!(case.remaining_responses, 1);
 }

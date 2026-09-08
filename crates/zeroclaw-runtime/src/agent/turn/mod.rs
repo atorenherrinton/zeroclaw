@@ -1430,7 +1430,18 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             iteration,
             turn_id,
-        )?;
+        )
+        .map_err(|error| {
+            // Retain both typed errors: a size failure cannot erase a sibling's
+            // already-known delivery/deadline/cancellation evidence.
+            match error.downcast::<results_collect::ResultBudgetExceeded>() {
+                Ok(budget_error) => match terminal_error.take() {
+                    Some(prior) => prior.context(budget_error),
+                    None => budget_error.into(),
+                },
+                Err(error) => error,
+            }
+        })?;
 
         if !stopped_mid_batch && recovery_trigger.is_none() {
             recovery_trigger = check_identical_output_abort(

@@ -194,3 +194,27 @@ Key code entry points:
   `crates/zeroclaw-api/src/model_provider.rs`
 - Channel attachments: `crates/zeroclaw-api/src/channel.rs` and
   `crates/zeroclaw-api/src/media.rs`
+
+## Encoded tool-history admission
+
+The runtime result collector checks the complete serialized source envelope
+(names, call IDs, typed outcomes, structured data, errors, and receipts) without
+allocating a serialized copy. It then checks both native and prompt history
+representations, including nested JSON escaping, receipt formatting, and XML
+wrapping. Each result must fit `max_tool_result_chars` interpreted as encoded
+bytes at this boundary (zero uses 32 KiB); each complete round must fit 64 KiB.
+An otherwise valid text excerpt can therefore be rejected when its envelope
+exceeds the limit.
+
+A rejected round terminates before another provider request and before mutating
+history, loop detection, or the receipt collector. The typed terminal error owns
+the outcomes received by the collector and retains any existing typed batch
+failure as its cause. Its display text does not include the rejected payload.
+This is transient error ownership, not durable receipt storage or permission to
+repeat an external effect. Already completed tools are not undone. Synchronous agentic delegation and
+the tool dispatcher propagate this typed error outside ordinary repair recovery.
+
+These checks cover collection and history admission. Earlier execution,
+observer, hook, and SOP copies, source excerpt evidence preservation, parallel/background delegation outcome transport, delegated receipt accumulation,
+and durable recovery of rejected results remain separate
+boundaries; this check does not establish a complete end-to-end output budget.

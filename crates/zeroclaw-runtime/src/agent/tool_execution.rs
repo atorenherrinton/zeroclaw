@@ -125,6 +125,7 @@ fn unavailable_tool_outcome(
 
 // ── Outcome ──────────────────────────────────────────────────────────────
 
+#[derive(serde::Serialize)]
 pub struct ToolExecutionOutcome {
     pub output: String,
     /// Structured output when the tool declared one (`ToolOutput::data`).
@@ -146,7 +147,7 @@ pub struct ToolExecutionOutcome {
     pub receipt: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ToolFailureKind {
     /// The tool ran (or failed to run) for a reason that is not a policy gate.
     Ordinary,
@@ -455,6 +456,7 @@ pub(crate) async fn execute_one_tool(
                 // recovery treat uncertain delivery as an ordinary retryable error.
                 if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
                     || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || e.is::<super::turn::results_collect::ResultBudgetExceeded>()
                     || is_tool_loop_cancelled(&e)
                 {
                     return Err(e);
@@ -803,6 +805,12 @@ mod tests {
                 }
                 .into());
             }
+            if self.name == "fixture_budget_error" {
+                return Err(crate::agent::turn::results_collect::ResultBudgetExceeded {
+                    results: Vec::new(),
+                }
+                .into());
+            }
             if self.name == "fixture_timeout_error" {
                 return Err(zeroclaw_api::deadline::DeadlineExceeded {
                     phase: zeroclaw_api::deadline::Phase::Tool,
@@ -819,8 +827,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_delivery_and_deadline_errors_never_enter_string_recovery() {
-        for name in ["fixture_delivery_error", "fixture_timeout_error"] {
+    async fn structured_delivery_deadline_and_budget_errors_never_enter_string_recovery() {
+        for name in [
+            "fixture_delivery_error",
+            "fixture_timeout_error",
+            "fixture_budget_error",
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let registry =
                 crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
@@ -861,6 +873,8 @@ mod tests {
                     evidence.outcome,
                     zeroclaw_api::delivery::EffectOutcome::PossiblyApplied
                 );
+            } else if name == "fixture_budget_error" {
+                assert!(error.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
             } else {
                 assert_eq!(
                     error

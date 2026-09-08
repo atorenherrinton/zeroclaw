@@ -4,6 +4,17 @@
 
 use zeroclaw_providers::{ChatMessage, ToolCall};
 
+/// Canonical native-result envelope used for both admission measurement and
+/// history append. Keeping serialization here prevents the budget from drifting
+/// from the provider-history representation.
+pub(crate) fn native_tool_result_content(tool_call_id: Option<&str>, result: &str) -> String {
+    serde_json::json!({
+        "tool_call_id": tool_call_id,
+        "content": result,
+    })
+    .to_string()
+}
+
 pub(crate) fn append_tool_round_to_history(
     history: &mut Vec<ChatMessage>,
     assistant_history_content: String,
@@ -21,11 +32,10 @@ pub(crate) fn append_tool_round_to_history(
                 .all(|(tool_call_id, _)| tool_call_id.is_some());
         if all_results_have_ids {
             for (tool_call_id, result) in individual_results {
-                let tool_msg = serde_json::json!({
-                    "tool_call_id": tool_call_id,
-                    "content": result,
-                });
-                history.push(ChatMessage::tool(tool_msg.to_string()));
+                history.push(ChatMessage::tool(native_tool_result_content(
+                    tool_call_id.as_deref(),
+                    result,
+                )));
             }
         } else {
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
@@ -38,11 +48,10 @@ pub(crate) fn append_tool_round_to_history(
             let resolved_id = tool_call_id
                 .clone()
                 .or_else(|| native_tool_calls.get(idx).map(|call| call.id.clone()));
-            let tool_msg = serde_json::json!({
-                "tool_call_id": resolved_id,
-                "content": result,
-            });
-            history.push(ChatMessage::tool(tool_msg.to_string()));
+            history.push(ChatMessage::tool(native_tool_result_content(
+                resolved_id.as_deref(),
+                result,
+            )));
         }
     }
 }

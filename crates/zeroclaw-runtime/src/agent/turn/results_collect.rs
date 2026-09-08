@@ -17,6 +17,64 @@ use std::time::{Duration, Instant};
 use zeroclaw_config::schema::PacingConfig;
 use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
+use zeroclaw_tools::output_budget::{ROUND_PAYLOAD_BYTES, encoded_size};
+
+type OrderedResults = Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>;
+
+/// Transient ownership of results that cannot be forwarded within the budget.
+/// Keep the original typed outcomes and receipts in the terminal error; a size
+/// failure must never become evidence that a tool did not execute.
+pub(crate) struct ResultBudgetExceeded {
+    pub(crate) results: OrderedResults,
+}
+
+impl std::fmt::Debug for ResultBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResultBudgetExceeded")
+            .field("result_count", &self.results.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Display for ResultBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::i18n::get_required_cli_string(
+            "turn-tool-result-budget-exceeded",
+        ))
+    }
+}
+
+impl std::error::Error for ResultBudgetExceeded {}
+
+/// Check both supported history representations, including the nested JSON
+/// string used by native tool messages and the prompt-mode XML/name envelope.
+fn history_results_fit(
+    individual_results: &[(Option<String>, String)],
+    tool_results: &str,
+    per_result_limit: usize,
+) -> bool {
+    let mut native_size = 2usize; // JSON array delimiters
+    for (index, (tool_call_id, content)) in individual_results.iter().enumerate() {
+        // The source envelope has already passed the allocation-free check.
+        let message = ChatMessage::tool(super::history_append::native_tool_result_content(
+            tool_call_id.as_deref(),
+            content,
+        ));
+        let Some(size) = encoded_size(&message, per_result_limit) else {
+            return false;
+        };
+        native_size = native_size.saturating_add(size + usize::from(index > 0));
+        if native_size > ROUND_PAYLOAD_BYTES {
+            return false;
+        }
+    }
+    let prompt = format!("[Tool results]\n{tool_results}");
+    encoded_size(
+        &ChatMessage::user(prompt),
+        ROUND_PAYLOAD_BYTES - 2, // containing history array
+    )
+    .is_some()
+}
 
 /// One round's collected tool results.
 pub(crate) struct CollectedResults {
@@ -50,19 +108,65 @@ pub(crate) fn collect_tool_results(
     iteration: usize,
     turn_id: &str,
 ) -> Result<CollectedResults> {
+    let per_result_limit = if max_tool_result_chars == 0 {
+        32768
+    } else {
+        max_tool_result_chars
+    }
+    .min(ROUND_PAYLOAD_BYTES);
+    // Include names, IDs, typed state, structured data, errors, and receipts
+    // before cloning any source payload for collection. The vector encoding
+    // accounts for aggregate punctuation and empty slots as well.
+    if encoded_size(&ordered_results, ROUND_PAYLOAD_BYTES).is_none()
+        || ordered_results
+            .iter()
+            .flatten()
+            .any(|result| encoded_size(result, per_result_limit).is_none())
+    {
+        return Err(ResultBudgetExceeded {
+            results: ordered_results,
+        }
+        .into());
+    }
+
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
     let mut detection_relevant_output = String::new();
     let mut recovery_trigger = None;
-    // Use enumerate *before* filter_map so result_index stays aligned with
-    // tool_calls even when some ordered_results entries are None.
-    for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
-        .into_iter()
+    for (tool_name, tool_call_id, outcome) in ordered_results.iter().flatten() {
+        let canonical_output =
+            canonicalize_tool_result_media_markers_for(tool_name, &outcome.output);
+        let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
+        if let Some(receipt) = &outcome.receipt {
+            write!(result_output, "\n\n[receipt: {receipt}]")?;
+        }
+        let block =
+            format!("<tool_result name=\"{tool_name}\">\n{result_output}\n</tool_result>\n");
+        let prompt_block = ChatMessage::user(format!("[Tool results]\n{block}"));
+        if encoded_size(&prompt_block, per_result_limit).is_none() {
+            return Err(ResultBudgetExceeded {
+                results: ordered_results,
+            }
+            .into());
+        }
+        individual_results.push((tool_call_id.clone(), result_output));
+        tool_results.push_str(&block);
+    }
+    if !history_results_fit(&individual_results, &tool_results, per_result_limit) {
+        return Err(ResultBudgetExceeded {
+            results: ordered_results,
+        }
+        .into());
+    }
+
+    // Use enumerate before filter_map so slots stay aligned with tool_calls.
+    for (result_index, (tool_name, _, outcome)) in ordered_results
+        .iter()
         .enumerate()
-        .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        .filter_map(|(i, opt)| opt.as_ref().map(|v| (i, v)))
     {
         if recovery_trigger.is_none() {
-            recovery_trigger = recovery_tracker.observe(&tool_name, &outcome, iteration);
+            recovery_trigger = recovery_tracker.observe(tool_name, outcome, iteration);
         }
         if !loop_ignore_tools.contains(tool_name.as_str()) {
             if outcome.success {
@@ -74,7 +178,7 @@ pub(crate) fn collect_tool_results(
                 .map(|c| &c.arguments)
                 .unwrap_or(&serde_json::Value::Null);
             let det_result = if outcome.success {
-                loop_detector.record(&tool_name, args, &outcome.output)
+                loop_detector.record(tool_name, args, &outcome.output)
             } else {
                 crate::agent::loop_detector::LoopDetectionResult::Ok
             };
@@ -127,16 +231,12 @@ pub(crate) fn collect_tool_results(
                         "loop_detector_circuit_breaker"
                     );
                     recovery_trigger.get_or_insert_with(|| {
-                        RecoveryTrigger::circuit_breaker(&tool_name, &msg, iteration)
+                        RecoveryTrigger::circuit_breaker(tool_name, &msg, iteration)
                     });
                 }
             }
         }
-        let canonical_output =
-            canonicalize_tool_result_media_markers_for(&tool_name, &outcome.output);
-        let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
-        // Append HMAC receipt to tool result when receipts are enabled
-        if let Some(ref receipt) = outcome.receipt {
+        if let Some(receipt) = &outcome.receipt {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -144,19 +244,12 @@ pub(crate) fn collect_tool_results(
                     .with_attrs(::serde_json::json!({"tool": tool_name, "receipt": receipt})),
                 "Tool receipt generated"
             );
-            result_output = format!("{result_output}\n\n[receipt: {receipt}]");
             if let Some(store) = collected_receipts
-                && let Ok(mut v) = store.lock()
+                && let Ok(mut receipts) = store.lock()
             {
-                v.push(format!("{tool_name}: {receipt}"));
+                receipts.push(format!("{tool_name}: {receipt}"));
             }
         }
-        individual_results.push((tool_call_id, result_output.clone()));
-        let _ = writeln!(
-            tool_results,
-            "<tool_result name=\"{}\">\n{}\n</tool_result>",
-            tool_name, result_output
-        );
     }
 
     Ok(CollectedResults {
@@ -229,6 +322,158 @@ mod tests {
     use crate::agent::loop_detector::{LoopDetector, LoopDetectorConfig};
     use crate::agent::tool_execution::ToolExecutionOutcome;
     use zeroclaw_tool_call_parser::ParsedToolCall;
+
+    fn collect_fixture(ordered: OrderedResults, limit: usize) -> Result<CollectedResults> {
+        collect_tool_results(
+            ordered,
+            &[],
+            &mut Vec::new(),
+            &mut LoopDetector::new(LoopDetectorConfig::default()),
+            &mut RecoveryTracker::default(),
+            &HashSet::new(),
+            limit,
+            None,
+            "fixture-model",
+            0,
+            "fixture-turn",
+        )
+    }
+
+    #[test]
+    fn oversized_source_fields_retain_original_evidence_in_terminal_error() {
+        for field in ["name", "id", "error", "data", "receipt"] {
+            let huge = "private-fixture\u{0001}😀".repeat(4000);
+            let mut result = outcome("confirmed fixture", true);
+            result.receipt = Some("fixture-receipt".into());
+            let mut name = "fixture-tool".to_owned();
+            let mut id = Some("fixture-id".to_owned());
+            match field {
+                "name" => name = huge.clone(),
+                "id" => id = Some(huge.clone()),
+                "error" => result.error_reason = Some(huge.clone()),
+                "data" => result.output_data = Some(serde_json::json!({"scope": huge})),
+                "receipt" => result.receipt = Some(huge.clone()),
+                _ => unreachable!(),
+            }
+            let error = collect_fixture(vec![Some((name, id, result))], 32768)
+                .err()
+                .unwrap();
+            let retained = error.downcast_ref::<ResultBudgetExceeded>().unwrap();
+            let (name, id, outcome) = retained.results[0].as_ref().unwrap();
+            assert!(outcome.success);
+            assert_eq!(outcome.output, "confirmed fixture");
+            match field {
+                "name" => assert_eq!(name, &huge),
+                "id" => assert_eq!(id.as_deref(), Some(huge.as_str())),
+                "error" => assert_eq!(outcome.error_reason.as_deref(), Some(huge.as_str())),
+                "data" => assert_eq!(outcome.output_data.as_ref().unwrap()["scope"], huge),
+                "receipt" => assert_eq!(outcome.receipt.as_deref(), Some(huge.as_str())),
+                _ => unreachable!(),
+            }
+            assert!(!format!("{error:?}").contains("private-fixture"));
+        }
+    }
+
+    #[test]
+    fn tiny_configured_budget_is_not_silently_raised() {
+        let mut result = outcome("confirmed fixture", true);
+        result.receipt = Some("fixture-receipt".into());
+        let error = collect_fixture(vec![Some(("fixture".into(), None, result))], 1)
+            .err()
+            .unwrap();
+        let evidence = error.downcast_ref::<ResultBudgetExceeded>().unwrap();
+        assert_eq!(
+            evidence.results[0].as_ref().unwrap().2.receipt.as_deref(),
+            Some("fixture-receipt")
+        );
+    }
+
+    #[test]
+    fn actual_native_and_prompt_history_stay_within_round_budget() {
+        let ordered = (0..zeroclaw_tools::output_budget::MAX_BATCH_CALLS)
+            .map(|i| {
+                let mut result = outcome(&"😀\"\\\n".repeat(8), true);
+                result.receipt = Some("fixture-receipt".into());
+                Some(("file_read".into(), Some(format!("fixture-{i}")), result))
+            })
+            .collect();
+        let collected = collect_fixture(ordered, 32768).unwrap();
+        for native in [false, true] {
+            let mut history = Vec::new();
+            super::super::history_append::append_tool_round_to_history(
+                &mut history,
+                String::new(),
+                &[],
+                &collected.individual_results,
+                &collected.tool_results,
+                native,
+            );
+            let encoded = serde_json::to_vec(&history[1..]).unwrap();
+            assert!(encoded.len() <= ROUND_PAYLOAD_BYTES, "{}", encoded.len());
+            assert_eq!(collected.individual_results.len(), 128);
+            assert!(history.last().unwrap().content.contains("fixture-receipt"));
+        }
+    }
+
+    #[test]
+    fn nested_history_json_escaping_is_included_in_budget() {
+        let result = vec![(Some("fixture-id".into()), "\u{0001}".repeat(100))];
+        let raw = serde_json::to_vec(&result).unwrap().len();
+        assert!(!history_results_fit(&result, "", raw));
+        assert!(history_results_fit(&result, "", raw * 2));
+    }
+
+    #[test]
+    fn rejected_projection_does_not_mutate_history_or_receipt_collector() {
+        let mut result = outcome(&"\\".repeat(120), true);
+        result.receipt = Some("fixture-receipt".into());
+        let ordered = vec![Some(("fixture".into(), Some("fixture-id".into()), result))];
+        assert!(
+            encoded_size(&ordered, 512).is_some(),
+            "source fits; history escaping must reject"
+        );
+        let mut history = vec![ChatMessage::user("unchanged fixture")];
+        let receipts = Mutex::new(vec!["existing receipt".to_owned()]);
+        let error = collect_tool_results(
+            ordered,
+            &[],
+            &mut history,
+            &mut LoopDetector::new(LoopDetectorConfig::default()),
+            &mut RecoveryTracker::default(),
+            &HashSet::new(),
+            512,
+            Some(&receipts),
+            "fixture-model",
+            0,
+            "fixture-turn",
+        )
+        .err()
+        .unwrap();
+        assert!(error.is::<ResultBudgetExceeded>());
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "unchanged fixture");
+        assert_eq!(*receipts.lock().unwrap(), vec!["existing receipt"]);
+    }
+
+    #[test]
+    fn aggregate_metadata_is_counted_even_when_each_result_fits() {
+        let ordered = (0..128)
+            .map(|i| {
+                let mut result = outcome("ok", true);
+                result.output_data = Some(serde_json::json!({"metadata": "x".repeat(512)}));
+                Some(("file_read".into(), Some(format!("fixture-{i}")), result))
+            })
+            .collect();
+        let error = collect_fixture(ordered, 32768).err().unwrap();
+        assert_eq!(
+            error
+                .downcast_ref::<ResultBudgetExceeded>()
+                .unwrap()
+                .results
+                .len(),
+            128
+        );
+    }
 
     const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
 
