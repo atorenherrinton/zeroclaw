@@ -19,13 +19,55 @@ enum Mode {
     OversizedFailedOutputWithoutError,
     Delivery,
     Deadline,
+    NestedBudget,
+    OversizedError,
+    EnvelopeError,
+    OrdinaryError,
+    FormattingError,
     Cancel,
 }
 struct EvidenceTool {
     name: &'static str,
     mode: Mode,
     calls: Arc<AtomicUsize>,
+    error_dropped: Arc<std::sync::atomic::AtomicBool>,
 }
+struct ErrorDropProof(Arc<std::sync::atomic::AtomicBool>);
+impl std::fmt::Display for ErrorDropProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("fixture wrapper")
+    }
+}
+impl std::fmt::Debug for ErrorDropProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+impl Drop for ErrorDropProof {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+#[derive(Debug)]
+struct OrdinaryErrorEvidence {
+    count: usize,
+    writes: AtomicUsize,
+    scope: &'static str,
+    drop_proof: ErrorDropProof,
+}
+impl std::fmt::Display for OrdinaryErrorEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.count == 0 {
+            return Err(std::fmt::Error);
+        }
+        for _ in 0..self.count {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            f.write_str("\0")?;
+        }
+        f.write_str("fixture-original-error-tail")
+    }
+}
+impl std::error::Error for OrdinaryErrorEvidence {}
 zeroclaw_api::tool_attribution!(EvidenceTool, zeroclaw_api::attribution::ToolKind::Plugin);
 #[async_trait]
 impl Tool for EvidenceTool {
@@ -40,7 +82,7 @@ impl Tool for EvidenceTool {
     }
     async fn execute(&self, _: serde_json::Value) -> Result<ToolResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        match self.mode {
+        let result = match self.mode {
             Mode::Success => Ok(ToolResult {
                 success: true,
                 output: "fixture-success-evidence".into(),
@@ -112,8 +154,60 @@ impl Tool for EvidenceTool {
                 started: true,
             }
             .into()),
+            Mode::NestedBudget => {
+                let output = "fixture-inner-evidence".repeat(5000);
+                let receipt = ReceiptGenerator::with_key(vec![7; 32]).generate_now(
+                    "fixture_inner_tool",
+                    &serde_json::json!({}),
+                    &output,
+                );
+                Err(anyhow::Error::new(
+                    crate::agent::turn::results_collect::ResultBudgetExceeded {
+                        errors: Vec::new(),
+                        results: vec![Some((
+                            "fixture_inner_tool".into(),
+                            Some("fixture-inner-call".into()),
+                            crate::agent::tool_execution::ToolExecutionOutcome {
+                                output,
+                                output_data: Some(
+                                    serde_json::json!({"scope": "fixture-inner-owner", "delivered": true}),
+                                ),
+                                success: true,
+                                error_reason: None,
+                                failure_kind: None,
+                                duration: std::time::Duration::ZERO,
+                                receipt: Some(receipt),
+                            },
+                        ))],
+                    },
+                ))
+            }
+            Mode::OversizedError
+            | Mode::EnvelopeError
+            | Mode::OrdinaryError
+            | Mode::FormattingError => {
+                return Err(anyhow::Error::new(OrdinaryErrorEvidence {
+                    count: match self.mode {
+                        Mode::OversizedError => 20_000,
+                        Mode::EnvelopeError => 6_000,
+                        Mode::FormattingError => 0,
+                        _ => 4,
+                    },
+                    writes: AtomicUsize::new(0),
+                    scope: "fixture-error-owner",
+                    drop_proof: ErrorDropProof(self.error_dropped.clone()),
+                }));
+            }
             Mode::Cancel => Err(crate::agent::loop_::ToolLoopCancelled.into()),
-        }
+        };
+        result.map_err(|error| {
+            let error = error.context(ErrorDropProof(self.error_dropped.clone()));
+            if matches!(self.mode, Mode::NestedBudget) {
+                error.context("fixture-inner-private-context".repeat(5000))
+            } else {
+                error
+            }
+        })
     }
 }
 
@@ -125,6 +219,7 @@ struct Case {
     calls: Vec<usize>,
     step_calls: Vec<crate::sop::types::StepToolCall>,
     remaining_responses: usize,
+    error_drops: Vec<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 async fn run_case(
@@ -149,6 +244,10 @@ async fn run_case_with_result_limit(
         .iter()
         .map(|_| Arc::new(AtomicUsize::new(0)))
         .collect();
+    let error_drops: Vec<_> = modes
+        .iter()
+        .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .collect();
     let provider = ScriptedProvider::new(vec![
         tool_response(
             modes
@@ -168,6 +267,7 @@ async fn run_case_with_result_limit(
                     name: names[i],
                     mode: *mode,
                     calls: counters[i].clone(),
+                    error_dropped: error_drops[i].clone(),
                 }) as Box<dyn Tool>
             })
             .collect(),
@@ -248,6 +348,7 @@ async fn run_case_with_result_limit(
         calls: counters.iter().map(|c| c.load(Ordering::SeqCst)).collect(),
         step_calls: crate::sop::executor::drain_step_calls(&sink),
         remaining_responses: provider.responses.lock().len(),
+        error_drops,
     }
 }
 
@@ -865,4 +966,286 @@ async fn admitted_artifact_keeps_typed_delivery_metadata() {
     assert_eq!(artifact.mime, "text/plain");
     assert_eq!(artifact.size, 42);
     assert_eq!(case.receipts.len(), 1);
+}
+
+#[tokio::test]
+async fn parallel_failures_keep_original_errors_until_terminal_error_is_dropped() {
+    for modes in [
+        [Mode::Deadline, Mode::Delivery, Mode::Success],
+        [Mode::Delivery, Mode::Deadline, Mode::Success],
+        [Mode::Delivery, Mode::Delivery, Mode::Success],
+        [Mode::Cancel, Mode::Deadline, Mode::Delivery],
+        [Mode::Deadline, Mode::Cancel, Mode::Delivery],
+    ] {
+        let case = run_case(&modes, true, None, None).await;
+        assert!(case.result.as_ref().unwrap_err().is::<DeliveryFailure>());
+        assert_eq!(case.calls, vec![1, 1, 1]);
+        assert_eq!(case.remaining_responses, 1);
+        let retained = case
+            .result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<crate::agent::turn::batch_failures::RetainedToolFailures>()
+            .unwrap();
+        let primary = modes
+            .iter()
+            .position(|mode| matches!(mode, Mode::Delivery))
+            .unwrap();
+        assert_eq!(retained.primary_call_index, primary);
+        let expected_indices: Vec<_> = modes
+            .iter()
+            .enumerate()
+            .filter(|(index, mode)| *index != primary && !matches!(mode, Mode::Success))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            retained
+                .siblings
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            expected_indices
+        );
+        for (index, error) in &retained.siblings {
+            match modes[*index] {
+                Mode::Deadline => {
+                    assert!(error.downcast_ref::<DeadlineExceeded>().unwrap().started)
+                }
+                Mode::Delivery => assert_eq!(
+                    error
+                        .downcast_ref::<DeliveryFailure>()
+                        .unwrap()
+                        .confirmed_chunks,
+                    1
+                ),
+                Mode::Cancel => assert!(crate::agent::loop_::is_tool_loop_cancelled(error)),
+                _ => unreachable!("only failed fixture calls are retained"),
+            }
+        }
+        let drops = case.error_drops.clone();
+        for (index, mode) in modes.iter().enumerate() {
+            if !matches!(mode, Mode::Success) {
+                assert!(
+                    !drops[index].load(Ordering::SeqCst),
+                    "error for call {index} dropped before return"
+                );
+            }
+        }
+        if matches!(modes[2], Mode::Success) {
+            assert_success_retained(&case, 2);
+        }
+        drop(case);
+        for (index, mode) in modes.iter().enumerate() {
+            if !matches!(mode, Mode::Success) {
+                assert!(
+                    drops[index].load(Ordering::SeqCst),
+                    "error for call {index} leaked after return"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn sibling_error_ownership_survives_small_budget_rejection() {
+    for limit in [1, 30_000] {
+        for modes in [
+            [Mode::NestedBudget, Mode::Delivery, Mode::Success],
+            [Mode::Delivery, Mode::NestedBudget, Mode::Success],
+        ] {
+            let case = run_case_with_result_limit(&modes, true, None, None, limit).await;
+            let error = case.result.as_ref().unwrap_err();
+            assert!(error.is::<DeliveryFailure>());
+            let retained = error
+                .downcast_ref::<crate::agent::turn::batch_failures::RetainedToolFailures>()
+                .unwrap();
+            let nested_index = usize::from(matches!(modes[0], Mode::Delivery));
+            assert_eq!(retained.primary_call_index, 1 - nested_index);
+            assert_eq!(retained.siblings.len(), 1);
+            assert_eq!(retained.siblings[0].0, nested_index);
+            assert_eq!(
+                retained.siblings[0]
+                    .1
+                    .downcast_ref::<String>()
+                    .unwrap()
+                    .len(),
+                "fixture-inner-private-context".len() * 5000
+            );
+            let nested = retained.siblings[0]
+                .1
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            let (name, id, outcome) = nested.results[0].as_ref().unwrap();
+            assert_eq!(name, "fixture_inner_tool");
+            assert_eq!(id.as_deref(), Some("fixture-inner-call"));
+            assert_eq!(
+                outcome.output_data.as_ref().unwrap()["scope"],
+                "fixture-inner-owner"
+            );
+            assert_eq!(outcome.output_data.as_ref().unwrap()["delivered"], true);
+            assert!(outcome.success);
+            assert!(ReceiptGenerator::with_key(vec![7; 32]).verify(
+                outcome.receipt.as_ref().unwrap(),
+                name,
+                &serde_json::json!({}),
+                &outcome.output,
+            ));
+            for rendered in [
+                error.to_string(),
+                format!("{error:#}"),
+                format!("{error:?}"),
+                format!("{error:#?}"),
+            ] {
+                assert!(rendered.len() < 4096);
+                assert!(!rendered.contains("fixture-inner-evidence"));
+                assert!(!rendered.contains("fixture-inner-owner"));
+                assert!(!rendered.contains("fixture-inner-private-context"));
+            }
+            assert_eq!(case.calls, vec![1, 1, 1]);
+            assert_eq!(case.remaining_responses, 1);
+            assert!(!case.error_drops[0].load(Ordering::SeqCst));
+            assert!(!case.error_drops[1].load(Ordering::SeqCst));
+            if limit == 1 {
+                let outer = error
+                    .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                    .unwrap();
+                assert!(outer.results[2].as_ref().unwrap().2.receipt.is_some());
+                assert_eq!(case.history.len(), 1);
+                assert!(case.step_calls.is_empty());
+                assert!(case.receipts.is_empty());
+            } else {
+                assert_success_retained(&case, 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_ordinary_error_preserves_original_error_ownership() {
+    for mode in [
+        Mode::OversizedError,
+        Mode::EnvelopeError,
+        Mode::FormattingError,
+    ] {
+        let case = run_case(&[mode], false, None, None).await;
+        let error = case.result.as_ref().unwrap_err();
+        let rejected = error
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        assert!(rejected.results.is_empty());
+        assert_eq!(rejected.errors.len(), 1);
+        let original = rejected.errors[0]
+            .downcast_ref::<OrdinaryErrorEvidence>()
+            .unwrap();
+        assert_eq!(original.scope, "fixture-error-owner");
+        assert!(!original.drop_proof.0.load(Ordering::SeqCst));
+        let writes = original.writes.load(Ordering::SeqCst);
+        match mode {
+            Mode::OversizedError => assert!(writes < 11_000, "formatter did not stop early"),
+            Mode::EnvelopeError => assert_eq!(writes, 6_000),
+            Mode::FormattingError => assert_eq!(writes, 0),
+            _ => unreachable!(),
+        }
+        for rendered in [
+            error.to_string(),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(rendered.len() < 4096);
+            assert!(!rendered.contains("fixture-error-owner"));
+            assert!(!rendered.contains("fixture-original-error-tail"));
+        }
+        assert!(!case.error_drops[0].load(Ordering::SeqCst));
+        assert_eq!(case.remaining_responses, 1);
+        assert!(case.receipts.is_empty());
+        assert!(case.events.iter().any(|event| matches!(event,
+            TurnEvent::ToolResult { id, artifact: None, output, .. }
+                if id == "fixture-0" && output.len() < 4096)));
+        let dropped = case.error_drops[0].clone();
+        drop(case);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn normalized_error_rejection_preserves_siblings_and_delivery_through_tiny_budgets() {
+    for parallel in [false, true] {
+        let case = run_case(
+            &[Mode::Success, Mode::OversizedError, Mode::Success],
+            parallel,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            case.calls,
+            if parallel {
+                vec![1, 1, 1]
+            } else {
+                vec![1, 1, 0]
+            }
+        );
+        assert_success_retained(&case, 0);
+        if parallel {
+            assert_success_retained(&case, 2);
+        }
+        assert_eq!(case.remaining_responses, 1);
+        assert!(!case.error_drops[1].load(Ordering::SeqCst));
+    }
+    for limit in [1, 30_000] {
+        let case = run_case_with_result_limit(
+            &[Mode::EnvelopeError, Mode::Delivery, Mode::Success],
+            true,
+            None,
+            None,
+            limit,
+        )
+        .await;
+        let error = case.result.as_ref().unwrap_err();
+        assert!(error.is::<DeliveryFailure>());
+        let failures = error
+            .downcast_ref::<crate::agent::turn::batch_failures::RetainedToolFailures>()
+            .unwrap();
+        assert_eq!(failures.primary_call_index, 1);
+        assert_eq!(failures.siblings[0].0, 0);
+        let budget = failures.siblings[0]
+            .1
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        assert_eq!(
+            budget.errors[0]
+                .downcast_ref::<OrdinaryErrorEvidence>()
+                .unwrap()
+                .scope,
+            "fixture-error-owner"
+        );
+        assert_eq!(case.calls, vec![1, 1, 1]);
+        assert_eq!(case.remaining_responses, 1);
+        if limit == 1 {
+            let outer = error
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            assert!(outer.results[2].as_ref().unwrap().2.receipt.is_some());
+            assert!(case.step_calls.is_empty());
+            assert_eq!(case.history.len(), 1);
+        } else {
+            assert_success_retained(&case, 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn fitting_ordinary_error_keeps_full_normal_recovery_text() {
+    let case = run_case(&[Mode::OrdinaryError], false, None, None).await;
+    assert_eq!(case.result.as_ref().unwrap(), "done");
+    assert_eq!(case.calls, vec![1]);
+    assert_eq!(case.remaining_responses, 0);
+    let results = tool_results(&case);
+    let content = results[0]["content"].as_str().unwrap();
+    assert!(content.contains("Error executing file_read:"));
+    assert!(content.contains("fixture-original-error-tail"));
+    assert_eq!(content.matches('\0').count(), 4);
+    assert!(case.error_drops[0].load(Ordering::SeqCst));
+    assert!(case.receipts.is_empty());
 }

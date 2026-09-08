@@ -1,6 +1,7 @@
 //! The agent turn engine, decomposed into single-purpose step modules.
 
 pub(crate) mod approval_gate;
+pub(crate) mod batch_failures;
 pub(crate) mod call_prep;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
@@ -1301,7 +1302,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         let stopped_mid_batch = executed_slots
             .iter()
             .any(|slot| !matches!(slot, ToolExecutionSlot::Completed(_)));
-        let mut terminal_error: Option<anyhow::Error> = None;
+        let mut terminal_failures = batch_failures::TerminalFailures::default();
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -1339,6 +1340,10 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                             error.downcast_ref::<zeroclaw_api::deadline::DeadlineExceeded>()
                         {
                             e.to_string()
+                        } else if let Some(e) =
+                            error.downcast_ref::<results_collect::ResultBudgetExceeded>()
+                        {
+                            e.to_string()
                         } else {
                             error.to_string()
                         };
@@ -1347,15 +1352,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                             &[("reason", reason.as_str())],
                         )
                     };
-                    // Effect evidence takes precedence over deadline/cancellation;
-                    // all failed siblings also keep their own history projection.
-                    if terminal_error.as_ref().is_none_or(|previous| {
-                        (is_tool_loop_cancelled(previous) && !is_tool_loop_cancelled(&error))
-                            || (error.is::<zeroclaw_api::delivery::DeliveryFailure>()
-                                && !previous.is::<zeroclaw_api::delivery::DeliveryFailure>())
-                    }) {
-                        terminal_error = Some(error);
-                    }
+                    terminal_failures.push(call_idx, error, &output);
                     output
                 }
             };
@@ -1385,6 +1382,8 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 },
             ));
         }
+
+        let mut terminal_error = terminal_failures.into_error();
 
         record_executed_outcomes(
             &ctx,

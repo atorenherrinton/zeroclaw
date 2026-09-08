@@ -205,18 +205,32 @@ rejection; it does not excerpt the source or copy it into a fallback error field
 Below that ceiling, failure formatting includes the full returned text and error.
 Policy classification scans borrowed bytes rather than allocating a lowercase
 copy. This normalization ceiling does not replace configured or aggregate batch
-admission, and it does not cover arbitrary `anyhow::Error` rendering.
+admission.
 
-The executor's ordinary-error debug log renders into a disposable sink capped at
-4 KiB for the encoded JSON string, including quotes and escaping. It checks each
+Ordinary `anyhow::Error` returns use a bounded formatter for the execution reason,
+with a 64 KiB encoded JSON-string ceiling. Before duplicating that reason into
+output and error fields, the executor measures the complete one-result source
+envelope, including names, IDs, both reason fields, defaults, duration and JSON
+escaping. A shared borrowed field view is the serialization shape for this check
+and for owned outcomes. Formatting failure or source overflow moves the original
+error into `ResultBudgetExceeded::errors`, outside automatic Display/Debug and
+standard cause traversal. No ordinary repair or next provider request follows
+that rejection; completed siblings retain the existing batch evidence path.
+Fitting errors keep their full reason and existing failure classification.
+This early hard ceiling is separate from configured/aggregate source admission
+and later native/prompt history wrapping.
+
+The executor's ordinary-error debug log uses the same formatter with a disposable
+sink capped at 4 KiB for the encoded JSON string, including quotes and escaping. It checks each
 borrowed formatter chunk before copying, stops on a failed write, and discards
 partial content. Fitting projections pass through credential redaction and a
 final encoded-size check; oversized or failed formatting produces a bounded
 omission marker. The original error stays borrowed and ordinary recovery is
 unchanged. This caps the runtime-owned log string, not allocations performed
-inside custom formatters or `anyhow` backtrace rendering. The separate ordinary
-error `Display` used for outcome construction remains an unbounded allocation
-before source admission. Whole log envelopes and streams need their own budgets.
+inside custom formatters or `anyhow` backtrace rendering. Both the debug-log and
+ordinary-reason guards bound runtime-owned projections; they cannot preempt
+arbitrary work or allocations inside a formatter. Whole log envelopes and
+streams need their own budgets.
 
 Both tool-result event emitters measure the complete encoded artifact projection
 from borrowed fields before copying its path, URI, filename, title, and MIME
@@ -254,6 +268,22 @@ failure as its cause. Its display text does not include the rejected payload.
 This is transient error ownership, not durable receipt storage or permission to
 repeat an external effect. Already completed tools are not undone. Synchronous agentic delegation and
 the tool dispatcher propagate this typed error outside ordinary repair recovery.
+
+When multiple dispatched calls return terminal errors, the turn keeps every
+original error. Terminal history projects the typed delivery, deadline or budget
+failure itself instead of rendering arbitrary context attached to that type.
+The primary error retains its existing cause-chain routing
+(delivery first, otherwise the first non-cancellation). `RetainedToolFailures`
+owns the other errors, ordered by their positions in the original model batch;
+matching call metadata remains in history or the rejected ordered-result envelope.
+Its display is a bounded, scrubbed projection of the primary call's history
+failure text; its debug output includes only the primary index and sibling count.
+Neither formatter traverses sibling errors or nested result payloads. Existing
+primary-error cause/backtrace rendering remains a separate boundary. A later
+source or history budget rejection retains this complete failure context along
+with completed outcomes. Single failures return their original error unchanged.
+This retains more original error memory until the returned error is dropped; it
+does not copy those payloads or create a persistent failure ledger.
 
 Source admission bounds payload copies into post-execution consumers; final
 history wrapping can still reject a source-admitted batch later. Empty SOP

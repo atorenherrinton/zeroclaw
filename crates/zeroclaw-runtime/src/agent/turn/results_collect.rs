@@ -25,9 +25,19 @@ pub(crate) type OrderedResults = Vec<Option<(String, Option<String>, ToolExecuti
 /// failure must never become evidence that a tool did not execute.
 pub(crate) struct ResultBudgetExceeded {
     pub(crate) results: OrderedResults,
+    /// Errors that could not be normalized within the hard source ceiling.
+    /// Kept opaque to automatic Display/Debug and standard cause traversal.
+    pub(crate) errors: Vec<anyhow::Error>,
 }
 
 impl ResultBudgetExceeded {
+    pub(crate) fn from_error(error: anyhow::Error) -> Self {
+        Self {
+            results: Vec::new(),
+            errors: vec![error],
+        }
+    }
+
     /// Keep an already-known terminal batch cause downcastable alongside the
     /// complete result evidence owned by this rejection.
     pub(crate) fn with_prior(self, prior: Option<anyhow::Error>) -> anyhow::Error {
@@ -59,6 +69,7 @@ pub(crate) fn admit_source_results(
     {
         return Err(ResultBudgetExceeded {
             results: std::mem::take(ordered_results),
+            errors: Vec::new(),
         });
     }
     Ok(per_result_limit)
@@ -68,6 +79,7 @@ impl std::fmt::Debug for ResultBudgetExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResultBudgetExceeded")
             .field("result_count", &self.results.len())
+            .field("error_count", &self.errors.len())
             .finish_non_exhaustive()
     }
 }
@@ -162,6 +174,7 @@ pub(crate) fn collect_tool_results(
         if encoded_size(&prompt_block, per_result_limit).is_none() {
             return Err(ResultBudgetExceeded {
                 results: ordered_results,
+                errors: Vec::new(),
             }
             .into());
         }
@@ -171,6 +184,7 @@ pub(crate) fn collect_tool_results(
     if !history_results_fit(&individual_results, &tool_results, per_result_limit) {
         return Err(ResultBudgetExceeded {
             results: ordered_results,
+            errors: Vec::new(),
         }
         .into());
     }
