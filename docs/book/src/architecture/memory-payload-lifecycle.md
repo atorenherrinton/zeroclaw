@@ -362,3 +362,22 @@ Earlier executor/observer copies, independent SOP display excerpts and history t
 parallel/background delegation outcome transport, delegated receipt accumulation,
 and durable recovery of rejected results remain separate boundaries. These checks
 do not establish a complete end-to-end output budget.
+
+## Shell stream previews
+
+The shell tool drains stdout and stderr concurrently with the existing 1 MiB
+capture cap per stream. Before returning a completed process result, it reduces
+each oversized stream to a 4 KiB JSON-encoded preview. Fitting streams remain
+unchanged; previews keep UTF-8-safe beginning and ending excerpts and an explicit
+omission notice. The capture-limit marker remains when capture itself overflowed.
+Exit success/failure, timeouts, command authorization, and sandboxing are unchanged.
+The dispatcher still owns failure formatting, execution receipts and history
+admission; unusually large batches or tiny configured limits can still be rejected.
+
+This applies to shell presentation regardless of command effects. The notice
+states that the command already ran and forbids rerunning it merely to recover
+omitted output. A missing confirmation in a preview is not evidence that a write
+failed or did not occur. Reconcile effects separately. No full-output resource is
+created: future commands needing complete output should redirect it to a file
+within their permitted workspace and inspect bounded sections. Preview text lives
+in the ordinary tool-result/session lifecycle, not a new persistent output store.

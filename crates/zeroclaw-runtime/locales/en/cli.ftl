@@ -1284,3 +1284,5 @@ turn-tool-batch-failed = [tool stopped without a normal result; reconcile extern
 turn-tool-batch-cancelled = [cancelled before this tool returned a normal result]
 
 turn-tool-result-budget-exceeded = Tool results exceed the encoded output budget. The turn stopped; reconcile external effects before retrying.
+
+shell-output-preview-truncated = [Shell output truncated; the middle was omitted. The command already ran. This incomplete preview is not evidence that a write failed or did not occur. Do not rerun the command to recover output; reconcile effects first. Full output is not retained here. For future commands, redirect large output to a file and inspect bounded sections.]

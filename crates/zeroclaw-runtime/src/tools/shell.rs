@@ -11,6 +11,8 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult, with_ephemeral_workspace_
 
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
+/// Presentation budget per stream, including JSON quotes and escaping.
+const MAX_STREAM_PREVIEW_BYTES: usize = 4096;
 const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
@@ -442,6 +444,12 @@ impl Tool for ShellTool {
                         append_truncation_marker(&mut stderr, "\n... [stderr truncated at 1MB]");
                     }
 
+                    // Shell streams already have a lossy capture cap. Bound their
+                    // presentation before failure formatting and history escaping,
+                    // without changing the process outcome or executing it again.
+                    let stdout = shell_stream_preview(stdout);
+                    let stderr = shell_stream_preview(stderr);
+
                     ToolResult {
                         success: status.success(),
                         output: stdout.into(),
@@ -563,6 +571,18 @@ async fn drain_capped_into<R>(
             Err(_) => break,
         }
     }
+}
+
+fn shell_stream_preview(output: String) -> String {
+    if zeroclaw_tools::output_budget::encoded_size(&output, MAX_STREAM_PREVIEW_BYTES).is_some() {
+        return output;
+    }
+    let notice = crate::i18n::get_required_cli_string("shell-output-preview-truncated");
+    zeroclaw_tools::output_budget::bounded_text_preview(
+        output,
+        MAX_STREAM_PREVIEW_BYTES,
+        &format!("\n{notice}\n"),
+    )
 }
 
 fn append_truncation_marker(output: &mut String, marker: &str) {
@@ -1702,10 +1722,13 @@ mod tests {
             "large stdout command should not time out: {:?}",
             result.error
         );
-        assert_eq!(
-            result.output.len(),
-            200_000,
-            "stdout should be drained while the child is still running"
+        assert!(result.output.contains("Shell output truncated"));
+        assert!(
+            zeroclaw_tools::output_budget::encoded_size(
+                result.output.as_str(),
+                MAX_STREAM_PREVIEW_BYTES
+            )
+            .is_some()
         );
     }
 
