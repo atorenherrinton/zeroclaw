@@ -251,6 +251,28 @@ and helper may remain dormant after the old config is restored. Preserve any
 subsequent configuration changes when rolling back a later installation.
 
 
+## Existing-group generated audio and file sharing
+
+`files_prepare` accepts exactly one of `recipients` (separate individual
+messages) or `group_token` from `imessage_group_search` / `imessage_group_get`
+(one existing conversation). For a generated recording, save the MP3, M4A or
+WAV under an operator-approved sharing root and pass its absolute path in
+`paths`. An optional `text` supplies the caption. Audio uses a playable file
+attachment; native Messages voice-note styling is not promised.
+
+Preparation stages immutable files and saves one item per file, binding the
+existing group identity and participants. It does not send. Main uses the
+existing `delivery_execute` only for an explicit owner send request. Dispatch
+revalidates the group and file hashes, and preserves uncertain-send deduplication.
+Supplying both destination forms, an invalid/stale token, or a disallowed path
+fails without creating a delivery plan. Archived phone recordings still use
+`voicemail_group_prepare` so recording-consent checks remain in effect.
+
+Upgrade the personal-ops helper and reconnect its MCP clients to refresh the
+existing `files_prepare` schema. No new tool allowlist entries or sharing roots
+are needed. Roll back to the previous helper and reconnect; preserve the ledger
+and staged files so previous attempts cannot be replayed.
+
 ## Existing-group voicemail sharing
 
 Recipient arrays target separate individual iMessages. Use
