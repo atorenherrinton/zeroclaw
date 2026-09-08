@@ -369,6 +369,115 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn http_read_previews_fit_source_and_history_but_write_receipts_remain_intact() {
+        use std::sync::Arc;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+        let server = MockServer::start().await;
+        let body = format!("START{}END", "\u{0001}😀\"\\".repeat(20_000));
+        Mock::given(matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tool = zeroclaw_tools::http_request::HttpRequestTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["127.0.0.1".into()],
+            1_000_000,
+            5,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut ordered = Vec::new();
+        for i in 0..2 {
+            let result = tool
+                .execute(serde_json::json!({"url":server.uri(),"method":"GET"}))
+                .await
+                .unwrap();
+            assert!(result.success);
+            let (text, data) = result.output.into_parts();
+            let mut result = outcome(&text, true);
+            result.output_data = data;
+            result.receipt = Some("fixture-http-receipt".into());
+            ordered.push(Some((
+                "http_request".into(),
+                Some(format!("fixture-{i}")),
+                result,
+            )));
+        }
+        admit_source_results(&mut ordered, 32768).unwrap();
+        let collected = collect_fixture(ordered, 32768).unwrap();
+        for native in [false, true] {
+            let mut history = Vec::new();
+            super::super::history_append::append_tool_round_to_history(
+                &mut history,
+                String::new(),
+                &[],
+                &collected.individual_results,
+                &collected.tool_results,
+                native,
+            );
+            assert!(encoded_size(&history[1..], ROUND_PAYLOAD_BYTES).is_some());
+            assert_eq!(collected.individual_results.len(), 2);
+            assert!(
+                history
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("Read response truncated")
+            );
+            assert!(
+                history
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("fixture-http-receipt")
+            );
+        }
+        let result = tool
+            .execute(serde_json::json!({"url":server.uri(),"method":"POST","body":"fixture"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let (text, data) = result.output.into_parts();
+        let mut result = outcome(&text, true);
+        result.output_data = data;
+        result.receipt = Some("fixture-write-receipt".into());
+        let error = collect_fixture(
+            vec![Some((
+                "http_request".into(),
+                Some("write-fixture".into()),
+                result,
+            ))],
+            32768,
+        )
+        .err()
+        .unwrap();
+        let retained = &error
+            .downcast_ref::<ResultBudgetExceeded>()
+            .unwrap()
+            .results[0]
+            .as_ref()
+            .unwrap()
+            .2;
+        assert!(retained.output.ends_with(&body));
+        assert_eq!(retained.output_data.as_ref().unwrap()["body"], body);
+        assert_eq!(retained.receipt.as_deref(), Some("fixture-write-receipt"));
+    }
+
     #[test]
     fn oversized_source_fields_retain_original_evidence_in_terminal_error() {
         for field in ["name", "id", "error", "data", "receipt"] {

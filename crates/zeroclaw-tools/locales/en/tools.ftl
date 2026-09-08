@@ -197,3 +197,5 @@ tool-weather = Get current weather conditions and forecast for any location worl
 
 # Large read-only MCP responses retain an explicitly incomplete preview.
 mcp-read-result-truncated = [Read result truncated; the middle of this response was omitted. Narrow the source query or request a smaller page. This excerpt is not proof that a write did not occur; do not replay writes.]
+
+http-read-result-truncated = [Read response truncated; the middle was omitted. Request a smaller resource or use a Range header if supported. This preview is incomplete, not proof that a write did not occur; do not replay writes.]
