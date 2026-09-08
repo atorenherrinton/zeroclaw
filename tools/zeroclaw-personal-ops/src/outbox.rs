@@ -545,9 +545,9 @@ impl Ops {
                     );
                 }
                 Ok(match imessage::send_item(item, path).await {
-                    imessage::SendOutcome::Submitted => Outcome {
+                    imessage::SendOutcome::Submitted(receipt) => Outcome {
                         state: "submitted".into(),
-                        evidence: json!({"provider":"imessage","delivered":false}),
+                        evidence: json!({"provider":"imessage","delivered":false,"receipt":receipt}),
                     },
                     imessage::SendOutcome::NotStarted(e) => Outcome {
                         state: "failed".into(),

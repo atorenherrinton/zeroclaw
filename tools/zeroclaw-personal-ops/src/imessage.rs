@@ -19,7 +19,7 @@ const GROUP_PREFIX: &str = "imessage-group:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SendOutcome {
-    Submitted,
+    Submitted(Value),
     NotStarted(String),
     Uncertain(String),
 }
@@ -357,7 +357,23 @@ fn rpc_error_summary(error: &Value) -> String {
 
 pub(crate) fn classify_rpc_response(value: &Value) -> SendOutcome {
     if value["result"]["ok"] == true {
-        return SendOutcome::Submitted;
+        let mut receipt = json!({"verification_scope":"submission_only"});
+        // Keep only bounded provider identifiers, never arbitrary response content.
+        for key in ["guid", "transport", "service"] {
+            if let Some(value) = value["result"][key]
+                .as_str()
+                .filter(|s| !s.is_empty() && s.len() <= 512)
+            {
+                receipt[key] = json!(value);
+            }
+        }
+        if let Some(id) = value["result"]["id"].as_i64().filter(|id| *id > 0) {
+            receipt["id"] = json!(id);
+        }
+        if receipt["guid"].is_string() {
+            receipt["verification_scope"] = json!("text");
+        }
+        return SendOutcome::Submitted(receipt);
     }
     let error = &value["error"];
     let retry_safe = error["data"]["retry_safe"] == true;
@@ -427,13 +443,107 @@ pub(crate) async fn send_item(item: Item, path: Option<PathBuf>) -> SendOutcome 
             continue;
         };
         if value["id"].as_str() == Some(&request_id) {
-            return classify_rpc_response(&value);
+            return classify_send_response(&value, path.is_some(), item.text.is_empty());
         }
     }
     SendOutcome::Uncertain(format!(
         "imsg returned no matching structured result: {}",
         clean_error(&output.stderr)
     ))
+}
+
+fn classify_send_response(value: &Value, attachment: bool, empty_text: bool) -> SendOutcome {
+    let mut outcome = classify_rpc_response(value);
+    if let SendOutcome::Submitted(receipt) = &mut outcome {
+        receipt["verification_scope"] = json!(if !receipt["guid"].is_string() {
+            "submission_only"
+        } else if attachment {
+            if empty_text {
+                "submission_only"
+            } else {
+                "caption_only"
+            }
+        } else {
+            "text"
+        });
+    }
+    outcome
+}
+
+pub(crate) fn parse_send_status(guid: &str, response: &Value) -> Result<Value> {
+    let result = &response["result"];
+    ensure!(
+        result["ok"] == true,
+        "{}",
+        rpc_error_summary(&response["error"])
+    );
+    ensure!(
+        result["guid"].as_str() == Some(guid),
+        "Messages status returned a different message ID"
+    );
+    // imsg uses pending + null status_fields when the row is absent. Absence is
+    // not evidence of pending delivery, failure, or permission to resend.
+    ensure!(
+        result["status_fields"].is_object(),
+        "Messages has no status row for this message ID"
+    );
+    let state = result["send_state"]
+        .as_str()
+        .context("Messages status omitted send_state")?;
+    ensure!(
+        ["pending", "sent", "delivered", "failed"].contains(&state),
+        "unrecognized Messages send state"
+    );
+    let mut observation = json!({"state":state,"guid":guid});
+    for key in ["checked_at", "delivered_at", "service"] {
+        if let Some(value) = result[key].as_str().filter(|s| s.len() <= 128) {
+            observation[key] = json!(value);
+        }
+    }
+    if let Some(error) = result["status_fields"]["error"].as_i64() {
+        observation["error_code"] = json!(error);
+    }
+    Ok(observation)
+}
+
+pub(crate) async fn send_status(guid: String) -> Result<Value> {
+    send_status_via(guid, std::path::Path::new(IMSG)).await
+}
+
+async fn send_status_via(guid: String, executable: &std::path::Path) -> Result<Value> {
+    ensure!(!guid.is_empty() && guid.len() <= 512, "invalid message ID");
+    let id = uuid::Uuid::new_v4().to_string();
+    let request =
+        json!({"jsonrpc":"2.0","id":id,"method":"message.send_status","params":{"guid":guid}});
+    let mut child = tokio::process::Command::new(executable)
+        .arg("rpc")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("could not start Messages status lookup")?;
+    let mut input = child
+        .stdin
+        .take()
+        .context("Messages status request stream unavailable")?;
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    input.write_all(&bytes).await?;
+    input.shutdown().await?;
+    drop(input);
+    let output = child.wait_with_output().await?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Ok(value) = serde_json::from_str::<Value>(line)
+            && value["id"].as_str() == Some(&id)
+        {
+            return parse_send_status(&guid, &value);
+        }
+    }
+    anyhow::bail!(
+        "Messages status lookup returned no matching response: {}",
+        clean_error(&output.stderr)
+    )
 }
 
 #[cfg(test)]
@@ -545,10 +655,106 @@ mod tests {
     }
 
     #[test]
+    fn attachment_receipts_never_claim_file_delivery() {
+        for (attachment, empty_text, scope) in [
+            (false, false, "text"),
+            (true, false, "caption_only"),
+            (true, true, "submission_only"),
+        ] {
+            let SendOutcome::Submitted(receipt) = classify_send_response(
+                &json!({"result":{"ok":true,"guid":"fixture-guid"}}),
+                attachment,
+                empty_text,
+            ) else {
+                panic!("expected submission");
+            };
+            assert_eq!(receipt["verification_scope"], scope);
+        }
+    }
+
+    #[tokio::test]
+    async fn status_rpc_uses_exact_guid_and_readonly_method() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("fixture-imsg");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+[ "$1" = rpc ] || exit 1
+IFS= read -r request
+case "$request" in *'"method":"message.send_status"'*) ;; *) exit 2;; esac
+case "$request" in *'"params":{"guid":"fixture-guid"}'*) ;; *) exit 3;; esac
+id=$(printf '%s' "$request" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+printf '{"id":"wrong-request","result":{"ok":true}}\n'
+printf '{"id":"%s","result":{"ok":true,"guid":"fixture-guid","send_state":"delivered","status_fields":{"error":0}}}\n' "$id"
+"#,
+        )?;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_status_via("fixture-guid".into(), &script),
+        )
+        .await??;
+        assert_eq!(result["state"], "delivered");
+        assert_eq!(result["guid"], "fixture-guid");
+        Ok(())
+    }
+
+    #[test]
+    fn receipts_keep_bounded_identifiers_and_exclude_response_content() {
+        let result = classify_rpc_response(
+            &json!({"result":{"ok":true,"guid":"fixture-guid","id":42,"transport":"applescript","service":"iMessage","text":"private response content","chat_guid":"private chat","extra":"x".repeat(9000)}}),
+        );
+        assert_eq!(
+            result,
+            SendOutcome::Submitted(
+                json!({"guid":"fixture-guid","id":42,"transport":"applescript","service":"iMessage","verification_scope":"text"})
+            )
+        );
+        assert_eq!(
+            classify_rpc_response(&json!({"result":{"ok":true,"guid":"x".repeat(513),"id":-1}})),
+            SendOutcome::Submitted(json!({"verification_scope":"submission_only"}))
+        );
+    }
+
+    #[test]
+    fn status_requires_matching_guid_and_an_observed_row() {
+        let mut response = json!({"result":{"ok":true,"guid":"fixture-guid","send_state":"delivered","status_fields":{"error":0},"checked_at":"2026-01-01T00:00:00Z"}});
+        assert_eq!(
+            parse_send_status("fixture-guid", &response).unwrap()["state"],
+            "delivered"
+        );
+        assert!(parse_send_status("different-guid", &response).is_err());
+        response["result"]["send_state"] = json!("unknown future state");
+        assert!(parse_send_status("fixture-guid", &response).is_err());
+        response["result"]["send_state"] = json!("pending");
+        response["result"]["status_fields"] = Value::Null;
+        assert!(parse_send_status("fixture-guid", &response).is_err());
+        assert!(
+            parse_send_status(
+                "fixture-guid",
+                &json!({"error":{"message":"permission denied"}})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn applescript_number_alone_never_makes_retry_safe() {
+        for disposition in ["not_started", "may_have_completed", "still_in_flight"] {
+            let retry_safe = disposition == "not_started";
+            let outcome = classify_rpc_response(
+                &json!({"error":{"code":-32603,"data":{"disposition":disposition,"retry_safe":retry_safe,"detail":"Messages automation failed with AppleScript error -1728."}}}),
+            );
+            assert_eq!(matches!(outcome, SendOutcome::NotStarted(_)), retry_safe);
+        }
+    }
+
+    #[test]
     fn structured_delivery_dispositions_are_authoritative() {
         assert_eq!(
             classify_rpc_response(&json!({"result":{"ok":true}})),
-            SendOutcome::Submitted
+            SendOutcome::Submitted(json!({"verification_scope":"submission_only"}))
         );
         assert!(matches!(
             classify_rpc_response(

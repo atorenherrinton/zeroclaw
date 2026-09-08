@@ -223,6 +223,26 @@ Messages command accepted the item, not a recipient delivery/read receipt.
 For batches, inspect status and continue the same plan for remaining prepared
 items, without retrying uncertain items. Partial success is reported per item.
 
+Dispatch evidence is retained in `delivery_evidence` in the same operations
+ledger, including pre-dispatch failures and ambiguous results. `deliveries`
+remains the canonical duplicate guard. New successful sends preserve bounded
+provider message IDs in their receipts; the durable outbox also keeps these
+IDs in its existing step receipts. Older rows cannot recover discarded IDs.
+
+`delivery_status` reads fresh status for recorded message IDs through the
+read-only `imsg message.send_status` RPC, with a ten-second total lookup deadline.
+It reports `pending`, `sent`, `delivered`, or `failed` only when Messages returns
+an exact matching row. Missing rows, missing IDs, permission failures, and
+expired lookups report `unavailable`; none prove that a message was not sent.
+The observation is returned without caching it as current ledger state or
+changing a duplicate guard. For attachments with text, `caption_only` means
+that the receipt tracks the caption; it does not verify the attached file.
+
+AppleScript error `-1728` does not by itself prove a safe retry. Only an explicit
+pre-dispatch result can leave an item prepared. An error after dispatch may
+represent a partial send. Inspect the intended Messages conversation before
+changing a destination; this helper does not substitute phone/email aliases.
+
 The durable operations extension below adds Calendar editing/invitations and
 email sending through fixed provider adapters. Reminders reuse the native connector.
 The scheduler uses the existing native cron interface and preserves task state.
