@@ -4,6 +4,7 @@
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
+use super::results_collect::{OrderedResults, ResultBudgetExceeded, admit_source_results};
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
@@ -11,7 +12,8 @@ use zeroclaw_tool_call_parser::ParsedToolCall;
 /// post-execution section): one `tool_call_result` log line, the
 /// `after_tool_call` hook, a completion Status to the draft, and the
 /// call's slot in `ordered_results`. Terminal batches retain evidence without
-/// awaiting hooks or draft consumers (`publish_auxiliary = false`).
+/// awaiting hooks or draft consumers (`publish_auxiliary = false`). Source
+/// admission precedes all post-execution payload copies, even for terminal batches.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn record_executed_outcomes(
     ctx: &TurnCtx<'_>,
@@ -19,16 +21,31 @@ pub(crate) async fn record_executed_outcomes(
     executable_calls: &[ParsedToolCall],
     stream_calls: &[Option<StreamToolCall>],
     executed_outcomes: Vec<ToolExecutionOutcome>,
-    ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
+    ordered_results: &mut OrderedResults,
+    max_tool_result_chars: usize,
     iteration: usize,
     publish_auxiliary: bool,
-) {
-    for (((idx, call), stream_call), outcome) in executable_indices
+) -> Result<(), ResultBudgetExceeded> {
+    // The ordered vector is the canonical ownership handoff. Populate every
+    // completed slot before checking the batch; a later oversized sibling must
+    // not let earlier payloads escape into SOP capture, hooks, or progress.
+    for ((idx, call), outcome) in executable_indices
         .iter()
-        .zip(executable_calls.iter())
-        .zip(stream_calls.iter())
+        .zip(executable_calls)
         .zip(executed_outcomes)
     {
+        ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+    admit_source_results(ordered_results, max_tool_result_chars)?;
+
+    for ((idx, call), stream_call) in executable_indices
+        .iter()
+        .zip(executable_calls)
+        .zip(stream_calls)
+    {
+        let Some((_, _, outcome)) = ordered_results[*idx].as_ref() else {
+            continue;
+        };
         // The pending ToolCall and terminal ToolResult are emitted by the
         // executor (execute_one_tool) at dispatch and completion time so serial
         // batches interleave call->result per tool. Post-exec only records the
@@ -68,8 +85,6 @@ pub(crate) async fn record_executed_outcomes(
             );
         }
 
-        let (_, _, outcome) =
-            ordered_results[*idx].insert((call.name.clone(), call.tool_call_id.clone(), outcome));
         // Completed evidence belongs to ordered history before any auxiliary
         // async work. A terminal batch skips hooks/draft progress so backpressure
         // or a stalled hook cannot swallow an already returned result.
@@ -114,4 +129,5 @@ pub(crate) async fn record_executed_outcomes(
                 .await;
         }
     }
+    Ok(())
 }

@@ -19,13 +19,50 @@ use zeroclaw_providers::ChatMessage;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 use zeroclaw_tools::output_budget::{ROUND_PAYLOAD_BYTES, encoded_size};
 
-type OrderedResults = Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>;
+pub(crate) type OrderedResults = Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>;
 
 /// Transient ownership of results that cannot be forwarded within the budget.
 /// Keep the original typed outcomes and receipts in the terminal error; a size
 /// failure must never become evidence that a tool did not execute.
 pub(crate) struct ResultBudgetExceeded {
     pub(crate) results: OrderedResults,
+}
+
+impl ResultBudgetExceeded {
+    /// Keep an already-known terminal batch cause downcastable alongside the
+    /// complete result evidence owned by this rejection.
+    pub(crate) fn with_prior(self, prior: Option<anyhow::Error>) -> anyhow::Error {
+        match prior {
+            Some(prior) => prior.context(self),
+            None => self.into(),
+        }
+    }
+}
+
+/// Admit the existing ordered batch before any consumer copies its payloads.
+/// Failure transfers ownership to the typed error without duplicating evidence.
+/// The returned limit is also used for the final history representation.
+pub(crate) fn admit_source_results(
+    ordered_results: &mut OrderedResults,
+    configured_limit: usize,
+) -> std::result::Result<usize, ResultBudgetExceeded> {
+    let per_result_limit = if configured_limit == 0 {
+        32768
+    } else {
+        configured_limit
+    }
+    .min(ROUND_PAYLOAD_BYTES);
+    if encoded_size(ordered_results, ROUND_PAYLOAD_BYTES).is_none()
+        || ordered_results
+            .iter()
+            .flatten()
+            .any(|result| encoded_size(result, per_result_limit).is_none())
+    {
+        return Err(ResultBudgetExceeded {
+            results: std::mem::take(ordered_results),
+        });
+    }
+    Ok(per_result_limit)
 }
 
 impl std::fmt::Debug for ResultBudgetExceeded {
@@ -96,7 +133,7 @@ pub(crate) struct CollectedResults {
 /// truncate, append receipts, and build the per-call and XML result forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
-    ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>>,
+    mut ordered_results: OrderedResults,
     tool_calls: &[ParsedToolCall],
     history: &mut Vec<ChatMessage>,
     loop_detector: &mut LoopDetector,
@@ -108,26 +145,7 @@ pub(crate) fn collect_tool_results(
     iteration: usize,
     turn_id: &str,
 ) -> Result<CollectedResults> {
-    let per_result_limit = if max_tool_result_chars == 0 {
-        32768
-    } else {
-        max_tool_result_chars
-    }
-    .min(ROUND_PAYLOAD_BYTES);
-    // Include names, IDs, typed state, structured data, errors, and receipts
-    // before cloning any source payload for collection. The vector encoding
-    // accounts for aggregate punctuation and empty slots as well.
-    if encoded_size(&ordered_results, ROUND_PAYLOAD_BYTES).is_none()
-        || ordered_results
-            .iter()
-            .flatten()
-            .any(|result| encoded_size(result, per_result_limit).is_none())
-    {
-        return Err(ResultBudgetExceeded {
-            results: ordered_results,
-        }
-        .into());
-    }
+    let per_result_limit = admit_source_results(&mut ordered_results, max_tool_result_chars)?;
 
     let mut tool_results = String::new();
     let mut individual_results: Vec<(Option<String>, String)> = Vec::new();

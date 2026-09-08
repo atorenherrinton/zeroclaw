@@ -447,10 +447,139 @@ async fn oversized_tool_metadata_stops_before_next_provider_call_and_retains_evi
 }
 
 #[tokio::test]
-async fn output_budget_failure_keeps_original_typed_delivery_failure() {
-    let case = run_case(&[Mode::OversizedData, Mode::Delivery], false, None, None).await;
-    let error = case.result.as_ref().unwrap_err();
-    assert!(error.is::<DeliveryFailure>());
-    assert!(error.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
-    assert_eq!(case.remaining_responses, 1);
+async fn output_budget_failure_keeps_original_typed_terminal_failure() {
+    for parallel in [false, true] {
+        for mode in [Mode::Delivery, Mode::Deadline, Mode::Cancel] {
+            let case = run_case(&[Mode::OversizedData, mode], parallel, None, None).await;
+            let error = case.result.as_ref().unwrap_err();
+            match mode {
+                Mode::Delivery => assert!(error.is::<DeliveryFailure>()),
+                Mode::Deadline => assert!(error.is::<DeadlineExceeded>()),
+                Mode::Cancel => assert!(error.is::<crate::agent::loop_::ToolLoopCancelled>()),
+                _ => unreachable!("terminal fixture modes only"),
+            }
+            let evidence = error
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            assert!(evidence.results[0].as_ref().unwrap().2.receipt.is_some());
+            assert!(case.step_calls.is_empty());
+            assert_eq!(case.remaining_responses, 1);
+        }
+    }
+}
+
+struct CountingPostToolHook(Arc<AtomicUsize>);
+#[async_trait]
+impl crate::hooks::HookHandler for CountingPostToolHook {
+    fn name(&self) -> &str {
+        "synthetic post-tool counter"
+    }
+    async fn on_after_tool_call(&self, _: &str, _: &ToolResult, _: std::time::Duration) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn oversized_batch_is_rejected_before_sop_capture_or_post_tool_hooks() {
+    for parallel in [false, true] {
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(CountingPostToolHook(hook_calls.clone())));
+        let case = run_case(
+            &[Mode::Success, Mode::OversizedData],
+            parallel,
+            Some(&hooks),
+            None,
+        )
+        .await;
+        assert!(
+            case.result
+                .as_ref()
+                .unwrap_err()
+                .is::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+        );
+        assert!(
+            case.step_calls.is_empty(),
+            "oversized batch must not be copied into SOP capture"
+        );
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            0,
+            "no sibling reaches post-tool hooks before batch admission"
+        );
+        assert_eq!(
+            case.calls,
+            vec![1, 1],
+            "already executed effects remain real"
+        );
+        assert_eq!(case.remaining_responses, 1);
+        let evidence = case
+            .result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        assert_eq!(
+            evidence.results[1]
+                .as_ref()
+                .unwrap()
+                .2
+                .output_data
+                .as_ref()
+                .unwrap()["metadata"]
+                .as_str()
+                .unwrap()
+                .len(),
+            100_000
+        );
+        assert!(
+            evidence
+                .results
+                .iter()
+                .flatten()
+                .all(|(_, _, outcome)| outcome.success && outcome.receipt.is_some())
+        );
+    }
+}
+
+#[tokio::test]
+async fn oversized_batch_does_not_await_a_stalled_post_tool_hook() {
+    let mut hooks = crate::hooks::HookRunner::new();
+    hooks.register(Box::new(StalledHook));
+    let case = run_case(
+        &[Mode::Success, Mode::OversizedData],
+        false,
+        Some(&hooks),
+        None,
+    )
+    .await;
+    assert!(
+        case.result
+            .as_ref()
+            .unwrap_err()
+            .is::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+    );
+    assert!(case.step_calls.is_empty());
+}
+
+#[tokio::test]
+async fn admitted_batch_still_runs_post_tool_hooks_and_sop_capture() {
+    for parallel in [false, true] {
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(CountingPostToolHook(hook_calls.clone())));
+        let case = run_case(
+            &[Mode::Success, Mode::Success],
+            parallel,
+            Some(&hooks),
+            None,
+        )
+        .await;
+        case.result.as_ref().unwrap();
+        assert_eq!(case.step_calls.len(), 2);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(case.receipts.len(), 2);
+        assert_success_retained(&case, 0);
+        assert_success_retained(&case, 1);
+    }
 }

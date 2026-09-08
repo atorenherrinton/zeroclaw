@@ -1393,10 +1393,12 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
+            max_tool_result_chars,
             iteration,
             !stopped_mid_batch,
         )
-        .await;
+        .await
+        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))?;
         let payload_budget = zeroclaw_tools::output_budget::per_result_budget(
             max_tool_result_chars,
             ordered_results.len(),
@@ -1435,10 +1437,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             // Retain both typed errors: a size failure cannot erase a sibling's
             // already-known delivery/deadline/cancellation evidence.
             match error.downcast::<results_collect::ResultBudgetExceeded>() {
-                Ok(budget_error) => match terminal_error.take() {
-                    Some(prior) => prior.context(budget_error),
-                    None => budget_error.into(),
-                },
+                Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
                 Err(error) => error,
             }
         })?;
