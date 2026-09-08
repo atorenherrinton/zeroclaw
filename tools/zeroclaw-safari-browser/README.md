@@ -183,3 +183,39 @@ connector. Do not rerun broad installers or modify unrelated services/state.
 Rollback restores the backed-up executable and only the affected guidance,
 then reloads the connector and verifies health. Preserve newer credentials,
 delivery receipts, schedules, signing setup and unrelated edits.
+
+## Web components and page visibility
+
+Version 0.1.6 walks nested **open** shadow roots when reading controls and page
+text. It follows assigned slot content, keeps control IDs scoped to their root,
+and returns `shadow:["host selector","nested host selector","control selector"]`
+paths for shadow controls. Copy these paths exactly into interaction,
+verification, AutoFill, or readiness requests. Ordinary CSS interaction selectors
+retain their document scope. A plain CSS readiness query searches open roots and
+must match one control; ambiguous matches now return an explicit DOM error.
+
+Form input/change events cross shadow boundaries. Hidden, inert and disabled
+composed ancestors remain blocked, and page text excludes input values and script
+content. Closed roots, cross-origin frames and browser-native UI still require
+Computer; missing controls are not proof that no controls exist. Scans are limited
+to 50,000 elements and 256 open roots; paths are limited to 16 segments and 1,024
+UTF-8 bytes. Exceeding a limit reports an error rather than selecting a partial path.
+
+A hidden Safari document is not ready. `document_hidden` in readiness or
+verification means the Mac must be unlocked and the dedicated Safari window made
+visible before interaction. The connector will not silently treat a background or
+locked-screen page shell as a loaded calendar. `custom_elements_pending` means
+custom elements have not yet registered; a timed-out read remains incomplete.
+The page's `rendering` metadata reports visibility and open/pending component
+counts, derived from the current document. Nothing is persisted between calls.
+
+The shadow regression fixture uses the exact production DOM programs:
+
+```sh
+node tools/zeroclaw-safari-browser/tests/build-browser-fixture.cjs /tmp/zeroclaw-shadow-fixture.html shadow
+```
+
+Open it in the browser. Its PASS result covers nested roots, duplicate IDs,
+slotted text, composed form events, verification, hidden/disabled/inert hosts,
+closed roots, stale paths, delayed component registration and document visibility.
+No real appointment or external submission is made by this fixture.

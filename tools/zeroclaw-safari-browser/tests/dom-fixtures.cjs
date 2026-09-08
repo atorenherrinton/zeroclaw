@@ -19,6 +19,7 @@ class Element {
     this.disabled = false; this.readOnly = false; this.clicks = 0;
   }
   append(child) { this.children.push(child); child.parentElement = this; return child; }
+  get childNodes() { return [{nodeType:3,textContent:this.innerText}, ...this.children]; }
   get id() { return this.attrs.id || ''; }
   getAttribute(name) { return this.attrs[name] ?? null; }
   getClientRects() { return this.hidden ? [] : [this.rect]; }
@@ -68,13 +69,13 @@ function selectorMatches(node, selector) {
 function context(controls, root) {
   const nodes = root ? allNodes(root) : controls;
   return {
-    HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, Event, URL, setTimeout, clearTimeout,
+    HTMLInputElement, HTMLTextAreaElement, HTMLSelectElement, Event, URL, TextEncoder, setTimeout, clearTimeout,
     getComputedStyle: element => element.style,
     CSS: {escape: text => text},
     innerWidth: 1000, innerHeight: 800, scrollX: 0, scrollY: 0,
     location: {href: 'https://example.com/form'},
     document: {
-      readyState: 'complete', title: 'Offline form', body: {innerText: 'Fixture page'},
+      readyState: 'complete', title: 'Offline form', body: {childNodes:[{nodeType:3,textContent:'Fixture page'}]},
       querySelectorAll(selector) {
         if (selector.startsWith('a,button,input:')) return controls;
         return nodes.filter(node => selectorMatches(node, selector));

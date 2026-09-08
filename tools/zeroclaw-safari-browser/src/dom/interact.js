@@ -1,7 +1,7 @@
 const element = target(args.selector);
 const notifyValueChange = () => {
-  element.dispatchEvent(new Event('input', {bubbles: true}));
-  element.dispatchEvent(new Event('change', {bubbles: true}));
+  element.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+  element.dispatchEvent(new Event('change', {bubbles: true, composed: true}));
 };
 let verification = null;
 if (args.action === 'click') {

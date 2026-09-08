@@ -24,12 +24,11 @@ const optionsFor = element => {
   return {options, totalOptions: source.length, optionsTruncated: options.length < source.length,
     ...(!native ? {optionsScope: 'visible_aria_owned', expanded: element.getAttribute('aria-expanded')} : {})};
 };
-const allControls = [...document.querySelectorAll(controlsSelector)].filter(visible);
+const allControls = deepQuery(controlsSelector).filter(visible);
 allControls.sort((a, b) => Number(inViewport(b)) - Number(inViewport(a)));
 const controls = allControls.slice(0, 160).map(element => {
   const tag = element.tagName.toLowerCase();
   const type = (element.getAttribute('type') || '').toLowerCase();
-  const label = element.labels && element.labels.length ? element.labels[0].innerText : '';
   const isValueControl = tag === 'input' || tag === 'select' || tag === 'textarea';
   const constraints = {};
   for (const name of ['placeholder', 'inputmode', 'pattern', 'min', 'max', 'step', 'maxlength', 'autocomplete', 'aria-describedby']) {
@@ -39,7 +38,7 @@ const controls = allControls.slice(0, 160).map(element => {
   return {
     selector: selectorFor(element), tag, type, role: element.getAttribute('role') || '',
     name: element.getAttribute('name') || '',
-    text: (element.innerText || label || element.getAttribute('aria-label') || element.getAttribute('placeholder') || element.getAttribute('title') || '').trim().slice(0, 240),
+    text: controlText(element).slice(0, 240),
     href: element.href || '', hasValue: isValueControl ? Boolean(element.value) : false,
     checked: (type === 'checkbox' || type === 'radio') ? Boolean(element.checked) : false,
     sensitive: type === 'password', disabled: disabled(element), readOnly: Boolean(element.readOnly),
@@ -51,7 +50,8 @@ const controls = allControls.slice(0, 160).map(element => {
 });
 return JSON.stringify({
   url: location.href, title: document.title, readyState: document.readyState,
-  text: (document.body?.innerText || '').slice(0, 50000), controls,
+  text: composedText(document.body), controls,
+  rendering: {openShadowRoots: openRoots().length - 1, pendingCustomElements: pendingCustomElements().length, visibility: document.visibilityState},
   totalControls: allControls.length, controlsTruncated: allControls.length > controls.length,
   viewport: {width: innerWidth, height: innerHeight, scrollX, scrollY}
 });

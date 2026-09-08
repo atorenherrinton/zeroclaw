@@ -1,5 +1,6 @@
+if (document.visibilityState === 'hidden') return JSON.stringify({matches:false,status:'document_hidden'});
 if (args.url && location.href !== args.url) return JSON.stringify({matches: false, status: 'page_changed'});
-const matches = document.querySelectorAll(args.selector);
+const matches = queryPath(args.selector);
 if (matches.length !== 1) return JSON.stringify({matches: false, status: matches.length ? 'ambiguous' : 'control_missing'});
 const element = matches[0];
 if (element.type === 'password') {
@@ -22,7 +23,7 @@ if (typeof args.checked === 'boolean') {
   equal = selected.length === 1 && optionLabel(selected[0]) === args.text;
   evidence = 'aria_selected_option';
   const display = element.tagName === 'INPUT' ? element.value :
-    (element.getAttribute('aria-valuetext') || element.innerText || '').trim();
+    (element.getAttribute('aria-valuetext') || composedText(element, 1024) || '').trim();
   if (args.comparison === 'displayed_value') {
     equal = display === args.text;
     evidence = 'displayed_value_only';

@@ -232,7 +232,7 @@ const DOM_MARK_NAVIGATION: &str = include_str!("dom/mark-navigation.js");
 
 fn dom_program(body: &str, args: &Value) -> Result<String> {
     Ok(format!(
-        "(() => {{ const args = {}; {DOM_COMMON} {body} }})()",
+        "(() => {{ try {{ const args = {}; {DOM_COMMON} {body} }} catch (error) {{ return JSON.stringify({{__zeroclawDomError:true,message:String(error.message || error).slice(0,240)}}); }} }})()",
         serde_json::to_string(args)?
     ))
 }
@@ -417,7 +417,15 @@ impl Safari {
 
     async fn dom(&self, body: &str, args: &Value) -> Result<Value> {
         let raw = self.javascript(&dom_program(body, args)?).await?;
-        serde_json::from_str(&raw).context("Safari returned invalid page data")
+        let value: Value =
+            serde_json::from_str(&raw).context("Safari returned invalid page data")?;
+        if value["__zeroclawDomError"] == true {
+            bail!(
+                "Safari DOM operation failed: {}",
+                value["message"].as_str().unwrap_or("Inspection failed")
+            );
+        }
+        Ok(value)
     }
 
     async fn readiness(&self, selector: Option<&str>, timeout_ms: u64) -> Result<Value> {
@@ -542,11 +550,10 @@ impl Safari {
         )
         .await?;
 
-        let encoded = serde_json::to_string(selector)?;
-        let focus_source = format!(
-            "(() => {{ const element = document.querySelector({encoded}); if (!element) throw new Error('Element not found'); if (!['INPUT','TEXTAREA'].includes(element.tagName)) throw new Error('AutoFill target must be a text field'); element.focus(); return 'focused'; }})()"
-        );
-        self.javascript(&focus_source).await?;
+        self.dom(
+            "const element = target(args.selector); if (!['INPUT','TEXTAREA'].includes(element.tagName)) throw new Error('AutoFill target must be a text field'); element.focus(); return JSON.stringify({focused:true});",
+            &json!({"selector":selector}),
+        ).await?;
         let selection =
             osascript(AUTOFILL_SCRIPT, &[self.id()?.to_string(), expected_host]).await?;
         tokio::time::sleep(Duration::from_millis(500)).await;
