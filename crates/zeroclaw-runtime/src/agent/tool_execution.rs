@@ -33,40 +33,9 @@ pub(crate) fn bounded_observer_text(text: &str) -> String {
 /// Build only a bounded JSON-string projection of a formatter's output.
 /// The source remains borrowed. This cannot bound work inside the formatter.
 fn format_with_encoded_limit(arguments: std::fmt::Arguments<'_>, limit: usize) -> Option<String> {
-    use zeroclaw_api::serialization::encoded_size;
-
-    if limit < 2 {
-        return None;
-    }
-    struct Projection {
-        text: Option<String>,
-        encoded_len: usize,
-        limit: usize,
-    }
-    impl std::fmt::Write for Projection {
-        fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
-            let Some(text) = &mut self.text else {
-                return Err(std::fmt::Error);
-            };
-            // JSON string contents compose across valid UTF-8 chunks. Count
-            // each chunk using the shared serializer, excluding its two quotes.
-            let Some(size) = encoded_size(chunk, self.limit - self.encoded_len + 2) else {
-                self.text = None;
-                return Err(std::fmt::Error);
-            };
-            self.encoded_len += size - 2;
-            text.push_str(chunk);
-            Ok(())
-        }
-    }
-    let mut projection = Projection {
-        text: Some(String::with_capacity((limit - 2).min(4094))),
-        encoded_len: 2,
-        limit,
-    };
+    let mut projection = zeroclaw_api::serialization::EncodedStringWriter::new(limit);
     std::fmt::write(&mut projection, arguments).ok()?;
-    // Rejection is sticky even if a custom formatter ignores a failed write.
-    projection.text
+    projection.finish()
 }
 
 fn bounded_observer_error(error: &anyhow::Error) -> String {
@@ -486,7 +455,23 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let outcome = returned_failure_outcome(r.output, r.error, duration);
+                    let outcome = returned_failure_outcome(
+                        r.output,
+                        r.error,
+                        duration,
+                        call_name,
+                        tool_call_id,
+                    )
+                    .map_err(|outcome| {
+                        super::turn::results_collect::ResultBudgetExceeded {
+                            results: vec![Some((
+                                call_name.to_owned(),
+                                tool_call_id_owned.clone(),
+                                *outcome,
+                            ))],
+                            errors: Vec::new(),
+                        }
+                    })?;
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
@@ -630,7 +615,9 @@ fn returned_failure_outcome(
     source: crate::tools::ToolOutput,
     error: Option<String>,
     duration: Duration,
-) -> ToolExecutionOutcome {
+    call_name: &str,
+    tool_call_id: Option<&str>,
+) -> std::result::Result<ToolExecutionOutcome, Box<ToolExecutionOutcome>> {
     let (output, output_data) = source.into_parts();
     let reason = error.as_deref().unwrap_or(&output);
     let failure_kind = if is_security_policy_failure(reason) {
@@ -655,23 +642,44 @@ fn returned_failure_outcome(
     )
     .is_none()
     {
-        return outcome;
+        return Ok(outcome);
     }
-    let reason = outcome
-        .error_reason
-        .get_or_insert_with(|| outcome.output.clone());
-    outcome.output = if !outcome.output.is_empty() && outcome.output != *reason {
-        crate::i18n::get_required_cli_string_with_args(
+    let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
+    // Reserve every final envelope field (including the fallback reason) before
+    // copying it. Only the empty output's two JSON quotes may be replaced.
+    let fields = OutcomeFields {
+        output: "",
+        output_data: outcome.output_data.as_ref(),
+        success: outcome.success,
+        error_reason: Some(reason),
+        failure_kind: outcome.failure_kind,
+        duration: outcome.duration,
+        receipt: outcome.receipt.as_deref(),
+    };
+    let limit = zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES;
+    let Some(reserved) =
+        zeroclaw_api::serialization::encoded_size(&[(call_name, tool_call_id, fields)], limit)
+    else {
+        return Err(Box::new(outcome));
+    };
+    let output_limit = limit - reserved + 2;
+    let projection = if !outcome.output.is_empty() && outcome.output != reason {
+        crate::i18n::get_required_cli_string_with_args_with_limit(
             "turn-tool-failed-with-output",
-            &[
-                ("reason", reason.as_str()),
-                ("output", outcome.output.as_str()),
-            ],
+            &[("reason", reason), ("output", outcome.output.as_str())],
+            output_limit,
         )
     } else {
-        format!("Error: {reason}")
+        format_with_encoded_limit(format_args!("Error: {reason}"), output_limit)
+    };
+    let Some(projection) = projection else {
+        return Err(Box::new(outcome));
     };
     outcome
+        .error_reason
+        .get_or_insert_with(|| outcome.output.clone());
+    outcome.output = projection;
+    Ok(outcome)
 }
 
 fn is_security_policy_failure(reason: &str) -> bool {
@@ -991,7 +999,11 @@ mod tests {
             crate::tools::ToolOutput::text(source),
             None,
             std::time::Duration::ZERO,
-        );
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
         assert_eq!(outcome.output.as_ptr(), source_ptr);
         assert!(outcome.error_reason.is_none());
         assert_eq!(outcome.output.len(), 20_000);
@@ -1005,7 +1017,11 @@ mod tests {
             crate::tools::ToolOutput::text("fixture-effect-evidence"),
             Some(reason),
             std::time::Duration::ZERO,
-        );
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
         assert_eq!(outcome.error_reason.as_ref().unwrap().as_ptr(), reason_ptr);
         assert_eq!(outcome.output, "fixture-effect-evidence");
         assert_eq!(
@@ -1021,7 +1037,11 @@ mod tests {
             crate::tools::ToolOutput::text(source.clone()),
             Some("fixture exit failed".into()),
             std::time::Duration::ZERO,
-        );
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
         assert!(outcome.output.contains(&source));
         assert!(outcome.output.contains("fixture exit failed"));
         assert!(!outcome.output.contains("truncated"));
@@ -1039,6 +1059,90 @@ mod tests {
             super::bounded_observer_text("small safe result"),
             "small safe result"
         );
+    }
+
+    #[test]
+    fn failure_normalization_preserves_sources_when_final_envelope_cannot_fit() {
+        for (text, reason, name, id) in [
+            (
+                "\0".repeat(6_000),
+                None,
+                "fixture_tool".into(),
+                "fixture-id".into(),
+            ),
+            (
+                "x".repeat(30_000),
+                Some("\n".repeat(10_000)),
+                "fixture_tool".into(),
+                "fixture-id".into(),
+            ),
+            (
+                "small output".into(),
+                Some("denied by policy".into()),
+                "n".repeat(40_000),
+                "\0".repeat(5_000),
+            ),
+        ] {
+            let text_ptr = text.as_ptr();
+            let reason_ptr = reason.as_ref().map(|s| s.as_ptr());
+            let source = crate::tools::ToolOutput::json_with_text(
+                serde_json::json!({"scope":"fixture-owner", "delivered": true}),
+                text,
+            );
+            let original = super::returned_failure_outcome(
+                source,
+                reason,
+                std::time::Duration::ZERO,
+                &name,
+                Some(&id),
+            )
+            .err()
+            .expect("expanded envelope must reject");
+            assert_eq!(original.output.as_ptr(), text_ptr);
+            assert_eq!(
+                original.error_reason.as_ref().map(|s| s.as_ptr()),
+                reason_ptr
+            );
+            assert_eq!(
+                original.output_data.as_ref().unwrap()["scope"],
+                "fixture-owner"
+            );
+            assert_eq!(original.output_data.as_ref().unwrap()["delivered"], true);
+            assert!(!original.success);
+        }
+    }
+
+    #[test]
+    fn failure_normalization_admits_exact_final_envelope_including_metadata() {
+        let normalize = |padding: usize| {
+            super::returned_failure_outcome(
+                crate::tools::ToolOutput::json_with_text(
+                    serde_json::json!({"scope":"fixture-owner", "padding":"x".repeat(padding)}),
+                    "😀\"\n",
+                ),
+                Some("fixture failure".into()),
+                std::time::Duration::ZERO,
+                "fixture_tool",
+                Some("fixture-id"),
+            )
+        };
+        let initial = normalize(0).ok().unwrap();
+        let size = serde_json::to_vec(&[("fixture_tool", Some("fixture-id"), initial)])
+            .unwrap()
+            .len();
+        let padding = zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES - size;
+        let exact = normalize(padding).ok().expect("exact envelope fits");
+        assert_eq!(
+            serde_json::to_vec(&[("fixture_tool", Some("fixture-id"), exact)])
+                .unwrap()
+                .len(),
+            zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES
+        );
+        let original = normalize(padding + 1)
+            .err()
+            .expect("one byte over must reject");
+        assert_eq!(original.output, "😀\"\n");
+        assert_eq!(original.error_reason.as_deref(), Some("fixture failure"));
     }
 
     use super::{

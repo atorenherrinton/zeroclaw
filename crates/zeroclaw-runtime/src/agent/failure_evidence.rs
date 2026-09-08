@@ -17,6 +17,8 @@ enum Mode {
     OversizedArtifact,
     OversizedFailedOutput,
     OversizedFailedOutputWithoutError,
+    ExpandingFailedOutput,
+    LocalizedExpandingFailedOutput,
     Delivery,
     Deadline,
     NestedBudget,
@@ -142,6 +144,22 @@ impl Tool for EvidenceTool {
                         .then(|| "fixture exit check failed".into()),
                 })
             }
+            Mode::ExpandingFailedOutput => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::json_with_text(
+                    serde_json::json!({"scope":"fixture-owner", "delivered":true}),
+                    "\0".repeat(6_000),
+                ),
+                error: None,
+            }),
+            Mode::LocalizedExpandingFailedOutput => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::json_with_text(
+                    serde_json::json!({"scope":"fixture-owner", "delivered":true}),
+                    "x".repeat(30_000),
+                ),
+                error: Some("\n".repeat(10_000)),
+            }),
             Mode::Delivery => Err(anyhow::Error::new(DeliveryFailure {
                 outcome: EffectOutcome::PossiblyApplied,
                 chunk_index: 1,
@@ -738,6 +756,110 @@ async fn admitted_batch_still_runs_post_tool_hooks_and_sop_capture() {
 
 fn oversized_failure_text() -> String {
     format!("{}fixture-effect-evidence-at-end", "😀\"\n".repeat(20_000))
+}
+
+#[tokio::test]
+async fn failure_display_expansion_retains_source_and_stops_without_retry() {
+    for parallel in [false, true] {
+        for mode in [
+            Mode::ExpandingFailedOutput,
+            Mode::LocalizedExpandingFailedOutput,
+        ] {
+            let case = run_case_with_result_limit(
+                &[Mode::Success, mode, Mode::Success],
+                parallel,
+                None,
+                None,
+                65_536,
+            )
+            .await;
+            let error = case.result.as_ref().unwrap_err();
+            let evidence = error
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            let (_, id, failed) = evidence
+                .results
+                .iter()
+                .flatten()
+                .find(|(_, id, _)| id.as_deref() == Some("fixture-1"))
+                .unwrap();
+            assert_eq!(id.as_deref(), Some("fixture-1"));
+            let (text, reason) = if matches!(mode, Mode::ExpandingFailedOutput) {
+                ("\0".repeat(6_000), None)
+            } else {
+                ("x".repeat(30_000), Some("\n".repeat(10_000)))
+            };
+            assert!(
+                failed.output == text,
+                "keep original source before display expansion"
+            );
+            assert!(
+                failed.error_reason == reason,
+                "keep original optional error before display expansion"
+            );
+            assert_eq!(
+                failed.output_data.as_ref().unwrap()["scope"],
+                "fixture-owner"
+            );
+            assert_eq!(failed.output_data.as_ref().unwrap()["delivered"], true);
+            assert!(!failed.success);
+            assert!(failed.receipt.is_none());
+            assert_eq!(
+                case.calls,
+                if parallel {
+                    vec![1, 1, 1]
+                } else {
+                    vec![1, 1, 0]
+                }
+            );
+            assert_eq!(case.remaining_responses, 1);
+            assert_success_retained(&case, 0);
+            if parallel {
+                assert_success_retained(&case, 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn failure_display_rejection_keeps_delivery_priority_at_tiny_budgets() {
+    for limit in [1, 65_536] {
+        let case = run_case_with_result_limit(
+            &[Mode::ExpandingFailedOutput, Mode::Delivery, Mode::Success],
+            true,
+            None,
+            None,
+            limit,
+        )
+        .await;
+        let error = case.result.as_ref().unwrap_err();
+        assert!(error.is::<DeliveryFailure>());
+        let failures = error
+            .downcast_ref::<crate::agent::turn::batch_failures::RetainedToolFailures>()
+            .unwrap();
+        assert_eq!(failures.primary_call_index, 1);
+        assert_eq!(failures.siblings[0].0, 0);
+        let budget = failures.siblings[0]
+            .1
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        let failed = &budget.results[0].as_ref().unwrap().2;
+        assert!(failed.output == "\0".repeat(6_000));
+        assert!(failed.error_reason.is_none());
+        assert_eq!(failed.output_data.as_ref().unwrap()["delivered"], true);
+        assert_eq!(case.calls, vec![1, 1, 1]);
+        assert_eq!(case.remaining_responses, 1);
+        if limit == 1 {
+            let outer = error
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            assert!(outer.results[2].as_ref().unwrap().2.receipt.is_some());
+            assert!(case.step_calls.is_empty());
+            assert_eq!(case.history.len(), 1);
+        } else {
+            assert_success_retained(&case, 2);
+        }
+    }
 }
 
 #[tokio::test]

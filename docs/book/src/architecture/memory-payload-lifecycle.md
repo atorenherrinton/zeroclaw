@@ -202,10 +202,21 @@ At executor normalization, successful text and structured data move together int
 move their original text, data, and optional error into that outcome first. If its
 encoded size exceeds the 64 KiB ceiling, normalization leaves it intact for batch
 rejection; it does not excerpt the source or copy it into a fallback error field.
-Below that ceiling, failure formatting includes the full returned text and error.
+Below that ceiling, normalization first reserves the final one-result envelope,
+including names, call IDs, structured data, JSON escaping, and a fallback error
+reason. The remaining encoded string allowance bounds the failure display while
+it is written. Fluent argument text stays borrowed, and repeated translated
+arguments consume the same allowance; an overflowing selected catalog does not
+fall back to a shorter translation. Missing catalog entries and formatting errors within the allowance retain
+the ordinary fallback rules. Fitting failures include the full returned text and
+error. If the display or its envelope cannot fit, the existing typed budget error
+owns the original outcome, including its unchanged optional error and structured
+effect evidence. Sequential dispatch stops its remaining tail; parallel completed
+siblings and delivery failures retain their normal terminal evidence path.
 Policy classification scans borrowed bytes rather than allocating a lowercase
 copy. This normalization ceiling does not replace configured or aggregate batch
-admission.
+admission. The writer bounds the runtime-owned string, not Fluent catalog loading,
+parsing, or allocations internal to Fluent expression evaluation.
 
 Ordinary `anyhow::Error` returns use a bounded formatter for the execution reason,
 with a 64 KiB encoded JSON-string ceiling. Before duplicating that reason into
