@@ -14928,6 +14928,7 @@ Let me check the result."#;
                 zeroclaw_tools::mcp_deferred::DeferredMcpToolStub::new(
                     (*name).to_string(),
                     zeroclaw_tools::mcp_protocol::McpToolDef {
+                        annotations: None,
                         name: (*name).to_string(),
                         description: Some("test tool".to_string()),
                         input_schema: serde_json::json!({"type": "object", "properties": {}}),

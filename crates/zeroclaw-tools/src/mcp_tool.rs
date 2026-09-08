@@ -30,6 +30,8 @@ pub struct McpToolWrapper {
     input_schema: Arc<serde_json::Value>,
     /// Shared registry — used to dispatch actual tool calls.
     registry: Arc<McpRegistry>,
+    /// Formatting hint from the discovered definition; does not grant access.
+    read_only_hint: bool,
     /// Security policy handle — workspace for embedded blob materialization.
     security: Arc<SecurityPolicy>,
 }
@@ -41,12 +43,19 @@ impl McpToolWrapper {
         registry: Arc<McpRegistry>,
         security: Arc<SecurityPolicy>,
     ) -> Self {
+        let read_only_hint = def
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("readOnlyHint"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
         let description = def.description.unwrap_or_else(|| "MCP tool".to_string());
         Self {
             prefixed_name,
             description,
             input_schema: Arc::new(def.input_schema),
             registry,
+            read_only_hint,
             security,
         }
     }
@@ -95,10 +104,26 @@ impl Tool for McpToolWrapper {
         };
         match self.registry.call_tool(&self.prefixed_name, args).await {
             Ok(result) => {
+                // Preserve attachment/resource markers intact. Server annotations
+                // only select a text projection; they never authorize execution.
+                let preview_read = self.read_only_hint
+                    && result
+                        .get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|items| {
+                            items.iter().all(|item| {
+                                item.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                            })
+                        });
                 match format_mcp_tool_result_for_model(result, &self.security.workspace_dir) {
                     Ok(output) => Ok(ToolResult {
                         success: true,
-                        output: output.into(),
+                        output: if preview_read {
+                            bounded_read_result(output)
+                        } else {
+                            output
+                        }
+                        .into(),
                         error: None,
                     }),
                     Err(e) => Ok(ToolResult {
@@ -118,13 +143,73 @@ impl Tool for McpToolWrapper {
     }
 }
 
+/// A conservative preview allowance leaves room for native history's second
+/// JSON escaping layer, call IDs, receipts, and several results in one round.
+/// The runtime remains the authority for configured and aggregate admission.
+const READ_RESULT_PREVIEW_BYTES: usize = 4096;
+
+fn bounded_read_result(output: String) -> String {
+    use crate::output_budget::encoded_size;
+    if encoded_size(&output, READ_RESULT_PREVIEW_BYTES).is_some() {
+        return output;
+    }
+    let marker = format!(
+        "\n{}\n",
+        crate::i18n::get_required_tool_string("mcp-read-result-truncated")
+    );
+    if encoded_size(&marker, READ_RESULT_PREVIEW_BYTES).is_none() {
+        // Do not clip a localized warning into an ambiguous result. Ordinary
+        // runtime admission still rejects a projection that cannot fit.
+        return output;
+    }
+    let excerpt = |bytes: usize| {
+        let head = output.floor_char_boundary(bytes * 3 / 4);
+        let tail = output.ceil_char_boundary(output.len().saturating_sub(bytes / 4));
+        format!("{}{}{}", &output[..head], marker, &output[tail..])
+    };
+    let (mut low, mut high) = (0, READ_RESULT_PREVIEW_BYTES.min(output.len()));
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if encoded_size(&excerpt(mid), READ_RESULT_PREVIEW_BYTES).is_some() {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    excerpt(low)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn read_preview_bounds_encoded_bytes_and_keeps_both_ends() {
+        let original = format!("start:{}:end", "\u{0001}😀\"\\".repeat(20000));
+        let output = bounded_read_result(original);
+        assert!(output.starts_with("start:"));
+        assert!(output.ends_with(":end"));
+        assert!(output.contains("Read result truncated"));
+        assert!(output.contains("do not replay writes"));
+        assert!(crate::output_budget::encoded_size(&output, READ_RESULT_PREVIEW_BYTES).is_some());
+        let message = zeroclaw_providers::ChatMessage::tool(
+            serde_json::json!({"tool_call_id":"fixture-call", "content": output}).to_string(),
+        );
+        assert!(crate::output_budget::encoded_size(&message, 12 * 1024).is_some());
+    }
+
+    #[test]
+    fn read_preview_preserves_fitting_output_byte_for_byte() {
+        for output in [String::new(), "fixture 😀 output".into(), "x".repeat(4094)] {
+            assert_eq!(bounded_read_result(output.clone()), output);
+        }
+        assert!(bounded_read_result("x".repeat(4095)).contains("Read result truncated"));
+    }
+
     fn make_def(name: &str, description: Option<&str>, schema: serde_json::Value) -> McpToolDef {
         McpToolDef {
+            annotations: None,
             name: name.to_string(),
             description: description.map(str::to_string),
             input_schema: schema,

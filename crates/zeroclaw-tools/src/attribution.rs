@@ -176,6 +176,7 @@ mod tests {
         let tool = McpToolWrapper::new(
             "mcp__shell".to_string(),
             crate::mcp_protocol::McpToolDef {
+                annotations: None,
                 name: "shell".to_string(),
                 description: None,
                 input_schema: serde_json::json!({"type": "object"}),

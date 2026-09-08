@@ -373,6 +373,7 @@ mod tests {
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
         let def = McpToolDef {
+            annotations: None,
             name: name.to_string(),
             description: Some(desc.to_string()),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
