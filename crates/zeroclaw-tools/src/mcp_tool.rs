@@ -153,7 +153,7 @@ fn bounded_read_result(output: String) -> String {
         "\n{}\n",
         crate::i18n::get_required_tool_string("mcp-read-result-truncated")
     );
-    crate::output_budget::bounded_read_text(output, READ_RESULT_PREVIEW_BYTES, &marker)
+    crate::output_budget::bounded_text_preview(output, READ_RESULT_PREVIEW_BYTES, &marker)
 }
 
 #[cfg(test)]

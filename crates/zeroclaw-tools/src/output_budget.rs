@@ -6,10 +6,10 @@ pub const MAX_BATCH_CALLS: usize = 128;
 
 pub use zeroclaw_api::serialization::encoded_size;
 
-/// Format a read preview at its tool boundary, before display and structured
+/// Format a preview at its tool boundary, before display and structured
 /// mirrors are constructed. The caller supplies the localized omission notice.
 /// This does not admit the result to history or establish external-effect safety.
-pub(crate) fn bounded_read_text(output: String, max_bytes: usize, marker: &str) -> String {
+pub fn bounded_text_preview(output: String, max_bytes: usize, marker: &str) -> String {
     if encoded_size(&output, max_bytes).is_some() {
         return output;
     }
@@ -123,6 +123,23 @@ fn bounded_excerpt(output: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn text_preview_preserves_small_output_and_warns_without_splitting_unicode() {
+        let small = "\0😀\"\\".repeat(20);
+        assert_eq!(bounded_text_preview(small.clone(), 4096, "NOTICE"), small);
+        let large = format!("START{}END", "\0😀\"\\".repeat(20_000));
+        let preview = bounded_text_preview(large.clone(), 4096, "\nNOTICE\n");
+        assert!(encoded_size(&preview, 4096).is_some());
+        assert!(preview.starts_with("START"));
+        assert!(preview.ends_with("END"));
+        assert_eq!(preview.matches("NOTICE").count(), 1);
+        // An oversized translated warning must fail closed at history admission.
+        assert_eq!(
+            bounded_text_preview(large.clone(), 32, &"!".repeat(33)),
+            large
+        );
+    }
+
     #[test]
     fn encoded_counter_matches_serializer_and_stops_at_exact_limit() {
         let value = serde_json::json!({"id": "\u{0001}😀\"\\", "metadata": [null, false, 42]});

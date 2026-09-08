@@ -679,12 +679,12 @@ impl Tool for HttpRequestTool {
                         crate::i18n::get_required_tool_string("http-read-result-truncated")
                     );
                     (
-                        crate::output_budget::bounded_read_text(
+                        crate::output_budget::bounded_text_preview(
                             response_text,
                             READ_BODY_PREVIEW_BYTES,
                             &marker,
                         ),
-                        crate::output_budget::bounded_read_text(
+                        crate::output_budget::bounded_text_preview(
                             headers_text,
                             READ_HEADERS_PREVIEW_BYTES,
                             &marker,

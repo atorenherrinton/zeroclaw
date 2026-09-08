@@ -369,6 +369,119 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_previews_survive_dispatch_and_both_history_formats_without_reexecution() {
+        use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
+        use crate::agent::tool_receipts::ReceiptGenerator;
+        use crate::agent::turn::TurnMeta;
+        use crate::observability::NoopObserver;
+        use crate::platform::NativeRuntime;
+        use crate::tools::{ShellTool, Tool};
+        use std::sync::Arc;
+        use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+        for exit_code in [0, 7] {
+            let workspace = tempfile::tempdir().unwrap();
+            let body = format!("START{}END", "\0😀\"\\".repeat(20_000));
+            std::fs::write(workspace.path().join("payload"), body).unwrap();
+            let policy = Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: workspace.path().to_path_buf(),
+                allowed_commands: vec!["*".into()],
+                block_high_risk_commands: false,
+                ..SecurityPolicy::default()
+            });
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(
+                ShellTool::new(policy, Arc::new(NativeRuntime::new()))
+                    .with_persistent_writes(false),
+            )];
+            let receipts = ReceiptGenerator::with_key(vec![42; 32]);
+            let mut ordered = Vec::new();
+            for i in 0..2 {
+                // A real write plus oversized stdout/stderr: presentation must
+                // not turn a completed command into budget failure or replay it.
+                let arguments = serde_json::json!({
+                    "command": format!("printf x >> executions; cat payload; cat payload >&2; exit {exit_code}"),
+                    "approved": true
+                });
+                let id = format!("shell-fixture-{i}");
+                let outcome = execute_one_tool(
+                    "shell",
+                    arguments.clone(),
+                    Some(&id),
+                    ToolDispatchContext {
+                        tools_registry: &tools,
+                        activated_tools: None,
+                        excluded_tools: &[],
+                        model_switch_callback: None,
+                    },
+                    &TurnMeta {
+                        parent_agent_alias: None,
+                        agent_alias: Some("fixture-agent"),
+                        turn_id: "fixture-turn",
+                        channel_name: "test",
+                    },
+                    &NoopObserver,
+                    None,
+                    Some(&receipts),
+                    None,
+                )
+                .await
+                .unwrap();
+                assert_eq!(outcome.success, exit_code == 0);
+                assert!(outcome.output.contains("Shell output truncated"));
+                assert!(outcome.output.contains("Do not rerun the command"));
+                assert!(outcome.output.contains("EPHEMERAL WORKSPACE"));
+                assert!(outcome.output.contains("START"));
+                assert!(outcome.output.contains("END"));
+                if exit_code == 0 {
+                    assert!(receipts.verify(
+                        outcome.receipt.as_deref().unwrap(),
+                        "shell",
+                        &arguments,
+                        &outcome.output
+                    ));
+                } else {
+                    assert!(
+                        outcome
+                            .error_reason
+                            .as_deref()
+                            .unwrap()
+                            .contains("Shell output truncated")
+                    );
+                    assert!(!outcome.output.contains("Tool results exceed"));
+                }
+                ordered.push(Some(("shell".into(), Some(id), outcome)));
+            }
+            admit_source_results(&mut ordered, 32768).unwrap();
+            let collected = collect_fixture(ordered, 32768).unwrap();
+            for native in [false, true] {
+                let mut history = Vec::new();
+                super::super::history_append::append_tool_round_to_history(
+                    &mut history,
+                    String::new(),
+                    &[],
+                    &collected.individual_results,
+                    &collected.tool_results,
+                    native,
+                );
+                assert!(encoded_size(&history[1..], ROUND_PAYLOAD_BYTES).is_some());
+                assert!(
+                    history
+                        .last()
+                        .unwrap()
+                        .content
+                        .contains("Do not rerun the command")
+                );
+            }
+            assert_eq!(
+                std::fs::read(workspace.path().join("executions")).unwrap(),
+                b"xx"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn http_read_previews_fit_source_and_history_but_write_receipts_remain_intact() {
         use std::sync::Arc;
