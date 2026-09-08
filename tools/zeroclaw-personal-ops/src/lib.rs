@@ -234,7 +234,27 @@ impl Ops {
     }
 
     pub fn prepare_files(&self, args: &Value) -> Result<Value> {
-        let recips = recipients(args)?;
+        self.prepare_files_using(args, imessage::resolve_group_token)
+    }
+
+    fn prepare_files_using(
+        &self,
+        args: &Value,
+        resolve_group: impl FnOnce(&str) -> Result<GroupTarget>,
+    ) -> Result<Value> {
+        ensure!(
+            args.get("recipients").is_some() != args.get("group_token").is_some(),
+            "provide exactly one of recipients or group_token"
+        );
+        let destinations = if args.get("group_token").is_some() {
+            let group = resolve_group(text(args, "group_token", 512)?)?;
+            vec![(group.token()?, Some(group))]
+        } else {
+            recipients(args)?
+                .into_iter()
+                .map(|recipient| (recipient, None))
+                .collect()
+        };
         let files = args
             .get("paths")
             .and_then(Value::as_array)
@@ -307,10 +327,10 @@ impl Ops {
             } else {
                 caption.to_owned()
             };
-            for r in &recips {
+            for (recipient, group) in &destinations {
                 items.push(Item {
-                    recipient: r.clone(),
-                    group: None,
+                    recipient: recipient.clone(),
+                    group: group.clone(),
                     text: body.clone(),
                     attachment: Some(name.clone()),
                     attachment_sha256: Some(hash.clone()),
@@ -650,9 +670,9 @@ pub fn schema() -> Value {
         ),
         make(
             "files_prepare",
-            "Prepare general file sharing with exact absolute paths and exact iMessage recipients. Creates private immutable copies; does not send. Only operator-approved roots and file types. Never copy a rejected file to evade policy. For phone recordings use voicemail_prepare to preserve consent checks.",
-            json!({"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":10},"recipients":recips,"text":{"type":"string","maxLength":4000}}),
-            json!(["paths", "recipients"])
+            "Prepare files, including generated mp3/m4a/wav audio, for separate individual recipients OR one existing Messages group using group_token from imessage_group_search/get. Supply exactly one destination type. Audio is a playable file attachment, not a native voice-note bubble. Creates private immutable copies; does not send. Only operator-approved roots and file types. Never copy a rejected file to evade policy. For archived phone recordings use voicemail_prepare or voicemail_group_prepare to preserve consent checks.",
+            json!({"paths":{"type":"array","items":{"type":"string"},"minItems":1,"maxItems":10},"recipients":recips,"group_token":{"type":"string","maxLength":512},"text":{"type":"string","maxLength":4000}}),
+            json!(["paths"])
         ),
         make(
             "delivery_execute",
@@ -667,6 +687,16 @@ pub fn schema() -> Value {
             json!(["plan_id"])
         )
     ]);
+    if let Some(files) = tools.as_array_mut().and_then(|tools| {
+        tools
+            .iter_mut()
+            .find(|tool| tool["name"] == "files_prepare")
+    }) {
+        files["inputSchema"]["oneOf"] = json!([
+            {"required":["recipients"],"not":{"required":["group_token"]}},
+            {"required":["group_token"],"not":{"required":["recipients"]}}
+        ]);
+    }
     tools
         .as_array_mut()
         .expect("literal tool array")
@@ -719,6 +749,154 @@ mod tests {
             serde_json::to_string(&json!({"allowed_roots":[share]}))?.as_bytes(),
         )?;
         Ok((temp, ops, share))
+    }
+
+    fn file_group_fixture() -> GroupTarget {
+        GroupTarget {
+            chat_id: 42,
+            chat_identifier: "chat42".into(),
+            chat_guid: "iMessage;+;chat42".into(),
+            service: "iMessage".into(),
+            name: "Fixture group".into(),
+            participants: vec!["+12025550123".into(), "+12025550124".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_audio_group_plan_stages_once_and_targets_existing_chat() -> Result<()> {
+        let (_temp, ops, share) = fixture()?;
+        let group = file_group_fixture();
+        let token = group.token()?;
+        let sources = [share.join("first.m4a"), share.join("second.wav")];
+        for (i, path) in sources.iter().enumerate() {
+            private_write(path, &[i as u8, 42])?;
+        }
+        let result = ops.prepare_files_using(
+            &json!({"paths":sources,"group_token":token,"text":"Fictional character recording"}),
+            |input| {
+                assert_eq!(input, token);
+                Ok(group.clone())
+            },
+        )?;
+        assert_eq!(result["sent"], false);
+        let plan: Plan = serde_json::from_value(result["plan"].clone())?;
+        assert_eq!(plan.items.len(), sources.len());
+        for (i, item) in plan.items.iter().enumerate() {
+            assert_eq!(item.group.as_ref(), Some(&group));
+            assert_eq!(item.recipient, token);
+            assert!(item.source_call.is_none());
+            let staged = ops
+                .root
+                .join("extensions/personal-ops/files")
+                .join(item.attachment.as_ref().context("attachment")?);
+            fs::write(&sources[i], b"changed source")?;
+            assert_eq!(fs::read(&staged)?, vec![i as u8, 42]);
+            assert_eq!(item.attachment_sha256, Some(digest(&fs::read(&staged)?)));
+            let params = imessage::send_params(item, Some(&staged));
+            assert_eq!(params["chat_id"], 42);
+            assert_eq!(params["file"], json!(staged));
+            assert!(params.get("to").is_none());
+            assert_eq!(params["allow_sms_fallback"], false);
+        }
+        assert!(
+            ops.execute_using(
+                &json!({"plan_id":plan.id,"owner_requested_send":false}),
+                |_, _| async { panic!("unapproved group send") },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(ops.status(&plan.id)?["remaining_prepared"], 2);
+        Ok(())
+    }
+
+    #[test]
+    fn file_destinations_fail_closed_before_lookup_or_staging() -> Result<()> {
+        let (_temp, ops, _) = fixture()?;
+        for args in [
+            json!({"paths":[]}),
+            json!({"paths":[],"recipients":["+12025550123"],"group_token":"token"}),
+            json!({"paths":[],"recipients":null,"group_token":"token"}),
+            json!({"paths":[],"group_token":null}),
+            json!({"paths":[],"group_token":""}),
+        ] {
+            assert!(
+                ops.prepare_files_using(&args, |_| panic!("invalid destination lookup"))
+                    .is_err()
+            );
+        }
+        assert!(
+            ops.prepare_files_using(
+                &json!({"paths":[],"group_token":"stale-token"}),
+                |_| anyhow::bail!("group participants changed"),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ops.db
+                .query_row("SELECT count(*) FROM plans", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        assert!(!ops.root.join("extensions/personal-ops/files").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn group_files_preserve_sharing_policy_and_individual_fanout() -> Result<()> {
+        let (_temp, ops, share) = fixture()?;
+        let group = file_group_fixture();
+        let secret = ops.root.join("private.m4a");
+        let hidden = share.join(".private.m4a");
+        let unsupported = share.join("payload.exe");
+        let link = share.join("linked.m4a");
+        for path in [&secret, &hidden, &unsupported] {
+            private_write(path, b"fixture")?;
+        }
+        std::os::unix::fs::symlink(&secret, &link)?;
+        for path in [&secret, &hidden, &unsupported, &link] {
+            assert!(
+                ops.prepare_files_using(
+                    &json!({"paths":[path],"group_token":group.token()?}),
+                    |_| Ok(group.clone()),
+                )
+                .is_err()
+            );
+        }
+        let source = share.join("voice.mp3");
+        private_write(&source, b"fixture")?;
+        let result = ops.prepare_files_using(
+            &json!({"paths":[source],"recipients":["+12025550123","+12025550124"]}),
+            |_| panic!("individuals must not look up groups"),
+        )?;
+        let plan: Plan = serde_json::from_value(result["plan"].clone())?;
+        assert_eq!(plan.items.len(), 2);
+        assert!(plan.items.iter().all(|item| item.group.is_none()));
+        assert_eq!(plan.items[0].recipient, "+12025550123");
+        assert_eq!(plan.items[1].recipient, "+12025550124");
+        Ok(())
+    }
+
+    #[test]
+    fn files_schema_exposes_exclusive_destination_choices() {
+        let tools = schema();
+        let file = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "files_prepare")
+            .unwrap();
+        assert_eq!(file["inputSchema"]["required"], json!(["paths"]));
+        assert_eq!(
+            file["inputSchema"]["properties"]["group_token"]["type"],
+            "string"
+        );
+        assert_eq!(
+            file["inputSchema"]["oneOf"],
+            json!([
+                {"required":["recipients"],"not":{"required":["group_token"]}},
+                {"required":["group_token"],"not":{"required":["recipients"]}}
+            ])
+        );
     }
 
     #[tokio::test]
