@@ -335,6 +335,24 @@ with completed outcomes. Single failures return their original error unchanged.
 This retains more original error memory until the returned error is dropped; it
 does not copy those payloads or create a persistent failure ledger.
 
+The native `http_request` adapter also projects oversized GET, HEAD and OPTIONS
+responses before constructing the display/structured mirrors. Body previews
+allow 4 KiB and header previews 1 KiB of encoded JSON-string data, including an
+explicit incomplete-response notice and both ends of the captured text. Both
+representations use that same preview; a truncated JSON body remains a string
+instead of retaining an oversized parsed object. Optional `body_truncated` and
+`headers_truncated` fields identify previewed fields. Complete fitting responses
+retain their parsed JSON bodies and existing shape. Status and error semantics,
+network capture limits, DNS pinning and access policy remain unchanged.
+
+The MCP and HTTP adapters share the encoded text-preview implementation, with
+caller-owned localized notices. HTTP POST, PUT, PATCH and DELETE retain their
+complete captured responses for ordinary runtime admission; they do not use the
+read preview path. A read method is only a formatting classification, not proof
+that an arbitrary server performed no side effects. The adapter never retries
+or persists full responses, and unusually small configured limits or large
+batches can still fail the canonical per-result/round admission checks.
+
 Source admission bounds payload copies into post-execution consumers; final
 history wrapping can still reject a source-admitted batch later. Empty SOP
 capture after a source rejection does not mean the tools did not execute: the

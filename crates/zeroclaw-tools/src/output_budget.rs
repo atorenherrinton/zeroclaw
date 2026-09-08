@@ -6,6 +6,35 @@ pub const MAX_BATCH_CALLS: usize = 128;
 
 pub use zeroclaw_api::serialization::encoded_size;
 
+/// Format a read preview at its tool boundary, before display and structured
+/// mirrors are constructed. The caller supplies the localized omission notice.
+/// This does not admit the result to history or establish external-effect safety.
+pub(crate) fn bounded_read_text(output: String, max_bytes: usize, marker: &str) -> String {
+    if encoded_size(&output, max_bytes).is_some() {
+        return output;
+    }
+    if encoded_size(&marker, max_bytes).is_none() {
+        // Never cut a warning into an ambiguous result. Runtime admission still
+        // rejects an oversized projection when the localized notice cannot fit.
+        return output;
+    }
+    let excerpt = |bytes: usize| {
+        let head = output.floor_char_boundary(bytes * 3 / 4);
+        let tail = output.ceil_char_boundary(output.len().saturating_sub(bytes / 4));
+        format!("{}{}{}", &output[..head], marker, &output[tail..])
+    };
+    let (mut low, mut high) = (0, max_bytes.min(output.len()));
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if encoded_size(&excerpt(mid), max_bytes).is_some() {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    excerpt(low)
+}
+
 pub fn per_result_budget(configured: usize, calls: usize) -> usize {
     let source_limit = if configured == 0 { 32768 } else { configured };
     source_limit

@@ -149,34 +149,11 @@ impl Tool for McpToolWrapper {
 const READ_RESULT_PREVIEW_BYTES: usize = 4096;
 
 fn bounded_read_result(output: String) -> String {
-    use crate::output_budget::encoded_size;
-    if encoded_size(&output, READ_RESULT_PREVIEW_BYTES).is_some() {
-        return output;
-    }
     let marker = format!(
         "\n{}\n",
         crate::i18n::get_required_tool_string("mcp-read-result-truncated")
     );
-    if encoded_size(&marker, READ_RESULT_PREVIEW_BYTES).is_none() {
-        // Do not clip a localized warning into an ambiguous result. Ordinary
-        // runtime admission still rejects a projection that cannot fit.
-        return output;
-    }
-    let excerpt = |bytes: usize| {
-        let head = output.floor_char_boundary(bytes * 3 / 4);
-        let tail = output.ceil_char_boundary(output.len().saturating_sub(bytes / 4));
-        format!("{}{}{}", &output[..head], marker, &output[tail..])
-    };
-    let (mut low, mut high) = (0, READ_RESULT_PREVIEW_BYTES.min(output.len()));
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        if encoded_size(&excerpt(mid), READ_RESULT_PREVIEW_BYTES).is_some() {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    excerpt(low)
+    crate::output_budget::bounded_read_text(output, READ_RESULT_PREVIEW_BYTES, &marker)
 }
 
 #[cfg(test)]

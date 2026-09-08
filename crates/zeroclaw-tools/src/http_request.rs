@@ -12,6 +12,11 @@ use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
 
+// These are encoded JSON-string allowances, independent of transport capture.
+// Leave room for the structured mirror, native history escaping and receipts.
+const READ_BODY_PREVIEW_BYTES: usize = 4096;
+const READ_HEADERS_PREVIEW_BYTES: usize = 1024;
+
 const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
      proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
      proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
@@ -509,7 +514,9 @@ impl Tool for HttpRequestTool {
                 "status": { "type": "integer", "description": "HTTP status code" },
                 "reason": { "type": "string", "description": "Canonical status reason" },
                 "headers": { "type": "string", "description": "Response headers (sensitive values redacted)" },
-                "body": { "description": "Response body: parsed JSON when the body is JSON, raw string otherwise" }
+                "body": { "description": "Response body: parsed JSON when complete JSON, raw string otherwise; oversized read responses contain an explicitly incomplete preview" },
+                "body_truncated": { "type": "boolean", "description": "Present for an oversized read response; whether body is an incomplete preview" },
+                "headers_truncated": { "type": "boolean", "description": "Present for an oversized read response; whether headers are an incomplete preview" }
             },
             "required": ["status", "reason", "headers", "body"]
         }))
@@ -622,6 +629,10 @@ impl Tool for HttpRequestTool {
             });
         }
 
+        let preview_read = matches!(
+            method,
+            reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
+        );
         match self
             .execute_request(&target, method, request_headers, body)
             .await
@@ -650,6 +661,38 @@ impl Tool for HttpRequestTool {
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
+                // Bound source fields before making a parsed or display copy.
+                // Mutating methods retain their complete receipts and continue
+                // through the runtime's existing fail-closed budget admission.
+                let body_truncated = preview_read
+                    && crate::output_budget::encoded_size(&response_text, READ_BODY_PREVIEW_BYTES)
+                        .is_none();
+                let headers_truncated = preview_read
+                    && crate::output_budget::encoded_size(
+                        &headers_text,
+                        READ_HEADERS_PREVIEW_BYTES,
+                    )
+                    .is_none();
+                let (response_text, headers_text) = if body_truncated || headers_truncated {
+                    let marker = format!(
+                        "\n{}\n",
+                        crate::i18n::get_required_tool_string("http-read-result-truncated")
+                    );
+                    (
+                        crate::output_budget::bounded_read_text(
+                            response_text,
+                            READ_BODY_PREVIEW_BYTES,
+                            &marker,
+                        ),
+                        crate::output_budget::bounded_read_text(
+                            headers_text,
+                            READ_HEADERS_PREVIEW_BYTES,
+                            &marker,
+                        ),
+                    )
+                } else {
+                    (response_text, headers_text)
+                };
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
                     status_code,
@@ -660,14 +703,22 @@ impl Tool for HttpRequestTool {
 
                 // Structured mirror of the display text; body is parsed
                 // JSON when it parses, raw string otherwise.
-                let body_value = serde_json::from_str::<serde_json::Value>(&response_text)
-                    .unwrap_or_else(|_| serde_json::Value::String(response_text.clone()));
-                let data = json!({
+                let body_value = if body_truncated {
+                    serde_json::Value::String(response_text.clone())
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&response_text)
+                        .unwrap_or_else(|_| serde_json::Value::String(response_text.clone()))
+                };
+                let mut data = json!({
                     "status": status_code,
                     "reason": status.canonical_reason().unwrap_or("Unknown"),
                     "headers": headers_text,
                     "body": body_value,
                 });
+                if body_truncated || headers_truncated {
+                    data["body_truncated"] = json!(body_truncated);
+                    data["headers_truncated"] = json!(headers_truncated);
+                }
 
                 Ok(ToolResult {
                     success: status.is_success(),
@@ -834,6 +885,122 @@ mod tests {
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         test_tool_with_private(allowed_domains, false)
+    }
+
+    async fn execute_fixture(
+        method: &str,
+        status: u16,
+        body: &str,
+        large_headers: bool,
+    ) -> ToolResult {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(status).set_body_string(body);
+        if large_headers {
+            for i in 0..30 {
+                response =
+                    response.insert_header(format!("x-fixture-{i:03}-{}", "x".repeat(60)), "value");
+            }
+        }
+        Mock::given(matchers::method(method.to_ascii_uppercase().as_str()))
+            .respond_with(response)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["127.0.0.1".into()],
+            1_000_000,
+            5,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        tool.execute(json!({"url":server.uri(),"method":method}))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_http_reads_bound_text_and_structured_copies() {
+        for (method, status) in [("GET", 200), ("get", 404), ("OPTIONS", 200)] {
+            let body = format!("START{}END", "\u{0001}😀\"\\".repeat(20_000));
+            let result = execute_fixture(method, status, &body, true).await;
+            assert_eq!(result.success, status == 200, "{:?}", result.error);
+            assert_eq!(result.error, (status == 404).then(|| "HTTP 404".into()));
+            let data = result.output.data().unwrap();
+            assert_eq!(data["status"], status);
+            assert_eq!(data["body_truncated"], true);
+            assert_eq!(data["headers_truncated"], true);
+            let preview = data["body"].as_str().unwrap();
+            assert!(preview.starts_with("START"));
+            assert!(preview.ends_with("END"));
+            assert!(preview.contains("Read response truncated"));
+            assert!(preview.contains("do not replay writes"));
+            assert!(result.output.ends_with(preview));
+            assert!(crate::output_budget::encoded_size(&result.output, 12 * 1024).is_some());
+            let message = zeroclaw_providers::ChatMessage::tool(
+                json!({"tool_call_id":"fixture", "content":result.output.as_str()}).to_string(),
+            );
+            assert!(crate::output_budget::encoded_size(&message, 16 * 1024).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_json_read_does_not_keep_a_hidden_full_structured_body() {
+        let body = json!({"items": "x".repeat(100_000)}).to_string();
+        let result = execute_fixture("GET", 200, &body, false).await;
+        assert!(result.success);
+        let data = result.output.data().unwrap();
+        assert!(data["body"].is_string());
+        assert_eq!(data["body_truncated"], true);
+        assert_eq!(data["headers_truncated"], false);
+        assert!(crate::output_budget::encoded_size(&result.output, 12 * 1024).is_some());
+    }
+
+    #[tokio::test]
+    async fn fitting_json_reads_keep_structured_values_and_no_preview_flags() {
+        let body = r#"{"answer":42,"text":"fixture"}"#;
+        let result = execute_fixture("GET", 200, body, false).await;
+        assert!(result.success);
+        assert!(result.output.ends_with(body));
+        let data = result.output.data().unwrap();
+        assert_eq!(data["body"], json!({"answer":42,"text":"fixture"}));
+        assert!(data.get("body_truncated").is_none());
+        assert!(data.get("headers_truncated").is_none());
+    }
+
+    #[tokio::test]
+    async fn head_bounds_large_headers_without_inventing_a_body() {
+        let result = execute_fixture("HEAD", 200, "", true).await;
+        assert!(result.success, "{:?}", result.error);
+        let data = result.output.data().unwrap();
+        assert_eq!(data["body"], "");
+        assert_eq!(data["body_truncated"], false);
+        assert_eq!(data["headers_truncated"], true);
+        assert!(crate::output_budget::encoded_size(&result.output, 12 * 1024).is_some());
+    }
+
+    #[tokio::test]
+    async fn mutating_http_methods_keep_complete_response_evidence() {
+        let body = json!({"operation_id":"fixture-operation", "state":"uncertain", "body":"x".repeat(100_000)}).to_string();
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            let result = execute_fixture(method, 200, &body, false).await;
+            assert!(result.success);
+            assert!(result.output.ends_with(&body));
+            let data = result.output.data().unwrap();
+            assert_eq!(
+                data["body"],
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()
+            );
+            assert!(data.get("body_truncated").is_none());
+            assert!(crate::output_budget::encoded_size(&result.output, 32768).is_none());
+        }
     }
 
     #[tokio::test]
