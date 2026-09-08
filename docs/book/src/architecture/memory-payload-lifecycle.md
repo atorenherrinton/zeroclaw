@@ -207,6 +207,19 @@ Policy classification scans borrowed bytes rather than allocating a lowercase
 copy. This normalization ceiling does not replace configured or aggregate batch
 admission, and it does not cover arbitrary `anyhow::Error` rendering.
 
+Both tool-result event emitters measure the complete encoded artifact projection
+from borrowed fields before copying its path, URI, filename, title, and MIME
+strings. The shared artifact conversion has a hard 64 KiB runtime ceiling,
+including field names, defaults, size, and JSON escaping. It uses the same bounded
+JSON counter as source/history admission, now shared through
+`zeroclaw_api::serialization` and re-exported by `zeroclaw_tools::output_budget`.
+An oversized artifact is omitted from the event; the original outcome still owns
+its structured data, delivery assertion, success state, and receipt for batch
+rejection. An omitted artifact is not evidence of non-delivery. Both emitters
+also use the bounded, credential-scrubbed result-text projection.
+This artifact ceiling does not replace configured/aggregate source admission or
+bound the entire event envelope or event stream.
+
 The runtime moves each completed batch into its existing ordered-result slots,
 then checks the complete serialized source envelope (names, call IDs, typed
 outcomes, structured data, errors, and receipts) without allocating a serialized

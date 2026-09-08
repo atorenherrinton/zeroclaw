@@ -490,7 +490,12 @@ pub(crate) async fn execute_one_tool(
                     .output_data
                     .as_ref()
                     .filter(|_| out.success)
-                    .and_then(ToolArtifact::from_delivered_data),
+                    .and_then(|data| {
+                        ToolArtifact::from_delivered_data_with_limit(
+                            data,
+                            zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+                        )
+                    }),
             })
             .await;
     }

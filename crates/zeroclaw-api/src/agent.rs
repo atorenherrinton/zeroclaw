@@ -21,12 +21,20 @@ pub struct ToolArtifact {
     pub size: u64,
 }
 
-impl ToolArtifact {
-    /// Build from a tool's structured `output_data` when it declares a delivered
-    /// file (`delivered: true` with a non-empty `path`). Returns `None` for any
-    /// other structured output, keeping this a channel-neutral convention rather
-    /// than a hook tied to one tool name.
-    pub fn from_delivered_data(data: &serde_json::Value) -> Option<Self> {
+/// One borrowed serialization shape for admission and the owned artifact.
+/// This view resolves fields from the source; it does not copy their payloads.
+#[derive(serde::Serialize)]
+struct ArtifactFields<'a> {
+    path: &'a str,
+    uri: &'a str,
+    filename: &'a str,
+    title: &'a str,
+    mime: &'a str,
+    size: u64,
+}
+
+impl<'a> ArtifactFields<'a> {
+    fn from_delivered_data(data: &'a serde_json::Value) -> Option<Self> {
         if data.get("delivered").and_then(serde_json::Value::as_bool) != Some(true) {
             return None;
         }
@@ -34,13 +42,13 @@ impl ToolArtifact {
             data.get(key)
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
-                .to_string()
         };
         let path = field("path");
         if path.is_empty() {
             return None;
         }
         Some(Self {
+            path,
             uri: field("uri"),
             filename: field("filename"),
             title: field("title"),
@@ -49,8 +57,49 @@ impl ToolArtifact {
                 .get("bytes")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0),
-            path,
         })
+    }
+
+    fn into_owned(self) -> ToolArtifact {
+        ToolArtifact {
+            path: self.path.to_owned(),
+            uri: self.uri.to_owned(),
+            filename: self.filename.to_owned(),
+            title: self.title.to_owned(),
+            mime: self.mime.to_owned(),
+            size: self.size,
+        }
+    }
+}
+
+impl serde::Serialize for ToolArtifact {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ArtifactFields {
+            path: &self.path,
+            uri: &self.uri,
+            filename: &self.filename,
+            title: &self.title,
+            mime: &self.mime,
+            size: self.size,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl ToolArtifact {
+    /// Build from delivered structured data, preserving the existing uncapped
+    /// conversion API. Runtime emitters use the bounded conversion below.
+    pub fn from_delivered_data(data: &serde_json::Value) -> Option<Self> {
+        ArtifactFields::from_delivered_data(data).map(ArtifactFields::into_owned)
+    }
+
+    /// Admit the complete encoded artifact before copying any source fields.
+    /// Returns `None` for invalid metadata or an over-budget artifact. This
+    /// projection never changes the source's delivery state or owns its receipt.
+    pub fn from_delivered_data_with_limit(data: &serde_json::Value, limit: usize) -> Option<Self> {
+        let fields = ArtifactFields::from_delivered_data(data)?;
+        crate::serialization::encoded_size(&fields, limit)?;
+        Some(fields.into_owned())
     }
 }
 
@@ -147,6 +196,55 @@ mod plan_event_tests {
 mod tool_artifact_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn bounded_artifact_matches_owned_encoding_at_the_exact_limit() {
+        for data in [
+            json!({"delivered": true, "path": "/synthetic/minimal"}),
+            json!({
+                "delivered": true, "path": "/synthetic/😀\"\n",
+                "uri": "attachment://fixture/\0", "filename": "fixture.txt",
+                "title": "fixture \"title\"", "mimeType": "text/plain", "bytes": u64::MAX,
+            }),
+        ] {
+            let artifact = ToolArtifact::from_delivered_data(&data).unwrap();
+            let encoded = serde_json::to_vec(&artifact).unwrap();
+            assert_eq!(
+                ToolArtifact::from_delivered_data_with_limit(&data, encoded.len()),
+                Some(artifact)
+            );
+            assert!(
+                ToolArtifact::from_delivered_data_with_limit(&data, encoded.len() - 1).is_none()
+            );
+            assert!(ToolArtifact::from_delivered_data_with_limit(&data, 0).is_none());
+            let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 6);
+            assert!(value.get("mime").is_some());
+            assert!(value.get("size").is_some());
+        }
+    }
+
+    #[test]
+    fn artifact_limit_counts_escaping_in_every_string_field() {
+        for field in ["path", "uri", "filename", "title", "mimeType"] {
+            let mut data = json!({"delivered": true, "path": "/synthetic/artifact"});
+            data[field] = json!("\0".repeat(12_000));
+            assert!(
+                ToolArtifact::from_delivered_data_with_limit(&data, 64 * 1024).is_none(),
+                "uncapped {field}"
+            );
+            assert_eq!(data[field].as_str().unwrap().len(), 12_000);
+        }
+    }
+
+    #[test]
+    fn artifact_limit_counts_all_fields_together() {
+        let mut data = json!({"delivered": true, "bytes": u64::MAX});
+        for field in ["path", "uri", "filename", "title", "mimeType"] {
+            data[field] = json!("x".repeat(14_000));
+        }
+        assert!(ToolArtifact::from_delivered_data_with_limit(&data, 64 * 1024).is_none());
+    }
 
     #[test]
     fn projects_delivered_data_into_typed_fields() {

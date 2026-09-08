@@ -2,7 +2,6 @@
 //! loop's `TurnEvent` emission helpersconsolidation).
 
 use super::outcome::ToolLoopCancelled;
-use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
@@ -197,14 +196,19 @@ pub(crate) async fn emit_tool_result(
         .send(TurnEvent::ToolResult {
             id: id.to_string(),
             name: name.to_string(),
-            output: scrub_credentials(&outcome.output),
+            output: crate::agent::tool_execution::bounded_observer_text(&outcome.output),
             // Project the tool's structured output into typed artifact metadata
             // when it declared a delivered file, so channels never parse `output`.
             artifact: outcome
                 .output_data
                 .as_ref()
                 .filter(|_| outcome.success)
-                .and_then(ToolArtifact::from_delivered_data),
+                .and_then(|data| {
+                    ToolArtifact::from_delivered_data_with_limit(
+                        data,
+                        zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+                    )
+                }),
         })
         .await;
 }
@@ -366,6 +370,35 @@ mod tests {
         }
         assert!(saw_result, "a ToolResult event must be emitted");
     }
+    #[tokio::test]
+    async fn prepared_result_bounds_display_and_artifact_without_mutating_source() {
+        let mut outcome = ok_outcome();
+        outcome.output = format!("{}Bearer fixture-private-token", "😀".repeat(30_000));
+        outcome.output_data = Some(serde_json::json!({
+            "delivered": true, "path": "/synthetic/artifact.txt", "title": "\0".repeat(20_000),
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        emit_tool_result(&tx, "fixture", "fixture", &outcome).await;
+        let TurnEvent::ToolResult {
+            output, artifact, ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected result");
+        };
+        assert!(artifact.is_none());
+        assert!(output.len() <= 4096);
+        assert!(output.contains("omitted"));
+        assert!(!output.contains("fixture-private-token"));
+        assert!(outcome.output.ends_with("Bearer fixture-private-token"));
+        assert_eq!(
+            outcome.output_data.as_ref().unwrap()["title"]
+                .as_str()
+                .unwrap()
+                .len(),
+            20_000
+        );
+    }
+
     #[tokio::test]
     async fn failed_source_delivery_assertion_never_projects_a_delivered_artifact() {
         for success in [false, true] {

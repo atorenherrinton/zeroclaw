@@ -4,30 +4,7 @@
 pub const ROUND_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_BATCH_CALLS: usize = 128;
 
-/// Count the complete JSON representation without allocating a serialized copy.
-/// Stop serialization as soon as the limit is exceeded. Callers must treat
-/// serialization failure as over budget, never as a zero-sized payload.
-pub fn encoded_size<T: serde::Serialize + ?Sized>(value: &T, limit: usize) -> Option<usize> {
-    struct Counter {
-        used: usize,
-        limit: usize,
-    }
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.used) {
-                return Err(std::io::Error::other("encoded tool output budget exceeded"));
-            }
-            self.used += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter { used: 0, limit };
-    serde_json::to_writer(&mut counter, value).ok()?;
-    Some(counter.used)
-}
+pub use zeroclaw_api::serialization::encoded_size;
 
 pub fn per_result_budget(configured: usize, calls: usize) -> usize {
     let source_limit = if configured == 0 { 32768 } else { configured };

@@ -13,6 +13,8 @@ enum Mode {
     EscapedUnevenOutput,
     FailedOutput,
     OversizedData,
+    Artifact,
+    OversizedArtifact,
     OversizedFailedOutput,
     OversizedFailedOutputWithoutError,
     Delivery,
@@ -62,6 +64,22 @@ impl Tool for EvidenceTool {
                     "fixture-partial-output",
                 ),
                 error: Some("fixture exit check failed".into()),
+            }),
+            Mode::Artifact | Mode::OversizedArtifact => Ok(ToolResult {
+                success: true,
+                output: ToolOutput::json_with_text(
+                    serde_json::json!({
+                        "delivered": true, "path": "/synthetic/artifact.txt",
+                        "uri": "attachment://fixture/artifact", "filename": "artifact.txt",
+                        "mimeType": "text/plain", "bytes": 42,
+                        "scope": "fixture-owner", "operation_id": "fixture-operation",
+                        "title": if matches!(self.mode, Mode::OversizedArtifact) {
+                            "\0".repeat(20_000)
+                        } else { "fixture artifact".to_string() },
+                    }),
+                    "fixture-artifact-evidence",
+                ),
+                error: None,
             }),
             Mode::OversizedData => Ok(ToolResult {
                 success: true,
@@ -772,4 +790,79 @@ async fn final_history_rejection_keeps_unexcerpted_source_and_receipts() {
                 .all(|(_, _, result)| result.success && result.receipt.is_some())
         );
     }
+}
+
+#[tokio::test]
+async fn oversized_artifact_is_not_projected_before_batch_rejection() {
+    for parallel in [false, true] {
+        let case = run_case(
+            &[Mode::OversizedArtifact, Mode::Success],
+            parallel,
+            None,
+            None,
+        )
+        .await;
+        let evidence = case
+            .result
+            .as_ref()
+            .unwrap_err()
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        assert!(
+            case.events.iter().any(|event| matches!(event,
+                TurnEvent::ToolResult { id, artifact: None, .. } if id == "fixture-0"
+            )),
+            "close the result card without copying the oversized artifact"
+        );
+        assert!(
+            !case.events.iter().any(|event| matches!(
+                event,
+                TurnEvent::ToolResult {
+                    artifact: Some(_),
+                    ..
+                }
+            )),
+            "oversized artifact fields must never reach the event channel"
+        );
+        let outcome = &evidence.results[0].as_ref().unwrap().2;
+        assert!(outcome.success);
+        let data = outcome.output_data.as_ref().unwrap();
+        assert_eq!(data["title"].as_str().unwrap().len(), 20_000);
+        assert_eq!(data["scope"], "fixture-owner");
+        assert_eq!(data["operation_id"], "fixture-operation");
+        assert_eq!(data["delivered"], true);
+        assert!(ReceiptGenerator::with_key(vec![7; 32]).verify(
+            outcome.receipt.as_ref().unwrap(),
+            "file_read",
+            &serde_json::json!({}),
+            &outcome.output,
+        ));
+        assert_eq!(case.calls, vec![1, 1]);
+        assert_eq!(case.remaining_responses, 1);
+        assert!(case.step_calls.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn admitted_artifact_keeps_typed_delivery_metadata() {
+    let case = run_case(&[Mode::Artifact], false, None, None).await;
+    case.result.as_ref().unwrap();
+    let artifact = case
+        .events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult {
+                artifact: Some(artifact),
+                ..
+            } => Some(artifact),
+            _ => None,
+        })
+        .expect("a fitting delivered artifact must still be projected");
+    assert_eq!(artifact.path, "/synthetic/artifact.txt");
+    assert_eq!(artifact.uri, "attachment://fixture/artifact");
+    assert_eq!(artifact.filename, "artifact.txt");
+    assert_eq!(artifact.title, "fixture artifact");
+    assert_eq!(artifact.mime, "text/plain");
+    assert_eq!(artifact.size, 42);
+    assert_eq!(case.receipts.len(), 1);
 }
