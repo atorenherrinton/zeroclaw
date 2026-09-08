@@ -6,6 +6,54 @@ prefixes its compatibility tools as `google_write__calendar_create_event`,
 `src/main.rs::tools` (including `calendar_update::tool`) is the canonical public
 schema/metadata; the runtime discovers it rather than maintaining another schema.
 
+## Gmail standalone and reply drafts
+
+`google_write__gmail_create_draft` creates one unsent plain-text draft. `to`
+(explicit comma-separated recipient addresses) and `body` remain required.
+Standalone drafts also require `subject` and retain the existing behavior.
+
+For an existing conversation, supply exactly one optional reply target from
+Gmail read-tool results:
+
+- `reply_to_message_id`: the Gmail API message ID, not an RFC `Message-ID` header.
+- `thread_id`: the Gmail API thread ID; the installed gog client selects the
+  latest sent or received message in that thread for reply headers.
+
+Omit `subject` for a reply to let gog inherit the original subject. If supplying
+it explicitly, keep the conversation's subject (an optional `Re:` prefix is
+allowed). Gmail requires matching subjects as well as thread identity and RFC
+reply headers; see [Google's threading guide](https://developers.google.com/workspace/gmail/api/guides/threads).
+The existing gog client owns resolution of the source message, `threadId`,
+`In-Reply-To`, and `References`; the connector forwards the validated target.
+It does not infer recipients or enable reply-all, quoting, attachments, sending,
+draft updates, or deletion. Both reply targets together, invalid IDs, nulls,
+unknown parameters and invalid required fields fail before Google is invoked.
+
+Example (synthetic IDs; replace with values returned by Gmail read tools):
+
+```json
+{
+  "to": "recipient@example.com",
+  "body": "Thanks, that time works for me.",
+  "reply_to_message_id": "18abcdef01234567"
+}
+```
+
+Results include `draft_id`, `message_id`, `thread_id`, and `sent: false`.
+`subject` echoes an explicit subject and is null when inherited by gog; no
+subject is fabricated in the receipt. Both gog's `draftId` receipt and a raw
+Gmail `id` receipt are supported. Missing draft identity, missing reply thread,
+or a returned thread different from an explicit target are uncertain outcomes:
+inspect existing drafts before retrying. The connector invokes creation once
+and never falls back to a standalone draft on failure. Existing transport
+restrictions, including `--enable-commands-exact=gmail.drafts.create` and
+`--gmail-no-send`, remain in place.
+
+Rebuild and replace only this connector using the installation steps below.
+Refresh any local guidance that still says the draft tool cannot reply, then
+reload and verify `reply_to_message_id` and `thread_id` in the agents' tool
+schemas. No core runtime rebuild or new permission is needed.
+
 ## Calendar create and invitations
 
 Creates only one non-recurring event on the authenticated owner's primary
