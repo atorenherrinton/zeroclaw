@@ -17,6 +17,8 @@ mod calendar_update;
 
 #[cfg(test)]
 mod calendar_tests;
+#[cfg(test)]
+mod gmail_tests;
 
 fn require_text<'a>(args: &'a Value, key: &str, max_len: usize) -> Result<&'a str> {
     let value = args
@@ -363,10 +365,52 @@ where
 }
 
 async fn create_gmail_draft(args: &Value) -> Result<Value> {
+    create_gmail_draft_with(args, run_gog).await
+}
+
+fn gmail_reply_target<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    let Some(value) = args.get(key) else {
+        return Ok(None);
+    };
+    let id = value
+        .as_str()
+        .with_context(|| format!("{key} must be a string"))?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+    {
+        bail!("{key} must be a Gmail API ID, not a URL or RFC Message-ID header");
+    }
+    Ok(Some(id))
+}
+
+async fn create_gmail_draft_with<F, Fut>(args: &Value, mut run: F) -> Result<Value>
+where
+    F: FnMut(Vec<String>) -> Fut,
+    Fut: Future<Output = Result<Value>>,
+{
+    validate_arguments(
+        args,
+        &["to", "subject", "body", "reply_to_message_id", "thread_id"],
+    )?;
+    let reply_to_message_id = gmail_reply_target(args, "reply_to_message_id")?;
+    let thread_id = gmail_reply_target(args, "thread_id")?;
+    if reply_to_message_id.is_some() && thread_id.is_some() {
+        bail!("Use only one of reply_to_message_id or thread_id");
+    }
+    let is_reply = reply_to_message_id.is_some() || thread_id.is_some();
     let to = require_text(args, "to", 2048)?;
     validate_email_list(to, "to")?;
-    let subject = require_text(args, "subject", 998)?;
-    if subject.contains(['\r', '\n']) {
+    // gog resolves the original subject and RFC reply headers from Gmail. Do
+    // not manufacture a second copy of that provider-owned reply context here.
+    let subject = if is_reply && args.get("subject").is_none() {
+        None
+    } else {
+        Some(require_text(args, "subject", 998)?)
+    };
+    if subject.is_some_and(|value| value.contains(['\r', '\n'])) {
         bail!("subject cannot contain line breaks");
     }
     let body = require_text(args, "body", 100_000)?;
@@ -377,15 +421,40 @@ async fn create_gmail_draft(args: &Value) -> Result<Value> {
         "drafts".to_owned(),
         "create".to_owned(),
         format!("--to={to}"),
-        format!("--subject={subject}"),
         format!("--body={body}"),
     ]);
-    let created = run_gog(command).await?;
+    if let Some(subject) = subject {
+        command.push(format!("--subject={subject}"));
+    }
+    if let Some(id) = reply_to_message_id {
+        command.push(format!("--reply-to-message-id={id}"));
+    }
+    if let Some(id) = thread_id {
+        command.push(format!("--thread-id={id}"));
+    }
+    let created = run(command).await?;
+    let draft_id = created.get("draftId").or_else(|| created.get("id"))
+        .and_then(Value::as_str).filter(|id| !id.is_empty())
+        .context("Google returned no draft ID; creation may have succeeded. Inspect drafts before retrying")?;
+    let created_thread_id = created
+        .pointer("/message/threadId")
+        .or_else(|| created.get("threadId"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty());
+    if is_reply
+        && (created_thread_id.is_none()
+            || thread_id.is_some_and(|id| Some(id) != created_thread_id))
+    {
+        bail!(
+            "Google did not confirm the reply thread; creation may have succeeded. Inspect drafts before retrying"
+        );
+    }
     Ok(json!({
         "created": true,
         "sent": false,
-        "draft_id": created.get("id").and_then(Value::as_str),
+        "draft_id": draft_id,
         "message_id": created.get("message").and_then(|message| message.get("id")).and_then(Value::as_str),
+        "thread_id": created_thread_id,
         "to": to,
         "subject": subject
     }))
@@ -417,13 +486,15 @@ fn tools() -> Value {
         },
         {
             "name":"gmail_create_draft",
-            "description":"Create a plain-text Gmail draft after the owner asks for one. This tool cannot send email, reply, forward, attach files, modify messages, or delete drafts.",
-            "annotations":{"readOnlyHint":false,"destructiveHint":false,"openWorldHint":true},
+            "description":"Create an unsent plain-text Gmail draft after the owner asks for one. For a reply in an existing conversation, pass either reply_to_message_id or thread_id from Gmail read tools. Omit subject on replies to inherit the original subject; an explicit reply subject must match the conversation. Recipients remain explicit. Cannot send email, forward, attach files, modify messages, or delete drafts. Inspect drafts before retrying an uncertain creation.",
+            "annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true},
             "inputSchema":{"type":"object","properties":{
                 "to":{"type":"string","description":"One or more comma-separated recipient email addresses"},
-                "subject":{"type":"string","minLength":1,"maxLength":998},
-                "body":{"type":"string","minLength":1,"maxLength":100000}
-            },"required":["to","subject","body"],"additionalProperties":false}
+                "subject":{"type":"string","minLength":1,"maxLength":998,"description":"Required for standalone drafts. Omit for replies to inherit the original subject; if supplied for a reply, keep the conversation subject (optional Re: prefix)."},
+                "body":{"type":"string","minLength":1,"maxLength":100000},
+                "reply_to_message_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$","description":"Gmail API message ID to reply to, not the RFC Message-ID header. Sets thread and In-Reply-To/References. Mutually exclusive with thread_id."},
+                "thread_id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_-]+$","description":"Gmail API thread ID to reply within. Uses the latest sent or received message for reply headers. Mutually exclusive with reply_to_message_id."}
+            },"required":["to","body"],"additionalProperties":false}
         },
         calendar_update::tool(),
         calendar_mutation::tool(),
@@ -452,10 +523,7 @@ async fn call(name: &str, args: Value) -> Result<Value> {
         "calendar_reconcile" => calendar_mutation::reconcile(&args).await?,
         "calendar_create_event" => calendar_mutation::legacy_create(&args).await?,
         "calendar_update_event" => calendar_mutation::legacy_update(&args).await?,
-        "gmail_create_draft" => {
-            validate_arguments(&args, &["to", "subject", "body"])?;
-            create_gmail_draft(&args).await?
-        }
+        "gmail_create_draft" => create_gmail_draft(&args).await?,
         _ => bail!("Unknown tool"),
     };
     Ok(json!({
