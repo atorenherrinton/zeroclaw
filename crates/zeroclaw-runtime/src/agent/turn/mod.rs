@@ -1399,21 +1399,10 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await
         .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))?;
-        let payload_budget = zeroclaw_tools::output_budget::per_result_budget(
-            max_tool_result_chars,
-            ordered_results.len(),
-        );
-        for (_, _, outcome) in ordered_results.iter_mut().flatten() {
-            let original_bytes = outcome.output.len();
-            outcome.output =
-                zeroclaw_tools::output_budget::bound_output(&outcome.output, payload_budget);
-            if outcome.output.len() < original_bytes {
-                ::zeroclaw_log::record!(INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(serde_json::json!({"trace_id":turn_id,"original_bytes":original_bytes,"context_bytes":outcome.output.len(),"phase":"tool_output_budget"})),
-                    "Tool context payload bounded");
-            }
-        }
+        // Source admission already checks the actual batch size. Keep the
+        // canonical outcomes intact through final history admission: an equal
+        // per-call excerpt can discard evidence from a batch that fits, or
+        // replace the original source just before a wrapping rejection.
 
         let CollectedResults {
             individual_results,

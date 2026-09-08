@@ -9,6 +9,8 @@ use zeroclaw_api::delivery::{DeliveryFailure, EffectOutcome};
 #[derive(Clone, Copy)]
 enum Mode {
     Success,
+    UnevenOutput,
+    EscapedUnevenOutput,
     FailedOutput,
     OversizedData,
     OversizedFailedOutput,
@@ -40,6 +42,14 @@ impl Tool for EvidenceTool {
             Mode::Success => Ok(ToolResult {
                 success: true,
                 output: "fixture-success-evidence".into(),
+                error: None,
+            }),
+            Mode::UnevenOutput | Mode::EscapedUnevenOutput => Ok(ToolResult {
+                success: true,
+                output: ToolOutput::json_with_text(
+                    serde_json::json!({"scope": "fixture-owner", "operation_id": "fixture-operation"}),
+                    uneven_output_text(self.mode),
+                ),
                 error: None,
             }),
             Mode::FailedOutput => Ok(ToolResult {
@@ -105,6 +115,16 @@ async fn run_case(
     hooks: Option<&crate::hooks::HookRunner>,
     cancellation: Option<tokio_util::sync::CancellationToken>,
 ) -> Case {
+    run_case_with_result_limit(modes, parallel, hooks, cancellation, 30_000).await
+}
+
+async fn run_case_with_result_limit(
+    modes: &[Mode],
+    parallel: bool,
+    hooks: Option<&crate::hooks::HookRunner>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+    max_tool_result_chars: usize,
+) -> Case {
     // Canonical read allowlist admits parallel execution; the fixtures never do I/O.
     let names = ["file_read", "web_fetch", "sessions_list"];
     let counters: Vec<_> = modes
@@ -168,7 +188,7 @@ async fn run_case(
             pacing: &pacing,
             strict_tool_parsing: false,
             parallel_tools: parallel,
-            max_tool_result_chars: 30_000,
+            max_tool_result_chars,
             context_token_budget: 100_000,
             receipt_generator: Some(&generator),
             knobs: &knobs,
@@ -637,5 +657,119 @@ async fn budget_rejection_preserves_failed_source_before_executor_excerpts() {
             assert_eq!(case.remaining_responses, 1);
             assert!(case.step_calls.is_empty());
         }
+    }
+}
+
+fn uneven_output_text(mode: Mode) -> String {
+    let prefix = match mode {
+        Mode::UnevenOutput => "😀".repeat(10_000),
+        Mode::EscapedUnevenOutput => format!("{}{}", "\n".repeat(16_000), "x".repeat(20_000)),
+        _ => unreachable!("uneven output fixture modes only"),
+    };
+    format!("{prefix}fixture-effect-evidence-at-end")
+}
+
+#[tokio::test]
+async fn uneven_admitted_batch_keeps_complete_text_and_verifiable_receipts() {
+    for parallel in [false, true] {
+        let case = run_case_with_result_limit(
+            &[Mode::UnevenOutput, Mode::Success],
+            parallel,
+            None,
+            None,
+            50_000,
+        )
+        .await;
+        case.result.as_ref().unwrap();
+        let source = uneven_output_text(Mode::UnevenOutput);
+        let results = tool_results(&case);
+        let text = results[0]["content"].as_str().unwrap();
+        let (actual, receipt) = text.split_once("\n\n[receipt: ").unwrap();
+        assert!(
+            actual == source,
+            "fitting batches must not lose a large sibling's tail to an equal-share excerpt"
+        );
+        let receipt = receipt.strip_suffix(']').unwrap();
+        assert!(ReceiptGenerator::with_key(vec![7; 32]).verify(
+            receipt,
+            "file_read",
+            &serde_json::json!({}),
+            actual,
+        ));
+        assert!(case.receipts.iter().any(|r| r.ends_with(receipt)));
+        // SOP owns a separate bounded display projection; provider history
+        // must retain the complete source independently of that display cap.
+        assert_eq!(case.step_calls.len(), 2);
+        assert!(case.step_calls[0].success);
+        assert_eq!(
+            case.step_calls[0].output_data.as_ref().unwrap()["scope"],
+            "fixture-owner"
+        );
+        assert_success_retained(&case, 1);
+        assert_eq!(case.remaining_responses, 0);
+        let messages: Vec<_> = case.history.iter().filter(|m| m.role == "tool").collect();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            serde_json::to_vec(&messages).unwrap().len()
+                <= zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|m| serde_json::to_vec(m).unwrap().len() <= 50_000)
+        );
+    }
+}
+
+#[tokio::test]
+async fn final_history_rejection_keeps_unexcerpted_source_and_receipts() {
+    for parallel in [false, true] {
+        let case = run_case_with_result_limit(
+            &[Mode::EscapedUnevenOutput, Mode::Success],
+            parallel,
+            None,
+            None,
+            zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+        )
+        .await;
+        let error = case
+            .result
+            .as_ref()
+            .expect_err("nested history escaping must exceed the budget");
+        let evidence = error
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        let source = uneven_output_text(Mode::EscapedUnevenOutput);
+        let outcome = &evidence.results[0].as_ref().unwrap().2;
+        assert!(
+            outcome.output == source,
+            "history rejection must own the unmodified source"
+        );
+        assert!(ReceiptGenerator::with_key(vec![7; 32]).verify(
+            outcome.receipt.as_ref().unwrap(),
+            "file_read",
+            &serde_json::json!({}),
+            &outcome.output,
+        ));
+        assert_eq!(
+            outcome.output_data.as_ref().unwrap()["operation_id"],
+            "fixture-operation"
+        );
+        assert_eq!(
+            case.step_calls.len(),
+            2,
+            "source admission succeeded before history wrapping rejected the batch"
+        );
+        assert_eq!(case.calls, vec![1, 1]);
+        assert_eq!(case.remaining_responses, 1);
+        assert_eq!(case.history.len(), 1);
+        assert!(case.receipts.is_empty());
+        assert!(
+            evidence
+                .results
+                .iter()
+                .flatten()
+                .all(|(_, _, result)| result.success && result.receipt.is_some())
+        );
     }
 }

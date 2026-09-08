@@ -211,14 +211,17 @@ The runtime moves each completed batch into its existing ordered-result slots,
 then checks the complete serialized source envelope (names, call IDs, typed
 outcomes, structured data, errors, and receipts) without allocating a serialized
 copy. This source admission runs before post-execution logs, SOP payload capture,
-post-tool hooks, progress, or per-round text excerpts. An oversized source batch
+post-tool hooks or progress. An oversized source batch
 reaches none of those post-execution consumers, including its smaller siblings.
 The collector rechecks source admission and then checks both native and prompt history
 representations, including nested JSON escaping, receipt formatting, and XML
 wrapping. Each result must fit `max_tool_result_chars` interpreted as encoded
 bytes at this boundary (zero uses 32 KiB); each complete round must fit 64 KiB.
-An otherwise valid text excerpt can therefore be rejected when its envelope
-exceeds the limit.
+Admitted source outcomes stay intact through history construction. The loop no
+longer assigns equal per-call text excerpts, and collection does not truncate a
+canonicalized result to make it fit. Uneven batches keep their complete text when
+the actual encoded source and history fit; expansion from JSON escaping, media
+markers, and receipts causes explicit rejection if the envelope exceeds a limit.
 
 A rejected round terminates before another provider request and before mutating
 history, loop detection, or the receipt collector. The typed terminal error owns
@@ -233,7 +236,7 @@ history wrapping can still reject a source-admitted batch later. Empty SOP
 capture after a source rejection does not mean the tools did not execute: the
 terminal error owns their returned outcomes and receipts.
 
-Earlier executor/observer copies, later per-round source excerpt evidence preservation,
+Earlier executor/observer copies, independent SOP display excerpts and history trimming,
 parallel/background delegation outcome transport, delegated receipt accumulation,
 and durable recovery of rejected results remain separate boundaries. These checks
 do not establish a complete end-to-end output budget.

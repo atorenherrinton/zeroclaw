@@ -1,10 +1,9 @@
-//! Results collection: build per-tool outputs (with receipts and truncation),
+//! Results collection: admit encoded per-tool outputs with receipts,
 //! feed the pattern-based loop detector, and run the time-gated
 //! identical-output abort.
 
 use crate::agent::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers_for,
-    truncate_tool_result,
 };
 use crate::agent::loop_detector::LoopDetector;
 use crate::agent::tool_execution::ToolExecutionOutcome;
@@ -130,7 +129,7 @@ pub(crate) struct CollectedResults {
 /// Collect this round's tool results (upstream loop body, results-collection
 /// section): feed the loop detector (Warning/Block append system messages;
 /// Break yields a typed recovery trigger), canonicalize media markers,
-/// truncate, append receipts, and build the per-call and XML result forms.
+/// append receipts, and admit the complete per-call and XML result forms.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_tool_results(
     mut ordered_results: OrderedResults,
@@ -152,9 +151,8 @@ pub(crate) fn collect_tool_results(
     let mut detection_relevant_output = String::new();
     let mut recovery_trigger = None;
     for (tool_name, tool_call_id, outcome) in ordered_results.iter().flatten() {
-        let canonical_output =
+        let mut result_output =
             canonicalize_tool_result_media_markers_for(tool_name, &outcome.output);
-        let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
         if let Some(receipt) = &outcome.receipt {
             write!(result_output, "\n\n[receipt: {receipt}]")?;
         }
