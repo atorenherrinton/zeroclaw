@@ -147,7 +147,10 @@ const validityFor = element => {
   };
 };
 
-const pendingCustomElements = () => typeof customElements === 'undefined' ? [] : deepQuery('*').filter(element => element.tagName.includes('-') && !element.shadowRoot && !customElements.get(element.tagName.toLowerCase()));
+// Semantic containers may deliberately use hyphenated tags without registering
+// a custom element (for example a calendar grid). Their explicit role is valid
+// rendered DOM, not evidence that a component is waiting to hydrate.
+const pendingCustomElements = () => typeof customElements === 'undefined' ? [] : deepQuery('*').filter(element => element.tagName.includes('-') && !element.shadowRoot && !element.hasAttribute?.('role') && !customElements.get(element.tagName.toLowerCase()));
 
 const controlText = element => {
   const label = element.labels && element.labels.length ? composedText(element.labels[0], 1024) : '';
