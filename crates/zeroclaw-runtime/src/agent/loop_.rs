@@ -12821,7 +12821,7 @@ This is an example, not an invocation."#;
     }
 
     #[test]
-    fn agent_turn_forwards_max_tool_result_chars_to_truncate_tool_result() {
+    fn agent_turn_rejects_configured_budget_that_cannot_fit_result_envelope() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -12849,7 +12849,7 @@ This is an example, not an invocation."#;
             ];
             let observer = NoopObserver;
 
-            let _result = agent_turn(
+            let result = agent_turn(
                 None,
                 &model_provider,
                 &mut history,
@@ -12870,7 +12870,7 @@ This is an example, not an invocation."#;
                 None,
                 false,
                 false,
-                100, // max_tool_result_chars: truncate at 100 chars
+                100, // too small for the full encoded result envelope
                 0,   // context_token_budget: disabled
                 None,
                 TurnOrigin::SubTurn,
@@ -12879,7 +12879,7 @@ This is an example, not an invocation."#;
                 None, // turn_id: self-minted
             )
             .await
-            .expect("agent_turn should complete");
+            .expect_err("a tiny budget must not silently admit a larger result");
 
             assert_eq!(
                 invocations.load(Ordering::SeqCst),
@@ -12887,17 +12887,12 @@ This is an example, not an invocation."#;
                 "tool should be called once"
             );
 
-            // The tool result in history should be truncated (contain the
-            // truncation marker "...") rather than preserving the full 500+ char output.
-            let all_content: String = history
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<&str>>()
-                .join(" ");
-
-            assert!(
-                !all_content.contains(&"X".repeat(500)),
-                "tool result should not contain 500 consecutive X chars when truncated to 100 chars"
+            assert!(result.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
+            assert_eq!(history.len(), 2, "no partially admitted tool round");
+            assert_eq!(
+                model_provider.responses.lock().unwrap().len(),
+                1,
+                "no follow-up model request"
             );
         });
     }

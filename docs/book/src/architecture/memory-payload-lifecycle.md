@@ -194,3 +194,114 @@ Key code entry points:
   `crates/zeroclaw-api/src/model_provider.rs`
 - Channel attachments: `crates/zeroclaw-api/src/channel.rs` and
   `crates/zeroclaw-api/src/media.rs`
+
+## Encoded tool-history admission
+
+At executor normalization, successful text and structured data move together into
+`ToolExecutionOutcome` without cloning the source buffers. Returned failures also
+move their original text, data, and optional error into that outcome first. If its
+encoded size exceeds the 64 KiB ceiling, normalization leaves it intact for batch
+rejection; it does not excerpt the source or copy it into a fallback error field.
+Below that ceiling, normalization first reserves the final one-result envelope,
+including names, call IDs, structured data, JSON escaping, and a fallback error
+reason. The remaining encoded string allowance bounds the failure display while
+it is written. Fluent argument text stays borrowed, and repeated translated
+arguments consume the same allowance; an overflowing selected catalog does not
+fall back to a shorter translation. Missing catalog entries and formatting errors within the allowance retain
+the ordinary fallback rules. Fitting failures include the full returned text and
+error. If the display or its envelope cannot fit, the existing typed budget error
+owns the original outcome, including its unchanged optional error and structured
+effect evidence. Sequential dispatch stops its remaining tail; parallel completed
+siblings and delivery failures retain their normal terminal evidence path.
+Policy classification scans borrowed bytes rather than allocating a lowercase
+copy. This normalization ceiling does not replace configured or aggregate batch
+admission. The writer bounds the runtime-owned string, not Fluent catalog loading,
+parsing, or allocations internal to Fluent expression evaluation.
+
+Ordinary `anyhow::Error` returns use a bounded formatter for the execution reason,
+with a 64 KiB encoded JSON-string ceiling. Before duplicating that reason into
+output and error fields, the executor measures the complete one-result source
+envelope, including names, IDs, both reason fields, defaults, duration and JSON
+escaping. A shared borrowed field view is the serialization shape for this check
+and for owned outcomes. Formatting failure or source overflow moves the original
+error into `ResultBudgetExceeded::errors`, outside automatic Display/Debug and
+standard cause traversal. No ordinary repair or next provider request follows
+that rejection; completed siblings retain the existing batch evidence path.
+Fitting errors keep their full reason and existing failure classification.
+This early hard ceiling is separate from configured/aggregate source admission
+and later native/prompt history wrapping.
+
+The executor's ordinary-error debug log uses the same formatter with a disposable
+sink capped at 4 KiB for the encoded JSON string, including quotes and escaping. It checks each
+borrowed formatter chunk before copying, stops on a failed write, and discards
+partial content. Fitting projections pass through credential redaction and a
+final encoded-size check; oversized or failed formatting produces a bounded
+omission marker. The original error stays borrowed and ordinary recovery is
+unchanged. This caps the runtime-owned log string, not allocations performed
+inside custom formatters or `anyhow` backtrace rendering. Both the debug-log and
+ordinary-reason guards bound runtime-owned projections; they cannot preempt
+arbitrary work or allocations inside a formatter. Whole log envelopes and
+streams need their own budgets.
+
+Both tool-result event emitters measure the complete encoded artifact projection
+from borrowed fields before copying its path, URI, filename, title, and MIME
+strings. The shared artifact conversion has a hard 64 KiB runtime ceiling,
+including field names, defaults, size, and JSON escaping. It uses the same bounded
+JSON counter as source/history admission, now shared through
+`zeroclaw_api::serialization` and re-exported by `zeroclaw_tools::output_budget`.
+An oversized artifact is omitted from the event; the original outcome still owns
+its structured data, delivery assertion, success state, and receipt for batch
+rejection. An omitted artifact is not evidence of non-delivery. Both emitters
+also use the bounded, credential-scrubbed result-text projection.
+This artifact ceiling does not replace configured/aggregate source admission or
+bound the entire event envelope or event stream.
+
+The runtime moves each completed batch into its existing ordered-result slots,
+then checks the complete serialized source envelope (names, call IDs, typed
+outcomes, structured data, errors, and receipts) without allocating a serialized
+copy. This source admission runs before post-execution logs, SOP payload capture,
+post-tool hooks or progress. An oversized source batch
+reaches none of those post-execution consumers, including its smaller siblings.
+The collector rechecks source admission and then checks both native and prompt history
+representations, including nested JSON escaping, receipt formatting, and XML
+wrapping. Each result must fit `max_tool_result_chars` interpreted as encoded
+bytes at this boundary (zero uses 32 KiB); each complete round must fit 64 KiB.
+Admitted source outcomes stay intact through history construction. The loop no
+longer assigns equal per-call text excerpts, and collection does not truncate a
+canonicalized result to make it fit. Uneven batches keep their complete text when
+the actual encoded source and history fit; expansion from JSON escaping, media
+markers, and receipts causes explicit rejection if the envelope exceeds a limit.
+
+A rejected round terminates before another provider request and before mutating
+history, loop detection, or the receipt collector. The typed terminal error owns
+the outcomes received by the collector and retains any existing typed batch
+failure as its cause. Its display text does not include the rejected payload.
+This is transient error ownership, not durable receipt storage or permission to
+repeat an external effect. Already completed tools are not undone. Synchronous agentic delegation and
+the tool dispatcher propagate this typed error outside ordinary repair recovery.
+
+When multiple dispatched calls return terminal errors, the turn keeps every
+original error. Terminal history projects the typed delivery, deadline or budget
+failure itself instead of rendering arbitrary context attached to that type.
+The primary error retains its existing cause-chain routing
+(delivery first, otherwise the first non-cancellation). `RetainedToolFailures`
+owns the other errors, ordered by their positions in the original model batch;
+matching call metadata remains in history or the rejected ordered-result envelope.
+Its display is a bounded, scrubbed projection of the primary call's history
+failure text; its debug output includes only the primary index and sibling count.
+Neither formatter traverses sibling errors or nested result payloads. Existing
+primary-error cause/backtrace rendering remains a separate boundary. A later
+source or history budget rejection retains this complete failure context along
+with completed outcomes. Single failures return their original error unchanged.
+This retains more original error memory until the returned error is dropped; it
+does not copy those payloads or create a persistent failure ledger.
+
+Source admission bounds payload copies into post-execution consumers; final
+history wrapping can still reject a source-admitted batch later. Empty SOP
+capture after a source rejection does not mean the tools did not execute: the
+terminal error owns their returned outcomes and receipts.
+
+Earlier executor/observer copies, independent SOP display excerpts and history trimming,
+parallel/background delegation outcome transport, delegated receipt accumulation,
+and durable recovery of rejected results remain separate boundaries. These checks
+do not establish a complete end-to-end output budget.

@@ -30,6 +30,27 @@ pub(crate) fn bounded_observer_text(text: &str) -> String {
     scrubbed
 }
 
+/// Build only a bounded JSON-string projection of a formatter's output.
+/// The source remains borrowed. This cannot bound work inside the formatter.
+fn format_with_encoded_limit(arguments: std::fmt::Arguments<'_>, limit: usize) -> Option<String> {
+    let mut projection = zeroclaw_api::serialization::EncodedStringWriter::new(limit);
+    std::fmt::write(&mut projection, arguments).ok()?;
+    projection.finish()
+}
+
+fn bounded_observer_error(error: &anyhow::Error) -> String {
+    const LIMIT: usize = 4096;
+    const OMITTED: &str = "[observer error omitted: formatting failed or exceeded encoded budget]";
+    let Some(text) = format_with_encoded_limit(format_args!("{error:?}"), LIMIT) else {
+        return OMITTED.into();
+    };
+    let scrubbed = bounded_observer_text(&text);
+    if zeroclaw_api::serialization::encoded_size(&scrubbed, LIMIT).is_none() {
+        return OMITTED.into();
+    }
+    scrubbed
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -146,7 +167,38 @@ pub struct ToolExecutionOutcome {
     pub receipt: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// One serialization shape serves both owned outcomes and pre-copy admission.
+#[derive(serde::Serialize)]
+#[serde(rename = "ToolExecutionOutcome")]
+struct OutcomeFields<'a> {
+    output: &'a str,
+    output_data: Option<&'a serde_json::Value>,
+    success: bool,
+    error_reason: Option<&'a str>,
+    failure_kind: Option<ToolFailureKind>,
+    duration: Duration,
+    receipt: Option<&'a str>,
+}
+
+impl serde::Serialize for ToolExecutionOutcome {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        OutcomeFields {
+            output: &self.output,
+            output_data: self.output_data.as_ref(),
+            success: self.success,
+            error_reason: self.error_reason.as_deref(),
+            failure_kind: self.failure_kind,
+            duration: self.duration,
+            receipt: self.receipt.as_deref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ToolFailureKind {
     /// The tool ran (or failed to run) for a reason that is not a policy gate.
     Ordinary,
@@ -374,13 +426,12 @@ pub(crate) async fn execute_one_tool(
                     );
                 }
                 if r.success {
-                    let normalized_output = if r.output.is_empty() {
-                        "(no output)"
-                    } else {
-                        &r.output
-                    };
+                    let (mut normalized_output, output_data) = r.output.into_parts();
+                    if normalized_output.is_empty() {
+                        normalized_output.push_str("(no output)");
+                    }
                     let receipt = receipt_generator.map(|receipt_gen| {
-                        receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
+                        receipt_gen.generate_now(call_name, &call_arguments, &normalized_output)
                     });
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
@@ -388,15 +439,15 @@ pub(crate) async fn execute_one_tool(
                         duration,
                         success: true,
                         arguments: Some(bounded_observer_text(&full_args)),
-                        result: Some(bounded_observer_text(normalized_output)),
+                        result: Some(bounded_observer_text(&normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
-                        output: normalized_output.to_string(),
-                        output_data: r.output.into_data(),
+                        output: normalized_output,
+                        output_data,
                         success: true,
                         error_reason: None,
                         failure_kind: None,
@@ -404,50 +455,38 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or_else(|| r.output.as_str().to_owned());
-                    // Keep the source's returned evidence even when its later
-                    // exit/status check failed. It is not a delivery acknowledgement.
-                    let output = if !r.output.is_empty() && r.output.as_str() != reason {
-                        let display_reason =
-                            zeroclaw_tools::output_budget::bound_output(&reason, 4096);
-                        let display_output =
-                            zeroclaw_tools::output_budget::bound_output(&r.output, 32768);
-                        crate::i18n::get_required_cli_string_with_args(
-                            "turn-tool-failed-with-output",
-                            &[
-                                ("reason", display_reason.as_str()),
-                                ("output", display_output.as_str()),
-                            ],
-                        )
-                    } else {
-                        format!("Error: {reason}")
-                    };
-                    let failure_kind = if is_security_policy_failure(&reason) {
-                        ToolFailureKind::PolicyDenied
-                    } else {
-                        ToolFailureKind::Ordinary
-                    };
+                    let outcome = returned_failure_outcome(
+                        r.output,
+                        r.error,
+                        duration,
+                        call_name,
+                        tool_call_id,
+                    )
+                    .map_err(|outcome| {
+                        super::turn::results_collect::ResultBudgetExceeded {
+                            results: vec![Some((
+                                call_name.to_owned(),
+                                tool_call_id_owned.clone(),
+                                *outcome,
+                            ))],
+                            errors: Vec::new(),
+                        }
+                    })?;
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
                         arguments: Some(bounded_observer_text(&full_args)),
-                        result: Some(bounded_observer_text(&reason)),
+                        result: Some(bounded_observer_text(
+                            outcome.error_reason.as_deref().unwrap_or(&outcome.output),
+                        )),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
-                    Ok(ToolExecutionOutcome {
-                        output,
-                        success: false,
-                        error_reason: Some(reason),
-                        failure_kind: Some(failure_kind),
-                        duration,
-                        receipt: None,
-                        output_data: r.output.into_data(),
-                    })
+                    Ok(outcome)
                 }
             }
             Err(e) => {
@@ -455,11 +494,46 @@ pub(crate) async fn execute_one_tool(
                 // recovery treat uncertain delivery as an ordinary retryable error.
                 if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
                     || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || e.is::<super::turn::results_collect::ResultBudgetExceeded>()
                     || is_tool_loop_cancelled(&e)
                 {
                     return Err(e);
                 }
                 let duration = start.elapsed();
+                let Some(reason) = format_with_encoded_limit(
+                    format_args!("Error executing {call_name}: {e}"),
+                    zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+                ) else {
+                    return Err(
+                        super::turn::results_collect::ResultBudgetExceeded::from_error(e).into(),
+                    );
+                };
+                let failure_kind = if is_security_policy_failure(&reason) {
+                    ToolFailureKind::PolicyDenied
+                } else {
+                    ToolFailureKind::Ordinary
+                };
+                let fields = OutcomeFields {
+                    output: &reason,
+                    output_data: None,
+                    success: false,
+                    error_reason: Some(&reason),
+                    failure_kind: Some(failure_kind),
+                    duration,
+                    receipt: None,
+                };
+                // Measure the actual source shape, including both copies of the
+                // reason, metadata and JSON escaping, before allocating its twin.
+                if zeroclaw_api::serialization::encoded_size(
+                    &[(call_name, tool_call_id, fields)],
+                    zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+                )
+                .is_none()
+                {
+                    return Err(
+                        super::turn::results_collect::ResultBudgetExceeded::from_error(e).into(),
+                    );
+                }
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -470,16 +544,10 @@ pub(crate) async fn execute_one_tool(
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
                             "input": bounded_observer_text(&full_args),
-                            "error": bounded_observer_text(&format!("{e:?}")),
+                            "error": bounded_observer_error(&e),
                         })),
                     format!("tool error: {call_name}")
                 );
-                let reason = format!("Error executing {call_name}: {e}");
-                let failure_kind = if is_security_policy_failure(&reason) {
-                    ToolFailureKind::PolicyDenied
-                } else {
-                    ToolFailureKind::Ordinary
-                };
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
                     tool_call_id: tool_call_id_owned.clone(),
@@ -517,7 +585,12 @@ pub(crate) async fn execute_one_tool(
                     .output_data
                     .as_ref()
                     .filter(|_| out.success)
-                    .and_then(ToolArtifact::from_delivered_data),
+                    .and_then(|data| {
+                        ToolArtifact::from_delivered_data_with_limit(
+                            data,
+                            zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+                        )
+                    }),
             })
             .await;
     }
@@ -535,14 +608,98 @@ pub(crate) async fn execute_one_tool(
     outcome
 }
 
+/// Keep returned source evidence in the canonical outcome before producing a
+/// failure display. An oversized source must reach batch admission intact; it
+/// must not become an excerpt, or a second full-sized fallback error string.
+fn returned_failure_outcome(
+    source: crate::tools::ToolOutput,
+    error: Option<String>,
+    duration: Duration,
+    call_name: &str,
+    tool_call_id: Option<&str>,
+) -> std::result::Result<ToolExecutionOutcome, Box<ToolExecutionOutcome>> {
+    let (output, output_data) = source.into_parts();
+    let reason = error.as_deref().unwrap_or(&output);
+    let failure_kind = if is_security_policy_failure(reason) {
+        ToolFailureKind::PolicyDenied
+    } else {
+        ToolFailureKind::Ordinary
+    };
+    let mut outcome = ToolExecutionOutcome {
+        output,
+        output_data,
+        success: false,
+        error_reason: error,
+        failure_kind: Some(failure_kind),
+        duration,
+        receipt: None,
+    };
+    // This ceiling bounds normalization copies only. The batch owner still
+    // enforces configured per-result and aggregate limits, including names/IDs.
+    if zeroclaw_tools::output_budget::encoded_size(
+        &outcome,
+        zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+    )
+    .is_none()
+    {
+        return Ok(outcome);
+    }
+    let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
+    // Reserve every final envelope field (including the fallback reason) before
+    // copying it. Only the empty output's two JSON quotes may be replaced.
+    let fields = OutcomeFields {
+        output: "",
+        output_data: outcome.output_data.as_ref(),
+        success: outcome.success,
+        error_reason: Some(reason),
+        failure_kind: outcome.failure_kind,
+        duration: outcome.duration,
+        receipt: outcome.receipt.as_deref(),
+    };
+    let limit = zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES;
+    let Some(reserved) =
+        zeroclaw_api::serialization::encoded_size(&[(call_name, tool_call_id, fields)], limit)
+    else {
+        return Err(Box::new(outcome));
+    };
+    let output_limit = limit - reserved + 2;
+    let projection = if !outcome.output.is_empty() && outcome.output != reason {
+        crate::i18n::get_required_cli_string_with_args_with_limit(
+            "turn-tool-failed-with-output",
+            &[("reason", reason), ("output", outcome.output.as_str())],
+            output_limit,
+        )
+    } else {
+        format_with_encoded_limit(format_args!("Error: {reason}"), output_limit)
+    };
+    let Some(projection) = projection else {
+        return Err(Box::new(outcome));
+    };
+    outcome
+        .error_reason
+        .get_or_insert_with(|| outcome.output.clone());
+    outcome.output = projection;
+    Ok(outcome)
+}
+
 fn is_security_policy_failure(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("security policy")
-        || reason.contains("denied by policy")
-        || reason.contains("workspace allowlist")
-        || reason.contains("rate limit exceeded")
-        || reason.contains("action budget exhausted")
-        || reason.contains("requires approval and no operator decision was available")
+    // Scan the borrowed bytes: lowercasing an arbitrary source error would
+    // allocate another unbounded payload before admission.
+    [
+        "security policy",
+        "denied by policy",
+        "workspace allowlist",
+        "rate limit exceeded",
+        "action budget exhausted",
+        "requires approval and no operator decision was available",
+    ]
+    .iter()
+    .any(|needle| {
+        reason
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -692,6 +849,206 @@ pub(crate) async fn execute_tools_sequential(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn outcome_serialization_preserves_complete_owned_shape() {
+        let outcome = super::ToolExecutionOutcome {
+            output: "fixture 😀 output".into(),
+            output_data: Some(serde_json::json!({"scope": "fixture-owner"})),
+            success: false,
+            error_reason: Some("fixture \"error\"".into()),
+            failure_kind: Some(super::ToolFailureKind::PolicyDenied),
+            duration: std::time::Duration::new(2, 3),
+            receipt: Some("fixture-receipt".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(&outcome).unwrap(),
+            serde_json::json!({
+                "output": "fixture 😀 output", "output_data": {"scope": "fixture-owner"},
+                "success": false, "error_reason": "fixture \"error\"", "failure_kind": "PolicyDenied",
+                "duration": {"secs": 2, "nanos": 3}, "receipt": "fixture-receipt",
+            })
+        );
+    }
+
+    struct StreamingDebugError {
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        chunk: &'static str,
+        count: usize,
+    }
+
+    impl std::fmt::Display for StreamingDebugError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for _ in 0..self.count {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                f.write_str(self.chunk)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Debug for StreamingDebugError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self, f)
+        }
+    }
+
+    impl std::error::Error for StreamingDebugError {}
+
+    #[test]
+    fn observer_error_stops_rendering_at_encoded_limit() {
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = anyhow::Error::new(StreamingDebugError {
+            writes: writes.clone(),
+            chunk: "\0",
+            count: 20_000,
+        });
+        let projection = super::bounded_observer_error(&error);
+        assert!(writes.load(std::sync::atomic::Ordering::SeqCst) < 700);
+        assert!(projection.contains("omitted"));
+        assert!(zeroclaw_api::serialization::encoded_size(&projection, 4096).is_some());
+        assert_eq!(
+            error.downcast_ref::<StreamingDebugError>().unwrap().count,
+            20_000
+        );
+    }
+
+    #[test]
+    fn observer_error_checks_exact_encoded_boundaries() {
+        for (chunk, count, fits) in [
+            ("x", 4094, true),
+            ("x", 4095, false),
+            ("\0", 682, true),
+            ("\0", 683, false),
+            ("😀", 1023, true),
+            ("😀", 1024, false),
+            ("\"", 2047, true),
+            ("\"", 2048, false),
+        ] {
+            let error = anyhow::Error::new(StreamingDebugError {
+                writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                chunk,
+                count,
+            });
+            let projection = super::bounded_observer_error(&error);
+            assert!(zeroclaw_api::serialization::encoded_size(&projection, 4096).is_some());
+            if fits {
+                assert_eq!(projection, chunk.repeat(count));
+            } else {
+                assert!(projection.contains("omitted"));
+            }
+        }
+    }
+
+    #[test]
+    fn observer_error_scrubs_complete_chains_and_discards_partial_secrets() {
+        let error = anyhow::Error::msg("token=fixture-secret-value").context("fixture context");
+        let projection = super::bounded_observer_error(&error);
+        assert_eq!(
+            projection,
+            super::bounded_observer_text(&format!("{error:?}"))
+        );
+        assert!(projection.contains("fixture context"));
+        assert!(projection.contains("[REDACTED]"));
+        assert!(!projection.contains("fixture-secret-value"));
+
+        // The context nearly fills the sink; the underlying credential must
+        // never be exposed as a prefix when its formatting hits the limit.
+        let error = error.context("x".repeat(4050));
+        let projection = super::bounded_observer_error(&error);
+        assert!(projection.contains("omitted"));
+        assert!(!projection.contains("token"));
+        assert!(!projection.contains("fixt"));
+
+        // Redaction itself can expand a fitting input beyond the encoded cap.
+        let error = anyhow::Error::msg(format!("{}token=12345678", "x".repeat(4078)));
+        assert!(zeroclaw_api::serialization::encoded_size(&format!("{error:?}"), 4096).is_some());
+        assert!(super::bounded_observer_error(&error).contains("omitted"));
+    }
+
+    #[test]
+    fn observer_error_omits_failed_or_noncooperative_formatting() {
+        #[derive(Debug)]
+        struct BrokenFormatter(bool);
+        impl std::fmt::Display for BrokenFormatter {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                if self.0 {
+                    // Simulate a formatter that ignores the sink's refusal.
+                    let _ = f.write_str(&"x".repeat(5000));
+                    let _ = f.write_str("token=fixture-secret-value");
+                    Ok(())
+                } else {
+                    f.write_str("token=fixture-secret")?;
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+        impl std::error::Error for BrokenFormatter {}
+        for ignores_error in [false, true] {
+            let error = anyhow::Error::new(BrokenFormatter(ignores_error));
+            let projection = super::bounded_observer_error(&error);
+            assert!(projection.contains("omitted"));
+            assert!(!projection.contains("token"));
+        }
+    }
+
+    #[test]
+    fn failure_normalization_counts_escaping_before_copies() {
+        let source = "\0".repeat(20_000);
+        let source_ptr = source.as_ptr();
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text(source),
+            None,
+            std::time::Duration::ZERO,
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
+        assert_eq!(outcome.output.as_ptr(), source_ptr);
+        assert!(outcome.error_reason.is_none());
+        assert_eq!(outcome.output.len(), 20_000);
+    }
+
+    #[test]
+    fn failure_normalization_preserves_large_error_and_policy_kind() {
+        let reason = format!("{}DENIED BY POLICY", "😀".repeat(20_000));
+        let reason_ptr = reason.as_ptr();
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text("fixture-effect-evidence"),
+            Some(reason),
+            std::time::Duration::ZERO,
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
+        assert_eq!(outcome.error_reason.as_ref().unwrap().as_ptr(), reason_ptr);
+        assert_eq!(outcome.output, "fixture-effect-evidence");
+        assert_eq!(
+            outcome.failure_kind,
+            Some(super::ToolFailureKind::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn admitted_failure_source_is_formatted_without_an_excerpt() {
+        let source = format!("{}fixture-effect-evidence-at-end", "x".repeat(40_000));
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text(source.clone()),
+            Some("fixture exit failed".into()),
+            std::time::Duration::ZERO,
+            "fixture_tool",
+            Some("fixture-id"),
+        )
+        .ok()
+        .expect("fixture source should retain its existing normalization path");
+        assert!(outcome.output.contains(&source));
+        assert!(outcome.output.contains("fixture exit failed"));
+        assert!(!outcome.output.contains("truncated"));
+        assert_eq!(outcome.error_reason.as_deref(), Some("fixture exit failed"));
+    }
+
+    #[test]
     fn observer_caps_before_redaction_and_never_exposes_a_cut_secret() {
         let text = format!("{}Bearer private-token", "😀".repeat(1023));
         let bounded = super::bounded_observer_text(&text);
@@ -702,6 +1059,90 @@ mod tests {
             super::bounded_observer_text("small safe result"),
             "small safe result"
         );
+    }
+
+    #[test]
+    fn failure_normalization_preserves_sources_when_final_envelope_cannot_fit() {
+        for (text, reason, name, id) in [
+            (
+                "\0".repeat(6_000),
+                None,
+                "fixture_tool".into(),
+                "fixture-id".into(),
+            ),
+            (
+                "x".repeat(30_000),
+                Some("\n".repeat(10_000)),
+                "fixture_tool".into(),
+                "fixture-id".into(),
+            ),
+            (
+                "small output".into(),
+                Some("denied by policy".into()),
+                "n".repeat(40_000),
+                "\0".repeat(5_000),
+            ),
+        ] {
+            let text_ptr = text.as_ptr();
+            let reason_ptr = reason.as_ref().map(|s| s.as_ptr());
+            let source = crate::tools::ToolOutput::json_with_text(
+                serde_json::json!({"scope":"fixture-owner", "delivered": true}),
+                text,
+            );
+            let original = super::returned_failure_outcome(
+                source,
+                reason,
+                std::time::Duration::ZERO,
+                &name,
+                Some(&id),
+            )
+            .err()
+            .expect("expanded envelope must reject");
+            assert_eq!(original.output.as_ptr(), text_ptr);
+            assert_eq!(
+                original.error_reason.as_ref().map(|s| s.as_ptr()),
+                reason_ptr
+            );
+            assert_eq!(
+                original.output_data.as_ref().unwrap()["scope"],
+                "fixture-owner"
+            );
+            assert_eq!(original.output_data.as_ref().unwrap()["delivered"], true);
+            assert!(!original.success);
+        }
+    }
+
+    #[test]
+    fn failure_normalization_admits_exact_final_envelope_including_metadata() {
+        let normalize = |padding: usize| {
+            super::returned_failure_outcome(
+                crate::tools::ToolOutput::json_with_text(
+                    serde_json::json!({"scope":"fixture-owner", "padding":"x".repeat(padding)}),
+                    "😀\"\n",
+                ),
+                Some("fixture failure".into()),
+                std::time::Duration::ZERO,
+                "fixture_tool",
+                Some("fixture-id"),
+            )
+        };
+        let initial = normalize(0).ok().unwrap();
+        let size = serde_json::to_vec(&[("fixture_tool", Some("fixture-id"), initial)])
+            .unwrap()
+            .len();
+        let padding = zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES - size;
+        let exact = normalize(padding).ok().expect("exact envelope fits");
+        assert_eq!(
+            serde_json::to_vec(&[("fixture_tool", Some("fixture-id"), exact)])
+                .unwrap()
+                .len(),
+            zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES
+        );
+        let original = normalize(padding + 1)
+            .err()
+            .expect("one byte over must reject");
+        assert_eq!(original.output, "😀\"\n");
+        assert_eq!(original.error_reason.as_deref(), Some("fixture failure"));
     }
 
     use super::{
@@ -803,6 +1244,13 @@ mod tests {
                 }
                 .into());
             }
+            if self.name == "fixture_budget_error" {
+                return Err(crate::agent::turn::results_collect::ResultBudgetExceeded {
+                    results: Vec::new(),
+                    errors: Vec::new(),
+                }
+                .into());
+            }
             if self.name == "fixture_timeout_error" {
                 return Err(zeroclaw_api::deadline::DeadlineExceeded {
                     phase: zeroclaw_api::deadline::Phase::Tool,
@@ -819,8 +1267,100 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_delivery_and_deadline_errors_never_enter_string_recovery() {
-        for name in ["fixture_delivery_error", "fixture_timeout_error"] {
+    async fn successful_execution_moves_source_allocations_and_preserves_receipt() {
+        struct OwnedOutputTool(Mutex<Option<crate::tools::ToolResult>>);
+        zeroclaw_api::tool_attribution!(
+            OwnedOutputTool,
+            zeroclaw_api::attribution::ToolKind::Plugin
+        );
+        #[async_trait]
+        impl Tool for OwnedOutputTool {
+            fn name(&self) -> &str {
+                "fixture_owned_output"
+            }
+            fn description(&self) -> &str {
+                "synthetic owned-output fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("fixture executes once"))
+            }
+        }
+        let text = "fixture-text".repeat(10_000);
+        let data_text = "fixture-metadata".repeat(10_000);
+        let text_ptr = text.as_ptr();
+        let data_ptr = data_text.as_ptr();
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            OwnedOutputTool(Mutex::new(Some(crate::tools::ToolResult::ok(
+                crate::tools::ToolOutput::json_with_text(
+                    serde_json::Value::String(data_text),
+                    text,
+                ),
+            )))),
+        )]);
+        let receipt_generator =
+            crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![7; 32]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "fixture-turn",
+            channel_name: "fixture",
+        };
+        let outcome = execute_one_tool(
+            "fixture_owned_output",
+            serde_json::json!({}),
+            Some("fixture-call"),
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            Some(&receipt_generator),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.output.as_ptr(), text_ptr);
+        assert_eq!(
+            outcome
+                .output_data
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            data_ptr
+        );
+        assert!(receipt_generator.verify(
+            outcome.receipt.as_ref().unwrap(),
+            "fixture_owned_output",
+            &serde_json::json!({}),
+            &outcome.output,
+        ));
+    }
+
+    #[tokio::test]
+    async fn structured_delivery_deadline_and_budget_errors_never_enter_string_recovery() {
+        for name in [
+            "fixture_delivery_error",
+            "fixture_timeout_error",
+            "fixture_budget_error",
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let registry =
                 crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
@@ -861,6 +1401,8 @@ mod tests {
                     evidence.outcome,
                     zeroclaw_api::delivery::EffectOutcome::PossiblyApplied
                 );
+            } else if name == "fixture_budget_error" {
+                assert!(error.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
             } else {
                 assert_eq!(
                     error

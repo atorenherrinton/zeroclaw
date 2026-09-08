@@ -449,10 +449,12 @@ mod tests {
                 receipt: None,
             }],
             &mut prepared.ordered_results,
+            32768,
             0,
             true,
         )
-        .await;
+        .await
+        .expect("small test result should fit the budget");
 
         let mut provenance = Vec::new();
         while provenance.len() < 2 {

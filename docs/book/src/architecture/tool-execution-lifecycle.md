@@ -143,12 +143,16 @@ Otherwise calls run sequentially. Sequential dispatch checks cancellation
 before each call and stops dispatching the tail when cancelled. Parallel
 dispatch can finish some siblings while others are interrupted; completed calls
 keep their real terminal result, and only unfinished calls get an interrupted
-result. A typed delivery failure or deadline stops the sequential tail without
-replaying it. Parallel dispatch retains every completed sibling in call order.
+result. A typed delivery failure, deadline, or result-budget rejection stops the
+sequential tail without replaying it. Parallel dispatch retains every completed sibling in call order.
 Tool-returned cancellation also remains typed and stops the sequential tail.
 Delivery failures take precedence over sibling deadlines/cancellation when the
 batch returns its terminal error; each failed call also gets its own history
-projection. Unstarted sequential calls are distinguished from calls that stopped
+projection. Multiple failures retain all original error objects in the terminal
+error: the primary cause keeps existing typed routing, and sibling errors remain
+owned by their original batch positions without expanding their payloads in
+Display/Debug. The payload lifecycle contract describes this transient ownership.
+Unstarted sequential calls are distinguished from calls that stopped
 without a normal result.
 
 The ordered result vector keeps one slot per original model call. Preparation
@@ -195,14 +199,21 @@ Failed `ToolResult` returns retain their source-reported display text alongside
 the error, and move structured `ToolOutput::data` into the existing outcome/SOP
 capture path. A failed return cannot create a delivered artifact merely because
 its source claims `delivered: true`. Custom display text remains the model-facing
-view; structured data is not automatically copied into model history. The new
-failure display bounds the error excerpt at 4 KiB and the accompanying source
-text at 32 KiB before the existing round/history budgets apply. These excerpts
-are source assertions, not proof of confirmed effects or safe replay.
+view; structured data is not automatically copied into model history. Failure
+normalization preserves original text, data, and errors, leaving oversized
+sources intact for explicit rejection. See [Encoded tool-history admission](./memory-payload-lifecycle.md#encoded-tool-history-admission)
+for the normalization, source, history, artifact, and debug-log projection
+limits. Ordinary error returns also undergo bounded formatting and complete
+source-envelope admission before their reason is copied into the outcome. An
+error that cannot be normalized stays owned by the typed budget rejection.
+Returned data is a source assertion, not proof of confirmed effects or safe replay.
 
 After a batch returns a typed terminal error, completed outcomes reach SOP
 capture, ordered history and the existing HMAC collector before that error is
-returned. They bypass post-execution hooks and draft progress, and terminal
+returned when the source and final history representations fit their budgets.
+An oversized source batch instead stays owned by a typed rejection before SOP
+capture; final history overflow likewise rejects with original source evidence.
+Terminal batches bypass post-execution hooks and draft progress, and terminal
 cards use a nonblocking best-effort send, so stalled auxiliary consumers cannot
 swallow already returned evidence. Completed cards are not emitted twice. The
 post-tool lifecycle checkpoint also runs after history retention, so its storage

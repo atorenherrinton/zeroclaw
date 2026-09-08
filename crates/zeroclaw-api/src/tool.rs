@@ -87,6 +87,11 @@ impl ToolOutput {
     pub fn into_string(self) -> String {
         self.text
     }
+
+    /// Move both source representations to their next owner without cloning.
+    pub fn into_parts(self) -> (String, Option<serde_json::Value>) {
+        (self.text, self.data)
+    }
 }
 
 impl std::ops::Deref for ToolOutput {
@@ -538,6 +543,22 @@ mod tests {
             }
         }
         assert!(Plain.invocation_triggers().is_empty());
+    }
+
+    #[test]
+    fn into_parts_preserves_text_and_data_allocations() {
+        let text = "fixture-text".repeat(1000);
+        let data_text = "fixture-metadata".repeat(1000);
+        let text_ptr = text.as_ptr();
+        let data_ptr = data_text.as_ptr();
+        let output = ToolOutput::json_with_text(serde_json::Value::String(data_text), text);
+        let (text, data) = output.into_parts();
+        assert_eq!(text.as_ptr(), text_ptr);
+        assert_eq!(data.unwrap().as_str().unwrap().as_ptr(), data_ptr);
+        assert_eq!(
+            ToolOutput::text("plain").into_parts(),
+            ("plain".into(), None)
+        );
     }
 
     #[test]

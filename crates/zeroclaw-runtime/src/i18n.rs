@@ -86,6 +86,23 @@ pub fn get_required_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> St
     get_cli_string_with_args(key, args).unwrap_or_else(|| missing_cli_string(key))
 }
 
+/// Bound a disposable localized projection before copying argument text.
+/// Overflow is terminal for the selected catalog, never a fallback to English.
+pub(crate) fn get_required_cli_string_with_args_with_limit(
+    key: &str,
+    args: &[(&str, &str)],
+    limit: usize,
+) -> Option<String> {
+    match format_cli_string_with_args_with_limit(cli_ftl_sources(), key, args, Some(limit)) {
+        Ok(Some(value)) => Some(value),
+        Ok(None) => {
+            let value = missing_cli_string(key);
+            zeroclaw_api::serialization::encoded_size(&value, limit).map(|_| value)
+        }
+        Err(_) => None,
+    }
+}
+
 fn active_locale() -> &'static str {
     LOCALE.get_or_init(detect_locale).as_str()
 }
@@ -193,17 +210,36 @@ fn format_cli_string_with_args(
     key: &str,
     args: &[(&str, &str)],
 ) -> Option<String> {
+    format_cli_string_with_args_with_limit(sources, key, args, None)
+        .ok()
+        .flatten()
+}
+
+fn format_cli_string_with_args_with_limit(
+    sources: &CliFtlSources,
+    key: &str,
+    args: &[(&str, &str)],
+    limit: Option<usize>,
+) -> Result<Option<String>, std::fmt::Error> {
     if let Some(locale_ftl) = sources.disk.as_deref()
-        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+        && let Some(value) =
+            format_ftl_message_with_limit(locale_ftl, &sources.locale, key, args, limit)?
     {
-        return Some(value);
+        return Ok(Some(value));
     }
     if let Some(locale_ftl) = sources.builtin
-        && let Some(value) = format_ftl_message(locale_ftl, &sources.locale, key, args)
+        && let Some(value) =
+            format_ftl_message_with_limit(locale_ftl, &sources.locale, key, args, limit)?
     {
-        return Some(value);
+        return Ok(Some(value));
     }
-    format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+    format_ftl_message_with_limit(
+        include_str!("../locales/en/cli.ftl"),
+        "en",
+        key,
+        args,
+        limit,
+    )
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
@@ -234,12 +270,25 @@ fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String
     map
 }
 
+#[cfg(test)]
 fn format_ftl_message(
     ftl_source: &str,
     locale: &str,
     key: &str,
     args: &[(&str, &str)],
 ) -> Option<String> {
+    format_ftl_message_with_limit(ftl_source, locale, key, args, None)
+        .ok()
+        .flatten()
+}
+
+fn format_ftl_message_with_limit(
+    ftl_source: &str,
+    locale: &str,
+    key: &str,
+    args: &[(&str, &str)],
+    limit: Option<usize>,
+) -> Result<Option<String>, std::fmt::Error> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
     let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
@@ -247,18 +296,27 @@ fn format_ftl_message(
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
 
-    let message = bundle.get_message(key)?;
-    let pattern = message.value()?;
+    let Some(pattern) = bundle.get_message(key).and_then(|message| message.value()) else {
+        return Ok(None);
+    };
     let mut fluent_args = FluentArgs::new();
     for (name, value) in args {
         fluent_args.set(*name, *value);
     }
     let mut errors = vec![];
-    let value = bundle.format_pattern(pattern, Some(&fluent_args), &mut errors);
-    if errors.is_empty() {
-        Some(value.into_owned())
+    let value = if let Some(limit) = limit {
+        let mut writer = zeroclaw_api::serialization::EncodedStringWriter::new(limit);
+        bundle.write_pattern(&mut writer, pattern, Some(&fluent_args), &mut errors)?;
+        writer.finish().ok_or(std::fmt::Error)?
     } else {
-        None
+        bundle
+            .format_pattern(pattern, Some(&fluent_args), &mut errors)
+            .into_owned()
+    };
+    if errors.is_empty() {
+        Ok(Some(value))
+    } else {
+        Ok(None)
     }
 }
 
@@ -372,6 +430,61 @@ pub fn normalize_locale(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bounded_fluent_projection_matches_unicode_and_repeated_arguments() {
+        let ftl = "fixture = 前 { $text } / { $text } 後";
+        let args = [("text", "😀\0\n\"\\")];
+        let expected = super::format_ftl_message(ftl, "en", "fixture", &args).unwrap();
+        let size = serde_json::to_vec(&expected).unwrap().len();
+        for limit in 0..=size + 1 {
+            let actual =
+                super::format_ftl_message_with_limit(ftl, "en", "fixture", &args, Some(limit));
+            if limit < size {
+                assert!(actual.is_err());
+            } else {
+                assert_eq!(actual.unwrap().as_deref(), Some(expected.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_fluent_overflow_does_not_select_a_smaller_fallback() {
+        let sources = super::CliFtlSources {
+            locale: "es".into(),
+            disk: Some("fixture = { $text } { $text } { $text }".into()),
+            builtin: Some("fixture = small fallback"),
+        };
+        assert!(
+            super::format_cli_string_with_args_with_limit(
+                &sources,
+                "fixture",
+                &[("text", "\0\n\"\\".repeat(500).as_str())],
+                Some(4096),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_fluent_missing_and_invalid_patterns_retain_fallback_rules() {
+        for disk in ["unrelated = unrelated", "fixture = invalid { $missing }"] {
+            let sources = super::CliFtlSources {
+                locale: "es".into(),
+                disk: Some(disk.into()),
+                builtin: Some("fixture = fallback { $text }"),
+            };
+            let value = super::format_cli_string_with_args_with_limit(
+                &sources,
+                "fixture",
+                &[("text", "😀")],
+                Some(128),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(value, "fallback 😀");
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -4,6 +4,8 @@
 pub const ROUND_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_BATCH_CALLS: usize = 128;
 
+pub use zeroclaw_api::serialization::encoded_size;
+
 pub fn per_result_budget(configured: usize, calls: usize) -> usize {
     let source_limit = if configured == 0 { 32768 } else { configured };
     source_limit
@@ -92,6 +94,15 @@ fn bounded_excerpt(output: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encoded_counter_matches_serializer_and_stops_at_exact_limit() {
+        let value = serde_json::json!({"id": "\u{0001}😀\"\\", "metadata": [null, false, 42]});
+        let actual = serde_json::to_vec(&value).unwrap().len();
+        assert_eq!(encoded_size(&value, actual), Some(actual));
+        assert_eq!(encoded_size(&value, actual - 1), None);
+        assert_eq!(encoded_size(&value, 0), None);
+    }
+
     #[test]
     fn unicode_round_budget_does_not_persist_unretained_private_data() {
         let output = "😀".repeat(10000);

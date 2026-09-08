@@ -1,6 +1,7 @@
 //! The agent turn engine, decomposed into single-purpose step modules.
 
 pub(crate) mod approval_gate;
+pub(crate) mod batch_failures;
 pub(crate) mod call_prep;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
@@ -1301,7 +1302,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         let stopped_mid_batch = executed_slots
             .iter()
             .any(|slot| !matches!(slot, ToolExecutionSlot::Completed(_)));
-        let mut terminal_error: Option<anyhow::Error> = None;
+        let mut terminal_failures = batch_failures::TerminalFailures::default();
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
@@ -1339,6 +1340,10 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                             error.downcast_ref::<zeroclaw_api::deadline::DeadlineExceeded>()
                         {
                             e.to_string()
+                        } else if let Some(e) =
+                            error.downcast_ref::<results_collect::ResultBudgetExceeded>()
+                        {
+                            e.to_string()
                         } else {
                             error.to_string()
                         };
@@ -1347,15 +1352,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                             &[("reason", reason.as_str())],
                         )
                     };
-                    // Effect evidence takes precedence over deadline/cancellation;
-                    // all failed siblings also keep their own history projection.
-                    if terminal_error.as_ref().is_none_or(|previous| {
-                        (is_tool_loop_cancelled(previous) && !is_tool_loop_cancelled(&error))
-                            || (error.is::<zeroclaw_api::delivery::DeliveryFailure>()
-                                && !previous.is::<zeroclaw_api::delivery::DeliveryFailure>())
-                    }) {
-                        terminal_error = Some(error);
-                    }
+                    terminal_failures.push(call_idx, error, &output);
                     output
                 }
             };
@@ -1386,6 +1383,8 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             ));
         }
 
+        let mut terminal_error = terminal_failures.into_error();
+
         record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
@@ -1393,25 +1392,16 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
+            max_tool_result_chars,
             iteration,
             !stopped_mid_batch,
         )
-        .await;
-        let payload_budget = zeroclaw_tools::output_budget::per_result_budget(
-            max_tool_result_chars,
-            ordered_results.len(),
-        );
-        for (_, _, outcome) in ordered_results.iter_mut().flatten() {
-            let original_bytes = outcome.output.len();
-            outcome.output =
-                zeroclaw_tools::output_budget::bound_output(&outcome.output, payload_budget);
-            if outcome.output.len() < original_bytes {
-                ::zeroclaw_log::record!(INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(serde_json::json!({"trace_id":turn_id,"original_bytes":original_bytes,"context_bytes":outcome.output.len(),"phase":"tool_output_budget"})),
-                    "Tool context payload bounded");
-            }
-        }
+        .await
+        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))?;
+        // Source admission already checks the actual batch size. Keep the
+        // canonical outcomes intact through final history admission: an equal
+        // per-call excerpt can discard evidence from a batch that fits, or
+        // replace the original source just before a wrapping rejection.
 
         let CollectedResults {
             individual_results,
@@ -1430,7 +1420,15 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             model,
             iteration,
             turn_id,
-        )?;
+        )
+        .map_err(|error| {
+            // Retain both typed errors: a size failure cannot erase a sibling's
+            // already-known delivery/deadline/cancellation evidence.
+            match error.downcast::<results_collect::ResultBudgetExceeded>() {
+                Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
+                Err(error) => error,
+            }
+        })?;
 
         if !stopped_mid_batch && recovery_trigger.is_none() {
             recovery_trigger = check_identical_output_abort(

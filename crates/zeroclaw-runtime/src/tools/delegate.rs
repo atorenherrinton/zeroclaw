@@ -2957,7 +2957,8 @@ impl DelegateTool {
             }),
             Ok(Err(e))
                 if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
-                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>() =>
+                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || e.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>() =>
             {
                 Err(e)
             }
@@ -5431,7 +5432,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_agentic_applies_target_profile_tool_result_limit() {
+    async fn execute_agentic_rejects_target_profile_budget_that_cannot_fit_result_envelope() {
         let config = agentic_agent_config();
         let mut runtime_profiles = agentic_runtime_profiles(10);
         runtime_profiles
@@ -5455,17 +5456,17 @@ mod tests {
                 Some(0.2),
             )
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert!(result.success);
-        let tool_message = model_provider
-            .tool_message()
-            .expect("tool message captured");
+        assert!(result.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
         assert!(
-            tool_message.contains("characters truncated"),
-            "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
-            tool_message
+            model_provider.tool_message().is_none(),
+            "no oversized result is sent back to the child provider"
         );
+        let evidence = result
+            .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+            .unwrap();
+        assert!(evidence.results[0].as_ref().unwrap().2.success);
     }
 
     #[tokio::test]

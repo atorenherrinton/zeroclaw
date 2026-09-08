@@ -1282,3 +1282,5 @@ turn-tool-failed-with-output =
 turn-tool-batch-not-started = [not started: the batch stopped before dispatching this call]
 turn-tool-batch-failed = [tool stopped without a normal result; reconcile external effects before retrying: { $reason }]
 turn-tool-batch-cancelled = [cancelled before this tool returned a normal result]
+
+turn-tool-result-budget-exceeded = Tool results exceed the encoded output budget. The turn stopped; reconcile external effects before retrying.
