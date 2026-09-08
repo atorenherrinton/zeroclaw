@@ -137,10 +137,11 @@ query summary and counts. Memory store events carry bounded category and backend
 identifiers.
 
 Tool-call observability needs extra care because the sinks do not share one
-payload contract. Current typed tool-call observer events can carry full
-arguments and credential-scrubbed full result output, and OTel forwards those
-values into span attributes. Do not describe that path as "summaries" unless the
-code actually bounds or summarizes it. New telemetry should prefer bounded
+payload contract. The dispatcher bounds each diagnostic argument/result string
+to 4 KiB of JSON encoding, including quotes and escaping, and OTel forwards those
+projections into span attributes. Overflow omits the whole diagnostic field's
+content rather than cutting a possible credential. This is a per-field limit,
+not a bound on complete event envelopes or streams. New telemetry should prefer bounded
 identifiers, counts, durations, success flags, and operator-useful summaries.
 Put raw content in logs or observer events only when the feature explicitly
 requires it and the privacy boundary is documented.
@@ -242,6 +243,19 @@ inside custom formatters or `anyhow` backtrace rendering. Both the debug-log and
 ordinary-reason guards bound runtime-owned projections; they cannot preempt
 arbitrary work or allocations inside a formatter. Whole log envelopes and
 streams need their own budgets.
+
+The same 4 KiB encoded-string limit applies to the dispatcher's observer/log text
+and both tool-result event emitters. Source text is measured while borrowed before
+redaction copies it, and the redacted projection is measured again because
+redaction can grow the representation. Diagnostic arguments stream from their
+borrowed JSON value through the bounded string writer, counting both the inner
+JSON and its escaping as an event string before copying chunks. Serialization
+overflow discards partial text without running redaction on a cut credential.
+Only the admitted, scrubbed argument projection is copied into diagnostic sinks.
+The canonical invocation arguments, source result, structured data, failure
+classification and HMAC receipt remain intact. Pending `ToolCall` event arguments,
+receipt hashing, identifiers, whole events and stream aggregates have separate
+contracts and are not bounded by this diagnostic projection.
 
 Both tool-result event emitters measure the complete encoded artifact projection
 from borrowed fields before copying its path, URI, filename, title, and MIME
