@@ -2,7 +2,7 @@
 //! is the sole authority for prepared messages and at-most-once send attempts.
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -159,6 +159,10 @@ impl Ops {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS plans(id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS deliveries(fingerprint TEXT PRIMARY KEY, plan_id TEXT NOT NULL, item_index INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('uncertain','submitted')), updated_ms INTEGER NOT NULL);")?;
+        // Canonical last dispatch evidence; deliveries remains the sole retry
+        // guard. A separate relation preserves compatibility with old writers
+        // that insert all five delivery columns positionally.
+        db.execute_batch("CREATE TABLE IF NOT EXISTS delivery_evidence(fingerprint TEXT PRIMARY KEY, evidence TEXT NOT NULL);")?;
         messages::migrate(&db)?;
         journal::migrate(&db)?;
         continuity::migrate(&db)?;
@@ -475,15 +479,16 @@ impl Ops {
         let mut items = Vec::new();
         for (index, item) in p.items.iter().enumerate() {
             let fingerprint = item.fingerprint()?;
-            let state: Option<String> = self
-                .db
-                .query_row(
-                    "SELECT state FROM deliveries WHERE fingerprint=?1",
-                    [fingerprint],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            items.push(json!({"index":index,"recipient":item.recipient,"state":state.unwrap_or_else(||"prepared".into())}));
+            let (state, evidence): (Option<String>, Option<String>) = self.db.query_row(
+                "SELECT (SELECT state FROM deliveries WHERE fingerprint=?1), (SELECT evidence FROM delivery_evidence WHERE fingerprint=?1)",
+                [fingerprint], |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let evidence: Option<Value> = evidence.map(|s| serde_json::from_str(&s)).transpose()?;
+            // An older binary can advance the guard without updating evidence.
+            // Never expose an earlier retry-safe failure as the current attempt.
+            let evidence =
+                evidence.filter(|e| e["disposition"] == state.as_deref().unwrap_or("not_started"));
+            items.push(json!({"index":index,"recipient":item.recipient,"state":state.unwrap_or_else(||"prepared".into()),"evidence":evidence}));
         }
         let remaining = items.iter().filter(|i| i["state"] == "prepared").count();
         let uncertain = items.iter().filter(|i| i["state"] == "uncertain").count();
@@ -504,16 +509,77 @@ impl Ops {
         )
     }
 
+    fn record_delivery_evidence(&self, fingerprint: &str, evidence: &Value) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO delivery_evidence(fingerprint,evidence) VALUES(?1,?2) ON CONFLICT(fingerprint) DO UPDATE SET evidence=excluded.evidence",
+            params![fingerprint, serde_json::to_string(evidence)?],
+        )?;
+        Ok(())
+    }
+
     fn claim(&self, p: &Plan, index: usize, item: &Item) -> Result<bool> {
-        Ok(self.db.execute(
+        let transaction = self.db.unchecked_transaction()?;
+        let fingerprint = item.fingerprint()?;
+        let claimed = self.db.execute(
             "INSERT OR IGNORE INTO deliveries VALUES(?1,?2,?3,'uncertain',?4)",
-            params![
-                item.fingerprint()?,
-                p.id,
-                index,
-                Utc::now().timestamp_millis()
-            ],
-        )? == 1)
+            params![fingerprint, p.id, index, Utc::now().timestamp_millis()],
+        )? == 1;
+        if claimed {
+            self.record_delivery_evidence(
+                &fingerprint,
+                &json!({
+                    "disposition":"uncertain","retry_safe":false,
+                    "detail":"Dispatch claimed; no completed result recorded"
+                }),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(claimed)
+    }
+
+    pub async fn delivery_status(&self, id: &str) -> Result<Value> {
+        self.delivery_status_using(id, imessage::send_status).await
+    }
+
+    async fn delivery_status_using<F, Fut>(&self, id: &str, lookup: F) -> Result<Value>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<Value>>,
+    {
+        let mut status = self.status(id)?;
+        // Live status belongs to Messages, not a second durable copy in our
+        // ledger. One total deadline bounds large plans and unavailable adapters.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        for item in status["items"]
+            .as_array_mut()
+            .context("delivery items missing")?
+        {
+            let guid = item["evidence"]["receipt"]["guid"]
+                .as_str()
+                .map(str::to_owned);
+            let observation = if let Some(guid) = guid {
+                if tokio::time::Instant::now() >= deadline {
+                    json!({"state":"unavailable","detail":"Status lookup deadline reached"})
+                } else {
+                    match tokio::time::timeout_at(deadline, lookup(guid)).await {
+                        Ok(Ok(value)) => value,
+                        Ok(Err(error)) => {
+                            json!({"state":"unavailable","detail":error.to_string().chars().take(500).collect::<String>()})
+                        }
+                        Err(_) => {
+                            json!({"state":"unavailable","detail":"Messages status lookup timed out"})
+                        }
+                    }
+                }
+            } else {
+                json!({"state":"unavailable","detail":"No exact message ID was recorded; delivery cannot be checked automatically"})
+            };
+            item["message_status"] = observation;
+        }
+        status["status_meaning"] = json!(
+            "message_status is a fresh observation of the exact Messages row. For caption_only receipts it covers the caption, not the attachment. Missing receipts and lookup failures do not prove non-delivery. Status checks never resend or release a duplicate guard."
+        );
+        Ok(status)
     }
 
     pub async fn execute(&self, args: &Value) -> Result<Value> {
@@ -598,13 +664,24 @@ impl Ops {
             attempts += 1;
             let fingerprint = item.fingerprint()?;
             match send(item.clone(), files[index].clone()).await {
-                imessage::SendOutcome::Submitted => {
+                imessage::SendOutcome::Submitted(receipt) => {
+                    let transaction = self.db.unchecked_transaction()?;
+                    self.record_delivery_evidence(
+                        &fingerprint,
+                        &json!({"disposition":"submitted","retry_safe":false,"receipt":receipt}),
+                    )?;
                     self.db.execute(
                         "UPDATE deliveries SET state='submitted',updated_ms=?2 WHERE fingerprint=?1",
                         params![fingerprint, Utc::now().timestamp_millis()],
                     )?;
+                    transaction.commit()?;
                 }
                 imessage::SendOutcome::NotStarted(detail) => {
+                    let transaction = self.db.unchecked_transaction()?;
+                    self.record_delivery_evidence(
+                        &fingerprint,
+                        &json!({"disposition":"not_started","detail":detail,"retry_safe":true}),
+                    )?;
                     last_attempt = Some(
                         json!({"index":index,"disposition":"not_started","detail":detail,"retry_safe":true}),
                     );
@@ -612,9 +689,14 @@ impl Ops {
                         "DELETE FROM deliveries WHERE fingerprint=?1 AND plan_id=?2 AND item_index=?3 AND state='uncertain'",
                         params![fingerprint, p.id, index],
                     )?;
+                    transaction.commit()?;
                     break;
                 }
                 imessage::SendOutcome::Uncertain(detail) => {
+                    self.record_delivery_evidence(
+                        &fingerprint,
+                        &json!({"disposition":"uncertain","detail":detail,"retry_safe":false}),
+                    )?;
                     last_attempt = Some(
                         json!({"index":index,"disposition":"uncertain","detail":detail,"retry_safe":false}),
                     );
@@ -682,7 +764,7 @@ pub fn schema() -> Value {
         ),
         make(
             "delivery_status",
-            "Read durable per-item delivery state. submitted means command accepted, not a delivery/read receipt. uncertain means possibly sent and must not be retried.",
+            "Read durable dispatch evidence and fresh Messages status by exact recorded message ID. submitted means command accepted. For attachments, caption status does not verify file delivery. unavailable means status cannot be checked, not failure. uncertain means possibly sent and must not be retried.",
             json!({"plan_id":{"type":"string"}}),
             json!(["plan_id"])
         )
@@ -726,7 +808,7 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "text_prepare" => ops.prepare_text(args),
         "files_prepare" => ops.prepare_files(args),
         "delivery_execute" => ops.execute(args).await,
-        "delivery_status" => ops.status(text(args, "plan_id", 64)?),
+        "delivery_status" => ops.delivery_status(text(args, "plan_id", 64)?).await,
         "imessage_draft" => ops.message_draft(args),
         "imessage_list" => ops.message_list(),
         "imessage_cancel" => ops.message_cancel(text(args, "draft_id", 64)?),
@@ -957,7 +1039,7 @@ mod tests {
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 async move {
                     if n == 0 {
-                        imessage::SendOutcome::Submitted
+                        imessage::SendOutcome::Submitted(json!({}))
                     } else {
                         imessage::SendOutcome::Uncertain("fixture failure".into())
                     }
@@ -971,12 +1053,153 @@ mod tests {
         let result = ops
             .execute_using(&args, |_, _| {
                 count.fetch_add(1, Ordering::SeqCst);
-                async { imessage::SendOutcome::Submitted }
+                async { imessage::SendOutcome::Submitted(json!({})) }
             })
             .await?;
         assert_eq!(count.load(Ordering::SeqCst), 3);
         assert_eq!(result["items"][1]["state"], "uncertain");
         assert_eq!(result["items"][2]["state"], "submitted");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dispatch_evidence_survives_reopen_and_status_never_replays() -> Result<()> {
+        let (_temp, ops, _) = fixture()?;
+        let prepared =
+            ops.prepare_text(&json!({"recipients":["+12025550123"],"text":"fixture"}))?;
+        let id = prepared["plan"]["id"]
+            .as_str()
+            .context("plan id")?
+            .to_owned();
+        let args = json!({"plan_id":id,"owner_requested_send":true});
+        ops.execute_using(&args, |_, _| async {
+            imessage::SendOutcome::NotStarted(
+                "Messages automation failed with AppleScript error -1728.".into(),
+            )
+        })
+        .await?;
+        let reopened = Ops::open(&ops.root)?;
+        let status = reopened.status(&id)?;
+        assert_eq!(status["items"][0]["state"], "prepared");
+        assert_eq!(status["items"][0]["evidence"]["retry_safe"], true);
+        assert!(
+            status["items"][0]["evidence"]["detail"]
+                .as_str()
+                .context("detail")?
+                .contains("-1728")
+        );
+        reopened
+            .execute_using(&args, |_, _| async {
+                imessage::SendOutcome::Uncertain(
+                    "Success returned, but no matching outgoing row within 8 seconds".into(),
+                )
+            })
+            .await?;
+        let reopened = Ops::open(&ops.root)?;
+        let status = reopened
+            .delivery_status_using(&id, |_| async {
+                panic!("no exact GUID: must not search by text or recipient")
+            })
+            .await?;
+        assert_eq!(status["items"][0]["state"], "uncertain");
+        assert_eq!(status["items"][0]["evidence"]["retry_safe"], false);
+        assert_eq!(
+            status["items"][0]["evidence"]["detail"],
+            "Success returned, but no matching outgoing row within 8 seconds"
+        );
+        assert_eq!(status["items"][0]["message_status"]["state"], "unavailable");
+        reopened
+            .execute_using(&args, |_, _| async {
+                panic!("uncertain send must never replay")
+            })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_receipt_status_is_live_and_cannot_release_claim() -> Result<()> {
+        let (_temp, ops, share) = fixture()?;
+        let file = share.join("fixture.m4a");
+        private_write(&file, b"synthetic attachment")?;
+        let prepared = ops.prepare_files(
+            &json!({"paths":[file],"recipients":["+12025550123"],"text":"fixture caption"}),
+        )?;
+        let id = prepared["plan"]["id"]
+            .as_str()
+            .context("plan id")?
+            .to_owned();
+        let args = json!({"plan_id":id,"owner_requested_send":true});
+        ops.execute_using(&args, |_, _| async {
+            imessage::SendOutcome::Submitted(
+                json!({"guid":"fixture-guid","verification_scope":"caption_only"}),
+            )
+        })
+        .await?;
+        let reopened = Ops::open(&ops.root)?;
+        for state in ["pending", "sent", "delivered", "failed"] {
+            let status = reopened.delivery_status_using(&id, |guid| async move {
+                assert_eq!(guid, "fixture-guid");
+                imessage::parse_send_status(&guid, &json!({"result":{"ok":true,"guid":guid,"send_state":state,"status_fields":{"error":0}}}))
+            }).await?;
+            assert_eq!(status["items"][0]["message_status"]["state"], state);
+            assert_eq!(status["items"][0]["state"], "submitted");
+            assert_eq!(
+                status["items"][0]["evidence"]["receipt"]["verification_scope"],
+                "caption_only"
+            );
+            reopened
+                .execute_using(&args, |_, _| async {
+                    panic!("status cannot authorize a resend")
+                })
+                .await?;
+        }
+        let unavailable = reopened
+            .delivery_status_using(&id, |_| async {
+                anyhow::bail!("database permission denied")
+            })
+            .await?;
+        assert_eq!(
+            unavailable["items"][0]["message_status"]["state"],
+            "unavailable"
+        );
+        assert_eq!(unavailable["items"][0]["state"], "submitted");
+        assert!(
+            reopened.status(&id)?["items"][0]
+                .get("message_status")
+                .is_none(),
+            "live status must not be snapshotted as current ledger truth"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_remain_guarded_without_invented_receipts() -> Result<()> {
+        let (_temp, ops, _) = fixture()?;
+        let prepared =
+            ops.prepare_text(&json!({"recipients":["+12025550123"],"text":"legacy fixture"}))?;
+        let plan: Plan = serde_json::from_value(prepared["plan"].clone())?;
+        // Old binaries insert all columns positionally. Migration must preserve
+        // this shape so restoring an old binary does not break duplicate guards.
+        ops.db.execute(
+            "INSERT INTO deliveries VALUES(?1,?2,0,'uncertain',0)",
+            params![plan.items[0].fingerprint()?, plan.id],
+        )?;
+        let reopened = Ops::open(&ops.root)?;
+        let status = reopened
+            .delivery_status_using(&plan.id, |_| async { panic!("legacy receipt unavailable") })
+            .await?;
+        assert_eq!(status["items"][0]["state"], "uncertain");
+        assert!(status["items"][0]["evidence"].is_null());
+        assert_eq!(status["items"][0]["message_status"]["state"], "unavailable");
+        assert!(!reopened.claim(&plan, 0, &plan.items[0])?);
+        reopened.record_delivery_evidence(
+            &plan.items[0].fingerprint()?,
+            &json!({"disposition":"not_started","retry_safe":true}),
+        )?;
+        assert!(
+            reopened.status(&plan.id)?["items"][0]["evidence"].is_null(),
+            "old-writer claim must suppress stale retry-safe evidence"
+        );
         Ok(())
     }
 
@@ -1064,7 +1287,9 @@ mod tests {
         assert_eq!(result["items"][0]["state"], "prepared");
         assert_eq!(result["last_attempt"]["disposition"], "not_started");
         let result = ops
-            .execute_using(&args, |_, _| async { imessage::SendOutcome::Submitted })
+            .execute_using(&args, |_, _| async {
+                imessage::SendOutcome::Submitted(json!({}))
+            })
             .await?;
         assert_eq!(result["items"][0]["state"], "submitted");
         ops.execute_using(&args, |_, _| async { panic!("duplicate send") })

@@ -331,7 +331,7 @@ mod tests {
         o.dispatch_message_using(id, now, |_, _| async { panic!("early send") })
             .await?;
         o.dispatch_message_using(id, now + 7_200_001, |_, _| async {
-            imessage::SendOutcome::Submitted
+            imessage::SendOutcome::Submitted(json!({}))
         })
         .await?;
         o.dispatch_message_using(id, now + 7_200_002, |_, _| async {
@@ -398,7 +398,7 @@ mod tests {
             async move {
                 sends.fetch_add(1, Ordering::SeqCst);
                 tokio::task::yield_now().await;
-                imessage::SendOutcome::Submitted
+                imessage::SendOutcome::Submitted(json!({}))
             }
         };
         let (a, b) = tokio::join!(
