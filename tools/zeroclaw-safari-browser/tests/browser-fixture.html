@@ -1,0 +1,204 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ZeroClaw Safari reliability fixture</title>
+<style>
+  body {font: 16px system-ui; margin: 24px; max-width: 1000px; background: #f5f7fa; color: #142132;}
+  fieldset {background: white; margin: 16px 0; border: 1px solid #abc; padding: 20px;}
+  input, select, button {font: inherit; padding: 7px; margin: 6px;}
+  [role=option] {padding: 8px; border: 1px solid #ccc;}
+  [role=option][aria-selected=true] {background: #def;}
+  pre {white-space: pre-wrap; border: 1px solid #abc; padding: 18px; background: white;}
+  #status {font-size: 1.3rem; font-weight: bold;}
+</style>
+<h1>Safari reliability fixture</h1>
+<p>Only synthetic data is used. The tests run the connector's fixed DOM programs in this real browser. No external requests, application submissions, or credentials.</p>
+<div id="status">Running…</div>
+<pre id="results"></pre>
+<form id="fixture-form">
+  <fieldset><legend>Native and custom form controls</legend>
+    <label>Draft count <input id="persisted" type="number" min="0" max="10"></label>
+    <label>Visit date <input id="date" type="date" min="2020-01-01" max="2030-12-31" required></label>
+    <label>Native option <select id="native"><option value="one">First</option><option value="two">Second</option></select></label>
+    <label>Hair color <input id="combo" role="combobox" aria-label="Hair color" aria-controls="options" aria-expanded="true"></label>
+    <div id="options" role="listbox" aria-label="Hair color options">
+      <div id="brown" role="option" aria-selected="false">Brown</div>
+      <div id="black" role="option" aria-selected="false">Black</div>
+      <div id="disabled" role="option" aria-disabled="true">Unavailable</div>
+    </div>
+    <div id="foreign" role="option">Brown</div>
+    <label>Employment type <input id="unmount-combo" role="combobox" aria-label="Employment type" aria-controls="unmount-options" aria-expanded="true"></label>
+    <div id="unmount-options" role="listbox"><div id="self-employed" role="option" aria-selected="false">Self employed</div></div>
+    <label>Async reset <input id="reverting"></label>
+    <label>Custom date <input id="masked" placeholder="MM/DD/YYYY" pattern="[0-9]{2}/[0-9]{2}/[0-9]{4}"></label>
+    <label>Validation on blur <input id="invalid-on-blur"></label>
+    <label>Test password <input id="password" type="password" autocomplete="off"></label>
+    <button id="save" type="submit">Save synthetic draft</button>
+  </fieldset>
+</form>
+<fieldset><legend>Manual native Computer fallback</legend>
+  <label>Native-only date <input id="native-only-date" aria-label="Native-only date" placeholder="MM/DD/YYYY" inputmode="numeric"></label>
+  <p id="native-date-status" role="status">Native date has not been entered.</p>
+</fieldset>
+<div id="async-container"></div>
+<script>
+const programs = __DOM_PROGRAMS__;
+const execute = (name,args={}) => JSON.parse(new Function('args',programs.common + programs[name])(args));
+const sleep = ms => new Promise(resolve => setTimeout(resolve,ms));
+const $ = selector => document.querySelector(selector);
+const logs = [];
+const log = message => {logs.push(message); $('#results').textContent = logs.join('\n');};
+const assert = (condition,message) => {if (!condition) throw new Error(message);};
+function throws(fn,pattern) {try {fn();} catch(error) {assert(pattern.test(error.message),error.message);return;} throw new Error('Expected an error');}
+const act = (action,selector,extra={}) => execute('interact',{action,selector,...extra});
+const inspect = (selector,text) => execute('inspect',{selector,text});
+let submissions = 0;
+$('#fixture-form').addEventListener('submit',event => {
+  event.preventDefault(); submissions++;
+  localStorage.setItem('zeroclaw-safari-synthetic-draft',JSON.stringify({count:$('#persisted').value,date:$('#date').value,employment:$('#unmount-combo').value}));
+});
+for (const option of $('#options').querySelectorAll('[role=option]:not([aria-disabled=true])')) {
+  option.addEventListener('click',() => {
+    for (const other of $('#options').querySelectorAll('[role=option]')) other.setAttribute('aria-selected',String(other===option));
+    $('#combo').value = option.innerText;
+    $('#combo').setAttribute('aria-expanded','false');
+    $('#options').hidden = true;
+  });
+}
+$('#reverting').addEventListener('input',() => setTimeout(() => {$('#reverting').value='';},250));
+$('#native').addEventListener('change',() => {if ($('#native').dataset.revert) setTimeout(() => {$('#native').value='one';},250);});
+$('#masked').addEventListener('input',() => setTimeout(() => {$('#masked').value='';$('#masked').setAttribute('aria-invalid','true');},200));
+$('#invalid-on-blur').addEventListener('blur',() => $('#invalid-on-blur').setCustomValidity('Synthetic validation rejection'));
+$('#unmount-combo').addEventListener('blur',()=>{if ($('#unmount-options')) $('#unmount-options').hidden=true;});
+$('#self-employed').addEventListener('click',()=>{
+  $('#unmount-combo').value='Self employed';$('#unmount-combo').setAttribute('aria-expanded','false');$('#unmount-options').remove();
+});
+let trustedNativeDate = false;
+$('#native-only-date').addEventListener('input',event=>{
+  trustedNativeDate=event.isTrusted;
+  if (!event.isTrusted) {$('#native-only-date').value='';$('#native-date-status').textContent='Synthetic date entry rejected; native input required.';}
+});
+$('#native-only-date').addEventListener('blur',()=>{
+  const value=$('#native-only-date').value;
+  $('#native-date-status').textContent=trustedNativeDate && /^\d{2}\/\d{2}\/\d{4}$/.test(value) ?
+    `Native date accepted: ${value}` : 'Native date incomplete; enter MM/DD/YYYY using native typing, then Tab.';
+});
+async function test(name,body) {await body();log(`PASS ${name}`);}
+async function run() {
+  if (location.hash === '#verify-reopened') {
+    const saved = JSON.parse(localStorage.getItem('zeroclaw-safari-synthetic-draft'));
+    const earlier = JSON.parse(sessionStorage.getItem('zeroclaw-safari-fixture-results'));
+    for (const entry of earlier) log(entry);
+    assert(saved,'Synthetic draft missing after reload');
+    $('#persisted').value=saved.count; $('#date').value=saved.date;
+    $('#unmount-combo').value=saved.employment;$('#unmount-combo').setAttribute('aria-expanded','false');$('#unmount-options').remove();
+    await test('saved values survive a full page reload and are verified without returning values',async () => {
+      assert(execute('ready',{selector:'#persisted'}).ready,'Reopened form not ready');
+      assert(inspect('#persisted','3').matches,'Saved count mismatch');
+      assert(inspect('#date','2024-06-15').matches,'Saved date mismatch');
+      assert(!inspect('#unmount-combo','Self employed').matches,'Default verification accepted uncommitted display alone');
+      const displayed=execute('inspect',{selector:'#unmount-combo',text:'Self employed',comparison:'displayed_value'});
+      assert(displayed.matches && displayed.evidence==='displayed_value_only','Explicit reopened display comparison failed');
+    });
+    localStorage.removeItem('zeroclaw-safari-synthetic-draft');
+    sessionStorage.removeItem('zeroclaw-safari-fixture-results');
+    $('#status').textContent=`PASS — ${logs.length} real Safari DOM checks, including save and reopen`;
+    document.title='PASS — ZeroClaw Safari reliability fixture';
+    return;
+  }
+  await test('native date format and min/max constraints reject before mutating',() => {
+    throws(() => act('set_date','#date',{text:'06/15/2024'}),/YYYY-MM-DD/);
+    throws(() => act('set_date','#date',{text:'2024-02-31'}),/constraints/);
+    throws(() => act('set_date','#date',{text:'2019-12-31'}),/constraints/);
+    assert($('#date').value==='','Rejected date mutated original');
+    act('set_date','#date',{text:'2024-06-15'});
+    assert(inspect('#date','2024-06-15').matches,'Valid date did not match');
+  });
+  await test('Enter on a combobox or text field never submits the form',() => {
+    throws(() => act('press','#combo',{key:'Enter'}),/combobox is not form submission/);
+    throws(() => act('press','#reverting',{key:'Enter'}),/Enter only activates/);
+    assert(submissions===0,'Unintended form submission');
+  });
+  await test('ARIA options enumerate by ownership; foreign/disabled options are rejected',() => {
+    const control=execute('read').controls.find(control=>control.selector==='#combo');
+    assert(control.options.length===3,'Unexpected associated option count');
+    assert(control.options[0].selector==='#brown','Option selector missing');
+    throws(() => act('select','#combo',{option_selector:'#foreign'}),/ARIA-owned/);
+    throws(() => act('select','#combo',{option_selector:'#disabled'}),/disabled/);
+  });
+  await test('typed combobox search is uncommitted; exact owned selection commits',() => {
+    act('fill','#combo',{text:'Brown'});
+    assert(!inspect('#combo','Brown').matches,'Search query incorrectly verified as selection');
+    act('select','#combo',{option_selector:'#brown'});
+    assert(inspect('#combo','Brown').matches,'Selected option not verified after popup closes');
+  });
+  await test('asynchronous input reset is detected after the DOM setter initially succeeds',async () => {
+    act('fill','#reverting',{text:'Temporary'});
+    assert(inspect('#reverting','Temporary').matches,'Initial value missing');
+    await sleep(400);
+    assert(inspect('#reverting','Temporary').status==='value_mismatch','Delayed reset missed');
+  });
+  await test('autocomplete stays focused and an observed selection verifies after popup unmount',()=>{
+    act('fill','#unmount-combo',{text:'Self employed'});
+    assert(document.activeElement===$('#unmount-combo'),'Autocomplete lost focus');
+    assert(!$('#unmount-options').hidden,'Autocomplete popup was closed by fill');
+    assert(!inspect('#unmount-combo','Self employed').matches,'Uncommitted text was accepted');
+    const selected=act('select','#unmount-combo',{option_selector:'#self-employed'});
+    assert(!$('#unmount-options'),'Fixture did not unmount popup');
+    const result=execute('inspect',{selector:'#unmount-combo',...selected.verification});
+    assert(result.matches && result.evidence==='observed_option_activation_and_display_value','Observed choice did not verify after popup unmount');
+  });
+  await test('asynchronous select reset is detected',async () => {
+    $('#native').dataset.revert='true';act('select','#native',{text:'two'});
+    assert(inspect('#native','two').matches,'Initial selection missing');
+    await sleep(400);assert(!inspect('#native','two').matches,'Delayed select reset missed');
+  });
+  await test('masked custom date rejection is detected and native date operation refuses it',async () => {
+    throws(() => act('set_date','#masked',{text:'2024-06-15'}),/native date input/);
+    act('fill','#masked',{text:'06/15/2024'});await sleep(350);
+    assert(inspect('#masked','06/15/2024').status==='validation_failed','Masked widget rejection missed');
+  });
+  await test('blur-based custom validation prevents verification',() => {
+    act('fill','#invalid-on-blur',{text:'Rejected'});
+    assert(inspect('#invalid-on-blur','Rejected').status==='validation_failed','Blur validation missed');
+  });
+  await test('reader exposes native date constraints without actual field values',() => {
+    const control=execute('read').controls.find(control=>control.selector==='#date');
+    assert(control.constraints.min==='2020-01-01' && control.dateInputFormat==='YYYY-MM-DD','Date metadata absent');
+    assert(!('value' in control),'Reader exposed field value');
+  });
+  await test('password comparisons are refused and reader only reports presence',() => {
+    $('#password').value='synthetic-secret';
+    throws(()=>inspect('#password','synthetic-secret'),/cannot be compared/);
+    assert(!JSON.stringify(execute('read')).includes('synthetic-secret'),'Password leaked');
+  });
+  await test('expected-control readiness detects delayed mounting and aria-busy',async () => {
+    assert(!execute('ready',{selector:'#delayed'}).ready,'Missing control marked ready');
+    $('#async-container').setAttribute('aria-busy','true');$('#async-container').textContent='Loading synthetic form';
+    assert(execute('ready').reasons.includes('aria_busy'),'Busy state missed');
+    setTimeout(()=>{$('#async-container').innerHTML='<input id="delayed" aria-label="Delayed control">';$('#async-container').removeAttribute('aria-busy');},200);
+    await sleep(350);assert(execute('ready',{selector:'#delayed'}).ready,'Mounted control not ready');
+  });
+  await test('ambiguous expected selectors are explicit failures',() => {
+    throws(()=>execute('ready',{selector:'input'}),/multiple elements/);
+  });
+  await test('navigation marker rejects an old complete document until replacement',()=>{
+    document.__zeroclawNavigationMarker='synthetic-marker';
+    assert(!execute('navigation',{marker:'synthetic-marker'}).ready,'Old document passed navigation check');
+    delete document.__zeroclawNavigationMarker;
+    assert(execute('navigation',{marker:'synthetic-marker'}).ready,'Replacement document did not pass');
+  });
+  await test('explicit save and a fresh reload establish the persistence test boundary',() => {
+    act('fill','#persisted',{text:'3'});
+    // The earlier validation-failure fixtures intentionally made the form
+    // invalid. Clear just their synthetic errors before this explicit save.
+    $('#invalid-on-blur').setCustomValidity('');$('#masked').value='';
+    act('click','#save');assert(submissions===1,'Explicit save did not submit once');
+    sessionStorage.setItem('zeroclaw-safari-fixture-results',JSON.stringify(logs));
+  });
+  sessionStorage.setItem('zeroclaw-safari-fixture-results',JSON.stringify(logs));
+  location.hash='verify-reopened';location.reload();
+}
+window.addEventListener('load',()=>run().catch(error=>{
+  log(`FAIL ${error.stack || error.message}`);$('#status').textContent='FAIL';document.title='FAIL — ZeroClaw Safari reliability fixture';
+}));
+</script>

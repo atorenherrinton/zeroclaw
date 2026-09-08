@@ -1,0 +1,18 @@
+[package]
+name = "zeroclaw-safari-browser"
+version = "0.1.6"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "signal", "process", "io-util", "io-std"] }
+url = "2.5"
+
+[profile.release]
+strip = true
+
+# Keep this optional macOS MCP helper independent of the runtime workspace.
+[workspace]

@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ZeroClaw shadow controls fixture</title>
+<style>body{font:16px system-ui;max-width:1000px;margin:30px}pre{white-space:pre-wrap}input,button{padding:8px}fixture-form{display:block}</style>
+<h1>Shadow control regression</h1>
+<div id="status">Running</div><pre id="results"></pre>
+<fixture-form id="first"></fixture-form><fixture-form id="second"></fixture-form>
+<script>
+const programs = __DOM_PROGRAMS__;
+const execute=(name,args={})=>JSON.parse(new Function('args', programs.common+programs[name])(args));
+const entries=[];let checks=0;
+const assert=(value,message)=>{if(!value)throw Error(message);checks++;};
+const throws=(fn,pattern)=>{try{fn();}catch(e){assert(pattern.test(e.message),e.message);return;}throw Error('Expected rejection');};
+const log=text=>{entries.push(text);document.querySelector('#results').textContent=entries.join('\n');};
+for(const host of document.querySelectorAll('fixture-form')){
+ const root=host.attachShadow({mode:'open'});
+ root.innerHTML='<fixture-card id="card"></fixture-card>';
+ const inner=root.querySelector('fixture-card').attachShadow({mode:'open'});
+ inner.innerHTML='<button id="same"><slot name="label">Fallback</slot></button><label>Email<input id="email" type="email"></label><input id="secret" type="password"><input id="confirm" type="checkbox">';
+ const label=document.createElement('span');label.slot='label';label.textContent='Passport appointment';root.querySelector('fixture-card').append(label);
+ inner.querySelector('#secret').value='synthetic-secret-do-not-return';
+}
+window.addEventListener('load',()=>{
+ try{
+ const first=document.querySelector('#first');const second=document.querySelector('#second');
+ const inner=first.shadowRoot.querySelector('#card').shadowRoot;
+ const page=execute('read');const buttons=page.controls.filter(c=>c.tag==='button');
+ assert(buttons.length===2,'Both nested buttons must be exposed');
+ assert(buttons.every(c=>c.text==='Passport appointment'),'Slotted labels must be rendered');
+ assert(buttons[0].selector!==buttons[1].selector,'Duplicate IDs in different roots need distinct paths');
+ assert(buttons.every(c=>c.selector.startsWith('shadow:')),'Shadow paths must be explicit');
+ assert(!JSON.stringify(page).includes('synthetic-secret'),'Passwords must not enter page text');
+ log('PASS nested roots, unique paths, slotted labels and password privacy');
+ let clicked=0;inner.querySelector('#same').addEventListener('click',()=>clicked++);
+ execute('interact',{action:'click',selector:buttons[0].selector});
+ assert(clicked===1,'Exactly the intended nested button should activate');
+ assert(execute('ready',{selector:buttons[0].selector}).ready,'Readiness must resolve the same path');
+ throws(()=>execute('ready',{selector:'button'}),/multiple elements/);
+ log('PASS click/readiness use the same path and reject ambiguous queries');
+ const email=page.controls.find(c=>c.selector.includes('first')&&c.type==='email');
+ let events=[];first.addEventListener('input',e=>events.push(e.type));first.addEventListener('change',e=>events.push(e.type));
+ execute('interact',{action:'fill',selector:email.selector,text:'fixture@example.com'});
+ assert(events.join(',')==='input,change','Events must cross nested shadow boundaries');
+ assert(execute('inspect',{selector:email.selector,text:'fixture@example.com'}).matches,'Verification must resolve shadow input');
+ const box=page.controls.find(c=>c.selector.includes('first')&&c.type==='checkbox');
+ execute('interact',{action:'check',selector:box.selector});
+ assert(execute('inspect',{selector:box.selector,checked:true}).matches,'Checkbox verification must work');
+ log('PASS composed fill events, value verification and checkbox state');
+ first.hidden=true;
+ throws(()=>execute('interact',{action:'click',selector:buttons[0].selector}),/not visible/);
+ assert(!execute('read').controls.some(c=>c.selector.includes('first')),'Hidden host controls must not leak');
+ first.hidden=false;first.setAttribute('aria-disabled','true');
+ throws(()=>execute('interact',{action:'click',selector:buttons[0].selector}),/disabled/);
+ first.removeAttribute('aria-disabled');first.setAttribute('inert','');
+ throws(()=>execute('interact',{action:'click',selector:buttons[0].selector}),/not visible/);first.removeAttribute('inert');
+ log('PASS hidden, disabled and inert composed ancestors');
+ const late=document.createElement('fixture-late');late.setAttribute('aria-label','Late action');document.body.append(late);
+ assert(execute('ready').reasons.includes('custom_elements_pending'),'Undefined components must report pending hydration');
+ customElements.define('fixture-late',class extends HTMLElement{constructor(){super();this.attachShadow({mode:'open'}).innerHTML='<button></button>';}});
+ assert(execute('ready').ready,'Registered and hydrated component must become ready');
+ const lateControl=execute('read').controls.find(c=>c.text==='Late action');
+ assert(Boolean(lateControl),'A single internal control must inherit its host accessible label');
+ assert(execute('ready',{selector:lateControl.selector}).ready,'Hydrated control path must resolve');
+ late.remove();log('PASS delayed custom-element registration and host labels');
+ const closed=document.createElement('fixture-closed');document.body.append(closed);closed.attachShadow({mode:'closed'}).innerHTML='<button>Never exposed</button>';
+ assert(!JSON.stringify(execute('read')).includes('Never exposed'),'Closed roots stay inaccessible');
+ throws(()=>execute('interact',{action:'click',selector:'shadow:["#first","#missing","#same"]'}),/missing or ambiguous/);
+ throws(()=>execute('interact',{action:'click',selector:'shadow:not-json'}),/Invalid shadow/);
+ const old=buttons[0].selector;first.shadowRoot.querySelector('#card').remove();
+ throws(()=>execute('interact',{action:'click',selector:old}),/missing or ambiguous/);
+ log('PASS closed roots and stale/malformed paths fail closed');
+ const visibilityDescriptor=Object.getOwnPropertyDescriptor(document,'visibilityState');
+ Object.defineProperty(document,'visibilityState',{value:'hidden',configurable:true});
+ assert(execute('ready').reasons.includes('document_hidden'),'Hidden document cannot be ready');
+ throws(()=>execute('interact',{action:'click',selector:buttons[1].selector}),/page is hidden/);
+ if(visibilityDescriptor) Object.defineProperty(document,'visibilityState',visibilityDescriptor); else delete document.visibilityState;
+ log('PASS hidden Safari documents cannot claim readiness or accept actions');
+ document.querySelector('#status').textContent=`PASS: ${checks} assertions`;document.title='PASS — ZeroClaw shadow controls';
+ }catch(e){log('FAIL '+e.stack);document.querySelector('#status').textContent='FAIL';}
+});
+</script>
