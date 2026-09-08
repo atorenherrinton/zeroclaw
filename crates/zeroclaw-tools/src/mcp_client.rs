@@ -2391,6 +2391,7 @@ mod tests {
             #[cfg(not(target_has_atomic = "64"))]
             next_id: AtomicU32::new(3),
             tools: vec![crate::mcp_protocol::McpToolDef {
+                annotations: None,
                 name: tool.to_string(),
                 description: Some("fake tool".into()),
                 input_schema: serde_json::json!({}),
@@ -2404,6 +2405,91 @@ mod tests {
             serial_gate: None,
             recovery: Arc::new(RecoveryBarrier::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_read_preview_fits_native_history_and_keeps_write_results_intact() {
+        use crate::mcp_tool::McpToolWrapper;
+        use zeroclaw_api::tool::Tool as _;
+        use zeroclaw_providers::ChatMessage;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The same JSON is returned in text and structured form, as by common
+        // search connectors. Control bytes exercise JSON's escaping expansion.
+        let data = serde_json::json!({
+            "messages":[{"id":"fixture-message", "body":"\u{0001}😀\"\\".repeat(20000)}],
+            "nextPageToken":"fixture-next-page",
+            "receipt":"fixture-source-receipt",
+        });
+        let result = serde_json::json!({
+            "content":[{"type":"text", "text":data.to_string()}],
+            "structuredContent":data,
+            "isError":false,
+        });
+        let original = serde_json::to_string_pretty(&result).unwrap();
+        let mut native_round = Vec::new();
+        for hint in [
+            Some(serde_json::json!(true)),
+            Some(serde_json::json!(false)),
+            None,
+            Some(serde_json::json!("true")),
+        ] {
+            let server = server_with_tool_returning("search", result.clone());
+            let registry = Arc::new(McpRegistry {
+                servers: vec![server],
+                tool_index: HashMap::from([("fake__search".into(), (0, "search".into()))]),
+                server_index: HashMap::from([("fake".into(), 0)]),
+            });
+            let def = serde_json::from_value(serde_json::json!({
+                "name":"search", "inputSchema":{},
+                "annotations":hint.as_ref().map(|v| serde_json::json!({"readOnlyHint":v}))
+            }))
+            .unwrap();
+            let wrapper = McpToolWrapper::new(
+                "fake__search".into(),
+                def,
+                registry,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                    workspace_dir: dir.path().to_path_buf(),
+                    ..Default::default()
+                }),
+            );
+            let out = wrapper.execute(serde_json::json!({})).await.unwrap();
+            assert!(out.success);
+            if hint == Some(serde_json::json!(true)) {
+                assert!(out.output.contains("Read result truncated"));
+                assert!(out.output.contains("fixture-source-receipt"));
+                assert!(out.output.contains("fixture-next-page"));
+                for i in 0..3 {
+                    // Receipt and name/call-ID envelopes are outside the preview.
+                    let content = format!("{}\n\n[receipt: fixture-hmac-receipt]", out.output);
+                    let message = ChatMessage::tool(
+                        serde_json::json!({
+                            "tool_call_id":format!("fixture-call-{i}"), "content":content
+                        })
+                        .to_string(),
+                    );
+                    assert!(crate::output_budget::encoded_size(&message, 32768).is_some());
+                    native_round.push(message);
+                }
+            } else {
+                assert_eq!(out.output.as_str(), original);
+                assert!(out.output.contains("fixture-source-receipt"));
+                assert!(crate::output_budget::encoded_size(&out.output.as_str(), 32768).is_none());
+            }
+        }
+        assert!(
+            crate::output_budget::encoded_size(
+                &native_round,
+                crate::output_budget::ROUND_PAYLOAD_BYTES
+            )
+            .is_some()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "text previews must not persist private connector output"
+        );
     }
 
     /// Production-path fixture: a tool result carrying text + a `resource` blob +
@@ -2421,7 +2507,7 @@ mod tests {
         let pdf_b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 hello world");
         let result = serde_json::json!({
             "content": [
-                { "type": "text", "text": "Here is your report." },
+                { "type": "text", "text": format!("Here is your report. {}", "x".repeat(8000)) },
                 { "type": "resource", "resource": {
                     "uri": "file:///report.pdf",
                     "mimeType": "application/pdf",
@@ -2452,6 +2538,7 @@ mod tests {
             ..Default::default()
         });
         let def = crate::mcp_protocol::McpToolDef {
+            annotations: Some(serde_json::json!({"readOnlyHint":true})),
             name: "do_thing".into(),
             description: Some("does".into()),
             input_schema: serde_json::json!({}),
@@ -2464,6 +2551,8 @@ mod tests {
             .expect("execute is non-fatal");
         assert!(out.success, "execute should succeed: {:?}", out.error);
         let text = out.output.as_str();
+        assert!(text.len() > 4096);
+        assert!(!text.contains("Read result truncated"));
 
         // Every non-binary result surface is preserved.
         assert!(text.contains("Here is your report."), "text lost: {text}");

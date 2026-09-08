@@ -6561,6 +6561,7 @@ mod tests {
         let deferred = crate::tools::DeferredMcpToolSet {
             stubs: vec![{
                 let def = zeroclaw_tools::mcp_protocol::McpToolDef {
+                    annotations: None,
                     name: "list_projects".to_string(),
                     description: Some("List projects".to_string()),
                     input_schema: serde_json::json!({"type": "object", "properties": {}}),

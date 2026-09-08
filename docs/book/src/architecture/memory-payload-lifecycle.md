@@ -196,6 +196,31 @@ Key code entry points:
 - Channel attachments: `crates/zeroclaw-api/src/channel.rs` and
   `crates/zeroclaw-api/src/media.rs`
 
+## MCP read-result previews
+
+MCP discovery retains the server's optional `annotations`. An explicit boolean
+`readOnlyHint: true` permits the MCP wrapper to shorten successful text-only
+responses to a 4 KiB JSON-encoded preview before returning them to the dispatcher.
+This is a presentation hint, never authorization or permission to replay a call.
+Missing, false, or non-boolean hints retain the full response and existing strict
+admission behavior. Responses with attachment, resource, or unknown content blocks
+also retain the existing formatter behavior so materialized markers remain intact.
+
+Fitting results remain byte-for-byte unchanged. Oversized text responses retain
+UTF-8-safe beginning and ending excerpts with a localized omission notice. The
+preview is not complete JSON or a complete search result; the notice directs the
+model to narrow its query or request a smaller page. No automatic follow-up or
+replay occurs, and no full-output file is created. Servers must report their
+read-only semantics accurately; the preview must never be used as non-delivery
+evidence for a write.
+
+The dispatcher generates its usual execution receipt over the returned preview.
+Write and unannotated tool results are not shortened by this path. Runtime
+configured per-result and aggregate checks remain authoritative, including the
+native history's additional JSON escaping, names, IDs, and receipts. The preview
+allowance supports several large read responses in a normal round; unusually
+large batches or very small configured limits can still be rejected.
+
 ## Encoded tool-history admission
 
 At executor normalization, successful text and structured data move together into

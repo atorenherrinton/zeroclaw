@@ -78,6 +78,9 @@ pub struct McpToolDef {
     pub description: Option<String>,
     #[serde(rename = "inputSchema")]
     pub input_schema: serde_json::Value,
+    /// Server-provided display hints, never authorization or replay policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<serde_json::Value>,
 }
 
 /// Expected shape of the `tools/list` result payload.
@@ -89,6 +92,23 @@ pub struct McpToolsListResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_annotations_round_trip_without_granting_default_read_hint() {
+        for annotations in [
+            serde_json::Value::Null,
+            serde_json::json!({"readOnlyHint":true, "title":"fixture"}),
+        ] {
+            let value =
+                serde_json::json!({"name":"search", "inputSchema":{}, "annotations":annotations});
+            let def: McpToolDef = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(&def).unwrap();
+            assert_eq!(
+                encoded.get("annotations").cloned().unwrap_or_default(),
+                annotations
+            );
+        }
+    }
 
     #[test]
     fn request_serializes_with_id() {
