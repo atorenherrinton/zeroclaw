@@ -400,6 +400,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_result_counts_encoded_text_and_preserves_evidence() {
+        let mut outcome = ok_outcome();
+        outcome.output = "\0".repeat(1000);
+        outcome.receipt = Some("fixture-receipt".into());
+        outcome.output_data = Some(serde_json::json!({"scope": "fixture-owner"}));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        emit_tool_result(&tx, "fixture-id", "fixture", &outcome).await;
+        let TurnEvent::ToolResult { output, id, .. } = rx.recv().await.unwrap() else {
+            panic!("expected result");
+        };
+        assert_eq!(id, "fixture-id");
+        assert!(output.contains("omitted"));
+        assert!(serde_json::to_vec(&output).unwrap().len() <= 4096);
+        assert_eq!(outcome.output, "\0".repeat(1000));
+        assert_eq!(outcome.receipt.as_deref(), Some("fixture-receipt"));
+        assert_eq!(
+            outcome.output_data.as_ref().unwrap()["scope"],
+            "fixture-owner"
+        );
+        assert!(outcome.success);
+    }
+
+    #[tokio::test]
     async fn failed_source_delivery_assertion_never_projects_a_delivered_artifact() {
         for success in [false, true] {
             let mut outcome = ok_outcome();

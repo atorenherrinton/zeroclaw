@@ -16,18 +16,30 @@ use zeroclaw_api::attribution::Attributable;
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
+const OBSERVER_TEXT_BYTES: usize = 4096;
+
 pub(crate) fn bounded_observer_text(text: &str) -> String {
     // Reject oversized bodies before scrubbing/allocation. Cutting a secret at
     // the byte boundary could prevent redaction from recognizing it.
-    const LIMIT: usize = 4096;
-    if text.len() > LIMIT {
+    if zeroclaw_api::serialization::encoded_size(text, OBSERVER_TEXT_BYTES).is_none() {
         return format!("[observer payload omitted: {} bytes]", text.len());
     }
     let scrubbed = scrub_credentials(text);
-    if scrubbed.len() > LIMIT {
+    if zeroclaw_api::serialization::encoded_size(&scrubbed, OBSERVER_TEXT_BYTES).is_none() {
         return "[observer payload omitted after redaction]".into();
     }
     scrubbed
+}
+
+fn bounded_observer_arguments(arguments: &serde_json::Value) -> String {
+    // Value's Display streams compact JSON into the writer. The writer counts
+    // its second layer of escaping as diagnostic string content before copying.
+    // The invocation's canonical arguments remain borrowed and unchanged.
+    let Some(text) = format_with_encoded_limit(format_args!("{arguments}"), OBSERVER_TEXT_BYTES)
+    else {
+        return "[observer arguments omitted: encoded budget exceeded]".into();
+    };
+    bounded_observer_text(&text)
 }
 
 /// Build only a bounded JSON-string projection of a formatter's output.
@@ -39,16 +51,12 @@ fn format_with_encoded_limit(arguments: std::fmt::Arguments<'_>, limit: usize) -
 }
 
 fn bounded_observer_error(error: &anyhow::Error) -> String {
-    const LIMIT: usize = 4096;
     const OMITTED: &str = "[observer error omitted: formatting failed or exceeded encoded budget]";
-    let Some(text) = format_with_encoded_limit(format_args!("{error:?}"), LIMIT) else {
+    let Some(text) = format_with_encoded_limit(format_args!("{error:?}"), OBSERVER_TEXT_BYTES)
+    else {
         return OMITTED.into();
     };
-    let scrubbed = bounded_observer_text(&text);
-    if zeroclaw_api::serialization::encoded_size(&scrubbed, LIMIT).is_none() {
-        return OMITTED.into();
-    }
-    scrubbed
+    bounded_observer_text(&text)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -115,7 +123,7 @@ fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
 fn unavailable_tool_outcome(
     call_name: &str,
     tool_call_id_owned: Option<String>,
-    full_args: &str,
+    observer_args: &str,
     meta: &TurnMeta<'_>,
     observer: &dyn Observer,
     duration: Duration,
@@ -126,7 +134,7 @@ fn unavailable_tool_outcome(
         tool_call_id: tool_call_id_owned,
         duration,
         success: false,
-        arguments: Some(bounded_observer_text(full_args)),
+        arguments: Some(observer_args.to_owned()),
         result: Some(bounded_observer_text(&reason)),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -230,12 +238,12 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
-    let full_args = call_arguments.to_string();
+    let observer_args = bounded_observer_arguments(&call_arguments);
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         tool_call_id: tool_call_id_owned.clone(),
-        arguments: Some(bounded_observer_text(&full_args)),
+        arguments: Some(observer_args.clone()),
         channel: Some(meta.channel_name.to_string()),
         agent_alias: meta.agent_alias.map(|s| s.to_string()),
         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
@@ -247,7 +255,7 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            &observer_args,
             meta,
             observer,
             start.elapsed(),
@@ -293,7 +301,7 @@ pub(crate) async fn execute_one_tool(
             tool_call_id: tool_call_id_owned.clone(),
             duration,
             success: false,
-            arguments: Some(bounded_observer_text(&full_args)),
+            arguments: Some(observer_args.clone()),
             result: Some(bounded_observer_text(&reason)),
             channel: Some(meta.channel_name.to_string()),
             agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -315,7 +323,7 @@ pub(crate) async fn execute_one_tool(
         return Ok(unavailable_tool_outcome(
             call_name,
             tool_call_id_owned,
-            &full_args,
+            &observer_args,
             meta,
             observer,
             start.elapsed(),
@@ -340,7 +348,7 @@ pub(crate) async fn execute_one_tool(
             .with_attrs(::serde_json::json!({
                 "tool": call_name,
                 "tool_call_id": tool_call_id,
-                "input": bounded_observer_text(&full_args),
+                "input": &observer_args,
             })),
         format!("tool call: {call_name}")
     );
@@ -403,7 +411,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": bounded_observer_text(&full_args),
+                            "input": &observer_args,
                             "output": bounded_observer_text(&r.output),
                         })),
                         format!("tool result: {call_name}")
@@ -418,7 +426,7 @@ pub(crate) async fn execute_one_tool(
                             .with_attrs(::serde_json::json!({
                                 "tool": call_name,
                                 "tool_call_id": tool_call_id,
-                                "input": bounded_observer_text(&full_args),
+                                "input": &observer_args,
                                 "error": bounded_observer_text(r.error.as_deref().unwrap_or_default()),
                                 "output": bounded_observer_text(&r.output),
                             })),
@@ -438,7 +446,7 @@ pub(crate) async fn execute_one_tool(
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: true,
-                        arguments: Some(bounded_observer_text(&full_args)),
+                        arguments: Some(observer_args.clone()),
                         result: Some(bounded_observer_text(&normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -477,7 +485,7 @@ pub(crate) async fn execute_one_tool(
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
-                        arguments: Some(bounded_observer_text(&full_args)),
+                        arguments: Some(observer_args.clone()),
                         result: Some(bounded_observer_text(
                             outcome.error_reason.as_deref().unwrap_or(&outcome.output),
                         )),
@@ -543,7 +551,7 @@ pub(crate) async fn execute_one_tool(
                         .with_attrs(::serde_json::json!({
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
-                            "input": bounded_observer_text(&full_args),
+                            "input": &observer_args,
                             "error": bounded_observer_error(&e),
                         })),
                     format!("tool error: {call_name}")
@@ -553,7 +561,7 @@ pub(crate) async fn execute_one_tool(
                     tool_call_id: tool_call_id_owned.clone(),
                     duration,
                     success: false,
-                    arguments: Some(bounded_observer_text(&full_args)),
+                    arguments: Some(observer_args.clone()),
                     result: Some(bounded_observer_text(&reason)),
                     channel: Some(meta.channel_name.to_string()),
                     agent_alias: meta.agent_alias.map(|s| s.to_string()),
@@ -848,6 +856,217 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observer_text_checks_complete_encoded_boundaries() {
+        for (text, fits) in [
+            ("x".repeat(4094), true),
+            ("x".repeat(4095), false),
+            (format!("{}xx", "\0".repeat(682)), true),
+            (format!("{}xxx", "\0".repeat(682)), false),
+            ("\"".repeat(2047), true),
+            ("\"".repeat(2048), false),
+            ("\\".repeat(2047), true),
+            ("\\".repeat(2048), false),
+            (format!("{}xx", "😀".repeat(1023)), true),
+            (format!("{}xxx", "😀".repeat(1023)), false),
+        ] {
+            let projection = super::bounded_observer_text(&text);
+            assert!(serde_json::to_vec(&projection).unwrap().len() <= 4096);
+            if fits {
+                assert_eq!(projection, text);
+            } else {
+                assert!(projection.contains("omitted"));
+            }
+        }
+    }
+
+    #[test]
+    fn observer_text_checks_redaction_growth_without_exposing_partial_secrets() {
+        let text = format!("{}token=12345678", "x".repeat(4074));
+        assert!(serde_json::to_vec(&text).unwrap().len() <= 4096);
+        let projection = super::bounded_observer_text(&text);
+        assert!(serde_json::to_vec(&projection).unwrap().len() <= 4096);
+        assert!(projection.contains("omitted"));
+        assert!(!projection.contains("12345678"));
+
+        let text = format!("{}token=fixture-private-value", "\0".repeat(682));
+        assert!(text.len() < 4096);
+        let projection = super::bounded_observer_text(&text);
+        assert!(projection.contains("omitted"));
+        assert!(!projection.contains("token"));
+    }
+
+    #[test]
+    fn observer_arguments_count_nested_encoding_and_scrub_only_complete_json() {
+        for arguments in [
+            serde_json::json!({"value": "😀\0\"\\".repeat(30), "count": 12}),
+            serde_json::json!({"token": "fixture-secret-value"}),
+            serde_json::json!({"value": "\\".repeat(1500)}),
+            serde_json::json!({"value": "x".repeat(100_000)}),
+            serde_json::json!({"value": "x".repeat(4080), "token": "fixture-secret-value"}),
+        ] {
+            let original = arguments.clone();
+            let text = arguments.to_string();
+            let projection = super::bounded_observer_arguments(&arguments);
+            assert!(serde_json::to_vec(&projection).unwrap().len() <= 4096);
+            if serde_json::to_vec(&text).unwrap().len() <= 4096 {
+                assert_eq!(projection, super::bounded_observer_text(&text));
+            } else {
+                assert!(projection.contains("omitted"));
+                assert!(!projection.contains("token"));
+            }
+            assert!(!projection.contains("fixture-secret-value"));
+            assert_eq!(arguments, original);
+        }
+
+        // Compact JSON fits as raw text but not as a string inside an event.
+        let arguments = serde_json::json!({"value": "\\".repeat(1500)});
+        assert!(arguments.to_string().len() < 4096);
+        assert!(serde_json::to_vec(&arguments.to_string()).unwrap().len() > 4096);
+        assert!(super::bounded_observer_arguments(&arguments).contains("omitted"));
+    }
+
+    #[tokio::test]
+    async fn observer_projection_dispatch_preserves_canonical_arguments_results_and_receipts() {
+        use super::*;
+        use crate::tools::{ToolOutput, ToolResult};
+
+        struct ProjectionTool {
+            arguments: serde_json::Value,
+            result: std::sync::Mutex<Option<ToolResult>>,
+        }
+        zeroclaw_api::tool_attribution!(
+            ProjectionTool,
+            zeroclaw_api::attribution::ToolKind::Plugin
+        );
+        #[async_trait::async_trait]
+        impl Tool for ProjectionTool {
+            fn name(&self) -> &str {
+                "fixture_projection"
+            }
+            fn description(&self) -> &str {
+                "Synthetic observer boundary fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, arguments: serde_json::Value) -> Result<ToolResult> {
+                assert_eq!(arguments, self.arguments);
+                Ok(self
+                    .result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("single execution"))
+            }
+        }
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<ObserverEvent>>);
+        impl Observer for Capture {
+            fn record_event(&self, event: &ObserverEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+            fn record_metric(&self, _: &zeroclaw_api::observability_traits::ObserverMetric) {}
+            fn name(&self) -> &str {
+                "fixture-capture"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn flush(&self) {}
+        }
+
+        for success in [true, false] {
+            let arguments = serde_json::json!({"value": "\\".repeat(1500)});
+            let source = "\0".repeat(1000);
+            let source_ptr = source.as_ptr();
+            let data = serde_json::json!({"scope": "fixture-owner", "effect": "fixture-receipt"});
+            let reason = (!success).then(|| "\"".repeat(2048));
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(ProjectionTool {
+                arguments: arguments.clone(),
+                result: std::sync::Mutex::new(Some(ToolResult {
+                    success,
+                    output: ToolOutput::json_with_text(data.clone(), source),
+                    error: reason.clone(),
+                })),
+            })];
+            let observer = Capture::default();
+            let receipts = super::super::tool_receipts::ReceiptGenerator::with_key(vec![42; 32]);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+            let outcome = execute_one_tool(
+                "fixture_projection",
+                arguments.clone(),
+                Some("fixture-id"),
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: Some("fixture-agent"),
+                    turn_id: "fixture-turn",
+                    channel_name: "test",
+                },
+                &observer,
+                None,
+                Some(&receipts),
+                Some(&tx),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.success, success);
+            assert_eq!(outcome.output_data, Some(data));
+            assert_eq!(outcome.error_reason, reason);
+            assert!(outcome.output.contains(&"\0".repeat(1000)));
+            if success {
+                assert_eq!(outcome.output.as_ptr(), source_ptr);
+                assert!(receipts.verify(
+                    outcome.receipt.as_deref().unwrap(),
+                    "fixture_projection",
+                    &arguments,
+                    &outcome.output
+                ));
+            } else {
+                assert!(outcome.receipt.is_none());
+                assert_eq!(outcome.failure_kind, Some(ToolFailureKind::Ordinary));
+            }
+            {
+                let events = observer.0.lock().unwrap();
+                assert_eq!(events.len(), 2);
+                for event in events.iter() {
+                    let (args, result) = match event {
+                        ObserverEvent::ToolCallStart { arguments, .. } => (arguments, None),
+                        ObserverEvent::ToolCall {
+                            arguments, result, ..
+                        } => (arguments, result.as_ref()),
+                        _ => panic!("unexpected observer event"),
+                    };
+                    let args = args.as_ref().expect("diagnostic arguments are present");
+                    if matches!(event, ObserverEvent::ToolCall { .. }) {
+                        assert!(result.is_some(), "terminal diagnostic result is present");
+                    }
+                    for text in std::iter::once(args).chain(result) {
+                        assert!(text.contains("omitted"));
+                        assert!(serde_json::to_vec(text).unwrap().len() <= 4096);
+                    }
+                }
+            }
+            let Some(TurnEvent::ToolCall { args, id, .. }) = rx.recv().await else {
+                panic!("pending event missing")
+            };
+            assert_eq!(args, arguments);
+            assert_eq!(id, "fixture-id");
+            let Some(TurnEvent::ToolResult { output, id, .. }) = rx.recv().await else {
+                panic!("result event missing")
+            };
+            assert_eq!(id, "fixture-id");
+            assert!(output.contains("omitted"));
+            assert!(serde_json::to_vec(&output).unwrap().len() <= 4096);
+        }
+    }
+
     #[test]
     fn outcome_serialization_preserves_complete_owned_shape() {
         let outcome = super::ToolExecutionOutcome {
