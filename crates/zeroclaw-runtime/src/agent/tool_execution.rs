@@ -30,6 +30,53 @@ pub(crate) fn bounded_observer_text(text: &str) -> String {
     scrubbed
 }
 
+fn bounded_observer_error(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+    use zeroclaw_api::serialization::encoded_size;
+
+    const LIMIT: usize = 4096;
+    const OMITTED: &str = "[observer error omitted: formatting failed or exceeded encoded budget]";
+
+    // The error remains the source of truth. This sink owns only a disposable
+    // log projection; never expose a partial credential when formatting stops.
+    struct Projection {
+        text: Option<String>,
+        encoded_len: usize,
+    }
+    impl Write for Projection {
+        fn write_str(&mut self, chunk: &str) -> std::fmt::Result {
+            let Some(text) = &mut self.text else {
+                return Err(std::fmt::Error);
+            };
+            // JSON string contents compose across valid UTF-8 chunks. Count
+            // each chunk using the shared serializer, excluding its two quotes.
+            let Some(size) = encoded_size(chunk, LIMIT - self.encoded_len + 2) else {
+                self.text = None;
+                return Err(std::fmt::Error);
+            };
+            self.encoded_len += size - 2;
+            text.push_str(chunk);
+            Ok(())
+        }
+    }
+    let mut projection = Projection {
+        text: Some(String::with_capacity(LIMIT - 2)),
+        encoded_len: 2,
+    };
+    if write!(&mut projection, "{error:?}").is_err() {
+        return OMITTED.into();
+    }
+    let Some(text) = projection.text else {
+        // A custom formatter may ignore a failed write. Rejection is sticky.
+        return OMITTED.into();
+    };
+    let scrubbed = bounded_observer_text(&text);
+    if encoded_size(&scrubbed, LIMIT).is_none() {
+        return OMITTED.into();
+    }
+    scrubbed
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 /// If a just-completed tool call was a successful `TodoWrite`, build the
@@ -443,7 +490,7 @@ pub(crate) async fn execute_one_tool(
                             "tool": call_name,
                             "tool_call_id": tool_call_id,
                             "input": bounded_observer_text(&full_args),
-                            "error": bounded_observer_text(&format!("{e:?}")),
+                            "error": bounded_observer_error(&e),
                         })),
                     format!("tool error: {call_name}")
                 );
@@ -730,6 +777,128 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
+    struct StreamingDebugError {
+        writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        chunk: &'static str,
+        count: usize,
+    }
+
+    impl std::fmt::Display for StreamingDebugError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for _ in 0..self.count {
+                self.writes
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                f.write_str(self.chunk)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl std::fmt::Debug for StreamingDebugError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(self, f)
+        }
+    }
+
+    impl std::error::Error for StreamingDebugError {}
+
+    #[test]
+    fn observer_error_stops_rendering_at_encoded_limit() {
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let error = anyhow::Error::new(StreamingDebugError {
+            writes: writes.clone(),
+            chunk: "\0",
+            count: 20_000,
+        });
+        let projection = super::bounded_observer_error(&error);
+        assert!(writes.load(std::sync::atomic::Ordering::SeqCst) < 700);
+        assert!(projection.contains("omitted"));
+        assert!(zeroclaw_api::serialization::encoded_size(&projection, 4096).is_some());
+        assert_eq!(
+            error.downcast_ref::<StreamingDebugError>().unwrap().count,
+            20_000
+        );
+    }
+
+    #[test]
+    fn observer_error_checks_exact_encoded_boundaries() {
+        for (chunk, count, fits) in [
+            ("x", 4094, true),
+            ("x", 4095, false),
+            ("\0", 682, true),
+            ("\0", 683, false),
+            ("😀", 1023, true),
+            ("😀", 1024, false),
+            ("\"", 2047, true),
+            ("\"", 2048, false),
+        ] {
+            let error = anyhow::Error::new(StreamingDebugError {
+                writes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                chunk,
+                count,
+            });
+            let projection = super::bounded_observer_error(&error);
+            assert!(zeroclaw_api::serialization::encoded_size(&projection, 4096).is_some());
+            if fits {
+                assert_eq!(projection, chunk.repeat(count));
+            } else {
+                assert!(projection.contains("omitted"));
+            }
+        }
+    }
+
+    #[test]
+    fn observer_error_scrubs_complete_chains_and_discards_partial_secrets() {
+        let error = anyhow::Error::msg("token=fixture-secret-value").context("fixture context");
+        let projection = super::bounded_observer_error(&error);
+        assert_eq!(
+            projection,
+            super::bounded_observer_text(&format!("{error:?}"))
+        );
+        assert!(projection.contains("fixture context"));
+        assert!(projection.contains("[REDACTED]"));
+        assert!(!projection.contains("fixture-secret-value"));
+
+        // The context nearly fills the sink; the underlying credential must
+        // never be exposed as a prefix when its formatting hits the limit.
+        let error = error.context("x".repeat(4050));
+        let projection = super::bounded_observer_error(&error);
+        assert!(projection.contains("omitted"));
+        assert!(!projection.contains("token"));
+        assert!(!projection.contains("fixt"));
+
+        // Redaction itself can expand a fitting input beyond the encoded cap.
+        let error = anyhow::Error::msg(format!("{}token=12345678", "x".repeat(4078)));
+        assert!(zeroclaw_api::serialization::encoded_size(&format!("{error:?}"), 4096).is_some());
+        assert!(super::bounded_observer_error(&error).contains("omitted"));
+    }
+
+    #[test]
+    fn observer_error_omits_failed_or_noncooperative_formatting() {
+        #[derive(Debug)]
+        struct BrokenFormatter(bool);
+        impl std::fmt::Display for BrokenFormatter {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                if self.0 {
+                    // Simulate a formatter that ignores the sink's refusal.
+                    let _ = f.write_str(&"x".repeat(5000));
+                    let _ = f.write_str("token=fixture-secret-value");
+                    Ok(())
+                } else {
+                    f.write_str("token=fixture-secret")?;
+                    Err(std::fmt::Error)
+                }
+            }
+        }
+        impl std::error::Error for BrokenFormatter {}
+        for ignores_error in [false, true] {
+            let error = anyhow::Error::new(BrokenFormatter(ignores_error));
+            let projection = super::bounded_observer_error(&error);
+            assert!(projection.contains("omitted"));
+            assert!(!projection.contains("token"));
+        }
+    }
+
     #[test]
     fn failure_normalization_counts_escaping_before_copies() {
         let source = "\0".repeat(20_000);

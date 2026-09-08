@@ -207,6 +207,17 @@ Policy classification scans borrowed bytes rather than allocating a lowercase
 copy. This normalization ceiling does not replace configured or aggregate batch
 admission, and it does not cover arbitrary `anyhow::Error` rendering.
 
+The executor's ordinary-error debug log renders into a disposable sink capped at
+4 KiB for the encoded JSON string, including quotes and escaping. It checks each
+borrowed formatter chunk before copying, stops on a failed write, and discards
+partial content. Fitting projections pass through credential redaction and a
+final encoded-size check; oversized or failed formatting produces a bounded
+omission marker. The original error stays borrowed and ordinary recovery is
+unchanged. This caps the runtime-owned log string, not allocations performed
+inside custom formatters or `anyhow` backtrace rendering. The separate ordinary
+error `Display` used for outcome construction remains an unbounded allocation
+before source admission. Whole log envelopes and streams need their own budgets.
+
 Both tool-result event emitters measure the complete encoded artifact projection
 from borrowed fields before copying its path, URI, filename, title, and MIME
 strings. The shared artifact conversion has a hard 64 KiB runtime ceiling,

@@ -195,14 +195,19 @@ Failed `ToolResult` returns retain their source-reported display text alongside
 the error, and move structured `ToolOutput::data` into the existing outcome/SOP
 capture path. A failed return cannot create a delivered artifact merely because
 its source claims `delivered: true`. Custom display text remains the model-facing
-view; structured data is not automatically copied into model history. The new
-failure display bounds the error excerpt at 4 KiB and the accompanying source
-text at 32 KiB before the existing round/history budgets apply. These excerpts
-are source assertions, not proof of confirmed effects or safe replay.
+view; structured data is not automatically copied into model history. Failure
+normalization preserves original text, data, and errors, leaving oversized
+sources intact for explicit rejection. See [Encoded tool-history admission](./memory-payload-lifecycle.md#encoded-tool-history-admission)
+for the normalization, source, history, artifact, and debug-log projection
+limits. Returned data is a source assertion, not proof of confirmed effects or
+safe replay.
 
 After a batch returns a typed terminal error, completed outcomes reach SOP
 capture, ordered history and the existing HMAC collector before that error is
-returned. They bypass post-execution hooks and draft progress, and terminal
+returned when the source and final history representations fit their budgets.
+An oversized source batch instead stays owned by a typed rejection before SOP
+capture; final history overflow likewise rejects with original source evidence.
+Terminal batches bypass post-execution hooks and draft progress, and terminal
 cards use a nonblocking best-effort send, so stalled auxiliary consumers cannot
 swallow already returned evidence. Completed cards are not emitted twice. The
 post-tool lifecycle checkpoint also runs after history retention, so its storage
