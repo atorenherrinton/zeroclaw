@@ -197,6 +197,16 @@ Key code entry points:
 
 ## Encoded tool-history admission
 
+At executor normalization, successful text and structured data move together into
+`ToolExecutionOutcome` without cloning the source buffers. Returned failures also
+move their original text, data, and optional error into that outcome first. If its
+encoded size exceeds the 64 KiB ceiling, normalization leaves it intact for batch
+rejection; it does not excerpt the source or copy it into a fallback error field.
+Below that ceiling, failure formatting includes the full returned text and error.
+Policy classification scans borrowed bytes rather than allocating a lowercase
+copy. This normalization ceiling does not replace configured or aggregate batch
+admission, and it does not cover arbitrary `anyhow::Error` rendering.
+
 The runtime moves each completed batch into its existing ordered-result slots,
 then checks the complete serialized source envelope (names, call IDs, typed
 outcomes, structured data, errors, and receipts) without allocating a serialized
@@ -223,7 +233,7 @@ history wrapping can still reject a source-admitted batch later. Empty SOP
 capture after a source rejection does not mean the tools did not execute: the
 terminal error owns their returned outcomes and receipts.
 
-Earlier executor/observer copies, source excerpt evidence preservation,
+Earlier executor/observer copies, later per-round source excerpt evidence preservation,
 parallel/background delegation outcome transport, delegated receipt accumulation,
 and durable recovery of rejected results remain separate boundaries. These checks
 do not establish a complete end-to-end output budget.

@@ -375,13 +375,12 @@ pub(crate) async fn execute_one_tool(
                     );
                 }
                 if r.success {
-                    let normalized_output = if r.output.is_empty() {
-                        "(no output)"
-                    } else {
-                        &r.output
-                    };
+                    let (mut normalized_output, output_data) = r.output.into_parts();
+                    if normalized_output.is_empty() {
+                        normalized_output.push_str("(no output)");
+                    }
                     let receipt = receipt_generator.map(|receipt_gen| {
-                        receipt_gen.generate_now(call_name, &call_arguments, normalized_output)
+                        receipt_gen.generate_now(call_name, &call_arguments, &normalized_output)
                     });
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
@@ -389,15 +388,15 @@ pub(crate) async fn execute_one_tool(
                         duration,
                         success: true,
                         arguments: Some(bounded_observer_text(&full_args)),
-                        result: Some(bounded_observer_text(normalized_output)),
+                        result: Some(bounded_observer_text(&normalized_output)),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
                     Ok(ToolExecutionOutcome {
-                        output: normalized_output.to_string(),
-                        output_data: r.output.into_data(),
+                        output: normalized_output,
+                        output_data,
                         success: true,
                         error_reason: None,
                         failure_kind: None,
@@ -405,50 +404,22 @@ pub(crate) async fn execute_one_tool(
                         receipt,
                     })
                 } else {
-                    let reason = r.error.unwrap_or_else(|| r.output.as_str().to_owned());
-                    // Keep the source's returned evidence even when its later
-                    // exit/status check failed. It is not a delivery acknowledgement.
-                    let output = if !r.output.is_empty() && r.output.as_str() != reason {
-                        let display_reason =
-                            zeroclaw_tools::output_budget::bound_output(&reason, 4096);
-                        let display_output =
-                            zeroclaw_tools::output_budget::bound_output(&r.output, 32768);
-                        crate::i18n::get_required_cli_string_with_args(
-                            "turn-tool-failed-with-output",
-                            &[
-                                ("reason", display_reason.as_str()),
-                                ("output", display_output.as_str()),
-                            ],
-                        )
-                    } else {
-                        format!("Error: {reason}")
-                    };
-                    let failure_kind = if is_security_policy_failure(&reason) {
-                        ToolFailureKind::PolicyDenied
-                    } else {
-                        ToolFailureKind::Ordinary
-                    };
+                    let outcome = returned_failure_outcome(r.output, r.error, duration);
                     observer.record_event(&ObserverEvent::ToolCall {
                         tool: call_name.to_string(),
                         tool_call_id: tool_call_id_owned.clone(),
                         duration,
                         success: false,
                         arguments: Some(bounded_observer_text(&full_args)),
-                        result: Some(bounded_observer_text(&reason)),
+                        result: Some(bounded_observer_text(
+                            outcome.error_reason.as_deref().unwrap_or(&outcome.output),
+                        )),
                         channel: Some(meta.channel_name.to_string()),
                         agent_alias: meta.agent_alias.map(|s| s.to_string()),
                         parent_agent_alias: meta.parent_agent_alias.map(|s| s.to_string()),
                         turn_id: Some(meta.turn_id.to_string()),
                     });
-                    Ok(ToolExecutionOutcome {
-                        output,
-                        success: false,
-                        error_reason: Some(reason),
-                        failure_kind: Some(failure_kind),
-                        duration,
-                        receipt: None,
-                        output_data: r.output.into_data(),
-                    })
+                    Ok(outcome)
                 }
             }
             Err(e) => {
@@ -537,14 +508,75 @@ pub(crate) async fn execute_one_tool(
     outcome
 }
 
+/// Keep returned source evidence in the canonical outcome before producing a
+/// failure display. An oversized source must reach batch admission intact; it
+/// must not become an excerpt, or a second full-sized fallback error string.
+fn returned_failure_outcome(
+    source: crate::tools::ToolOutput,
+    error: Option<String>,
+    duration: Duration,
+) -> ToolExecutionOutcome {
+    let (output, output_data) = source.into_parts();
+    let reason = error.as_deref().unwrap_or(&output);
+    let failure_kind = if is_security_policy_failure(reason) {
+        ToolFailureKind::PolicyDenied
+    } else {
+        ToolFailureKind::Ordinary
+    };
+    let mut outcome = ToolExecutionOutcome {
+        output,
+        output_data,
+        success: false,
+        error_reason: error,
+        failure_kind: Some(failure_kind),
+        duration,
+        receipt: None,
+    };
+    // This ceiling bounds normalization copies only. The batch owner still
+    // enforces configured per-result and aggregate limits, including names/IDs.
+    if zeroclaw_tools::output_budget::encoded_size(
+        &outcome,
+        zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
+    )
+    .is_none()
+    {
+        return outcome;
+    }
+    let reason = outcome
+        .error_reason
+        .get_or_insert_with(|| outcome.output.clone());
+    outcome.output = if !outcome.output.is_empty() && outcome.output != *reason {
+        crate::i18n::get_required_cli_string_with_args(
+            "turn-tool-failed-with-output",
+            &[
+                ("reason", reason.as_str()),
+                ("output", outcome.output.as_str()),
+            ],
+        )
+    } else {
+        format!("Error: {reason}")
+    };
+    outcome
+}
+
 fn is_security_policy_failure(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    reason.contains("security policy")
-        || reason.contains("denied by policy")
-        || reason.contains("workspace allowlist")
-        || reason.contains("rate limit exceeded")
-        || reason.contains("action budget exhausted")
-        || reason.contains("requires approval and no operator decision was available")
+    // Scan the borrowed bytes: lowercasing an arbitrary source error would
+    // allocate another unbounded payload before admission.
+    [
+        "security policy",
+        "denied by policy",
+        "workspace allowlist",
+        "rate limit exceeded",
+        "action budget exhausted",
+        "requires approval and no operator decision was available",
+    ]
+    .iter()
+    .any(|needle| {
+        reason
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -694,6 +726,51 @@ pub(crate) async fn execute_tools_sequential(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn failure_normalization_counts_escaping_before_copies() {
+        let source = "\0".repeat(20_000);
+        let source_ptr = source.as_ptr();
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text(source),
+            None,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(outcome.output.as_ptr(), source_ptr);
+        assert!(outcome.error_reason.is_none());
+        assert_eq!(outcome.output.len(), 20_000);
+    }
+
+    #[test]
+    fn failure_normalization_preserves_large_error_and_policy_kind() {
+        let reason = format!("{}DENIED BY POLICY", "😀".repeat(20_000));
+        let reason_ptr = reason.as_ptr();
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text("fixture-effect-evidence"),
+            Some(reason),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(outcome.error_reason.as_ref().unwrap().as_ptr(), reason_ptr);
+        assert_eq!(outcome.output, "fixture-effect-evidence");
+        assert_eq!(
+            outcome.failure_kind,
+            Some(super::ToolFailureKind::PolicyDenied)
+        );
+    }
+
+    #[test]
+    fn admitted_failure_source_is_formatted_without_an_excerpt() {
+        let source = format!("{}fixture-effect-evidence-at-end", "x".repeat(40_000));
+        let outcome = super::returned_failure_outcome(
+            crate::tools::ToolOutput::text(source.clone()),
+            Some("fixture exit failed".into()),
+            std::time::Duration::ZERO,
+        );
+        assert!(outcome.output.contains(&source));
+        assert!(outcome.output.contains("fixture exit failed"));
+        assert!(!outcome.output.contains("truncated"));
+        assert_eq!(outcome.error_reason.as_deref(), Some("fixture exit failed"));
+    }
+
+    #[test]
     fn observer_caps_before_redaction_and_never_exposes_a_cut_secret() {
         let text = format!("{}Bearer private-token", "😀".repeat(1023));
         let bounded = super::bounded_observer_text(&text);
@@ -824,6 +901,94 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn successful_execution_moves_source_allocations_and_preserves_receipt() {
+        struct OwnedOutputTool(Mutex<Option<crate::tools::ToolResult>>);
+        zeroclaw_api::tool_attribution!(
+            OwnedOutputTool,
+            zeroclaw_api::attribution::ToolKind::Plugin
+        );
+        #[async_trait]
+        impl Tool for OwnedOutputTool {
+            fn name(&self) -> &str {
+                "fixture_owned_output"
+            }
+            fn description(&self) -> &str {
+                "synthetic owned-output fixture"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _: serde_json::Value,
+            ) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("fixture executes once"))
+            }
+        }
+        let text = "fixture-text".repeat(10_000);
+        let data_text = "fixture-metadata".repeat(10_000);
+        let text_ptr = text.as_ptr();
+        let data_ptr = data_text.as_ptr();
+        let registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            OwnedOutputTool(Mutex::new(Some(crate::tools::ToolResult::ok(
+                crate::tools::ToolOutput::json_with_text(
+                    serde_json::Value::String(data_text),
+                    text,
+                ),
+            )))),
+        )]);
+        let receipt_generator =
+            crate::agent::tool_receipts::ReceiptGenerator::with_key(vec![7; 32]);
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "fixture-turn",
+            channel_name: "fixture",
+        };
+        let outcome = execute_one_tool(
+            "fixture_owned_output",
+            serde_json::json!({}),
+            Some("fixture-call"),
+            ToolDispatchContext {
+                tools_registry: &registry,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            Some(&receipt_generator),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.success);
+        assert_eq!(outcome.output.as_ptr(), text_ptr);
+        assert_eq!(
+            outcome
+                .output_data
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            data_ptr
+        );
+        assert!(receipt_generator.verify(
+            outcome.receipt.as_ref().unwrap(),
+            "fixture_owned_output",
+            &serde_json::json!({}),
+            &outcome.output,
+        ));
     }
 
     #[tokio::test]

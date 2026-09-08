@@ -11,6 +11,8 @@ enum Mode {
     Success,
     FailedOutput,
     OversizedData,
+    OversizedFailedOutput,
+    OversizedFailedOutputWithoutError,
     Delivery,
     Deadline,
     Cancel,
@@ -59,6 +61,17 @@ impl Tool for EvidenceTool {
                 ),
                 error: None,
             }),
+            Mode::OversizedFailedOutput | Mode::OversizedFailedOutputWithoutError => {
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::json_with_text(
+                        serde_json::json!({"scope": "fixture-owner", "operation_id": "fixture-operation"}),
+                        oversized_failure_text(),
+                    ),
+                    error: matches!(self.mode, Mode::OversizedFailedOutput)
+                        .then(|| "fixture exit check failed".into()),
+                })
+            }
             Mode::Delivery => Err(anyhow::Error::new(DeliveryFailure {
                 outcome: EffectOutcome::PossiblyApplied,
                 chunk_index: 1,
@@ -581,5 +594,48 @@ async fn admitted_batch_still_runs_post_tool_hooks_and_sop_capture() {
         assert_eq!(case.receipts.len(), 2);
         assert_success_retained(&case, 0);
         assert_success_retained(&case, 1);
+    }
+}
+
+fn oversized_failure_text() -> String {
+    format!("{}fixture-effect-evidence-at-end", "😀\"\n".repeat(20_000))
+}
+
+#[tokio::test]
+async fn budget_rejection_preserves_failed_source_before_executor_excerpts() {
+    for parallel in [false, true] {
+        for mode in [
+            Mode::OversizedFailedOutput,
+            Mode::OversizedFailedOutputWithoutError,
+        ] {
+            let case = run_case(&[Mode::Success, mode], parallel, None, None).await;
+            let error = case.result.as_ref().unwrap_err();
+            let evidence = error
+                .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                .unwrap();
+            let failed = &evidence.results[1].as_ref().unwrap().2;
+            assert!(
+                failed.output == oversized_failure_text(),
+                "retain the entire original source, including its tail"
+            );
+            assert!(!failed.success);
+            assert!(failed.receipt.is_none());
+            assert_eq!(
+                failed.output_data.as_ref().unwrap()["scope"],
+                "fixture-owner"
+            );
+            assert_eq!(
+                failed.output_data.as_ref().unwrap()["operation_id"],
+                "fixture-operation"
+            );
+            assert_eq!(
+                failed.error_reason.as_deref(),
+                matches!(mode, Mode::OversizedFailedOutput).then_some("fixture exit check failed")
+            );
+            assert!(evidence.results[0].as_ref().unwrap().2.receipt.is_some());
+            assert_eq!(case.calls, vec![1, 1]);
+            assert_eq!(case.remaining_responses, 1);
+            assert!(case.step_calls.is_empty());
+        }
     }
 }
