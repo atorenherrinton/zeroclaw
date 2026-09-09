@@ -208,3 +208,5 @@ read-result-truncated = [Read preview incomplete; middle content was omitted and
 
 exact-read-result-too-large = Exact read result is too large to return intact. No partial binary or JSON was returned. Request a smaller result, use pagination where supported, or pass the file/attachment path to a format-specific reader.
 coding-cli-result-truncated = [Coding command output incomplete; middle content was omitted. The command already ran and may have changed files. Inspect the working tree and execution evidence before continuing. Do not rerun it because this output was truncated.]
+
+sessions-history-metadata-budget-exceeded = Session history metadata exceeds the output limit. Request fewer messages.

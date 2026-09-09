@@ -446,3 +446,8 @@ results, typed payloads, excessive envelopes or batches, and unusably small
 configured limits. Those results cannot safely be declared complete by arbitrary
 truncation. Rejections log tool names, byte counts, and the rejected phase without
 logging result content, so remaining failures can be diagnosed at their owner.
+
+Session-history pagination derives its encoded page ceiling from the same scoped
+allowance, preserving valid JSON, cursors, and unchanged stored rows. Report
+templates use the exact-read failure path when a complete rendering cannot fit.
+Optional cloud analysis and pattern listings use the native read-preview wrapper.

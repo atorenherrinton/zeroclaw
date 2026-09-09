@@ -1371,8 +1371,12 @@ pub fn all_tools_with_runtime(
 
     // Cloud operations advisory tools (read-only analysis)
     if root_config.cloud_ops.enabled {
-        tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
-        tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            CloudOpsTool::new(root_config.cloud_ops.clone()),
+        )));
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            CloudPatternsTool::new(),
+        )));
     }
 
     // Google Workspace CLI (gws) integration — requires shell access
