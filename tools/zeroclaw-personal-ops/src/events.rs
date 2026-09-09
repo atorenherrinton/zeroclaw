@@ -180,7 +180,8 @@ impl Ops {
         let email_result = self.capture_source("important_email", email);
         let invitations=outbox::google(&self.root,"calendar","calendar.events.list",json!({"calendarId":"primary","timeMin":now.to_rfc3339(),"timeMax":(now+chrono::Duration::days(90)).to_rfc3339(),"singleEvents":true,"orderBy":"startTime","maxResults":250}),None,"read-invitations").await.map(|v|json!({"events":v["items"].as_array().into_iter().flatten().filter(|e|e["attendees"].as_array().is_some_and(|a|a.iter().any(|a|matches!(a["responseStatus"].as_str(),Some("needsAction"|"declined"|"tentative"))))).cloned().collect::<Vec<_>>(),"truncated":v.get("nextPageToken").is_some(),"window_days":90}));
         let invitations_result = self.capture_source("pending_invitations", invitations);
-        calendar_result.and(email_result).and(invitations_result)
+        calendar_result.and(email_result).and(invitations_result)?;
+        self.health_record("google", "healthy", "Google read refresh verified")
     }
     fn capture_source(&self, name: &str, result: Result<Value>) -> Result<()> {
         match result {
