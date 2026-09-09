@@ -2408,6 +2408,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_standalone_screenshot_reaches_model_as_attachment() {
+        use crate::mcp_tool::McpToolWrapper;
+        use base64::Engine as _;
+        use zeroclaw_api::tool::Tool as _;
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = vec![42u8; 112_000];
+        let result = serde_json::json!({"content":[
+            {"type":"text", "text":"Capture complete"},
+            {"type":"image", "data":base64::engine::general_purpose::STANDARD.encode(&bytes), "mimeType":"image/png"}
+        ], "structuredContent":{"status":"completed", "receipt":"fixture"}});
+        assert!(serde_json::to_vec(&result).unwrap().len() > 149_000);
+        let server = server_with_tool_returning("js", result);
+        let registry = Arc::new(McpRegistry {
+            servers: vec![server],
+            tool_index: HashMap::from([("fake__js".into(), (0, "js".into()))]),
+            server_index: HashMap::from([("fake".into(), 0)]),
+        });
+        let def =
+            serde_json::from_value(serde_json::json!({"name":"js","inputSchema":{}})).unwrap();
+        let wrapper = McpToolWrapper::new(
+            "fake__js".into(),
+            def,
+            registry,
+            Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                workspace_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            }),
+        );
+        let result = wrapper.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success);
+        let parsed: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+        assert_eq!(parsed["structuredContent"]["receipt"], "fixture");
+        let marker = parsed["content"][1]["materialized"].as_str().unwrap();
+        let path = marker
+            .strip_prefix("[IMAGE:")
+            .unwrap()
+            .strip_suffix(']')
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let message = zeroclaw_providers::ChatMessage::tool(
+            serde_json::json!({"tool_call_id":"fixture", "content":result.output.as_str()})
+                .to_string(),
+        );
+        assert!(crate::output_budget::encoded_size(&message, 4096).is_some());
+    }
+
+    #[tokio::test]
     async fn mcp_read_preview_fits_native_history_and_keeps_write_results_intact() {
         use crate::mcp_tool::McpToolWrapper;
         use zeroclaw_api::tool::Tool as _;
