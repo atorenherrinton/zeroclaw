@@ -9,7 +9,13 @@ saved credentials. Safari remains the browser for saved sessions and AutoFill.
 
 - `browse`: open a public HTTPS URL, read visible controls, scroll, or screenshot.
   `read` accepts `offset`; continue with the returned `next_offset` until null.
+  Screenshots use an embedded PNG resource. Core intake materializes the image
+  through the existing workspace attachment writer and passes an image marker
+  to the model, keeping base64 out of text-budget admission. The existing
+  3,000,000-byte encoded screenshot capture limit still applies.
   Every text response fits within the runtime's 4 KiB encoded read preview.
+  A control without a unique selector has `selector: null` and `selector_error`;
+  it cannot be targeted, but other controls and page text remain readable.
   A page includes readiness; incomplete loading is not proof of missing controls.
 - `interact`: click, fill, or press a supported key on an observed unique control.
   Copy returned `shadow:` paths exactly. An owner request authorizes only its

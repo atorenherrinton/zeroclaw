@@ -22,7 +22,12 @@ const controls = deepQuery(controlsSelector).filter(visible);
 const text = composedText(document.body,1201);
 return {url:location.href,title:document.title,text:text.slice(0,1200),text_truncated:text.length>1200,
  totalControls:controls.length, offset:args.offset,
- controls:controls.slice(args.offset,args.offset+12).map(e=>({selector:selectorFor(e),tag:e.tagName.toLowerCase(),text:controlText(e).slice(0,160),disabled:disabled(e),...(e.href?{href:e.href}:{})}))};
+ controls:controls.slice(args.offset,args.offset+12).map(e=>{
+ const control = {tag:e.tagName.toLowerCase(),text:controlText(e).slice(0,160),disabled:disabled(e),...(e.href?{href:e.href}:{})};
+ try { control.selector = selectorFor(e); }
+ catch (error) { control.selector = null; control.selector_error = String(error.message || error).slice(0,160); }
+ return control;
+})};
 "#;
 
 fn page_result(mut page: Value, offset: usize) -> Result<Value> {
@@ -53,6 +58,19 @@ fn page_result(mut page: Value, offset: usize) -> Result<Value> {
             bail!("Page metadata exceeds the bounded response limit; no action should be repeated");
         }
     }
+}
+
+// Use the core's existing embedded-resource intake so PNG bytes become a
+// workspace image attachment before source-result admission. Inline image data
+// otherwise reaches the text budget as base64 and aborts ordinary screenshots.
+fn screenshot_result(data: &str) -> Result<Value> {
+    if data.len() > 3_000_000 {
+        bail!("Screenshot exceeds the safe response limit");
+    }
+    Ok(json!({"content":[{"type":"resource","resource":{
+        "uri":"zeroclaw://public-browser/screenshot.png",
+        "mimeType":"image/png","blob":data
+    }}]}))
 }
 
 #[derive(Deserialize, Debug)]
@@ -351,10 +369,7 @@ impl Browser {
                 let png = self.call(Method::GET, "/screenshot", Value::Null).await?;
                 self.check_current().await?;
                 let data = png.as_str().context("Invalid screenshot")?;
-                if data.len() > 3_000_000 {
-                    bail!("Screenshot exceeds the safe response limit");
-                }
-                Ok(json!({"content":[{"type":"image","data":data,"mimeType":"image/png"}]}))
+                screenshot_result(data)
             }
         }
     }
@@ -473,6 +488,24 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn screenshots_use_embedded_resources_and_keep_the_existing_capture_limit() {
+        for len in [100_000, 3_000_000] {
+            let data = "A".repeat(len);
+            let result = screenshot_result(&data).unwrap();
+            let item = &result["content"][0];
+            assert_eq!(item["type"], "resource");
+            assert!(item.get("data").is_none());
+            assert_eq!(item["resource"]["mimeType"], "image/png");
+            assert_eq!(item["resource"]["blob"], data);
+            assert_eq!(
+                item["resource"]["uri"],
+                "zeroclaw://public-browser/screenshot.png"
+            );
+        }
+        assert!(screenshot_result(&"A".repeat(3_000_001)).is_err());
+    }
+
     #[test]
     fn browse_never_accepts_mutating_actions_or_arbitrary_code() {
         for a in [
