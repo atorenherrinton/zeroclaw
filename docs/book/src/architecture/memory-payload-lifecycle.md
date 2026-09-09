@@ -381,3 +381,20 @@ failed or did not occur. Reconcile effects separately. No full-output resource i
 created: future commands needing complete output should redirect it to a file
 within their permitted workspace and inspect bounded sections. Preview text lives
 in the ordinary tool-result/session lifecycle, not a new persistent output store.
+
+## Web page previews
+
+`web_fetch` bounds successful standard-fetch text and Firecrawl markdown to a
+4 KiB JSON-encoded preview before returning the tool result. Small captured pages
+remain unchanged; large pages retain UTF-8-safe beginning and ending excerpts
+with an explicit incomplete-page notice. JSON responses may become incomplete
+text. Use a more specific page or a browser tool for omitted sections.
+
+The existing network capture limit is separate: zero still means unlimited
+capture, but does not disable the presentation limit. No full-output file is
+created and no request is retried to recover omitted text. GET transport, domain
+policy, DNS pinning, status/error handling and fallback selection remain intact.
+Receipts cover the returned preview; runtime per-result and aggregate source and
+history checks remain authoritative. Large batches or very small configured
+limits can still be rejected. A preview is never evidence that an external effect
+did not occur.

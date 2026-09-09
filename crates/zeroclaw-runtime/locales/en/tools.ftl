@@ -195,3 +195,5 @@ tool-weather = Get current weather conditions and forecast for any location worl
 mcp-read-result-truncated = [Read result truncated; the middle of this response was omitted. Narrow the source query or request a smaller page. This excerpt is not proof that a write did not occur; do not replay writes.]
 
 http-read-result-truncated = [Read response truncated; the middle was omitted. Request a smaller resource or use a Range header if supported. This preview is incomplete, not proof that a write did not occur; do not replay writes.]
+
+web-fetch-result-truncated = [Web page preview incomplete; the middle was omitted. Use a more specific page or a browser tool to inspect the missing section. This preview may not be valid JSON and is not evidence that a write did not occur; do not replay writes.]

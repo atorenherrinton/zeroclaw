@@ -483,6 +483,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_fetch_research_batch_fits_dispatch_and_both_history_formats() {
+        use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
+        use crate::agent::tool_receipts::ReceiptGenerator;
+        use crate::agent::turn::TurnMeta;
+        use crate::observability::NoopObserver;
+        use crate::tools::Tool;
+        use std::sync::Arc;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
+        use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+        let server = MockServer::start().await;
+        let body = format!("START{}END", "\u{0001}😀\"\\".repeat(20_000));
+        Mock::given(matchers::method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(5)
+            .mount(&server)
+            .await;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(
+            zeroclaw_tools::web_fetch::WebFetchTool::new(
+                Arc::new(SecurityPolicy {
+                    autonomy: AutonomyLevel::Supervised,
+                    ..SecurityPolicy::default()
+                }),
+                vec!["127.0.0.1".into()],
+                vec![],
+                1_000_000,
+                5,
+                Default::default(),
+                vec!["127.0.0.1".into()],
+                vec![],
+            )
+            .unwrap(),
+        )];
+        let receipts = ReceiptGenerator::with_key(vec![42; 32]);
+        let mut ordered = Vec::new();
+        for i in 0..5 {
+            let arguments = serde_json::json!({"url": format!("{}/{i}", server.uri())});
+            let id = format!("fetch-fixture-{i}");
+            let outcome = execute_one_tool(
+                "web_fetch",
+                arguments.clone(),
+                Some(&id),
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: Some("fixture-agent"),
+                    turn_id: "fixture-turn",
+                    channel_name: "test",
+                },
+                &NoopObserver,
+                None,
+                Some(&receipts),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.success);
+            assert!(outcome.output.starts_with("START"));
+            assert!(outcome.output.ends_with("END"));
+            assert!(receipts.verify(
+                outcome.receipt.as_deref().unwrap(),
+                "web_fetch",
+                &arguments,
+                &outcome.output
+            ));
+            ordered.push(Some(("web_fetch".into(), Some(id), outcome)));
+        }
+        // The failing research turn combined five page reads and three searches.
+        for i in 0..3 {
+            ordered.push(Some((
+                "web_search_tool".into(),
+                Some(format!("search-{i}")),
+                outcome(
+                    &"Search result title\nhttps://example.com/\nSnippet\n".repeat(60),
+                    true,
+                ),
+            )));
+        }
+        admit_source_results(&mut ordered, 32768).unwrap();
+        let collected = collect_fixture(ordered, 32768).unwrap();
+        assert_eq!(collected.individual_results.len(), 8);
+        for (_, output) in collected.individual_results.iter().take(5) {
+            assert!(output.contains("Web page preview incomplete"));
+            assert!(output.contains("[receipt:"));
+        }
+        for native in [false, true] {
+            let mut history = Vec::new();
+            super::super::history_append::append_tool_round_to_history(
+                &mut history,
+                String::new(),
+                &[],
+                &collected.individual_results,
+                &collected.tool_results,
+                native,
+            );
+            assert!(encoded_size(&history[1..], ROUND_PAYLOAD_BYTES).is_some());
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn http_read_previews_fit_source_and_history_but_write_receipts_remain_intact() {
         use std::sync::Arc;
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers};
