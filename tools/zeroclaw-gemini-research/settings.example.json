@@ -1,0 +1,4 @@
+{
+  "model": "gemini-2.5-flash",
+  "daily_request_limit": 50
+}
