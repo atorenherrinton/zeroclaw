@@ -9,6 +9,62 @@ use zeroclaw_config::policy::SecurityPolicy;
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
 type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
 
+/// Bounds presentation for a native read-only text tool selected explicitly at
+/// registration. This wrapper grants no access and must never wrap mixed/write
+/// tools, binary exports, or media producers. Forward metadata without cloning.
+pub struct ReadPreviewTool<T: Tool> {
+    inner: T,
+}
+
+impl<T: Tool> ReadPreviewTool<T> {
+    pub fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T: Tool> Attributable for ReadPreviewTool<T> {
+    fn role(&self) -> Role {
+        self.inner.role()
+    }
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
+}
+
+#[async_trait]
+impl<T: Tool> Tool for ReadPreviewTool<T> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+    fn output_schema(&self) -> Option<serde_json::Value> {
+        self.inner.output_schema()
+    }
+    fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
+        self.inner.param_domains()
+    }
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+    fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
+        self.inner.spec()
+    }
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.inner
+            .execute(args)
+            .await
+            .map(crate::output_budget::preview_read_result)
+    }
+}
+
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
 pub struct RateLimitedTool<T: Tool> {

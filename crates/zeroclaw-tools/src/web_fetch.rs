@@ -123,7 +123,12 @@ impl WebFetchTool {
     /// Standard fetch and Firecrawl must use the same model-visible allowance.
     fn response_preview(&self, text: &str) -> String {
         let output = self.truncate_response(text);
-        if crate::output_budget::encoded_size(&output, PAGE_PREVIEW_BYTES).is_some() {
+        if crate::output_budget::encoded_size(
+            &output,
+            crate::output_budget::preview_limit(PAGE_PREVIEW_BYTES),
+        )
+        .is_some()
+        {
             return output;
         }
         let marker = format!(

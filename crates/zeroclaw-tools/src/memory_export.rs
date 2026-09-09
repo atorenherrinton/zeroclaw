@@ -77,59 +77,64 @@ impl Tool for MemoryExportTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let namespace = args
-            .get("namespace")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_id = args
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let category = args
-            .get("category")
-            .and_then(|v| v.as_str())
-            .map(|s| match s {
-                "core" => MemoryCategory::Core,
-                "daily" => MemoryCategory::Daily,
-                "conversation" => MemoryCategory::Conversation,
-                other => MemoryCategory::Custom(other.to_string()),
-            });
-        let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
-        let until = args.get("until").and_then(|v| v.as_str()).map(String::from);
+        let result: anyhow::Result<ToolResult> = async {
+            let namespace = args
+                .get("namespace")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let session_id = args
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let category = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(|s| match s {
+                    "core" => MemoryCategory::Core,
+                    "daily" => MemoryCategory::Daily,
+                    "conversation" => MemoryCategory::Conversation,
+                    other => MemoryCategory::Custom(other.to_string()),
+                });
+            let since = args.get("since").and_then(|v| v.as_str()).map(String::from);
+            let until = args.get("until").and_then(|v| v.as_str()).map(String::from);
 
-        let filter = ExportFilter {
-            namespace,
-            session_id,
-            category,
-            since,
-            until,
-        };
+            let filter = ExportFilter {
+                namespace,
+                session_id,
+                category,
+                since,
+                until,
+            };
 
-        match self
-            .memory
-            .list(filter.category.as_ref(), filter.session_id.as_deref())
-            .await
-            .map(|entries| {
-                entries
-                    .into_iter()
-                    .filter(|entry| entry_matches_filter(entry, &filter))
-                    .collect::<Vec<_>>()
-            }) {
-            Ok(entries) => {
-                let json_output = serde_json::to_string(&entries)
-                    .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {e}\"}}"));
-                Ok(ToolResult {
-                    success: true,
-                    output: json_output.into(),
-                    error: None,
-                })
+            match self
+                .memory
+                .list(filter.category.as_ref(), filter.session_id.as_deref())
+                .await
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .filter(|entry| entry_matches_filter(entry, &filter))
+                        .collect::<Vec<_>>()
+                }) {
+                Ok(entries) => {
+                    let json_output = serde_json::to_string(&entries).unwrap_or_else(|e| {
+                        format!("{{\"error\": \"serialization failed: {e}\"}}")
+                    });
+                    Ok(ToolResult {
+                        success: true,
+                        output: json_output.into(),
+                        error: None,
+                    })
+                }
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Export failed: {e}")),
+                }),
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("Export failed: {e}")),
-            }),
         }
+        .await;
+        Ok(crate::output_budget::exact_read_result(result?))
     }
 }
 

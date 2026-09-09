@@ -346,11 +346,21 @@ pub fn default_tools_with_runtime(
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                zeroclaw_tools::wrappers::ReadPreviewTool::new(GlobSearchTool::new(
+                    security.clone(),
+                )),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                zeroclaw_tools::wrappers::ReadPreviewTool::new(ContentSearchTool::new(
+                    security.clone(),
+                )),
+                security.clone(),
+            ),
             security,
         )),
     ]
@@ -898,11 +908,21 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                zeroclaw_tools::wrappers::ReadPreviewTool::new(GlobSearchTool::new(
+                    security.clone(),
+                )),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                zeroclaw_tools::wrappers::ReadPreviewTool::new(ContentSearchTool::new(
+                    security.clone(),
+                )),
+                security.clone(),
+            ),
             security.clone(),
         )),
         Arc::new(CronAddTool::new_with_runtime(
@@ -911,7 +931,9 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronListTool::new(config.clone(), agent_alias)),
+        Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            CronListTool::new(config.clone(), agent_alias),
+        )),
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
@@ -929,7 +951,9 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
+        Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            CronRunsTool::new(config.clone(), agent_alias),
+        )),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
@@ -964,7 +988,9 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
-        Arc::new(WeatherTool::new()),
+        Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            WeatherTool::new(),
+        )),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
         Arc::new(TodoWriteTool::new()),
     ];
@@ -983,7 +1009,9 @@ pub fn all_tools_with_runtime(
     if root_config.channels.discord.values().any(|d| d.archive) {
         match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
             Ok(discord_mem) => {
-                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
+                tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+                    DiscordSearchTool::new(Arc::new(discord_mem)),
+                )));
             }
             Err(e) => {
                 ::zeroclaw_log::record!(
@@ -1019,13 +1047,11 @@ pub fn all_tools_with_runtime(
                 None
             };
             let configs = Arc::new(email_configs);
-            tool_arcs.push(Arc::new(EmailSearchTool::new(
-                Arc::clone(&configs),
-                auth_service.clone(),
+            tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+                EmailSearchTool::new(Arc::clone(&configs), auth_service.clone()),
             )));
-            tool_arcs.push(Arc::new(EmailReadTool::new(
-                Arc::clone(&configs),
-                auth_service,
+            tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+                EmailReadTool::new(Arc::clone(&configs), auth_service),
             )));
         }
     }
@@ -1220,7 +1246,7 @@ pub fn all_tools_with_runtime(
         // against the default DuckDuckGo scrape path, which gets the machine
         // blocked.
         tool_arcs.push(Arc::new(RateLimitedTool::new(
-            WebSearchTool::new_with_config(
+            zeroclaw_tools::wrappers::ReadPreviewTool::new(WebSearchTool::new_with_config(
                 root_config.web_search.search_provider.clone(),
                 root_config.web_search.brave_api_key.clone(),
                 root_config.web_search.tavily_api_key.clone(),
@@ -1230,7 +1256,7 @@ pub fn all_tools_with_runtime(
                 root_config.web_search.timeout_secs,
                 root_config.config_path.clone(),
                 root_config.secrets.encrypt,
-            ),
+            )),
             security.clone(),
         )));
     }
@@ -1309,9 +1335,11 @@ pub fn all_tools_with_runtime(
 
     // Project delivery intelligence
     if root_config.project_intel.enabled {
-        tool_arcs.push(Arc::new(ProjectIntelTool::new(
-            root_config.project_intel.default_language.clone(),
-            root_config.project_intel.risk_sensitivity.clone(),
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            ProjectIntelTool::new(
+                root_config.project_intel.default_language.clone(),
+                root_config.project_intel.risk_sensitivity.clone(),
+            ),
         )));
         // Report template tool — direct access to template engine
         tool_arcs.push(Arc::new(ReportTemplateTool::new()));
@@ -1454,8 +1482,12 @@ pub fn all_tools_with_runtime(
     if let Ok(backend) =
         zeroclaw_infra::make_session_backend(&config.data_dir, &config.channels.session_backend)
     {
-        tool_arcs.push(Arc::new(SessionsCurrentTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            SessionsCurrentTool::new(backend.clone()),
+        )));
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            SessionsListTool::new(backend.clone()),
+        )));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),
             security.clone(),
@@ -1546,7 +1578,9 @@ pub fn all_tools_with_runtime(
 
     // SOP tools (registered when engine handle is provided)
     if let Some(ref sop_engine) = sop_engine {
-        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(sop_engine))));
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
+            SopListTool::new(Arc::clone(sop_engine)),
+        )));
         if let Some(ref sop_audit) = sop_audit {
             tool_arcs.push(Arc::new(
                 SopExecuteTool::new(Arc::clone(sop_engine)).with_audit(Arc::clone(sop_audit)),
@@ -1566,10 +1600,10 @@ pub fn all_tools_with_runtime(
                 SopApproveTool::new(Arc::clone(sop_engine)).with_agent_alias(agent_alias),
             ));
         }
-        tool_arcs.push(Arc::new(
+        tool_arcs.push(Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
             SopStatusTool::new(Arc::clone(sop_engine))
                 .with_collector(crate::sop::SopMetricsCollector::shared()),
-        ));
+        )));
         if root_config.sop.procedural_memory_enabled {
             tool_arcs.push(Arc::new(SopWorkshopTool::new(
                 Arc::clone(sop_engine),
@@ -3923,6 +3957,46 @@ permissions = ["http_client"]
             !run_keys.is_empty(),
             "registered sop_execute must persist a sop_run_* audit entry; got none (audit not wired)"
         );
+    }
+
+    #[tokio::test]
+    async fn registered_search_tools_bound_encoded_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..180 {
+            std::fs::write(
+                tmp.path()
+                    .join(format!("long-file-name-{i:03}-{}.txt", "x".repeat(60))),
+                "needle 😀 \\\"\n".repeat(100),
+            )
+            .unwrap();
+        }
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+        for (name, args) in [
+            ("glob_search", serde_json::json!({"pattern":"*.txt"})),
+            (
+                "content_search",
+                serde_json::json!({"pattern":"needle","path":".","output_mode":"content","max_results":1000}),
+            ),
+        ] {
+            let result = tools
+                .iter()
+                .find(|tool| tool.name() == name)
+                .unwrap()
+                .execute(args)
+                .await
+                .unwrap();
+            assert!(result.success, "{name}: {:?}", result.error);
+            assert!(result.output.contains("Read preview incomplete"), "{name}");
+            assert!(
+                zeroclaw_tools::output_budget::encoded_size(result.output.as_str(), 4096).is_some(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

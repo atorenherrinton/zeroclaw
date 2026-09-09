@@ -398,3 +398,51 @@ Receipts cover the returned preview; runtime per-result and aggregate source and
 history checks remain authoritative. Large batches or very small configured
 limits can still be rejected. A preview is never evidence that an external effect
 did not occur.
+
+## Git inspection previews
+
+Successful `git_operations` status, diff, log, and branch reads use the shared
+4 KiB JSON-encoded text preview formatter before dispatcher receipts and history
+admission. Small results retain their existing JSON representation. Oversized
+results retain beginning and ending excerpts with an explicit incomplete-preview
+notice; they may not be valid JSON or a complete review. Use `files` to narrow a
+diff, `limit` to reduce a log, or `file_read` line ranges to inspect source details.
+No automatic follow-up, replay, or full-output resource is created. Git's process
+capture is unchanged, and the canonical runtime per-result and round limits still
+apply. Very large batches or unusually small configured limits can still fail.
+
+Only the four read-only operations enter this presentation path. Failed results,
+write operations, and mixed operations such as stash and worktree retain their
+existing evidence. Files, configuration, security policy, and execution receipts
+remain owned by their existing boundaries.
+
+
+## Shared read presentation and batch reservations
+
+The native registry explicitly wraps text-only searches and listings with
+`ReadPreviewTool`: glob/content search, cron jobs/runs, weather, email,
+Discord search, project analysis, current/listed sessions, SOP lists/status,
+and web search. The wrapper forwards metadata and preserves structured data,
+failures, access checks, and execution count. It never classifies a tool by name
+or wraps generic writes, media producers, or binary exports.
+
+File text, skill text, tool-discovery text, memory recall, and rendered MCP
+resource/prompt summaries use the same preview formatter at their source.
+Memory recall records promotion evidence only when its complete result fits.
+Large exact base64, memory-export JSON, and LLM-task JSON return a recoverable
+read failure with no partial data. Small exact results remain intact. Coding
+CLI stdout and stderr have their own source-side previews retaining exit status
+and an explicit warning that the command already ran; they are not replayed.
+
+The current turn's configured result limit and call count derive an ephemeral
+preview allowance around both sequential and parallel execution. Nested turns
+get their own scope, which restores its parent on completion. Existing MCP read,
+web-fetch, HTTP-read, and shell preview writers honor that allowance. It is a
+conservative presentation reservation, not a replacement for exact source and
+native/prompt history admission. No config fields or persistent state are added.
+
+The strict admission checks still reject oversized unannotated connector/write
+results, typed payloads, excessive envelopes or batches, and unusably small
+configured limits. Those results cannot safely be declared complete by arbitrary
+truncation. Rejections log tool names, byte counts, and the rejected phase without
+logging result content, so remaining failures can be diagnosed at their owner.

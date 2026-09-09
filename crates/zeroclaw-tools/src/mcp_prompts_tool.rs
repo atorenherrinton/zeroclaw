@@ -21,7 +21,7 @@ impl McpPromptsTool {
     fn ok(output: String) -> ToolResult {
         ToolResult {
             success: true,
-            output: output.into(),
+            output: crate::output_budget::read_text_preview(output).into(),
             error: None,
         }
     }

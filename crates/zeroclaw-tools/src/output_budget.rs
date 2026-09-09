@@ -6,10 +6,42 @@ pub const MAX_BATCH_CALLS: usize = 128;
 
 pub use zeroclaw_api::serialization::encoded_size;
 
+tokio::task_local! {
+    // Derived from the current execution round, never cached across turns.
+    static ROUND_PREVIEW_LIMIT: usize;
+}
+
+/// Reserve space for source mirrors, native JSON escaping, receipts, and errors.
+/// The canonical runtime admission checks remain authoritative; this is only a
+/// presentation allowance for tools that already opt into previewing.
+pub async fn with_round_preview_budget<F: std::future::Future>(
+    configured_limit: usize,
+    calls: usize,
+    future: F,
+) -> F::Output {
+    let configured = if configured_limit == 0 {
+        32768
+    } else {
+        configured_limit
+    };
+    let share = configured.min(ROUND_PAYLOAD_BYTES / calls.max(1));
+    let limit = share.saturating_sub(1024) / 8;
+    ROUND_PREVIEW_LIMIT
+        .scope(limit.clamp(384, READ_PREVIEW_BYTES), future)
+        .await
+}
+
+pub fn preview_limit(max_bytes: usize) -> usize {
+    ROUND_PREVIEW_LIMIT
+        .try_with(|limit| max_bytes.min(*limit))
+        .unwrap_or(max_bytes)
+}
+
 /// Format a preview at its tool boundary, before display and structured
 /// mirrors are constructed. The caller supplies the localized omission notice.
 /// This does not admit the result to history or establish external-effect safety.
 pub fn bounded_text_preview(output: String, max_bytes: usize, marker: &str) -> String {
+    let max_bytes = preview_limit(max_bytes);
     if encoded_size(&output, max_bytes).is_some() {
         return output;
     }
@@ -33,6 +65,48 @@ pub fn bounded_text_preview(output: String, max_bytes: usize, marker: &str) -> S
         }
     }
     excerpt(low)
+}
+
+/// Presentation allowance for text-only reads. Runtime admission still owns
+/// complete source/history envelopes and the aggregate batch ceiling.
+pub const READ_PREVIEW_BYTES: usize = 4096;
+
+pub fn read_text_preview(output: String) -> String {
+    if encoded_size(&output, preview_limit(READ_PREVIEW_BYTES)).is_some() {
+        return output;
+    }
+    let marker = format!(
+        "\n\n{}\n\n",
+        crate::i18n::get_required_tool_string("read-result-truncated")
+    );
+    bounded_text_preview(output, READ_PREVIEW_BYTES, &marker)
+}
+
+/// Only callers that own a read-only, text presentation contract may use this.
+/// Preserve typed data and failures; never erase a machine-readable payload or
+/// infer that an unknown/mixed operation is safe from its tool name.
+pub fn preview_read_result(
+    mut result: zeroclaw_api::tool::ToolResult,
+) -> zeroclaw_api::tool::ToolResult {
+    if result.success && result.output.data().is_none() {
+        result.output = read_text_preview(result.output.into_string()).into();
+    }
+    result
+}
+
+/// Exact encodings cannot be previewed: return a small, recoverable read
+/// failure rather than partial bytes/JSON falsely labelled as a successful read.
+pub fn exact_read_result(result: zeroclaw_api::tool::ToolResult) -> zeroclaw_api::tool::ToolResult {
+    if encoded_size(&result, preview_limit(16 * 1024)).is_none() {
+        return zeroclaw_api::tool::ToolResult {
+            success: false,
+            output: Default::default(),
+            error: Some(crate::i18n::get_required_tool_string(
+                "exact-read-result-too-large",
+            )),
+        };
+    }
+    result
 }
 
 pub fn per_result_budget(configured: usize, calls: usize) -> usize {
@@ -123,6 +197,49 @@ fn bounded_excerpt(output: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preview_preserves_typed_results_and_exact_reads_fail_without_partial_data() {
+        use zeroclaw_api::tool::{ToolOutput, ToolResult};
+        let typed = ToolResult {
+            success: true,
+            output: ToolOutput::json(serde_json::json!({"body":"x".repeat(30_000)})),
+            error: None,
+        };
+        let original = serde_json::to_vec(&typed).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&preview_read_result(typed)).unwrap(),
+            original
+        );
+        for success in [true, false] {
+            let exact = exact_read_result(ToolResult {
+                success,
+                output: "x".repeat(30_000).into(),
+                error: Some("details".into()),
+            });
+            assert!(!exact.success);
+            assert!(exact.output.is_empty());
+            assert!(exact.error.unwrap().contains("No partial binary or JSON"));
+        }
+    }
+
+    #[tokio::test]
+    async fn round_budget_is_isolated_and_nested_scope_restores_parent() {
+        assert_eq!(preview_limit(4096), 4096);
+        with_round_preview_budget(32768, 16, async {
+            let outer = preview_limit(4096);
+            assert!(outer < 4096);
+            with_round_preview_budget(32768, 1, async {
+                assert!(preview_limit(4096) > outer);
+            })
+            .await;
+            assert_eq!(preview_limit(4096), outer);
+            let preview = read_text_preview("\\\"😀".repeat(50_000));
+            assert!(encoded_size(&preview, outer).is_some());
+        })
+        .await;
+        assert_eq!(preview_limit(4096), 4096);
+    }
+
     #[test]
     fn text_preview_preserves_small_output_and_warns_without_splitting_unicode() {
         let small = "\0😀\"\\".repeat(20);

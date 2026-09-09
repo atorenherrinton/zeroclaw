@@ -89,113 +89,117 @@ impl Tool for LlmTaskTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Security gate
-        if let Err(error) = self
-            .security
-            .enforce_tool_operation(ToolOperation::Act, "llm_task")
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(error),
-            });
-        }
-
-        // Extract required prompt
-        let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
-            Some(p) if !p.trim().is_empty() => p,
-            _ => {
+        let result: anyhow::Result<ToolResult> = async {
+            // Security gate
+            if let Err(error) = self
+                .security
+                .enforce_tool_operation(ToolOperation::Act, "llm_task")
+            {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
-                    error: Some("Missing or empty required parameter: prompt".to_string()),
+                    error: Some(error),
                 });
             }
-        };
 
-        // Extract optional overrides
-        let schema = args.get("schema").and_then(|v| v.as_object());
-        let model = args
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_model);
-        let temperature = args
-            .get("temperature")
-            .and_then(|v| v.as_f64())
-            .or(self.default_temperature);
-
-        // Build the effective prompt, adding JSON schema instructions when needed
-        let effective_prompt = if let Some(schema_obj) = schema {
-            let schema_json =
-                serde_json::to_string_pretty(&serde_json::Value::Object(schema_obj.clone()))
-                    .unwrap_or_else(|_| "{}".to_string());
-            format!(
-                "{prompt}\n\n\
-                 IMPORTANT: You MUST respond with valid JSON that conforms to this schema:\n\
-                 ```json\n{schema_json}\n```\n\
-                 Respond ONLY with the JSON object, no explanation or markdown."
-            )
-        } else {
-            prompt.to_string()
-        };
-
-        // Create model_provider
-        let api_key_ref = self.api_key.as_deref();
-        let model_provider: Box<dyn ModelProvider> =
-            match zeroclaw_providers::create_model_provider_with_options(
-                &self.default_model_provider,
-                api_key_ref,
-                &self.provider_runtime_options,
-            ) {
-                Ok(p) => p,
-                Err(e) => {
+            // Extract required prompt
+            let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+                Some(p) if !p.trim().is_empty() => p,
+                _ => {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(format!("Failed to create model_provider: {e}")),
+                        error: Some("Missing or empty required parameter: prompt".to_string()),
                     });
                 }
             };
 
-        // Make the LLM call (no tools, no agent loop). `temperature` is
-        // already Option<f64>; pass straight through. None omits the field
-        // on the wire so the provider applies its own default.
-        let response = match ProviderDispatch::from_ref(&*model_provider)
-            .simple_chat(&effective_prompt, model, temperature)
-            .await
-        {
-            Ok(text) => text,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!("LLM call failed: {e}")),
-                });
-            }
-        };
+            // Extract optional overrides
+            let schema = args.get("schema").and_then(|v| v.as_object());
+            let model = args
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&self.default_model);
+            let temperature = args
+                .get("temperature")
+                .and_then(|v| v.as_f64())
+                .or(self.default_temperature);
 
-        // If schema was provided, validate the response
-        if let Some(schema_obj) = schema {
-            let schema_value = serde_json::Value::Object(schema_obj.clone());
-            match validate_json_response(&response, &schema_value) {
-                Ok(validated_json) => Ok(ToolResult {
+            // Build the effective prompt, adding JSON schema instructions when needed
+            let effective_prompt = if let Some(schema_obj) = schema {
+                let schema_json =
+                    serde_json::to_string_pretty(&serde_json::Value::Object(schema_obj.clone()))
+                        .unwrap_or_else(|_| "{}".to_string());
+                format!(
+                    "{prompt}\n\n\
+                     IMPORTANT: You MUST respond with valid JSON that conforms to this schema:\n\
+                     ```json\n{schema_json}\n```\n\
+                     Respond ONLY with the JSON object, no explanation or markdown."
+                )
+            } else {
+                prompt.to_string()
+            };
+
+            // Create model_provider
+            let api_key_ref = self.api_key.as_deref();
+            let model_provider: Box<dyn ModelProvider> =
+                match zeroclaw_providers::create_model_provider_with_options(
+                    &self.default_model_provider,
+                    api_key_ref,
+                    &self.provider_runtime_options,
+                ) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: ToolOutput::default(),
+                            error: Some(format!("Failed to create model_provider: {e}")),
+                        });
+                    }
+                };
+
+            // Make the LLM call (no tools, no agent loop). `temperature` is
+            // already Option<f64>; pass straight through. None omits the field
+            // on the wire so the provider applies its own default.
+            let response = match ProviderDispatch::from_ref(&*model_provider)
+                .simple_chat(&effective_prompt, model, temperature)
+                .await
+            {
+                Ok(text) => text,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("LLM call failed: {e}")),
+                    });
+                }
+            };
+
+            // If schema was provided, validate the response
+            if let Some(schema_obj) = schema {
+                let schema_value = serde_json::Value::Object(schema_obj.clone());
+                match validate_json_response(&response, &schema_value) {
+                    Ok(validated_json) => Ok(ToolResult {
+                        success: true,
+                        output: validated_json.into(),
+                        error: None,
+                    }),
+                    Err(validation_error) => Ok(ToolResult {
+                        success: false,
+                        output: response.into(),
+                        error: Some(format!("Schema validation failed: {validation_error}")),
+                    }),
+                }
+            } else {
+                Ok(ToolResult {
                     success: true,
-                    output: validated_json.into(),
-                    error: None,
-                }),
-                Err(validation_error) => Ok(ToolResult {
-                    success: false,
                     output: response.into(),
-                    error: Some(format!("Schema validation failed: {validation_error}")),
-                }),
+                    error: None,
+                })
             }
-        } else {
-            Ok(ToolResult {
-                success: true,
-                output: response.into(),
-                error: None,
-            })
         }
+        .await;
+        Ok(crate::output_budget::exact_read_result(result?))
     }
 }
 

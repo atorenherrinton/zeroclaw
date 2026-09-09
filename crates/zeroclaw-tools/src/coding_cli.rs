@@ -40,6 +40,16 @@ const SAFE_ENV_VARS: &[&str] = &[
     "USERNAME",
 ];
 
+/// A completed CLI may have changed files even when its display is too large.
+/// Bound stdout/stderr separately while preserving exit status at the caller.
+pub(crate) fn output_preview(output: String) -> String {
+    let marker = format!(
+        "\n\n{}\n\n",
+        crate::i18n::get_required_tool_string("coding-cli-result-truncated")
+    );
+    crate::output_budget::bounded_text_preview(output, 2048, &marker)
+}
+
 #[derive(Debug, Clone)]
 pub struct CodingCliCommand {
     pub program: OsString,

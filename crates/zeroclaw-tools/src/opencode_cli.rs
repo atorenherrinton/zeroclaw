@@ -172,11 +172,11 @@ impl Tool for OpenCodeCliTool {
 
                 Ok(ToolResult {
                     success: output.status.success(),
-                    output: stdout.into(),
+                    output: crate::coding_cli::output_preview(stdout).into(),
                     error: if stderr.is_empty() {
                         None
                     } else {
-                        Some(stderr)
+                        Some(crate::coding_cli::output_preview(stderr))
                     },
                 })
             }

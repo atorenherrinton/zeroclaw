@@ -574,7 +574,12 @@ async fn drain_capped_into<R>(
 }
 
 fn shell_stream_preview(output: String) -> String {
-    if zeroclaw_tools::output_budget::encoded_size(&output, MAX_STREAM_PREVIEW_BYTES).is_some() {
+    if zeroclaw_tools::output_budget::encoded_size(
+        &output,
+        zeroclaw_tools::output_budget::preview_limit(MAX_STREAM_PREVIEW_BYTES),
+    )
+    .is_some()
+    {
         return output;
     }
     let notice = crate::i18n::get_required_cli_string("shell-output-preview-truncated");

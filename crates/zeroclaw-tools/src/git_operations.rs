@@ -233,7 +233,7 @@ impl GitOperationsTool {
         working_dir: &std::path::Path,
     ) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["status", "--porcelain=2", "--branch"], working_dir)
+            .run_git_command(&["status", "--porcelain=2", "--branch", "-z"], working_dir)
             .await?;
 
         // Parse git status output into structured format
@@ -243,26 +243,41 @@ impl GitOperationsTool {
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
 
-        for line in output.lines() {
-            if line.starts_with("# branch.head ") {
-                branch = line.trim_start_matches("# branch.head ").to_string();
-            } else if let Some(rest) = line.strip_prefix("1 ") {
-                // Ordinary changed entry
-                let mut parts = rest.splitn(3, ' ');
-                if let (Some(staging), Some(path)) = (parts.next(), parts.next())
-                    && !staging.is_empty()
-                {
-                    let status_char = staging.chars().next().unwrap_or(' ');
-                    if status_char != '.' && status_char != ' ' {
-                        staged.push(json!({"path": path, "status": status_char}));
-                    }
-                    let status_char = staging.chars().nth(1).unwrap_or(' ');
-                    if status_char != '.' && status_char != ' ' {
-                        unstaged.push(json!({"path": path, "status": status_char}));
-                    }
+        // NUL delimiters preserve spaces, newlines, and non-ASCII filenames.
+        // Porcelain v2 has fixed metadata fields before the final path field.
+        let mut records = output.split('\0');
+        while let Some(line) = records.next() {
+            if let Some(head) = line.strip_prefix("# branch.head ") {
+                branch = head.to_string();
+                continue;
+            }
+            if let Some(path) = line.strip_prefix("? ") {
+                untracked.push(path.to_string());
+                continue;
+            }
+            let field_count = match line.as_bytes().first() {
+                Some(b'1') => 9,
+                Some(b'2') => 10,
+                Some(b'u') => 11,
+                _ => continue,
+            };
+            let fields: Vec<_> = line.splitn(field_count, ' ').collect();
+            if fields.len() != field_count {
+                anyhow::bail!("Malformed git status record");
+            }
+            if fields[0] == "2" {
+                // Rename/copy records carry the original path in the next record.
+                if records.next().is_none() {
+                    anyhow::bail!("Missing original git status path");
                 }
-            } else if let Some(rest) = line.strip_prefix("? ") {
-                untracked.push(rest.to_string());
+            }
+            let path = fields[field_count - 1];
+            let mut status = fields[1].chars();
+            if let Some(x) = status.next().filter(|c| *c != '.' && *c != ' ') {
+                staged.push(json!({"path": path, "status": x}));
+            }
+            if let Some(y) = status.next().filter(|c| *c != '.' && *c != ' ') {
+                unstaged.push(json!({"path": path, "status": y}));
             }
         }
 
@@ -865,7 +880,7 @@ impl Tool for GitOperationsTool {
     }
 
     fn description(&self) -> &str {
-        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output and integrates with security policy for autonomy controls."
+        "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, worktree). Provides parsed JSON output; large status/diff/log/branch reads return marked incomplete previews that may not be valid JSON. Narrow diffs with files or inspect source with file_read offset/limit. Integrates with security policy for autonomy controls."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -1032,8 +1047,10 @@ impl Tool for GitOperationsTool {
             });
         }
 
-        // Execute the requested operation
-        match operation {
+        // Only these operations are read-only by construction. Mixed operations
+        // such as stash/worktree keep their complete execution evidence.
+        let preview_read = matches!(operation, "status" | "diff" | "log" | "branch");
+        let mut result = match operation {
             "status" => self.git_status(args, &working_dir).await,
             "diff" => self.git_diff(args, &working_dir).await,
             "log" => self.git_log(args, &working_dir).await,
@@ -1048,7 +1065,17 @@ impl Tool for GitOperationsTool {
                 output: ToolOutput::default(),
                 error: Some(format!("Unknown operation: {operation}")),
             }),
+        }?;
+        if preview_read && result.success {
+            let output = result.output.into_string();
+            let marker = format!(
+                "\n\n{}\n\n",
+                crate::i18n::get_required_tool_string("git-read-result-truncated")
+            );
+            result.output =
+                crate::output_budget::bounded_text_preview(output, 4096, &marker).into();
         }
+        Ok(result)
     }
 }
 
@@ -1100,6 +1127,98 @@ mod tests {
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())
+    }
+
+    fn fixture_git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn status_preserves_real_paths_for_modified_renamed_and_untracked_files() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        for name in ["modified space.txt", "old.txt"] {
+            std::fs::write(tmp.path().join(name), "original\n").unwrap();
+        }
+        fixture_git(tmp.path(), &["add", "."]);
+        fixture_git(tmp.path(), &["commit", "--quiet", "-m", "fixture"]);
+        let renamed = "new \"name\" 😀\nfile.txt";
+        fixture_git(tmp.path(), &["mv", "old.txt", renamed]);
+        std::fs::write(tmp.path().join("modified space.txt"), "changed\n").unwrap();
+        std::fs::write(tmp.path().join("untracked\n😀.txt"), "new\n").unwrap();
+        let result = test_tool(tmp.path())
+            .execute(json!({"operation":"status"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(value["staged"], json!([{"path":renamed,"status":"R"}]));
+        assert_eq!(
+            value["unstaged"],
+            json!([{"path":"modified space.txt","status":"M"}])
+        );
+        assert_eq!(value["untracked"], json!(["untracked\n😀.txt"]));
+        assert_eq!(value["clean"], false);
+    }
+
+    #[tokio::test]
+    async fn status_reports_conflicted_paths_instead_of_clean() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        fixture_git(tmp.path(), &["checkout", "-b", "fixture-base"]);
+        std::fs::write(tmp.path().join("conflict.txt"), "base\n").unwrap();
+        fixture_git(tmp.path(), &["add", "."]);
+        fixture_git(tmp.path(), &["commit", "--quiet", "-m", "base"]);
+        fixture_git(tmp.path(), &["checkout", "-b", "fixture-side"]);
+        std::fs::write(tmp.path().join("conflict.txt"), "side\n").unwrap();
+        fixture_git(tmp.path(), &["commit", "-am", "side"]);
+        fixture_git(tmp.path(), &["checkout", "fixture-base"]);
+        std::fs::write(tmp.path().join("conflict.txt"), "other\n").unwrap();
+        fixture_git(tmp.path(), &["commit", "-am", "other"]);
+        let merge = std::process::Command::new("git")
+            .args(["merge", "fixture-side"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(!merge.status.success());
+        let result = test_tool(tmp.path())
+            .execute(json!({"operation":"status"}))
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            value["staged"],
+            json!([{"path":"conflict.txt","status":"U"}])
+        );
+        assert_eq!(value["unstaged"], value["staged"]);
+        assert_eq!(value["clean"], false);
+    }
+
+    #[tokio::test]
+    async fn read_preview_preserves_small_json_and_marks_large_diffs() {
+        let tmp = TempDir::new().unwrap();
+        git_init_no_sign(tmp.path(), &[]);
+        std::fs::write(tmp.path().join("file.txt"), "old\n").unwrap();
+        fixture_git(tmp.path(), &["add", "."]);
+        fixture_git(tmp.path(), &["commit", "--quiet", "-m", "fixture"]);
+        let tool = test_tool(tmp.path());
+        let small = tool.execute(json!({"operation":"diff"})).await.unwrap();
+        assert_eq!(
+            small.output.as_str(),
+            "{\n  \"file_count\": 0,\n  \"hunks\": []\n}"
+        );
+        std::fs::write(tmp.path().join("file.txt"), "😀 \" \\ \t\n".repeat(10000)).unwrap();
+        let large = tool.execute(json!({"operation":"diff"})).await.unwrap();
+        assert!(large.success);
+        assert!(crate::output_budget::encoded_size(large.output.as_str(), 4096).is_some());
+        assert!(large.output.contains("Git read preview incomplete"));
+        assert!(large.output.contains("file_count"));
+        assert!(large.output.ends_with("\n}"));
     }
 
     #[test]

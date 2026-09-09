@@ -1258,7 +1258,9 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         .await?;
 
         let live_sop_queue = crate::sop::executor::new_live_action_queue();
-        let executed_slots =
+        let executed_slots = zeroclaw_tools::output_budget::with_round_preview_budget(
+            max_tool_result_chars,
+            tool_calls.len(),
             crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
                 if allow_parallel_execution && executable_calls.len() > 1 {
                     let meta = ctx.meta();
@@ -1297,8 +1299,9 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                     .await
                 }
-            })
-            .await;
+            }),
+        )
+        .await;
         let stopped_mid_batch = executed_slots
             .iter()
             .any(|slot| !matches!(slot, ToolExecutionSlot::Completed(_)));
