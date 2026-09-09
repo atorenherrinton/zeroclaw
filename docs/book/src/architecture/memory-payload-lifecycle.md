@@ -451,3 +451,16 @@ Session-history pagination derives its encoded page ceiling from the same scoped
 allowance, preserving valid JSON, cursors, and unchanged stored rows. Report
 templates use the exact-read failure path when a complete rendering cannot fit.
 Optional cloud analysis and pattern listings use the native read-preview wrapper.
+## MCP standalone screenshots
+
+MCP image blocks are materialized through the same content-addressed workspace
+attachment writer as embedded resource blobs, including results with no resource
+block. The model receives an image marker instead of base64 text. Resource blobs,
+images, and audio share the existing aggregate byte and item preflight limits;
+unsupported image formats and inline audio receive explicit unavailable markers.
+Non-binary fields, source status, and operation metadata remain intact. The
+runtime's encoded source and history budgets remain authoritative.
+
+Images live in the executing agent's workspace `uploads/` directory under its
+existing filesystem policy and retention lifecycle, just like resource blobs.
+There is no new storage service, automatic deletion policy, replay, or memory row.

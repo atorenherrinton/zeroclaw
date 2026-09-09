@@ -333,16 +333,23 @@ pub(crate) fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
             .is_some()
 }
 
+/// Borrow the canonical binary field of a supported MCP content block.
+fn content_item_binary(item: &serde_json::Value) -> Option<&str> {
+    match item.get("type").and_then(serde_json::Value::as_str)? {
+        "resource" if content_item_has_resource_blob(item) => {
+            item.get("resource")?.get("blob")?.as_str()
+        }
+        "image" | "audio" => item.get("data")?.as_str(),
+        _ => None,
+    }
+}
+
 /// Format an MCP `tools/call` result for the model.
 ///
-/// When `content` contains any `type: "resource"` item with `blob`, materialize
-/// each blob under `{workspace}/uploads/` and return the full result as JSON with
-/// only the binary payloads redacted: a resource `blob` is replaced by a
-/// Document/IMAGE `materialized` marker, and image/audio `data` by a concise
-/// marker — never raw base64. Every non-binary field (text, `resource_link`,
-/// unknown content types, per-item `annotations`, and top-level
-/// `structuredContent`/`_meta`/`isError`) is preserved verbatim. Results without a
-/// resource blob keep the existing pretty-printed JSON shape.
+/// Resource blobs and standalone images use the existing workspace attachment
+/// writer; audio payloads become an explicit unavailable marker. All binary
+/// blocks share the preflight byte/item limits, including image-only responses.
+/// Non-binary metadata and execution evidence remain unchanged. No tool is replayed.
 ///
 /// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
 /// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
@@ -361,13 +368,9 @@ pub(crate) fn format_mcp_tool_result_for_model(
         match result.get("content").and_then(|c| c.as_array()) {
             Some(content) => content
                 .iter()
-                .filter(|i| content_item_has_resource_blob(i))
+                .filter(|i| content_item_binary(i).is_some())
                 .fold((0usize, 0u64), |(count, bytes), item| {
-                    let blob = item
-                        .get("resource")
-                        .and_then(|r| r.get("blob"))
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("");
+                    let blob = content_item_binary(item).unwrap_or("");
                     (
                         count + 1,
                         bytes.saturating_add(estimated_decoded_blob_len(blob)),
@@ -456,11 +459,35 @@ pub(crate) fn format_mcp_tool_result_for_model(
                     .unwrap_or("application/octet-stream")
                     .to_string();
                 if let Some(obj) = item.as_object_mut()
-                    && obj.remove("data").is_some()
+                    && let Some(data) = obj.remove("data")
                 {
+                    let marker = if let Some(marker) = over_budget_marker {
+                        marker.to_string()
+                    } else if typ == "image" {
+                        // Fixed names avoid treating server metadata as a path.
+                        let filename = match mime.as_str() {
+                            "image/png" => Some("image.png"),
+                            "image/jpeg" => Some("image.jpg"),
+                            "image/gif" => Some("image.gif"),
+                            "image/webp" => Some("image.webp"),
+                            _ => None,
+                        };
+                        match (filename, data.as_str()) {
+                            (Some(filename), Some(blob)) => {
+                                match materialize_resource_blob(workspace_dir, Some(filename), Some(&mime), blob) {
+                                    Ok(resource) => resource.marker,
+                                    Err(e) => format!("[attachment unavailable: {e}]"),
+                                }
+                            }
+                            _ => "[image attachment unavailable: unsupported MIME type or invalid data]".to_string(),
+                        }
+                    } else {
+                        "[audio attachment unavailable: inline audio is not materialized]"
+                            .to_string()
+                    };
                     obj.insert(
                         "materialized".to_string(),
-                        serde_json::Value::String(format!("[{typ} attachment: {mime}]")),
+                        serde_json::Value::String(marker),
                     );
                 }
             }
@@ -905,11 +932,78 @@ mod tests {
             ]
         });
         let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
-        assert!(out.contains("[image attachment: image/png]"));
+        assert!(out.contains("[IMAGE:"));
         assert!(
             !out.contains(&img_b64),
             "raw image base64 must not reach the model: {out}"
         );
+    }
+
+    #[test]
+    fn standalone_image_is_materialized_and_fits_encoded_history() {
+        let dir = tempdir().unwrap();
+        let bytes = vec![42u8; 112_000];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = json!({"content": [
+            {"type":"text", "text":"Screenshot captured; prior action completed"},
+            {"type":"image", "data":b64, "mimeType":"image/png", "_meta":{"detail":"original"}}
+        ], "structuredContent":{"status":"completed", "operation_id":"fixture"}, "isError":false});
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed["content"][1].get("data").is_none());
+        assert_eq!(parsed["content"][1]["_meta"]["detail"], "original");
+        assert_eq!(parsed["structuredContent"]["operation_id"], "fixture");
+        assert_eq!(parsed["isError"], false);
+        let marker = parsed["content"][1]["materialized"].as_str().unwrap();
+        let path = marker
+            .strip_prefix("[IMAGE:")
+            .unwrap()
+            .strip_suffix(']')
+            .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let native = zeroclaw_providers::ChatMessage::tool(
+            json!({"tool_call_id":"fixture", "content":out}).to_string(),
+        );
+        assert!(serde_json::to_vec(&native).unwrap().len() < 4096);
+    }
+
+    #[test]
+    fn standalone_media_preflight_prevents_aggregate_writes() {
+        let dir = tempdir().unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 6 * 1024 * 1024]);
+        let result = json!({"content":[
+            {"type":"resource", "resource":{"blob":b64, "mimeType":"image/png"}},
+            {"type":"image", "data":b64, "mimeType":"image/png"}
+        ]});
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert_eq!(out.matches("aggregate blob size exceeds limit").count(), 2);
+        assert!(!dir.path().join("uploads").exists());
+        let tiny = json!({"type":"image", "data":"eA==", "mimeType":"image/png"});
+        let out = format_mcp_tool_result_for_model(json!({"content": vec![tiny; 65]}), dir.path())
+            .unwrap();
+        assert_eq!(out.matches("too many embedded blobs").count(), 65);
+        assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn standalone_invalid_image_and_audio_never_leak_binary_data() {
+        let dir = tempdir().unwrap();
+        for (typ, mime, data) in [
+            ("image", "image/png", "%%%"),
+            ("image", "image/svg+xml", "eA=="),
+            ("audio", "audio/wav", "eA=="),
+        ] {
+            let out = format_mcp_tool_result_for_model(
+                json!({"content":[{"type":typ,"mimeType":mime,"data":data}],"isError":false}),
+                dir.path(),
+            )
+            .unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert!(parsed["content"][0].get("data").is_none());
+            assert!(out.contains("unavailable"));
+            assert_eq!(parsed["isError"], false);
+        }
+        assert!(!dir.path().join("uploads").exists());
     }
 
     #[test]
