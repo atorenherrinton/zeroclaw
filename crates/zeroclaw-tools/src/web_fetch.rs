@@ -15,6 +15,9 @@ use zeroclaw_config::schema::{FirecrawlConfig, ProxyConfig, ProxyScope};
 /// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
 const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
+// Leave room for runtime receipts, nested history encoding and multi-page batches.
+const PAGE_PREVIEW_BYTES: usize = 4 * 1024;
+
 const WEB_FETCH_PROXY_PINNING_ERROR: &str = "web_fetch requires direct transport so validated DNS answers remain pinned; set \
      proxy.scope = \"services\" and omit tool.* from proxy.services, or disable the proxy; \
      proxy.scope = \"environment\" is incompatible with the pinned standard fetch";
@@ -114,6 +117,20 @@ impl WebFetchTool {
         } else {
             text.to_string()
         }
+    }
+
+    /// Bound presentation independently of the configured network capture limit.
+    /// Standard fetch and Firecrawl must use the same model-visible allowance.
+    fn response_preview(&self, text: &str) -> String {
+        let output = self.truncate_response(text);
+        if crate::output_budget::encoded_size(&output, PAGE_PREVIEW_BYTES).is_some() {
+            return output;
+        }
+        let marker = format!(
+            "\n\n{}\n\n",
+            crate::i18n::get_required_tool_string("web-fetch-result-truncated")
+        );
+        crate::output_budget::bounded_text_preview(output, PAGE_PREVIEW_BYTES, &marker)
     }
 
     async fn read_response_text_limited(
@@ -320,7 +337,7 @@ impl WebFetchTool {
             });
         }
 
-        let output = self.truncate_response(markdown);
+        let output = self.response_preview(markdown);
 
         Ok(ToolResult {
             success: true,
@@ -398,7 +415,7 @@ impl WebFetchTool {
             body
         };
 
-        let output = self.truncate_response(&text);
+        let output = self.response_preview(&text);
 
         ToolResult {
             success: true,
@@ -417,7 +434,7 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a web page and return its content as clean plain text. \
          HTML pages are automatically converted to readable text. \
-         JSON and plain text responses are returned as-is. \
+         JSON and plain text responses are returned as text; large responses are incomplete previews. \
          Only GET requests; follows same-host redirects and rejects cross-host redirects. \
          Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
          Security: allowlist-only domains, no local/private hosts."
@@ -1328,6 +1345,31 @@ mod tests {
     }
 
     // ── Response truncation ──────────────────────────────────────
+
+    #[test]
+    fn response_preview_bounds_encoded_text_and_preserves_small_pages() {
+        let mut tool = test_tool(vec!["example.com"]);
+        tool.firecrawl.enabled = true;
+        let small = "Small page \u{0001}😀\"\\";
+        assert_eq!(tool.response_preview(small), small);
+        let body = format!("START{}END", "\u{0001}😀\"\\".repeat(20_000));
+        for capture_limit in [0, 500_000] {
+            tool.max_response_size = capture_limit;
+            let preview = tool.response_preview(&body);
+            assert!(crate::output_budget::encoded_size(&preview, PAGE_PREVIEW_BYTES).is_some());
+            assert!(preview.starts_with("START"));
+            assert!(preview.ends_with("END"));
+            assert!(preview.contains("Web page preview incomplete"));
+            assert!(!tool.should_fallback_to_firecrawl(
+                &ToolResult {
+                    success: true,
+                    output: preview.into(),
+                    error: None,
+                },
+                false
+            ));
+        }
+    }
 
     #[test]
     fn truncate_within_limit() {
