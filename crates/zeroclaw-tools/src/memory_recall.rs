@@ -121,12 +121,18 @@ impl Tool for MemoryRecallTool {
                         entry.category, entry.key, entry.content
                     );
                 }
-                let fully_exposed = zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
-                    .try_with(|ctx| {
-                        ctx.as_ref()
-                            .is_some_and(|ctx| output.len() <= ctx.tool_output_limit)
-                    })
-                    .unwrap_or(false);
+                let preview_fits = crate::output_budget::encoded_size(
+                    &output,
+                    crate::output_budget::preview_limit(crate::output_budget::READ_PREVIEW_BYTES),
+                )
+                .is_some();
+                let fully_exposed = preview_fits
+                    && zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
+                        .try_with(|ctx| {
+                            ctx.as_ref()
+                                .is_some_and(|ctx| output.len() <= ctx.tool_output_limit)
+                        })
+                        .unwrap_or(false);
                 // If the outer collector will truncate this result, do not
                 // count unseen entries. Time-only browse is not a query signal.
                 if fully_exposed
@@ -145,7 +151,7 @@ impl Tool for MemoryRecallTool {
                 }
                 Ok(ToolResult {
                     success: true,
-                    output: output.into(),
+                    output: crate::output_budget::read_text_preview(output).into(),
                     error: None,
                 })
             }

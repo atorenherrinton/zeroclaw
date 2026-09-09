@@ -48,6 +48,26 @@ impl ResultBudgetExceeded {
     }
 }
 
+fn record_budget_rejection(results: &OrderedResults, limit: usize, phase: &str) {
+    let sizes: Vec<_> = results
+        .iter()
+        .flatten()
+        .map(|(tool, _, outcome)| {
+            serde_json::json!({"tool": crate::agent::tool_execution::bounded_observer_text(tool),
+            "output_bytes": outcome.output.len(), "structured": outcome.output_data.is_some(),
+            "success": outcome.success})
+        })
+        .collect();
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_attrs(serde_json::json!({"phase":phase,"per_result_limit":limit,
+                "round_limit":ROUND_PAYLOAD_BYTES,"result_sizes":sizes})),
+        "tool_result_budget_rejected"
+    );
+}
+
 /// Admit the existing ordered batch before any consumer copies its payloads.
 /// Failure transfers ownership to the typed error without duplicating evidence.
 /// The returned limit is also used for the final history representation.
@@ -67,6 +87,7 @@ pub(crate) fn admit_source_results(
             .flatten()
             .any(|result| encoded_size(result, per_result_limit).is_none())
     {
+        record_budget_rejection(ordered_results, per_result_limit, "source");
         return Err(ResultBudgetExceeded {
             results: std::mem::take(ordered_results),
             errors: Vec::new(),
@@ -172,6 +193,7 @@ pub(crate) fn collect_tool_results(
             format!("<tool_result name=\"{tool_name}\">\n{result_output}\n</tool_result>\n");
         let prompt_block = ChatMessage::user(format!("[Tool results]\n{block}"));
         if encoded_size(&prompt_block, per_result_limit).is_none() {
+            record_budget_rejection(&ordered_results, per_result_limit, "prompt_result");
             return Err(ResultBudgetExceeded {
                 results: ordered_results,
                 errors: Vec::new(),
@@ -182,6 +204,7 @@ pub(crate) fn collect_tool_results(
         tool_results.push_str(&block);
     }
     if !history_results_fit(&individual_results, &tool_results, per_result_limit) {
+        record_budget_rejection(&ordered_results, per_result_limit, "history");
         return Err(ResultBudgetExceeded {
             results: ordered_results,
             errors: Vec::new(),
@@ -480,6 +503,215 @@ mod tests {
                 b"xx"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_read_batches_fit_source_and_both_history_formats() {
+        use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
+        use crate::agent::tool_receipts::ReceiptGenerator;
+        use crate::agent::turn::TurnMeta;
+        use crate::observability::NoopObserver;
+        use crate::tools::{FileReadTool, Tool};
+        use std::sync::Arc;
+        for calls in [8, 16, 32] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("source.txt"), "\\\"\t😀\n".repeat(20_000)).unwrap();
+            let policy = Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                workspace_dir: tmp.path().to_path_buf(),
+                ..Default::default()
+            });
+            let tools: Vec<Box<dyn Tool>> = vec![Box::new(FileReadTool::new(policy))];
+            let receipts = ReceiptGenerator::with_key(vec![42; 32]);
+            let ordered =
+                zeroclaw_tools::output_budget::with_round_preview_budget(32768, calls, async {
+                    let mut ordered = Vec::new();
+                    for i in 0..calls {
+                        let args = serde_json::json!({"path":"source.txt"});
+                        let id = format!("read-fixture-{i}");
+                        let result = execute_one_tool(
+                            "file_read",
+                            args.clone(),
+                            Some(&id),
+                            ToolDispatchContext {
+                                tools_registry: &tools,
+                                activated_tools: None,
+                                excluded_tools: &[],
+                                model_switch_callback: None,
+                            },
+                            &TurnMeta {
+                                parent_agent_alias: None,
+                                agent_alias: Some("fixture"),
+                                turn_id: "fixture",
+                                channel_name: "test",
+                            },
+                            &NoopObserver,
+                            None,
+                            Some(&receipts),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        assert!(result.success);
+                        assert!(result.output.contains("Read preview incomplete"));
+                        assert!(receipts.verify(
+                            result.receipt.as_deref().unwrap(),
+                            "file_read",
+                            &args,
+                            &result.output
+                        ));
+                        ordered.push(Some(("file_read".into(), Some(id), result)));
+                    }
+                    ordered
+                })
+                .await;
+            let collected = collect_fixture(ordered, 32768).unwrap();
+            assert_eq!(collected.individual_results.len(), calls);
+            for native in [false, true] {
+                let mut history = Vec::new();
+                super::super::history_append::append_tool_round_to_history(
+                    &mut history,
+                    String::new(),
+                    &[],
+                    &collected.individual_results,
+                    &collected.tool_results,
+                    native,
+                );
+                assert!(encoded_size(&history[1..], ROUND_PAYLOAD_BYTES).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn git_inspection_batch_fits_dispatch_and_both_history_formats() {
+        use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
+        use crate::agent::tool_receipts::ReceiptGenerator;
+        use crate::agent::turn::TurnMeta;
+        use crate::observability::NoopObserver;
+        use crate::tools::{FileReadTool, GitOperationsTool, Tool};
+        use std::sync::Arc;
+        use zeroclaw_config::{autonomy::AutonomyLevel, policy::SecurityPolicy};
+
+        let workspace = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(workspace.path().join("large.txt"), "old\n".repeat(1000)).unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        std::fs::write(
+            workspace.path().join("large.txt"),
+            "changed 😀 \" \\ \n".repeat(1000),
+        )
+        .unwrap();
+        for i in 0..5 {
+            std::fs::write(
+                workspace.path().join(format!("read-{i}.txt")),
+                "small \" \\ 😀\n".repeat(100),
+            )
+            .unwrap();
+        }
+        let before = std::fs::read(workspace.path().join("large.txt")).unwrap();
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(GitOperationsTool::new(
+                policy.clone(),
+                workspace.path().to_path_buf(),
+            )),
+            Box::new(FileReadTool::new(policy)),
+        ];
+        let mut calls = vec![
+            ("git_operations", serde_json::json!({"operation":"diff"})),
+            (
+                "git_operations",
+                serde_json::json!({"operation":"log","limit":8}),
+            ),
+        ];
+        for i in 0..5 {
+            calls.push((
+                "file_read",
+                serde_json::json!({"path":format!("read-{i}.txt")}),
+            ));
+        }
+        let receipts = ReceiptGenerator::with_key(vec![42; 32]);
+        let mut ordered = Vec::new();
+        for (i, (name, arguments)) in calls.into_iter().enumerate() {
+            let id = format!("inspection-{i}");
+            let outcome = execute_one_tool(
+                name,
+                arguments.clone(),
+                Some(&id),
+                ToolDispatchContext {
+                    tools_registry: &tools,
+                    activated_tools: None,
+                    excluded_tools: &[],
+                    model_switch_callback: None,
+                },
+                &TurnMeta {
+                    parent_agent_alias: None,
+                    agent_alias: Some("fixture-agent"),
+                    turn_id: "fixture-turn",
+                    channel_name: "test",
+                },
+                &NoopObserver,
+                None,
+                Some(&receipts),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(outcome.success);
+            assert!(receipts.verify(
+                outcome.receipt.as_deref().unwrap(),
+                name,
+                &arguments,
+                &outcome.output
+            ));
+            ordered.push(Some((name.into(), Some(id), outcome)));
+        }
+        let collected = collect_fixture(ordered, 32768).unwrap();
+        assert_eq!(collected.individual_results.len(), 7);
+        assert!(
+            collected.individual_results[0]
+                .1
+                .contains("Git read preview incomplete")
+        );
+        for native in [false, true] {
+            let mut history = Vec::new();
+            super::super::history_append::append_tool_round_to_history(
+                &mut history,
+                String::new(),
+                &[],
+                &collected.individual_results,
+                &collected.tool_results,
+                native,
+            );
+            assert!(encoded_size(&history[1..], ROUND_PAYLOAD_BYTES).is_some());
+        }
+        assert_eq!(
+            std::fs::read(workspace.path().join("large.txt")).unwrap(),
+            before
+        );
     }
 
     #[tokio::test]

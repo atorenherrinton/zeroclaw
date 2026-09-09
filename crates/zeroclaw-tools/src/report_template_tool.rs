@@ -109,11 +109,11 @@ impl Tool for ReportTemplateTool {
 
         let rendered = report_templates::render_template(template, language, &var_map)?;
 
-        Ok(ToolResult {
+        Ok(crate::output_budget::exact_read_result(ToolResult {
             success: true,
             output: rendered.into(),
             error: None,
-        })
+        }))
     }
 }
 
@@ -176,6 +176,19 @@ mod tests {
         let result = tool.execute(params).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("## Summary"));
+    }
+
+    #[tokio::test]
+    async fn oversized_render_returns_recoverable_error_without_partial_report() {
+        let result = ReportTemplateTool::new()
+            .execute(json!({
+                "template":"weekly_status", "variables":{"project_name":"😀".repeat(20_000)}
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        assert!(result.error.is_some());
     }
 
     #[tokio::test]

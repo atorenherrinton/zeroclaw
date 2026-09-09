@@ -239,3 +239,95 @@ async fn coding_agent_readonly_rejection_consumes_no_action() {
         );
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn completed_coding_commands_bound_both_streams_without_reexecution() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct LargeExecutor {
+        calls: AtomicUsize,
+        exit_code: i32,
+        as_json: bool,
+    }
+    #[async_trait]
+    impl CodingCliExecutor for LargeExecutor {
+        async fn output(&self, _: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+            use std::os::unix::process::ExitStatusExt;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = format!("START{}END", "\\\"\t😀".repeat(20_000));
+            let stdout = if self.as_json {
+                json!({"result":text,"session_id":"fixture-session"}).to_string()
+            } else {
+                text
+            };
+            Ok(Output {
+                status: ExitStatus::from_raw(self.exit_code << 8),
+                stdout: stdout.into_bytes(),
+                stderr: format!("ERROR{}TAIL", "\\\"\t😀".repeat(20_000)).into_bytes(),
+            })
+        }
+    }
+    for (exit_code, as_json) in [(0, false), (7, false), (0, true), (7, true)] {
+        let workspace = tempfile::TempDir::new().unwrap();
+        mark_as_zeroclaw_source(workspace.path());
+        let security = policy(AutonomyLevel::Full, 100, workspace.path());
+        let executor = Arc::new(LargeExecutor {
+            calls: AtomicUsize::new(0),
+            exit_code,
+            as_json,
+        });
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(ClaudeCodeTool::new_with_executor(
+                security.clone(),
+                ClaudeCodeConfig::default(),
+                executor.clone(),
+            )),
+            Box::new(CodexCliTool::new_with_executor(
+                security.clone(),
+                CodexCliConfig {
+                    recovery_source_workspace: Some(workspace.path().to_path_buf()),
+                    ..Default::default()
+                },
+                executor.clone(),
+            )),
+            Box::new(GeminiCliTool::new_with_executor(
+                security.clone(),
+                GeminiCliConfig::default(),
+                executor.clone(),
+            )),
+            Box::new(OpenCodeCliTool::new_with_executor(
+                security,
+                OpenCodeCliConfig::default(),
+                executor.clone(),
+            )),
+        ];
+        for tool in tools {
+            let invocation = tool.execute(json!({"prompt":"fixture only"}));
+            let result = if tool.name() == "codex_cli" {
+                crate::codex_cli::scope_zeroclaw_recovery("fixture recovery".into(), invocation)
+                    .await
+            } else {
+                invocation.await
+            }
+            .unwrap();
+            assert_eq!(
+                result.success,
+                exit_code == 0,
+                "{}: {:?}",
+                tool.name(),
+                result.error
+            );
+            assert!(result.output.contains("START"));
+            assert!(result.output.contains("END"));
+            if as_json {
+                assert!(result.output.contains("fixture-session"));
+            }
+            assert!(result.output.contains("command already ran"));
+            assert!(crate::output_budget::encoded_size(result.output.as_str(), 2048).is_some());
+            let error = result.error.as_deref().unwrap();
+            assert!(error.starts_with("ERROR") && error.ends_with("TAIL"));
+            assert!(crate::output_budget::encoded_size(error, 2048).is_some());
+        }
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+    }
+}

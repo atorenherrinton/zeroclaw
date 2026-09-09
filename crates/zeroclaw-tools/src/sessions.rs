@@ -8,7 +8,7 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
-use zeroclaw_infra::session_backend::SessionBackend;
+use zeroclaw_infra::session_backend::{HistoryPage, SessionBackend};
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -198,6 +198,41 @@ impl Tool for SessionsListTool {
     }
 }
 
+// Keep the encoded page string small enough for the runtime's source tuple,
+// receipt, and nested native-history envelope. The backend remains the owner of
+// stored rows; this projection must not mutate or persist a second history copy.
+const HISTORY_PAGE_OUTPUT_BYTES: usize = 8 * 1024;
+
+fn encode_history_page(mut page: HistoryPage) -> anyhow::Result<String> {
+    let limit = crate::output_budget::preview_limit(HISTORY_PAGE_OUTPUT_BYTES);
+    loop {
+        let output = serde_json::to_string(&page)?;
+        if crate::output_budget::encoded_size(&output, limit).is_some() {
+            return Ok(output);
+        }
+        if page.messages.len() > 1 {
+            // Pages are chronological. Defer the oldest row to the next page,
+            // and use the oldest retained ID as the exclusive cursor.
+            let removed = page.messages.remove(0);
+            page.content_bytes -= removed.content.len();
+            page.next_before = page.messages.first().map(|row| row.id);
+        } else if let Some(row) = page
+            .messages
+            .first_mut()
+            .filter(|row| !row.content.is_empty())
+        {
+            let keep = row.content.floor_char_boundary(row.content.len() / 2);
+            row.content.truncate(keep);
+            row.truncated = true;
+            page.content_bytes = keep;
+        } else {
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "sessions-history-metadata-budget-exceeded"
+            ));
+        }
+    }
+}
+
 // ── SessionsHistoryTool ─────────────────────────────────────────────
 
 /// Reads the message history of a specific session by ID.
@@ -294,7 +329,7 @@ impl Tool for SessionsHistoryTool {
         let page =
             tokio::task::spawn_blocking(move || backend.load_page(&key, before, limit, max_bytes))
                 .await??;
-        let output = serde_json::to_string(&page)?;
+        let output = encode_history_page(page)?;
 
         Ok(ToolResult {
             success: true,
@@ -1030,6 +1065,115 @@ mod tests {
         // Should show only the last message
         assert!(result.output.contains("assistant"));
         assert!(!result.output.contains("Hello from Alice"));
+    }
+
+    #[tokio::test]
+    async fn history_encoded_pages_preserve_cursor_and_stored_rows() {
+        let (tmp, backend) = history_backend();
+        let key = "encoded_history_fixture";
+        let content = "\\\"\n\0😀".repeat(250);
+        for _ in 0..24 {
+            backend
+                .append(key, &ChatMessage::tool(content.clone()))
+                .unwrap();
+        }
+        let original = backend.load(key);
+        let tool = SessionsHistoryTool::new(backend.clone(), test_security());
+        let mut before = None;
+        let mut seen = BTreeSet::new();
+        for _ in 0..24 {
+            let mut args = json!({"session_id":key,"limit":100,"max_bytes":65536});
+            if let Some(cursor) = before {
+                args["before"] = json!(cursor);
+            }
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success);
+            let output = result.output.as_str();
+            assert!(
+                crate::output_budget::encoded_size(&output, HISTORY_PAGE_OUTPUT_BYTES).is_some()
+            );
+            let native =
+                ChatMessage::tool(json!({"content":output,"tool_call_id":"fixture"}).to_string());
+            assert!(crate::output_budget::encoded_size(&native, 32768).is_some());
+            let page: serde_json::Value = serde_json::from_str(output).unwrap();
+            for row in page["messages"].as_array().unwrap() {
+                assert!(seen.insert(row["id"].as_i64().unwrap()), "duplicate row");
+            }
+            before = page["next_before"].as_i64();
+            if before.is_none() {
+                break;
+            }
+        }
+        assert!(before.is_none());
+        assert_eq!(seen.len(), 24);
+        assert_eq!(
+            serde_json::to_value(backend.load(key)).unwrap(),
+            serde_json::to_value(original).unwrap()
+        );
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn history_large_single_row_is_valid_json_and_marked_truncated() {
+        let (_tmp, backend) = history_backend();
+        backend
+            .append(
+                "large_fixture",
+                &ChatMessage::tool("\\\"\n\0😀".repeat(20_000)),
+            )
+            .unwrap();
+        let tool = SessionsHistoryTool::new(backend, test_security());
+        for max_bytes in [256, 16384, 20000, 65536] {
+            let result = tool
+                .execute(json!({"session_id":"large_fixture","max_bytes":max_bytes}))
+                .await
+                .unwrap();
+            assert!(
+                crate::output_budget::encoded_size(
+                    &result.output.as_str(),
+                    HISTORY_PAGE_OUTPUT_BYTES
+                )
+                .is_some()
+            );
+            let page: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+            let row = &page["messages"][0];
+            assert_eq!(row["truncated"], true);
+            assert_eq!(
+                page["content_bytes"].as_u64().unwrap() as usize,
+                row["content"].as_str().unwrap().len()
+            );
+            assert!(page["next_before"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn history_pages_honor_batch_allowance_without_changing_stored_rows() {
+        let (_tmp, backend) = history_backend();
+        let key = "batch_history";
+        let content = "\\\"\n😀".repeat(20_000);
+        backend.append(key, &ChatMessage::tool(content)).unwrap();
+        let original = serde_json::to_value(backend.load(key)).unwrap();
+        let tool = SessionsHistoryTool::new(backend.clone(), test_security());
+        for calls in [1, 8, 16, 32] {
+            crate::output_budget::with_round_preview_budget(32768, calls, async {
+                let result = tool
+                    .execute(json!({"session_id":key,"max_bytes":65536}))
+                    .await
+                    .unwrap();
+                assert!(result.success);
+                assert!(
+                    crate::output_budget::encoded_size(
+                        &result.output.as_str(),
+                        crate::output_budget::preview_limit(HISTORY_PAGE_OUTPUT_BYTES)
+                    )
+                    .is_some()
+                );
+                let page: serde_json::Value = serde_json::from_str(result.output.as_str()).unwrap();
+                assert_eq!(page["messages"][0]["truncated"], true);
+                assert_eq!(serde_json::to_value(backend.load(key)).unwrap(), original);
+            })
+            .await;
+        }
     }
 
     #[tokio::test]

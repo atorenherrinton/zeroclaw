@@ -201,3 +201,12 @@ mcp-read-result-truncated = [Read result truncated; the middle of this response 
 http-read-result-truncated = [Read response truncated; the middle was omitted. Request a smaller resource or use a Range header if supported. This preview is incomplete, not proof that a write did not occur; do not replay writes.]
 
 web-fetch-result-truncated = [Web page preview incomplete; the middle was omitted. Use a more specific page or a browser tool to inspect the missing section. This preview may not be valid JSON and is not evidence that a write did not occur; do not replay writes.]
+
+git-read-result-truncated = [Git read preview incomplete; the middle was omitted and this may not be valid JSON. Narrow diff with files, reduce log limit, or read source sections with file_read offset/limit. Do not treat this preview as a complete review or repeat writes based on omitted content.]
+
+read-result-truncated = [Read preview incomplete; middle content was omitted and this may not be valid JSON. Narrow the query, reduce the page/limit, or use file_read offset/limit to inspect missing sections. Do not act on omitted instructions, claim a complete review, or repeat writes based on this preview.]
+
+exact-read-result-too-large = Exact read result is too large to return intact. No partial binary or JSON was returned. Request a smaller result, use pagination where supported, or pass the file/attachment path to a format-specific reader.
+coding-cli-result-truncated = [Coding command output incomplete; middle content was omitted. The command already ran and may have changed files. Inspect the working tree and execution evidence before continuing. Do not rerun it because this output was truncated.]
+
+sessions-history-metadata-budget-exceeded = Session history metadata exceeds the output limit. Request fewer messages.

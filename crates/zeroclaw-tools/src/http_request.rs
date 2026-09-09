@@ -665,8 +665,11 @@ impl Tool for HttpRequestTool {
                 // Mutating methods retain their complete receipts and continue
                 // through the runtime's existing fail-closed budget admission.
                 let body_truncated = preview_read
-                    && crate::output_budget::encoded_size(&response_text, READ_BODY_PREVIEW_BYTES)
-                        .is_none();
+                    && crate::output_budget::encoded_size(
+                        &response_text,
+                        crate::output_budget::preview_limit(READ_BODY_PREVIEW_BYTES),
+                    )
+                    .is_none();
                 let headers_truncated = preview_read
                     && crate::output_budget::encoded_size(
                         &headers_text,

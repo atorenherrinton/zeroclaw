@@ -261,7 +261,7 @@ impl Tool for ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: output.into(),
+            output: crate::output_budget::read_text_preview(output).into(),
             error: None,
         })
     }
@@ -347,7 +347,7 @@ impl ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output: output.into(),
+            output: crate::output_budget::read_text_preview(output).into(),
             error: None,
         })
     }

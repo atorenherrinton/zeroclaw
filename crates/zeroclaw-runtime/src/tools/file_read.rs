@@ -91,6 +91,13 @@ impl Tool for FileReadTool {
         if !self.persistent_writes && result.success && !is_base64 {
             result.output = with_ephemeral_workspace_warning(&result.output).into();
         }
+        if result.success {
+            if is_base64 {
+                result = zeroclaw_tools::output_budget::exact_read_result(result);
+            } else {
+                result = zeroclaw_tools::output_budget::preview_read_result(result);
+            }
+        }
         Ok(result)
     }
 }
@@ -369,6 +376,39 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+
+    #[tokio::test]
+    async fn oversized_text_is_explicit_preview_and_base64_is_never_partial() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tool = test_tool(tmp.path().to_path_buf());
+        std::fs::write(tmp.path().join("large.txt"), "😀 \\\"\n".repeat(20_000)).unwrap();
+        let text = tool.execute(json!({"path":"large.txt"})).await.unwrap();
+        assert!(text.success);
+        assert!(text.output.contains("Read preview incomplete"));
+        assert!(zeroclaw_tools::output_budget::encoded_size(text.output.as_str(), 4096).is_some());
+        let page = tool
+            .execute(json!({"path":"large.txt","offset":10,"limit":2}))
+            .await
+            .unwrap();
+        assert!(page.success);
+        assert!(page.output.starts_with("10: "));
+        assert!(page.output.contains("[Lines 10-11 of 20000]"));
+        assert!(!page.output.contains("Read preview incomplete"));
+        let large = tool
+            .execute(json!({"path":"large.txt","encoding":"base64"}))
+            .await
+            .unwrap();
+        assert!(!large.success);
+        assert!(large.output.is_empty());
+        assert!(large.error.unwrap().contains("No partial binary or JSON"));
+        std::fs::write(tmp.path().join("small.bin"), [0, 1, 2, 3]).unwrap();
+        let small = tool
+            .execute(json!({"path":"small.bin","encoding":"base64"}))
+            .await
+            .unwrap();
+        assert!(small.success);
+        assert_eq!(small.output.as_str(), "AAECAw==");
+    }
 
     fn test_tool(workspace: std::path::PathBuf) -> FileReadTool {
         let security = Arc::new(SecurityPolicy {

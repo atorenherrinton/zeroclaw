@@ -101,7 +101,7 @@ impl Tool for ReadSkillTool {
         match tokio::fs::read_to_string(location).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
-                output: output.into(),
+                output: zeroclaw_tools::output_budget::read_text_preview(output).into(),
                 error: None,
             }),
             Err(err) => Ok(ToolResult {
