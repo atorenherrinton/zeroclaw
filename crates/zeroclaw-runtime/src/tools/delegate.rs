@@ -2251,7 +2251,8 @@ impl DelegateTool {
                     .iter()
                     .filter(|result| result.get("status") == Some(&json!("completed")))
                     .count();
-                let success = missing.is_empty() && pending.is_empty() && failed.is_empty();
+                // A bounded wait expiring is a successful observation, not a task failure.
+                let success = missing.is_empty() && failed.is_empty();
                 let error = if success {
                     None
                 } else if timed_out {
@@ -7350,17 +7351,11 @@ mod tests {
             .unwrap();
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
 
-        assert!(!result.success);
+        assert!(result.success);
         assert_eq!(output["status"], "timeout");
         assert_eq!(output["completed"], 1);
         assert_eq!(output["pending"].as_array().unwrap().len(), 1);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or_default()
-                .contains("pending")
-        );
+        assert!(result.error.is_none());
 
         let _ = std::fs::remove_dir_all(workspace);
     }

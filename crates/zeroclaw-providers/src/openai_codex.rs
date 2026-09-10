@@ -1159,7 +1159,7 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<Re
                     })),
                 "openai_codex: error reading response stream"
             );
-            anyhow::Error::msg(format!("error reading OpenAI Codex response stream: {err}"))
+            anyhow::Error::new(err).context("error reading OpenAI Codex response stream")
         })?;
         append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
     }
@@ -1373,7 +1373,7 @@ impl OpenAiCodexModelProvider {
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
         let has_tools = has_turn_tools(tools.as_ref());
-        let mut request = ResponsesRequest {
+        let request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
             instructions,
@@ -1426,60 +1426,10 @@ impl OpenAiCodexModelProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        match decode_responses_body(response).await {
-            Ok(result) => Ok(result),
-            Err(stream_err) => {
-                if stream_err
-                    .downcast_ref::<ResponsesStreamApiError>()
-                    .is_some()
-                {
-                    return Err(stream_err);
-                }
-
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", stream_err)})),
-                    "OpenAI Codex streaming response decode failed, retrying without streaming"
-                );
-
-                request.stream = false;
-                let non_streaming_response = self
-                    .responses_request_builder(
-                        &creds.bearer_token,
-                        creds.account_id.as_deref(),
-                        creds.access_token.as_deref(),
-                        creds.use_gateway_api_key_auth,
-                        &request,
-                    )
-                    .json(&request)
-                    .send()
-                    .await?;
-
-                if !non_streaming_response.status().is_success() {
-                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
-                }
-
-                decode_responses_body(non_streaming_response)
-                    .await
-                    .map_err(|fallback_err| {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "stream_err": format!("{}", stream_err),
-                                    "fallback_err": format!("{}", fallback_err),
-                                })),
-                            "openai_codex: stream + non-stream fallback both failed"
-                        );
-                        anyhow::Error::msg(format!(
-                            "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
-                        ))
-                    })
-            }
-        }
+        // This endpoint requires streaming even when the caller wants a buffered
+        // response. Return decode errors to the reliability wrapper so its bounded
+        // retry uses the same wire protocol and preserves the original failure.
+        decode_responses_body(response).await
     }
 }
 
@@ -1698,6 +1648,7 @@ mod tests {
 
     enum MockCodexReply {
         Sse(&'static str),
+        TruncatedSse,
         Json(serde_json::Value),
         Status(axum::http::StatusCode, &'static str),
     }
@@ -1745,6 +1696,23 @@ mod tests {
                             body.to_string(),
                         )
                             .into_response(),
+                        MockCodexReply::TruncatedSse => {
+                            let chunks = futures_util::stream::once(async {
+                                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: "))
+                            })
+                            .chain(futures_util::stream::once(async {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "stream interrupted",
+                                ))
+                            }));
+                            (
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                axum::body::Body::from_stream(chunks),
+                            )
+                                .into_response()
+                        }
                         MockCodexReply::Json(body) => Json(body).into_response(),
                         MockCodexReply::Status(status, body) => {
                             (status, body.to_string()).into_response()
@@ -2176,10 +2144,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_retries_non_streaming_when_stream_decode_fails() {
+    async fn codex_reliability_retries_streaming_when_stream_decode_fails() {
         let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![
-                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::TruncatedSse,
                 MockCodexReply::Json(serde_json::json!({
                     "output_text": "fallback ok",
                     "output": []
@@ -2187,6 +2155,12 @@ mod tests {
             ])
             .await;
 
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![("openai_codex".into(), Box::new(provider))],
+            1,
+            0,
+        );
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
             .chat(
@@ -2199,20 +2173,20 @@ mod tests {
                 None,
             )
             .await
-            .expect("provider should retry with stream=false after streaming decode failure");
+            .expect("reliability wrapper should retry the buffered streaming request");
 
         assert_eq!(response.text.as_deref(), Some("fallback ok"));
 
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 2, "expected one retry request");
+        assert_eq!(requests.len(), 2, "expected one bounded reliability retry");
         assert_eq!(requests[0]["stream"], true);
-        assert_eq!(requests[1]["stream"], false);
+        assert_eq!(requests[1]["stream"], true);
 
         server_handle.abort();
     }
 
     #[tokio::test]
-    async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
+    async fn codex_reliability_retries_buffered_partial_stream_without_changing_protocol() {
         let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
@@ -2224,6 +2198,12 @@ mod tests {
         ])
         .await;
 
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![("openai_codex".into(), Box::new(provider))],
+            1,
+            0,
+        );
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
             .chat(
@@ -2241,11 +2221,34 @@ mod tests {
         assert_eq!(response.text.as_deref(), Some("fallback after partial"));
 
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 2, "expected one retry request");
+        assert_eq!(requests.len(), 2, "expected one bounded reliability retry");
         assert_eq!(requests[0]["stream"], true);
-        assert_eq!(requests[1]["stream"], false);
+        assert_eq!(requests[1]["stream"], true);
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_preserves_transport_error_without_an_adapter_retry() {
+        let (provider, captured, server, _temp, _proxy) =
+            mock_codex_provider(vec![MockCodexReply::TruncatedSse]).await;
+        let messages = vec![ChatMessage::user("hello")];
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<reqwest::Error>().is_some());
+        assert!(!crate::reliable::is_non_retryable(&error));
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        server.abort();
     }
 
     #[tokio::test]

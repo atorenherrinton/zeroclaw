@@ -89,7 +89,7 @@ impl RecoveryTrigger {
 pub(crate) struct RecoveryTracker {
     // The turn iteration is the source of retry boundaries: parallel failures
     // in one tool round are one observation, not independent retries.
-    last_failure: Option<(String, u64, usize)>,
+    last_failure: Option<(String, RecoveryTriggerKind, u64, usize)>,
     consecutive_failures: usize,
 }
 
@@ -110,21 +110,25 @@ impl RecoveryTracker {
         }
 
         match outcome.failure_kind {
-            Some(ToolFailureKind::PolicyDenied) => {
-                self.clear();
-                Some(RecoveryTrigger {
-                    kind: RecoveryTriggerKind::SecurityPolicyDenied,
-                    tool: sanitize_identifier(tool),
-                    occurrences: 1,
-                    iteration: iteration + 1,
-                })
-            }
-            Some(ToolFailureKind::Ordinary) => {
-                let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
-                let fingerprint = failure_fingerprint(reason);
+            Some(kind @ (ToolFailureKind::PolicyDenied | ToolFailureKind::Ordinary)) => {
+                // A denied request is feedback the model can correct, not proof
+                // that the runtime is stuck. Require repeated unsuccessful rounds
+                // just as for other tool failures. Policy denials share a retry
+                // category even if the model varies the forbidden path.
+                let (kind, fingerprint) = if kind == ToolFailureKind::PolicyDenied {
+                    (RecoveryTriggerKind::SecurityPolicyDenied, 0)
+                } else {
+                    let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
+                    (
+                        RecoveryTriggerKind::RepeatedToolFailure,
+                        failure_fingerprint(reason),
+                    )
+                };
                 let tool = sanitize_identifier(tool);
-                if let Some((last_tool, last_fingerprint, last_iteration)) = &self.last_failure
+                if let Some((last_tool, last_kind, last_fingerprint, last_iteration)) =
+                    &self.last_failure
                     && last_tool == &tool
+                    && *last_kind == kind
                     && *last_fingerprint == fingerprint
                 {
                     if *last_iteration != iteration {
@@ -133,10 +137,10 @@ impl RecoveryTracker {
                 } else {
                     self.consecutive_failures = 1;
                 }
-                self.last_failure = Some((tool.clone(), fingerprint, iteration));
+                self.last_failure = Some((tool.clone(), kind, fingerprint, iteration));
                 (self.consecutive_failures >= REPEATED_FAILURE_THRESHOLD).then_some(
                     RecoveryTrigger {
-                        kind: RecoveryTriggerKind::RepeatedToolFailure,
+                        kind,
                         tool,
                         occurrences: self.consecutive_failures,
                         iteration: iteration + 1,
@@ -495,16 +499,17 @@ mod tests {
         );
 
         let mut tracker = RecoveryTracker::default();
-        assert_eq!(
-            tracker
-                .observe(
-                    "shell",
-                    &outcome(false, Some(ToolFailureKind::PolicyDenied), "private detail"),
-                    0,
-                )
-                .map(|trigger| trigger.kind),
-            Some(RecoveryTriggerKind::SecurityPolicyDenied)
-        );
+        for iteration in 0..3 {
+            let trigger = tracker.observe(
+                "shell",
+                &outcome(false, Some(ToolFailureKind::PolicyDenied), "private detail"),
+                iteration,
+            );
+            assert_eq!(
+                trigger.map(|t| t.kind),
+                (iteration == 2).then_some(RecoveryTriggerKind::SecurityPolicyDenied)
+            );
+        }
         assert!(
             tracker
                 .observe(
@@ -561,6 +566,58 @@ mod tests {
         }
         assert!(tracker.observe("http_request", &failed, 4).is_none());
         assert!(tracker.observe("http_request", &failed, 5).is_some());
+    }
+
+    #[test]
+    fn policy_denials_count_retry_rounds_and_success_clears_them() {
+        let mut tracker = RecoveryTracker::default();
+        for iteration in 0..2 {
+            for path in ["/tmp/a", "..", "/restricted/b"] {
+                let denied = outcome(false, Some(ToolFailureKind::PolicyDenied), path);
+                assert!(tracker.observe("shell", &denied, iteration).is_none());
+            }
+        }
+        assert!(
+            tracker
+                .observe("file_read", &outcome(true, None, "progress"), 2)
+                .is_none()
+        );
+        for iteration in 3..6 {
+            let denied = outcome(
+                false,
+                Some(ToolFailureKind::PolicyDenied),
+                &format!("blocked {iteration}"),
+            );
+            let trigger = tracker.observe("shell", &denied, iteration);
+            if iteration == 5 {
+                let trigger = trigger.expect("repeated denied retries remain bounded");
+                assert_eq!(trigger.kind, RecoveryTriggerKind::SecurityPolicyDenied);
+                assert_eq!(trigger.occurrences, 3);
+            } else {
+                assert!(trigger.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn policy_and_ordinary_failures_do_not_share_retry_counts() {
+        let mut tracker = RecoveryTracker::default();
+        for iteration in 0..6 {
+            let kind = if iteration % 2 == 0 {
+                ToolFailureKind::PolicyDenied
+            } else {
+                ToolFailureKind::Ordinary
+            };
+            assert!(
+                tracker
+                    .observe(
+                        "shell",
+                        &outcome(false, Some(kind), "same reason"),
+                        iteration
+                    )
+                    .is_none()
+            );
+        }
     }
 
     #[test]

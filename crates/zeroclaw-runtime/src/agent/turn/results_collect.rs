@@ -221,15 +221,17 @@ pub(crate) fn collect_tool_results(
         if recovery_trigger.is_none() {
             recovery_trigger = recovery_tracker.observe(tool_name, outcome, iteration);
         }
-        if !loop_ignore_tools.contains(tool_name.as_str()) {
+        let args = tool_calls
+            .get(result_index)
+            .map(|c| &c.arguments)
+            .unwrap_or(&serde_json::Value::Null);
+        if !loop_ignore_tools.contains(tool_name.as_str())
+            && !is_pending_delegate_wait(tool_name, args, outcome)
+        {
             if outcome.success {
                 detection_relevant_output.push_str(&outcome.output);
             }
 
-            let args = tool_calls
-                .get(result_index)
-                .map(|c| &c.arguments)
-                .unwrap_or(&serde_json::Value::Null);
             let det_result = if outcome.success {
                 loop_detector.record(tool_name, args, &outcome.output)
             } else {
@@ -317,6 +319,32 @@ pub(crate) fn collect_tool_results(
 /// `pacing.loop_detection_min_elapsed_secs` has elapsed, hash the
 /// detection-relevant output and bail after 3+ consecutive identical rounds.
 #[allow(clippy::too_many_arguments)]
+// The delegate result remains the source of task state. Only a successful,
+// blocking observation of known pending tasks is exempt; immediate polls,
+// missing/failed tasks, and other delegate actions retain loop detection.
+fn is_pending_delegate_wait(
+    tool: &str,
+    args: &serde_json::Value,
+    outcome: &ToolExecutionOutcome,
+) -> bool {
+    if tool != "delegate" || !outcome.success || args["action"] != "await_sessions" {
+        return false;
+    }
+    if args
+        .get("timeout_ms")
+        .is_some_and(|v| v.as_u64().is_none_or(|n| n == 0))
+    {
+        return false;
+    }
+    let Ok(result) = serde_json::from_str::<serde_json::Value>(&outcome.output) else {
+        return false;
+    };
+    result["status"] == "timeout"
+        && result["pending"].as_array().is_some_and(|v| !v.is_empty())
+        && result["failed"].as_array().is_some_and(Vec::is_empty)
+        && result["missing"].as_array().is_some_and(Vec::is_empty)
+}
+
 pub(crate) fn check_identical_output_abort(
     detection_relevant_output: &str,
     loop_started_at: Instant,
@@ -1063,6 +1091,66 @@ mod tests {
                 .len(),
             128
         );
+    }
+
+    #[test]
+    fn blocking_pending_waits_do_not_consume_loop_recovery() {
+        let output = serde_json::json!({
+            "status": "timeout", "pending": ["worker"], "failed": [], "missing": []
+        })
+        .to_string();
+        let args = serde_json::json!({"action":"await_sessions", "timeout_ms":120000});
+        let mut detector = LoopDetector::new(LoopDetectorConfig::default());
+        let mut tracker = RecoveryTracker::default();
+        let mut history = Vec::new();
+        for iteration in 0..8 {
+            let result = collect_tool_results(
+                vec![Some((
+                    "delegate".into(),
+                    Some("wait".into()),
+                    outcome(&output, true),
+                ))],
+                &[ParsedToolCall {
+                    name: "delegate".into(),
+                    arguments: args.clone(),
+                    tool_call_id: Some("wait".into()),
+                }],
+                &mut history,
+                &mut detector,
+                &mut tracker,
+                &HashSet::new(),
+                32768,
+                None,
+                "test",
+                iteration,
+                "test",
+            )
+            .unwrap();
+            assert!(result.recovery_trigger.is_none());
+            assert!(result.detection_relevant_output.is_empty());
+            assert!(result.tool_results.contains("worker"));
+        }
+        assert!(!is_pending_delegate_wait(
+            "delegate",
+            &serde_json::json!({"action":"await_sessions","timeout_ms":0}),
+            &outcome(&output, true)
+        ));
+        assert!(!is_pending_delegate_wait(
+            "delegate",
+            &args,
+            &outcome(&output, false)
+        ));
+        assert!(!is_pending_delegate_wait(
+            "shell",
+            &args,
+            &outcome(&output, true)
+        ));
+        let missing = serde_json::json!({"status":"timeout","pending":["worker"],"failed":[],"missing":["unknown"]}).to_string();
+        assert!(!is_pending_delegate_wait(
+            "delegate",
+            &args,
+            &outcome(&missing, true)
+        ));
     }
 
     const RATE_LIMIT_ERR: &str = "Rate limit exceeded: too many actions in the last hour";
