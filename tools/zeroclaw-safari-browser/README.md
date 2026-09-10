@@ -12,7 +12,7 @@ with the `safari_browser__` prefix:
 
 | Tool | Operations |
 | --- | --- |
-| `browse` | Open/read/scroll a public HTTPS page, wait for an expected control, or verify an expected field value. |
+| `browse` | Open/read/scroll a public HTTPS page, wait for an expected control, verify an expected field value, or request a display wake. |
 | `interact` | Click, fill, select a native/ARIA option, check/uncheck, activate a link/button with Enter, set a native date, or use native AutoFill. |
 | `close` | Close only the connector-owned window. |
 
@@ -89,6 +89,37 @@ returned. Respect `controlsTruncated`, `optionsTruncated`, `labelTruncated`, and
 `valueOmitted`; never guess an omitted option. Form field values are not returned.
 
 ## Latency and boundaries
+
+### Display wake
+
+On macOS, opening an allowed page and executing browser JavaScript refresh an
+IOKit user-activity assertion to wake the local display. The OS owns display and
+lock state; the helper owns only the assertion ID required for refresh/release.
+The assertion follows the user's existing display idle timeout. No background
+timer keeps the display lit between tasks. Close/shutdown releases the assertion.
+Each native wake failure is returned before the browser operation proceeds.
+
+`browse` with `{"action":"wake"}` requests the same wake without opening a page,
+for example before a native Computer handoff. It accepts no other arguments.
+`display_wake_requested` means macOS accepted the request, not proof that a
+physical monitor is on, the session is unlocked, or a website is signed in.
+Read the actual page/window next. A monitor turned off with its hardware button
+may not respond to an OS wake request.
+
+This uses Apple's `IOPMAssertionDeclareUserActivity`, which requires no special
+privileges. It does not change sleep/password settings, synthesize keystrokes,
+unlock the Mac, or bypass Touch ID/MFA. Display sleep and session locking are
+separate settings. If the session locks while idle, unattended login-dependent
+Safari work will still need the owner. Any change to automatic locking must be
+an explicit operator decision outside this tool.
+
+Native verification on a test Mac (wakes its display):
+
+```sh
+cargo test --locked --manifest-path tools/zeroclaw-safari-browser/Cargo.toml native_wake_refresh_and_release -- --ignored
+```
+
+### Page operations
 
 Link validation checks URL syntax individually, resolves each hostname once per
 read, and allows at most eight concurrent resolver futures. Lookups have a

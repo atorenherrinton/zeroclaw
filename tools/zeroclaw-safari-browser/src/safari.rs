@@ -282,11 +282,21 @@ where
 
 pub struct Safari {
     window_id: Option<i64>,
+    display: crate::display::DisplayActivity,
 }
 
 impl Safari {
     pub fn new() -> Self {
-        Self { window_id: None }
+        Self {
+            window_id: None,
+            display: crate::display::DisplayActivity::default(),
+        }
+    }
+
+    pub fn wake(&self) -> Result<Value> {
+        self.display.wake()?;
+        Ok(json!({"action":"wake", "status":"display_wake_requested",
+            "next_step":"macOS accepted the display wake request. This does not unlock the Mac or verify Safari visibility. Inspect the current page or native window before continuing."}))
     }
 
     pub async fn open(
@@ -296,6 +306,7 @@ impl Safari {
         timeout_ms: u64,
     ) -> Result<Value> {
         crate::policy::validate_url(url).await?;
+        self.display.wake()?;
         let prior_id = self.window_id.unwrap_or(0);
         let prior_url = if prior_id == 0 {
             String::new()
@@ -375,6 +386,7 @@ impl Safari {
     }
 
     pub async fn close(&mut self) -> Result<Value> {
+        self.display.release()?;
         let Some(id) = self.window_id else {
             return Ok(json!({"action":"close","completed":true,"result":"already_closed"}));
         };
@@ -389,11 +401,9 @@ impl Safari {
     }
 
     async fn javascript(&self, source: &str) -> Result<String> {
-        osascript(
-            JAVASCRIPT_SCRIPT,
-            &[self.id()?.to_string(), source.to_owned()],
-        )
-        .await
+        let id = self.id()?;
+        self.display.wake()?;
+        osascript(JAVASCRIPT_SCRIPT, &[id.to_string(), source.to_owned()]).await
     }
 
     async fn current_url(&self) -> Result<String> {
