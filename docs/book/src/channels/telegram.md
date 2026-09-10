@@ -30,6 +30,26 @@ There is no `allowed_users` field under `[channels.telegram.<alias>]`.
 Authorization lives in [Peer Groups](./peer-groups.md); that page is the
 canonical reference for peer-group fields, matching, and multi-agent behavior.
 
+## Repair and coding progress notices
+
+When a Telegram request starts native coding work, ZeroClaw sends a separate
+text notice to its original chat and topic. This covers built-in coding CLI
+tools, delegation to the explicit `coding` agent alias, and native file writes
+or edits to recognized source files. It sends one start notice per turn,
+followed by an update every two minutes while that request remains open.
+The update describes the request as still running; it does not claim that
+files are still being edited or that a repair succeeded.
+
+These notices also work with draft streaming disabled and with ordinary tool
+call messages hidden. They contain no tool arguments, source paths, prompts,
+commands, or tool output. They stay text-only for voice conversations. Read-only
+tools, ordinary document writes, arbitrary shell commands, other delegate
+aliases, and extension tools do not trigger them.
+
+Notices stop when the turn finishes or is cancelled. An unconfirmed or timed-out
+send disables further notices for that turn to avoid repeating a message that
+may already have arrived. The final response remains the outcome report.
+
 ## 1. Create a Telegram bot
 
 1. Open [@BotFather](https://t.me/BotFather) in Telegram.
