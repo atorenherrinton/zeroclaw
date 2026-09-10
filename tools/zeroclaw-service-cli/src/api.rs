@@ -196,6 +196,7 @@ pub fn client() -> Result<Client> {
 }
 
 pub fn auth_header(token: &[u8]) -> Result<header::HeaderValue> {
+    crate::credentials::validate_token(token)?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(token.len() + 7));
     bytes.extend_from_slice(b"Bearer ");
     bytes.extend_from_slice(token);
