@@ -661,7 +661,7 @@ mod tests {
                 self.inner
                     .send(msg)
                     .await
-                    .map_err(|_| anyhow::anyhow!("smoke Telegram send failed"))?;
+                    .map_err(|_| anyhow::Error::msg("smoke Telegram send failed"))?;
                 self.sent.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
