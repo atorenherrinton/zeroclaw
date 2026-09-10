@@ -5540,6 +5540,149 @@ mod tests {
         std::process::ExitStatus::from_raw(0)
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn policy_denials_require_repeated_failed_rounds_to_stop_the_tool_loop() {
+        for repeated_denials in [false, true] {
+            for parallel_tools in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                std::fs::write(workspace.path().join("progress.txt"), "verified progress").unwrap();
+                let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                    autonomy: zeroclaw_config::autonomy::AutonomyLevel::Full,
+                    workspace_dir: workspace.path().to_path_buf(),
+                    allowed_commands: vec!["cat".into()],
+                    ..zeroclaw_config::policy::SecurityPolicy::default()
+                });
+                let tools_registry =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                        crate::tools::ShellTool::new(
+                            security,
+                            Arc::new(crate::platform::NativeRuntime::new()),
+                        )
+                        .with_persistent_writes(false),
+                    )]);
+                let call = |command: &str| {
+                    format!(
+                        "<tool_call>\n{}\n</tool_call>",
+                        serde_json::json!({"name":"shell", "arguments":{"command":command}})
+                    )
+                };
+                // Two different denied paths, with useful work between them and
+                // successful siblings in each batch, reproduce the production stop.
+                let first = format!(
+                    "{}\n{}",
+                    call("cat /tmp/blocked.txt"),
+                    call("cat progress.txt")
+                );
+                let middle = call("cat ./progress.txt");
+                let second = format!(
+                    "{}\n{}",
+                    call("cat ../blocked.txt"),
+                    call("cat ././progress.txt")
+                );
+                let denied_rounds = (0..6)
+                    .map(|i| call(&format!("cat ../blocked-{i}.txt")))
+                    .collect::<Vec<_>>();
+                let responses = if repeated_denials {
+                    denied_rounds.iter().map(String::as_str).collect::<Vec<_>>()
+                } else {
+                    vec![
+                        first.as_str(),
+                        middle.as_str(),
+                        second.as_str(),
+                        "Finished permitted work",
+                    ]
+                };
+                let model_provider = ScriptedModelProvider::from_text_responses(responses);
+                let mut history = vec![
+                    ChatMessage::system("test-system"),
+                    ChatMessage::user("Read project files"),
+                ];
+                let observer = NoopObserver;
+                let turn_id = uuid::Uuid::new_v4().to_string();
+                let result = run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: None,
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 8,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "test",
+                    channel_reply_target: None,
+                    cancellation_token: None,
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: None,
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: Some("zeroclaw-test-agent"),
+                    turn_id: &turn_id,
+                })
+                .await;
+                if repeated_denials {
+                    assert!(result.unwrap_err().to_string().contains(
+                        "Agent loop remained stuck after the bounded Codex recovery attempt"
+                    ));
+                    assert_eq!(
+                        history
+                            .iter()
+                            .filter(|m| m.content.contains("[ZeroClaw recovery result]"))
+                            .count(),
+                        1
+                    );
+                    continue;
+                }
+                let result = result.expect(
+                    "isolated denials must return to the model instead of exhausting recovery",
+                );
+                assert_eq!(result, "Finished permitted work");
+                let tool_history = history
+                    .iter()
+                    .filter(|m| m.role == "tool" || m.content.starts_with("[Tool results]"))
+                    .map(|m| m.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(tool_history.contains("Path blocked by security policy: /tmp/blocked.txt"));
+                assert!(tool_history.contains("Path blocked by security policy: .."));
+                assert!(tool_history.contains("verified progress"));
+                assert!(
+                    !history
+                        .iter()
+                        .any(|m| m.content.contains("[ZeroClaw recovery result]"))
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn recovery_returns_control_to_zeroclaw_tool_loop() {
         let original_task = "ORIGINAL_TASK_SENTINEL: remain owned by ZeroClaw";
