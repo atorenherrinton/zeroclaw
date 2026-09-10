@@ -15,6 +15,7 @@ use super::context::TurnCtx;
 use super::events::StreamDelta;
 use crate::agent::tool_execution::{
     ToolDispatchContext, ToolExecutionOutcome, ToolFailureKind, execute_one_tool, find_tool,
+    resolved_tool_provenance,
 };
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::tools::{ActivatedToolSet, Tool};
@@ -299,6 +300,26 @@ pub(crate) async fn attempt_codex_recovery(
         excluded_tools,
         model_switch_callback,
     };
+    // Recovery dispatches directly, bypassing ordinary call preparation. Carry
+    // the same typed progress pair so channel consumers observe this admitted
+    // repair too. The registry remains the provenance authority; neither the
+    // private repair prompt nor failure details belong in draft events.
+    let stream_call = ctx.on_delta.map(|_| {
+        (
+            std::sync::Arc::new(serde_json::json!({})),
+            resolved_tool_provenance(tools_registry, activated_tools, CODEX_TOOL),
+        )
+    });
+    if let (Some(tx), Some((arguments, tool_provenance))) = (ctx.on_delta, &stream_call) {
+        let _ = tx
+            .send(StreamDelta::ToolStart {
+                tool: CODEX_TOOL.to_string(),
+                arguments: std::sync::Arc::clone(arguments),
+                tool_provenance: *tool_provenance,
+            })
+            .await;
+    }
+    let started = std::time::Instant::now();
     let outcome = zeroclaw_tools::codex_cli::scope_zeroclaw_recovery(
         prompt,
         execute_one_tool(
@@ -314,6 +335,22 @@ pub(crate) async fn attempt_codex_recovery(
         ),
     )
     .await;
+
+    if let (Some(tx), Some((arguments, tool_provenance))) = (ctx.on_delta, stream_call) {
+        let _ = tx
+            .send(StreamDelta::ToolComplete {
+                tool: CODEX_TOOL.to_string(),
+                arguments,
+                tool_provenance,
+                secs: outcome.as_ref().map_or_else(
+                    |_| started.elapsed().as_secs(),
+                    |result| result.duration.as_secs(),
+                ),
+                success: outcome.as_ref().is_ok_and(|result| result.success),
+                error: None,
+            })
+            .await;
+    }
 
     let status = match outcome {
         Ok(outcome) if outcome.success => parse_status(&outcome.output),
@@ -584,6 +621,7 @@ mod tests {
             ))]);
         let observer = NoopObserver;
         let pacing = PacingConfig::default();
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(32);
         let ctx = TurnCtx {
             observer: &observer,
             provider_name: "test-provider",
@@ -593,7 +631,7 @@ mod tests {
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
-            on_delta: None,
+            on_delta: Some(&delta_tx),
             event_tx: None,
             hooks: None,
             dedup_exempt_tools: &[],
@@ -625,6 +663,15 @@ mod tests {
         .await;
         assert_eq!(restricted.status, RecoveryStatus::Unavailable);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        while let Ok(event) = delta_rx.try_recv() {
+            assert!(
+                !matches!(
+                    event,
+                    StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }
+                ),
+                "excluded recovery must not announce a tool dispatch"
+            );
+        }
 
         let original_task = "ORIGINAL_TASK_SENTINEL: contact a person";
         let mut zeroclaw_history = vec![ChatMessage::user(original_task)];
@@ -634,6 +681,47 @@ mod tests {
 
         assert_eq!(recovered.status, RecoveryStatus::Applied);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let mut tool_phases = Vec::new();
+        while let Ok(event) = delta_rx.try_recv() {
+            match event {
+                StreamDelta::ToolStart {
+                    tool,
+                    arguments,
+                    tool_provenance,
+                } => {
+                    assert_eq!(tool, CODEX_TOOL);
+                    assert_eq!(*arguments, serde_json::json!({}));
+                    assert_eq!(
+                        tool_provenance,
+                        Some(zeroclaw_api::attribution::ToolProvenance::Native)
+                    );
+                    tool_phases.push("start");
+                }
+                StreamDelta::ToolComplete {
+                    tool,
+                    arguments,
+                    tool_provenance,
+                    success,
+                    error,
+                    ..
+                } => {
+                    assert_eq!(tool, CODEX_TOOL);
+                    assert_eq!(*arguments, serde_json::json!({}));
+                    assert_eq!(
+                        tool_provenance,
+                        Some(zeroclaw_api::attribution::ToolProvenance::Native)
+                    );
+                    assert!(success);
+                    assert!(
+                        error.is_none(),
+                        "repair details must stay out of draft progress"
+                    );
+                    tool_phases.push("complete");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tool_phases, ["start", "complete"]);
         let recorded = prompts.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert!(recorded[0].contains("ZeroClaw Rust runtime"));

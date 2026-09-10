@@ -5,6 +5,7 @@ pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
 pub mod media_pipeline;
+mod repair_notifications;
 mod turn_journal;
 use zeroclaw_api::turn::{TaskStatus, TurnJournal};
 #[cfg(feature = "channel-mqtt")]
@@ -6975,8 +6976,10 @@ async fn process_channel_message_body(
 
     ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"has_target_channel": target_channel.is_some(), "use_draft_streaming": use_draft_streaming})), "Streaming decision");
 
-    // Partial mode: delta channel for draft updates (progress + text).
-    let (delta_tx, delta_rx) = if use_draft_streaming {
+    // Telegram repair notices consume structured progress even without drafts.
+    let (delta_tx, delta_rx) = if use_draft_streaming
+        || (msg.channel == "telegram" && target_channel.is_some())
+    {
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::loop_::DraftEvent>(64);
         (Some(tx), Some(rx))
     } else {
@@ -7014,6 +7017,22 @@ async fn process_channel_message_body(
         }
     } else {
         None
+    };
+
+    // Keep operational repair notices separate from editable drafts and the
+    // optional per-tool transcript. The relay preserves the original events.
+    let (delta_rx, repair_notification_task) = match (delta_rx, target_channel.as_ref()) {
+        (Some(rx), Some(channel)) if msg.channel == "telegram" => {
+            let (draft_rx, task) = repair_notifications::start(
+                rx,
+                Arc::clone(channel),
+                msg.clone(),
+                cancellation_token.clone(),
+                use_draft_streaming && draft_message_id.is_some(),
+            );
+            (draft_rx, Some(task))
+        }
+        (rx, _) => (rx, None),
     };
 
     // Spawn the appropriate handler for the delta channel.
@@ -7485,6 +7504,9 @@ async fn process_channel_message_body(
         "Post-loop: dropping delta_tx and awaiting draft updater"
     );
     drop(delta_tx);
+    if let Some(task) = repair_notification_task {
+        task.finish().await;
+    }
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
@@ -18443,6 +18465,179 @@ api_key = "anthropic-key"
             attachments: vec![],
             subject: None,
             ..Default::default()
+        }
+    }
+
+    struct RepairNoticeModelProvider {
+        tool: &'static str,
+        stream_calls: AtomicUsize,
+    }
+
+    impl RepairNoticeModelProvider {
+        fn response(&self, messages: &[ChatMessage]) -> String {
+            if messages
+                .iter()
+                .any(|message| message.role == "tool" || message.content.contains("[Tool results]"))
+            {
+                "Finished the requested work.".to_string()
+            } else {
+                format!(
+                    "<tool_call>{}</tool_call>",
+                    serde_json::json!({"name":self.tool, "arguments":{"agent":"coding", "path":"source.rs"}})
+                )
+            }
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RepairNoticeModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Attributable::role(&DummyModelProvider)
+        }
+        fn alias(&self) -> &str {
+            "repair-notice-provider"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for RepairNoticeModelProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.response(&[]))
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _: &str,
+            _: Option<f64>,
+            _: zeroclaw_api::model_provider::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_api::model_provider::StreamResult<zeroclaw_api::model_provider::StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(futures_util::stream::iter([
+                Ok(zeroclaw_api::model_provider::StreamChunk::delta(
+                    self.response(messages),
+                )),
+                Ok(zeroclaw_api::model_provider::StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    struct RepairNoticeTool {
+        name: &'static str,
+        provenance: zeroclaw_api::attribution::ToolProvenance,
+    }
+    impl zeroclaw_api::attribution::Attributable for RepairNoticeTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            self.name
+        }
+        fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+            self.provenance
+        }
+    }
+    #[async_trait::async_trait]
+    impl Tool for RepairNoticeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Harmless repair notice test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "Test work completed".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// Exercise actual provider stream -> resolved native tool -> channel send
+    /// wiring with normal tool chatter disabled, including Telegram off mode.
+    #[tokio::test]
+    async fn telegram_repair_notification_process_boundary_with_and_without_drafts() {
+        use zeroclaw_api::attribution::ToolProvenance::{Extension, Native};
+        for draft_enabled in [false, true] {
+            for (tool, provenance, expected_notice) in [
+                ("delegate", Native, true),
+                ("delegate", Extension, false),
+                ("file_read", Native, false),
+            ] {
+                let plain = Arc::new(TelegramRecordingChannel::default());
+                let draft = Arc::new(DraftRecordingChannel {
+                    channel_name: "telegram",
+                    ..DraftRecordingChannel::new(false, false)
+                });
+                let channel: Arc<dyn Channel> = if draft_enabled {
+                    draft.clone()
+                } else {
+                    plain.clone()
+                };
+                let provider = Arc::new(RepairNoticeModelProvider {
+                    tool,
+                    stream_calls: AtomicUsize::new(0),
+                });
+                let mut context = test_runtime_ctx_with_observer_and_tools(
+                    channel,
+                    provider.clone(),
+                    Config::default(),
+                    zeroclaw_config::schema::AliasedAgentConfig::default(),
+                    "test-provider",
+                    None,
+                    Arc::new(NoopObserver),
+                    vec![Box::new(RepairNoticeTool {
+                        name: tool,
+                        provenance,
+                    })],
+                );
+                Arc::get_mut(&mut context).unwrap().show_tool_calls = false;
+                let mut message = message_sent_hook_test_message();
+                message.channel = "telegram".into();
+                process_channel_message(context, message, CancellationToken::new()).await;
+                let sent = if draft_enabled {
+                    draft.sent_messages.lock().await.clone()
+                } else {
+                    plain.sent_messages.lock().await.clone()
+                };
+                let notice = zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-repair-started",
+                );
+                assert_eq!(
+                    sent.iter().filter(|text| text.ends_with(&notice)).count(),
+                    usize::from(expected_notice),
+                    "draft={draft_enabled}, tool={tool}, provenance={provenance:?}: {sent:?}"
+                );
+                let final_messages = if draft_enabled {
+                    draft.finalized_messages.lock().await.clone()
+                } else {
+                    sent
+                };
+                assert!(
+                    final_messages
+                        .iter()
+                        .any(|text| text.ends_with("Finished the requested work.")),
+                    "complete final response must survive: {final_messages:?}"
+                );
+                assert!(
+                    provider.stream_calls.load(Ordering::SeqCst) >= 2,
+                    "off mode must exercise the newly enabled provider streaming path"
+                );
+            }
         }
     }
 

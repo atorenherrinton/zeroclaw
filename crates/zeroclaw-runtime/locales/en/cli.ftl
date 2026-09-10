@@ -1004,6 +1004,8 @@ channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized fo
 channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
+channel-runtime-repair-started = 🛠️ I’m starting repair or coding work for this request. I’ll keep you updated while it runs.
+channel-runtime-repair-ongoing = 🛠️ Your request is still running after starting repair or coding work. I’ll send the result when it finishes.
 channel-runtime-current-model-status =
     Current model_provider: `{ $provider }`
     Current model: `{ $model }`
