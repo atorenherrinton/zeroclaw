@@ -1,0 +1,6 @@
+/zeroclaw-google-push
+/config.json
+/state.json
+/*.log
+/.request-*
+/.state-*

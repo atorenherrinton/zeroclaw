@@ -208,18 +208,16 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         read_skill_available,
     );
 
-    // ── 0. Anti-narration (top priority) ───────────────────────
-    // When show_tool_calls is true, the model is allowed to describe
-    // its tool usage so channel users see what tools are being called.
+    // Tool visibility controls implementation detail, not useful conversation.
     if has_tools && !show_tool_calls {
         prompt.push_str(
-            "## CRITICAL: No Tool Narration\n\n\
-             NEVER narrate, announce, describe, or explain your tool usage to the user. \
-             Do NOT say things like 'Let me check...', 'I will use http_request to...', \
-             'I'll fetch that for you', 'Searching now...', or 'Using the web_search tool'. \
-             The user must ONLY see the final answer. Tool calls are invisible infrastructure — \
-             never reference them. If you catch yourself starting a sentence about what tool \
-             you are about to use or just used, DELETE it and give the answer directly.\n\n",
+            "## Progress and Tool Privacy\n\n\
+             Keep raw tool names, arguments, commands, payloads, and execution traces out of \
+             user-facing messages unless the user asks for technical detail. Brief conversational \
+             progress updates are allowed when they explain a meaningful finding, next step, or \
+             delay. Describe the user's task in plain language, such as 'I'm checking the schedule' \
+             or 'I found a conflict and am checking the alternatives.' Do not narrate every call \
+             or repeat generic status updates. Never claim work succeeded before its result is verified.\n\n",
         );
     }
 
@@ -510,7 +508,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
         prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
         prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
         if !show_tool_calls {
-            prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
+            prompt.push_str("- Keep raw tool details private. Brief, useful conversational progress updates are allowed; explain findings and delays in plain language, then provide the verified result.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
     } // end if !compact_context (full Channel Capabilities copy)
@@ -630,6 +628,36 @@ fn inject_workspace_file(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    #[test]
+    fn hidden_tool_details_allow_useful_progress_in_full_and_compact_prompts() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        for compact in [false, true] {
+            let prompt = build_system_prompt_with_mode_and_effective_tools(
+                workspace.path(),
+                "test-model",
+                &[("shell", "Execute commands")],
+                |_| true,
+                &[],
+                None,
+                None,
+                None,
+                false,
+                SkillsPromptInjectionMode::Full,
+                compact,
+                0,
+                false,
+                false,
+                None,
+            );
+            assert!(prompt.contains("Brief conversational progress updates are allowed"));
+            assert!(prompt.contains("Keep raw tool names, arguments, commands, payloads"));
+            assert!(prompt.contains("Never claim work succeeded before its result is verified"));
+            assert!(!prompt.contains("no progress updates"));
+            assert!(!prompt.contains("ONLY see the final answer"));
+            assert!(!prompt.contains("FINAL ANSWER only"));
+        }
+    }
 
     #[test]
     fn compact_skills_fall_back_to_full_when_loader_is_described_but_unavailable() {

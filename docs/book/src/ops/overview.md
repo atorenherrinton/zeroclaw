@@ -143,6 +143,16 @@ A plain `tar czf zeroclaw-$(date +%F).tar.gz ~/.zeroclaw` covers everything. Res
 
 ## Updates
 
+Custom source builds expose the source commit, working-tree state, enabled
+features, and compiler through `zeroclaw --version`; `zeroclaw -V` retains the
+short package version. Keep this metadata with executable checksums and signing
+requirements in the deployment record. A `dirty` or `unknown` source state is
+not a reproducible release. The phone extension also supports `--version`.
+
+The built-in updater installs upstream release artifacts. A custom installation
+must rebuild its reviewed integration branch to retain local capabilities and
+keep an independent known-good executable and state backup before replacing it.
+
 The service does not auto-update. Subscribe to the release feed (GitHub releases or the Discord `#releases` channel: see [Contributing → Communication](../contributing/communication.md)). Typical update cadence:
 
 1. Read the release notes

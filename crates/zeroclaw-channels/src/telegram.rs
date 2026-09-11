@@ -12650,9 +12650,18 @@ mod tests {
 
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(requests[1].url.path().ends_with("/answerCallbackQuery"));
-        assert!(requests[2].url.path().ends_with("/editMessageText"));
-        let edit_body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+        // Acknowledgement and the resolved approval edit run concurrently.
+        // Check both exact effects without inventing a transport ordering.
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/answerCallbackQuery"))
+        );
+        let edit = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("/editMessageText"))
+            .unwrap();
+        let edit_body: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
         let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
         assert_eq!(
             edit_body["text"],

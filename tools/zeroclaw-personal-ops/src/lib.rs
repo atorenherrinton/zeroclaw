@@ -17,6 +17,7 @@ use std::{
 pub mod contacts;
 pub mod continuity;
 pub mod events;
+mod google_push_health;
 mod imessage;
 mod imessage_history;
 pub mod install;

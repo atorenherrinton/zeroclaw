@@ -458,6 +458,69 @@ impl TaskRegistry for SqliteTaskStore {
         .await?
     }
 
+    async fn record_channel_error(&self, id: &str, error: String) -> Result<()> {
+        anyhow::ensure!(error.len() <= 8192, "channel error checkpoint too large");
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn=conn.lock();
+            conn.execute("UPDATE tasks SET error=?2 WHERE id=?1 AND kind='channel_turn' AND status IN ('running','waiting_on_tool')",params![id,error])?;
+            Ok(())
+        }).await?
+    }
+
+    async fn claim_delegate_notice(&self, id: &str, parent: &str) -> Result<bool> {
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        let parent = parent.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn=conn.lock();
+            conn.execute_batch("PRAGMA synchronous=FULL")?;
+            let result=conn.execute("UPDATE tasks SET idem_key='completion-notice-submitting'
+                WHERE id=?1 AND parent_id=?2 AND kind='delegate' AND status='completed'
+                AND delivered=0 AND idem_key IS NULL AND EXISTS
+                (SELECT 1 FROM tasks p WHERE p.id=?2 AND p.status IN ('uncertain','failed','cancelled','lost','timed_out','delivered','partially_delivered'))",params![id,parent]);
+            conn.execute_batch("PRAGMA synchronous=NORMAL")?;
+            Ok(result? == 1)
+        }).await?
+    }
+    async fn confirm_delegate_notice(&self, id: &str) -> Result<()> {
+        let conn = Arc::clone(&self.conn);
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn=conn.lock();
+            conn.execute("UPDATE tasks SET delivered=1,idem_key='completion-notice-confirmed' WHERE id=?1 AND idem_key='completion-notice-submitting'",[id])?;
+            Ok(())
+        }).await?
+    }
+
+    async fn conversation_delegates(
+        &self,
+        route: &zeroclaw_api::conversation::ConversationRoute,
+        parent: Option<&str>,
+    ) -> Result<Vec<(String, String, String)>> {
+        let conn = Arc::clone(&self.conn);
+        let route = serde_json::to_string(route)?;
+        let parent = parent.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare(
+                "SELECT d.id,d.status,substr(COALESCE(d.output,''),1,4000) FROM tasks d
+                 LEFT JOIN tasks p ON p.id=d.parent_id
+                 WHERE d.kind='delegate' AND d.delivered=0
+                 AND json_valid(d.originator_route)
+                 AND json_extract(d.originator_route,'$.channel')=json_extract(?1,'$.channel')
+                 AND json_extract(d.originator_route,'$.recipient')=json_extract(?1,'$.recipient')
+                 AND json_extract(d.originator_route,'$.sender')=json_extract(?1,'$.sender')
+                 AND json_extract(d.originator_route,'$.thread') IS json_extract(?1,'$.thread')
+                 AND ((?2 IS NOT NULL AND d.parent_id=?2) OR
+                      (?2 IS NULL AND p.status IN ('uncertain','failed','cancelled','lost','timed_out','delivered','partially_delivered')))
+                 ORDER BY d.started_at DESC LIMIT 8")?;
+            stmt.query_map(params![route,parent], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        }).await?
+    }
+
     async fn channel_turn_input(&self, id: &str) -> Result<Option<String>> {
         let conn = Arc::clone(&self.conn);
         let id = id.to_owned();
@@ -652,6 +715,123 @@ mod tests {
             started_at: "2026-06-18T00:00:00Z".into(),
             finished_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn stopped_parent_delegate_results_survive_reopen_and_are_route_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let mut parent = rec("parent", "fixture", 0, "fixture");
+        parent.kind = TaskKind::ChannelTurn;
+        store.create(parent).await.unwrap();
+        store
+            .checkpoint_channel_turn("parent", TaskStatus::Uncertain, None, false)
+            .await
+            .unwrap();
+        let route = zeroclaw_api::conversation::ConversationRoute {
+            channel: "fixture.channel".into(),
+            recipient: "room".into(),
+            sender: "owner".into(),
+            thread: None,
+            reply_to: "old".into(),
+        };
+        let mut child = rec("child", "coding", 0, "fixture");
+        child.parent_id = Some("parent".into());
+        child.originator_route = Some(serde_json::to_string(&route).unwrap());
+        store.create(child).await.unwrap();
+        store
+            .update_status(
+                "child",
+                TaskStatus::Completed,
+                Some("completed audit".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        drop(store);
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let mut next = route.clone();
+        next.reply_to = "next".into();
+        assert_eq!(
+            store.conversation_delegates(&next, None).await.unwrap(),
+            vec![("child".into(), "completed".into(), "completed audit".into())]
+        );
+        assert!(
+            !store.get("child").await.unwrap().unwrap().delivered,
+            "reading is not delivery"
+        );
+        for field in ["channel", "recipient", "sender", "thread"] {
+            let mut other = next.clone();
+            match field {
+                "channel" => other.channel = "other".into(),
+                "recipient" => other.recipient = "other".into(),
+                "sender" => other.sender = "other".into(),
+                _ => other.thread = Some("other".into()),
+            }
+            assert!(
+                store
+                    .conversation_delegates(&other, None)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_notice_claim_survives_restart_and_never_replays_uncertain_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        let mut parent = rec("parent", "fixture", 0, "fixture");
+        parent.kind = TaskKind::ChannelTurn;
+        store.create(parent).await.unwrap();
+        let mut child = rec("child", "fixture", 0, "fixture");
+        child.parent_id = Some("parent".into());
+        store.create(child).await.unwrap();
+        store
+            .update_status("child", TaskStatus::Completed, Some("saved".into()), None)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .claim_delegate_notice("child", "parent")
+                .await
+                .unwrap(),
+            "active parent owns delivery"
+        );
+        store
+            .checkpoint_channel_turn("parent", TaskStatus::Uncertain, None, false)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .claim_delegate_notice("child", "unrelated")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .claim_delegate_notice("child", "parent")
+                .await
+                .unwrap()
+        );
+        drop(store);
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        assert!(
+            !store
+                .claim_delegate_notice("child", "parent")
+                .await
+                .unwrap()
+        );
+        assert!(!store.get("child").await.unwrap().unwrap().delivered);
+        store.confirm_delegate_notice("child").await.unwrap();
+        assert!(store.get("child").await.unwrap().unwrap().delivered);
+        assert!(
+            !store
+                .claim_delegate_notice("child", "parent")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

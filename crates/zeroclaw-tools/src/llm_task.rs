@@ -14,36 +14,39 @@ use zeroclaw_providers::ProviderDispatch;
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
     security: Arc<SecurityPolicy>,
-    /// Default model_provider name from root config (e.g. "openrouter").
-    default_model_provider: String,
-    /// Default model from root config.
-    default_model: String,
-    /// Default temperature from root config. `None` means no temperature
-    /// is sent on the wire; provider applies its own default.
-    default_temperature: Option<f64>,
-    /// API key for model_provider authentication.
-    api_key: Option<String>,
-    /// ModelProvider runtime options inherited from root config.
-    provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+    /// Agent configuration is the source of truth for provider alias, auth,
+    /// endpoint, model, and temperature. Runtime reload reconstructs this tool.
+    config: Arc<zeroclaw_config::schema::Config>,
+    agent_alias: String,
 }
 
 impl LlmTaskTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
-        default_model_provider: String,
-        default_model: String,
-        default_temperature: Option<f64>,
-        api_key: Option<String>,
-        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions,
+        config: Arc<zeroclaw_config::schema::Config>,
+        agent_alias: String,
     ) -> Self {
         Self {
             security,
-            default_model_provider,
-            default_model,
-            default_temperature,
-            api_key,
-            provider_runtime_options,
+            config,
+            agent_alias,
         }
+    }
+
+    fn model_provider(&self) -> anyhow::Result<Box<dyn ModelProvider>> {
+        let (family, alias, entry) = self
+            .config
+            .resolved_model_provider_for_agent(&self.agent_alias)
+            .ok_or_else(|| anyhow::Error::msg("Agent model_provider is not configured"))?;
+        let options =
+            zeroclaw_providers::provider_runtime_options_for_alias(&self.config, family, alias);
+        zeroclaw_providers::create_model_provider_for_alias(
+            &self.config,
+            family,
+            alias,
+            entry.api_key.as_deref(),
+            &options,
+        )
     }
 }
 
@@ -114,16 +117,28 @@ impl Tool for LlmTaskTool {
                 }
             };
 
-            // Extract optional overrides
+            let entry = match self.config.model_provider_for_agent(&self.agent_alias) {
+                Some(entry) => entry,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some("Agent model_provider is not configured".to_string()),
+                    });
+                }
+            };
+
+            // Extract optional overrides from the calling agent's profile.
             let schema = args.get("schema").and_then(|v| v.as_object());
             let model = args
                 .get("model")
                 .and_then(|v| v.as_str())
-                .unwrap_or(&self.default_model);
+                .or(entry.model.as_deref())
+                .unwrap_or("openai/gpt-4o-mini");
             let temperature = args
                 .get("temperature")
                 .and_then(|v| v.as_f64())
-                .or(self.default_temperature);
+                .or(entry.temperature);
 
             // Build the effective prompt, adding JSON schema instructions when needed
             let effective_prompt = if let Some(schema_obj) = schema {
@@ -132,31 +147,25 @@ impl Tool for LlmTaskTool {
                         .unwrap_or_else(|_| "{}".to_string());
                 format!(
                     "{prompt}\n\n\
-                     IMPORTANT: You MUST respond with valid JSON that conforms to this schema:\n\
-                     ```json\n{schema_json}\n```\n\
-                     Respond ONLY with the JSON object, no explanation or markdown."
+                 IMPORTANT: You MUST respond with valid JSON that conforms to this schema:\n\
+                 ```json\n{schema_json}\n```\n\
+                 Respond ONLY with the JSON object, no explanation or markdown."
                 )
             } else {
                 prompt.to_string()
             };
 
-            // Create model_provider
-            let api_key_ref = self.api_key.as_deref();
-            let model_provider: Box<dyn ModelProvider> =
-                match zeroclaw_providers::create_model_provider_with_options(
-                    &self.default_model_provider,
-                    api_key_ref,
-                    &self.provider_runtime_options,
-                ) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: ToolOutput::default(),
-                            error: Some(format!("Failed to create model_provider: {e}")),
-                        });
-                    }
-                };
+            // Keep alias context so the factory can resolve profile-specific auth.
+            let model_provider = match self.model_provider() {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("Failed to create provider: {e}")),
+                    });
+                }
+            };
 
             // Make the LLM call (no tools, no agent loop). `temperature` is
             // already Option<f64>; pass straight through. None omits the field
@@ -280,6 +289,48 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config(oauth: bool) -> zeroclaw_config::schema::Config {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+        };
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "task_profile".into(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("test-model".into()),
+                    requires_openai_auth: oauth,
+                    temperature: Some(0.7),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test_agent".into(),
+            AliasedAgentConfig {
+                model_provider: "openai.task_profile".into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn provider_preserves_oauth_alias_without_api_key() {
+        let tool = LlmTaskTool::new(
+            Arc::new(SecurityPolicy::default()),
+            Arc::new(test_config(true)),
+            "test_agent".into(),
+        );
+        let provider = tool
+            .model_provider()
+            .expect("OAuth alias should construct without API key");
+        assert!(
+            provider.capabilities().native_tool_calling,
+            "must select the configured OAuth provider, not the API-key provider"
+        );
+    }
 
     // ── Schema validation tests ──────────────────────────────────────
 
@@ -414,11 +465,8 @@ mod tests {
     fn tool_metadata() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            "openrouter".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            Arc::new(test_config(false)),
+            "test_agent".to_string(),
         );
 
         assert_eq!(tool.name(), "llm_task");
@@ -440,11 +488,8 @@ mod tests {
     async fn execute_missing_prompt_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            "openrouter".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            Arc::new(test_config(false)),
+            "test_agent".to_string(),
         );
 
         let result = tool.execute(json!({})).await.unwrap();
@@ -456,11 +501,8 @@ mod tests {
     async fn execute_empty_prompt_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            "openrouter".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            Arc::new(test_config(false)),
+            "test_agent".to_string(),
         );
 
         let result = tool.execute(json!({"prompt": "  "})).await.unwrap();
@@ -472,11 +514,8 @@ mod tests {
     async fn execute_with_invalid_provider_returns_error() {
         let tool = LlmTaskTool::new(
             Arc::new(SecurityPolicy::default()),
-            "nonexistent_provider_xyz".to_string(),
-            "test-model".to_string(),
-            Some(0.7),
-            None,
-            zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            "missing_agent".to_string(),
         );
 
         let result = tool

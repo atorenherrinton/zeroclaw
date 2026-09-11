@@ -5245,6 +5245,7 @@ pub(crate) mod tests {
             },
             command: Some("echo decl-output".to_string()),
             prompt: None,
+            completion_check: None,
             enabled: true,
             model: None,
             allowed_tools: None,

@@ -1,0 +1,28 @@
+{
+  "credentials": {},
+  "profiles": {
+    "gh-cli-check": {
+      "executable": "/opt/homebrew/bin/gh",
+      "args": ["--version"],
+      "read_only": true,
+      "output": {"mode": "status"}
+    },
+    "gh-account": {
+      "executable": "/opt/homebrew/bin/gh",
+      "args": ["api", "--hostname", "github.com", "--method", "GET", "user"],
+      "secret_env": {"GH_TOKEN": "github"},
+      "env": {"GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1", "GH_HOST": "github.com"},
+      "read_only": true,
+      "output": {"mode": "json", "fields": {"login": "/login", "id": "/id", "type": "/type"}}
+    },
+    "aws-identity": {
+      "executable": "/opt/homebrew/bin/aws",
+      "args": ["sts", "get-caller-identity", "--output", "json", "--region", {"param": "region"}],
+      "params": {"region": {"choices": ["us-east-1", "us-west-2", "eu-west-1"]}},
+      "secret_env": {"AWS_ACCESS_KEY_ID": "aws-access-id", "AWS_SECRET_ACCESS_KEY": "aws-secret-key"},
+      "env": {"AWS_PAGER": "", "AWS_EC2_METADATA_DISABLED": "true"},
+      "read_only": true,
+      "output": {"mode": "json", "fields": {"account": "/Account", "arn": "/Arn"}}
+    }
+  }
+}

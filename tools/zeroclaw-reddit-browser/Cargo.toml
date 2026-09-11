@@ -1,0 +1,25 @@
+[package]
+name = "zeroclaw-reddit-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde_json = "1.0"
+url = "2.5"
+uuid = { version = "1.22", features = ["v4"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.26"
+fantoccini = { version = "0.22.1", default-features = false, features = ["rustls-tls"] }
+zeroclaw-spawn = { path = "../../crates/zeroclaw-spawn" }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[workspace]

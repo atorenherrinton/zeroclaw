@@ -828,6 +828,15 @@ impl ReliableProviderTerminalFailure {
         }
     }
 
+    /// Bounded adapter cause for the operator log only; callers must apply
+    /// their destination's credential scrubber. Display intentionally stays generic.
+    pub fn operator_diagnostic(&self) -> String {
+        self.terminal_cause
+            .as_ref()
+            .map(compact_error_detail)
+            .unwrap_or_else(|| self.diagnostic.clone())
+    }
+
     pub fn kind(&self) -> ReliableProviderTerminalFailureKind {
         self.kind
     }
@@ -3772,6 +3781,26 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn terminal_operator_diagnostic_preserves_cause_without_exposing_it_in_display() {
+        let cause = anyhow::Error::msg(
+            "OpenAI Codex SSE stream ended without completion; https://fixture.invalid?api_key=fixture-private-query; token=sk-abcdefghijklmnopqrstuvwxyz1234567890",
+        );
+        let diagnostic = provider_error_diagnostic(&cause);
+        assert_eq!(diagnostic.kind, "provider_error");
+        let failure = ReliableProviderTerminalFailure::with_cause(
+            Some("fixture"),
+            diagnostic,
+            "bounded provider failure".into(),
+            cause,
+        );
+        let detail = failure.operator_diagnostic();
+        assert!(detail.contains("SSE stream ended"));
+        assert!(!detail.contains("fixture-private-query"));
+        assert!(!detail.contains("abcdefghijklmnopqrstuvwxyz1234567890"));
+        assert_eq!(failure.to_string(), "bounded provider failure");
     }
 
     #[test]

@@ -360,7 +360,11 @@ pub fn default_tools_with_runtime(
                     security.clone(),
                 )),
                 security.clone(),
-            ),
+            )
+            .with_extractor(|args| {
+                // Patterns are regex data; ContentSearchTool owns the default search path.
+                args.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+            }),
             security,
         )),
     ]
@@ -922,7 +926,11 @@ pub fn all_tools_with_runtime(
                     security.clone(),
                 )),
                 security.clone(),
-            ),
+            )
+            .with_extractor(|args| {
+                // Patterns are regex data; ContentSearchTool owns the default search path.
+                args.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+            }),
             security.clone(),
         )),
         Arc::new(CronAddTool::new_with_runtime(
@@ -1056,23 +1064,15 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
-    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
+    // LLM task tool — the calling agent's profile owns auth and model selection.
+    if root_config
+        .resolved_model_provider_for_agent(agent_alias)
+        .is_some()
     {
-        let llm_task_provider = family.to_string();
-        let llm_task_model = entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
-            llm_task_model,
-            entry.temperature,
-            entry.api_key.clone(),
-            llm_task_runtime_options,
+            Arc::new(root_config.clone()),
+            agent_alias.to_string(),
         )));
     }
 
@@ -4027,6 +4027,48 @@ permissions = ["http_client"]
                 "Tool {} has empty description",
                 tool.name()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_content_search_guards_paths_not_patterns() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        std::fs::write(workspace.path().join("fixture.txt"), "../needle\n").unwrap();
+        std::fs::write(outside.path().join("fixture.txt"), "../needle\n").unwrap();
+        let tools = default_tools(security);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name() == "content_search")
+            .unwrap();
+
+        for args in [
+            serde_json::json!({"pattern": "../needle"}),
+            serde_json::json!({"pattern": "../needle", "path": "."}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "workspace search failed: {result:?}");
+            assert!(result.output.contains("../needle"));
+        }
+
+        for path in [
+            "..".to_string(),
+            outside.path().to_string_lossy().into_owned(),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"pattern": "needle", "path": path}))
+                .await
+                .unwrap();
+            assert!(
+                !result.success,
+                "unauthorized path was searched: {result:?}"
+            );
+            assert!(result.output.is_empty());
+            assert!(result.error.unwrap().contains("security policy"));
         }
     }
 

@@ -232,11 +232,12 @@ async fn agent_handles_interleaved_tools_and_text() {
 }
 
 #[tokio::test]
-async fn agent_survives_large_tool_output() {
+async fn agent_respects_large_tool_output_admission() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw::tools::{Tool, ToolResult};
 
-    /// Tool that returns a very large output.
-    struct LargeOutputTool;
+    /// Read-only fixture whose full output exceeds the exact result budget.
+    struct LargeOutputTool(Arc<AtomicUsize>);
 
     impl ::zeroclaw_api::attribution::Attributable for LargeOutputTool {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -259,8 +260,8 @@ async fn agent_survives_large_tool_output() {
             serde_json::json!({"type": "object"})
         }
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            // Return 100KB of text
-            let output = "x".repeat(100_000);
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let output = format!("read-begin:{}:read-end", "x".repeat(100_000));
             Ok(ToolResult {
                 success: true,
                 output: output.into(),
@@ -269,25 +270,64 @@ async fn agent_survives_large_tool_output() {
         }
     }
 
-    let model_provider = Box::new(MockModelProvider::new(vec![
-        tool_response(vec![ToolCall {
-            id: "tc1".into(),
-            name: "large_output".into(),
-            arguments: "{}".into(),
-            extra_content: None,
-        }]),
-        text_response("Processed the large output successfully"),
-    ]));
+    for allow_read_preview in [false, true] {
+        let (model_provider, requests) = crate::support::RecordingModelProvider::new(vec![
+            tool_response(vec![ToolCall {
+                id: "tc1".into(),
+                name: "large_output".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }]),
+            text_response("Reviewed the available excerpt; omitted content remains unknown."),
+        ]);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tool = LargeOutputTool(Arc::clone(&executions));
+        // A tool's read-preview contract must be selected at registration.
+        // Unannotated results remain exact; the agent cannot infer permission
+        // to discard their contents merely because the payload is large.
+        let tool: Box<dyn Tool> = if allow_read_preview {
+            Box::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(tool))
+        } else {
+            Box::new(tool)
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent =
+            build_agent_with_sqlite_memory(Box::new(model_provider), vec![tool], tmp.path());
 
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mut agent =
-        build_agent_with_sqlite_memory(model_provider, vec![Box::new(LargeOutputTool)], tmp.path());
-
-    let response = agent.turn("Generate a large output").await.unwrap();
-    assert!(
-        !response.is_empty(),
-        "Agent should handle large tool output without crashing"
-    );
+        let response = agent.turn("Inspect the large read result").await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "never replay the tool"
+        );
+        let requests = requests.lock().unwrap();
+        if allow_read_preview {
+            assert_eq!(
+                response.unwrap(),
+                "Reviewed the available excerpt; omitted content remains unknown."
+            );
+            assert_eq!(requests.len(), 2);
+            let results: Vec<_> = requests[1]
+                .iter()
+                .filter(|message| message.role == "tool")
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert!(results[0].content.contains("Read preview incomplete"));
+            assert!(results[0].content.contains("read-begin:"));
+            assert!(results[0].content.contains(":read-end"));
+            assert!(serde_json::to_vec(results[0]).unwrap().len() <= 32_768);
+        } else {
+            assert_eq!(
+                response.unwrap_err().to_string(),
+                zeroclaw_runtime::i18n::get_required_cli_string("turn-tool-result-budget-exceeded")
+            );
+            assert_eq!(
+                requests.len(),
+                1,
+                "rejected evidence must not reach the model"
+            );
+        }
+    }
 }
 
 #[tokio::test]

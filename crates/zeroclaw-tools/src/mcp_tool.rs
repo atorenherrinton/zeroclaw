@@ -106,15 +106,7 @@ impl Tool for McpToolWrapper {
             Ok(result) => {
                 // Preserve attachment/resource markers intact. Server annotations
                 // only select a text projection; they never authorize execution.
-                let preview_read = self.read_only_hint
-                    && result
-                        .get("content")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|items| {
-                            items.iter().all(|item| {
-                                item.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                            })
-                        });
+                let preview_read = self.read_only_hint && read_result_can_preview(&result);
                 match format_mcp_tool_result_for_model(result, &self.security.workspace_dir) {
                     Ok(output) => Ok(ToolResult {
                         success: true,
@@ -143,6 +135,40 @@ impl Tool for McpToolWrapper {
     }
 }
 
+// A read-only annotation does not make a review or receipt disposable. In
+// particular, existing MCP helpers return exact JSON reviews in text content,
+// not just structuredContent. Conservatively keep JSON-looking text exact too;
+// no second parsed copy or tool-name allowlist is needed.
+fn read_result_can_preview(result: &serde_json::Value) -> bool {
+    let Some(object) = result.as_object() else {
+        return false;
+    };
+    object
+        .keys()
+        .all(|key| matches!(key.as_str(), "content" | "isError"))
+        && !result
+            .get("isError")
+            .is_some_and(|value| value != &serde_json::Value::Bool(false))
+        && result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                !items.is_empty()
+                    && items.iter().all(|item| {
+                        item.as_object().is_some_and(|item| {
+                            item.keys()
+                                .all(|key| matches!(key.as_str(), "type" | "text"))
+                                && item.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("text")
+                                && item
+                                    .get("text")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|text| !text.trim_start().starts_with(['{', '[']))
+                        })
+                    })
+            })
+}
+
 /// A conservative preview allowance leaves room for native history's second
 /// JSON escaping layer, call IDs, receipts, and several results in one round.
 /// The runtime remains the authority for configured and aggregate admission.
@@ -160,6 +186,33 @@ fn bounded_read_result(output: String) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn read_annotations_cannot_hide_exact_structured_review_or_write_evidence() {
+        use serde_json::json;
+        let text = "read-only prose ".repeat(20_000);
+        let plain = json!({"content":[{"type":"text","text":text}],"isError":false});
+        assert!(read_result_can_preview(&plain));
+        for extra in ["structuredContent", "_meta", "receipt", "review_hash"] {
+            let mut exact = plain.clone();
+            exact[extra] = json!({"review":"x".repeat(100_000),"message_id":"fixture"});
+            assert!(!read_result_can_preview(&exact), "{extra}");
+        }
+        for text in [
+            "  {\"review\":{}}",
+            "\n[{\"message_id\":\"fixture\"}]",
+            "[receipt: fixture]",
+        ] {
+            let exact = json!({"content":[{"type":"text","text":text}]});
+            assert!(!read_result_can_preview(&exact));
+        }
+        let mut error = plain.clone();
+        error["isError"] = json!(true);
+        assert!(!read_result_can_preview(&error));
+        let mut annotated = plain;
+        annotated["content"][0]["annotations"] = json!({"receipt":"fixture"});
+        assert!(!read_result_can_preview(&annotated));
+    }
 
     #[test]
     fn read_preview_bounds_encoded_bytes_and_keeps_both_ends() {

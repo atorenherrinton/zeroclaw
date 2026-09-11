@@ -463,6 +463,13 @@ enum EstopLevelArg {
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
 #[command(version)]
+#[command(long_version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ", env!("ZEROCLAW_BUILD_GIT_SHA"),
+    "\nsource: ", env!("ZEROCLAW_BUILD_GIT_STATE"),
+    "\nfeatures: ", env!("ZEROCLAW_BUILD_FEATURES"),
+    "\ncompiler: ", env!("ZEROCLAW_BUILD_RUSTC"),
+))]
 // i18n-exempt: clap derive help — framework requires a compile-time literal
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
@@ -4966,7 +4973,30 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
             }));
 
-            Box::pin(agent::run(
+            // Only single-message TTY mode has unowned terminal input. The
+            // interactive REPL keeps its existing reader and must not compete
+            // with an MCP form prompt.
+            #[cfg(unix)]
+            let elicitation_cancellation = tokio_util::sync::CancellationToken::new();
+            #[cfg(unix)]
+            let _elicitation_scope_end = elicitation_cancellation.clone().drop_guard();
+            #[cfg(unix)]
+            let elicitation: Option<
+                std::sync::Arc<dyn zeroclaw_tools::mcp_protocol::McpElicitationHandler>,
+            > = if message.is_some()
+                && std::io::IsTerminal::is_terminal(&std::io::stdin())
+                && std::io::IsTerminal::is_terminal(&std::io::stdout())
+            {
+                Some(std::sync::Arc::new(
+                    zeroclaw_channels::mcp_elicitation::ConsoleElicitationHandler::new(
+                        elicitation_cancellation,
+                    )?,
+                ))
+            } else {
+                None
+            };
+
+            let run = Box::pin(agent::run(
                 config,
                 &agent_alias,
                 message,
@@ -4979,9 +5009,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 None,
                 zeroclaw_api::ingress::TurnOrigin::Interactive,
                 zeroclaw_runtime::agent::loop_::AgentRunOverrides::default(),
-            ))
-            .await
-            .map(|_| ())
+            ));
+            #[cfg(unix)]
+            if let Some(handler) = elicitation {
+                return zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, run)
+                    .await
+                    .map(|_| ());
+            }
+            run.await.map(|_| ())
         }
 
         Commands::Acp {

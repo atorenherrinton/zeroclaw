@@ -963,7 +963,7 @@ async fn uneven_admitted_batch_keeps_complete_text_and_verifiable_receipts() {
 }
 
 #[tokio::test]
-async fn final_history_rejection_keeps_unexcerpted_source_and_receipts() {
+async fn history_envelope_preflight_keeps_unexcerpted_source_and_receipts() {
     for parallel in [false, true] {
         let case = run_case_with_result_limit(
             &[Mode::EscapedUnevenOutput, Mode::Success],
@@ -998,8 +998,8 @@ async fn final_history_rejection_keeps_unexcerpted_source_and_receipts() {
         );
         assert_eq!(
             case.step_calls.len(),
-            2,
-            "source admission succeeded before history wrapping rejected the batch"
+            0,
+            "history envelope preflight rejects before downstream step copies"
         );
         assert_eq!(case.calls, vec![1, 1]);
         assert_eq!(case.remaining_responses, 1);

@@ -1,0 +1,2 @@
+# Unified-diff context deliberately prefixes blank and tab-indented source with a space.
+*.patch whitespace=-blank-at-eol,-space-before-tab

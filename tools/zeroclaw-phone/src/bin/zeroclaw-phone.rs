@@ -836,6 +836,20 @@ async fn main() {
         libc::umask(0o077);
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 2 && matches!(args[1].as_str(), "--version" | "-V") {
+        // i18n-exempt: stable build-provenance metadata, not conversational UI.
+        println!(concat!(
+            "zeroclaw-phone ",
+            env!("CARGO_PKG_VERSION"),
+            "\ncommit: ",
+            env!("ZEROCLAW_BUILD_GIT_SHA"),
+            "\nsource: ",
+            env!("ZEROCLAW_BUILD_GIT_STATE"),
+            "\ncompiler: ",
+            env!("ZEROCLAW_BUILD_RUSTC"),
+        ));
+        return;
+    }
     if args.len() != 3 {
         eprintln!("usage: zeroclaw-phone serve|mcp|check|probe|preflight|route-check ROOT");
         std::process::exit(2);

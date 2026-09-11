@@ -284,6 +284,169 @@ impl Ops {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn email_draft(o: &Ops) -> Result<Value> {
+        o.outbox_prepare(&json!({"idempotency_key":"email-fixture","channel":"email",
+            "recipients":["recipient@example.invalid"],"subject":"Fixture subject",
+            "text":"Exact draft body"}))
+    }
+    fn send_args(review: &Value) -> Value {
+        json!({"operation_id":review["operation_id"],"review_hash":review["review_hash"],
+            "review":review["review"],"owner_requested_send":true})
+    }
+
+    #[tokio::test]
+    async fn email_drafting_and_invalid_owner_authorization_never_execute() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let o = Ops::open(t.path())?;
+        let draft = email_draft(&o)?;
+        assert_eq!(draft["state"], "prepared");
+        assert!(draft["authorized_ms"].is_null());
+        assert!(
+            o.operation_execute_using("email-fixture", |_, _, _| async {
+                panic!("drafting must never invoke an external effect")
+            })
+            .await
+            .is_err()
+        );
+        for assertion in [
+            Value::Null,
+            json!(false),
+            json!("true"),
+            json!(1),
+            json!({"owner":true}),
+        ] {
+            let mut args = send_args(&draft);
+            args["owner_requested_send"] = assertion;
+            assert!(
+                crate::operations_api::call(&o, "outbox_send", &args)
+                    .await
+                    .is_err()
+            );
+            assert!(o.operation_status("email-fixture")?["authorized_ms"].is_null());
+        }
+        let mut missing = send_args(&draft);
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("owner_requested_send");
+        assert!(
+            crate::operations_api::call(&o, "outbox_send", &missing)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn email_authorization_binds_every_exact_review_field() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let o = Ops::open(t.path())?;
+        let draft = email_draft(&o)?;
+        let args = send_args(&draft);
+        for field in ["recipients", "subject", "text", "attachments"] {
+            let mut changed = args.clone();
+            changed["review"]["steps"][0]["arguments"][field] = json!("changed");
+            assert!(o.operation_authorize(&changed).is_err(), "{field}");
+        }
+        let mut timing = args.clone();
+        timing["review"]["send_at_ms"] = json!(123);
+        assert!(o.operation_authorize(&timing).is_err());
+        for field in ["operation_id", "review_hash", "review"] {
+            let mut changed = args.clone();
+            changed[field] = json!("changed");
+            assert!(o.operation_authorize(&changed).is_err(), "{field}");
+        }
+        assert!(o.operation_status("email-fixture")?["authorized_ms"].is_null());
+        let authorized = o.operation_authorize(&args)?;
+        assert_eq!(authorized["review"], draft["review"]);
+        assert!(authorized["authorized_ms"].is_i64());
+        assert_eq!(authorized["steps"][0]["state"], "prepared");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn email_future_schedule_waits_and_submitted_send_cannot_replay() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let o = Ops::open(t.path())?;
+        let at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let scheduled = o.outbox_prepare(&json!({"idempotency_key":"scheduled-email",
+            "channel":"email", "recipients":["recipient@example.invalid"],
+            "subject":"Exact subject", "text":" Exact body\n", "send_at":at,
+            "owner_requested_send":true}))?;
+        // Even a send assertion supplied to preparation cannot authorize it.
+        assert!(scheduled["authorized_ms"].is_null());
+        o.operation_authorize(&send_args(&scheduled))?;
+        let waiting = o
+            .operation_execute_using("scheduled-email", |_, _, _| async {
+                panic!("a future schedule must not call an adapter")
+            })
+            .await?;
+        assert_eq!(waiting["state"], "scheduled");
+        let draft = email_draft(&o)?;
+        o.operation_authorize(&send_args(&draft))?;
+        let submitted = o
+            .operation_execute_using("email-fixture", |step, _, reconcile| async move {
+                assert!(!reconcile);
+                assert_eq!(step.arguments["text"], "Exact draft body");
+                Ok(Outcome {
+                    state: "submitted".into(),
+                    evidence: json!({"provider_id":"mock-only", "delivered":false}),
+                })
+            })
+            .await?;
+        assert_eq!(submitted["state"], "submitted");
+        drop(o);
+        let o = Ops::open(t.path())?;
+        o.operation_authorize(&send_args(&submitted))?;
+        let same = o
+            .operation_execute_using("email-fixture", |_, _, _| async {
+                panic!("an attempted, submitted send must never replay")
+            })
+            .await?;
+        assert_eq!(same["steps"], submitted["steps"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn email_uncertain_send_is_claimed_once_and_only_reconciled_after_restart() -> Result<()>
+    {
+        let t = tempfile::tempdir()?;
+        {
+            let o = Ops::open(t.path())?;
+            let draft = email_draft(&o)?;
+            o.operation_authorize(&send_args(&draft))?;
+            let attempts = std::cell::Cell::new(0);
+            let result = o
+                .operation_execute_using("email-fixture", |step, _, reconcile| {
+                    assert_eq!(step.tool, "outbox_email");
+                    assert!(!reconcile);
+                    attempts.set(attempts.get() + 1);
+                    async { anyhow::bail!("fixture transport timeout; no real send") }
+                })
+                .await?;
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(result["state"], "uncertain");
+        }
+        let o = Ops::open(t.path())?;
+        for _ in 0..2 {
+            // Even repeating the owner assertion cannot turn an uncertain claim
+            // back into a send. Only a read-only reconciliation is dispatched.
+            let status = o.operation_status("email-fixture")?;
+            o.operation_authorize(&send_args(&status))?;
+            let result = o
+                .operation_execute_using("email-fixture", |_, _, reconcile| async move {
+                    assert!(reconcile, "an uncertain send must never be replayed");
+                    Ok(Outcome {
+                        state: "uncertain".into(),
+                        evidence: json!({"read_only":true}),
+                    })
+                })
+                .await?;
+            assert_eq!(result["state"], "uncertain");
+        }
+        Ok(())
+    }
+
     fn prepare(o: &Ops) -> Value {
         o.operation_prepare(&json!({"idempotency_key":"fixture","steps":[{"tool":"calendar_mutate","arguments":{}},{"tool":"outbox_email","arguments":{},"irreversible":true}]})).unwrap()
     }

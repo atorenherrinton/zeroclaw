@@ -75,6 +75,10 @@ pub trait TurnJournal: Send + Sync {
     fn trace_id(&self) -> Option<&str> {
         None
     }
+    /// Generation failure is separate from acknowledgement of its terminal notice.
+    async fn record_error(&self, _error: String) -> anyhow::Result<()> {
+        Ok(())
+    }
     async fn checkpoint(
         &self,
         status: TaskStatus,
@@ -104,4 +108,11 @@ pub fn trace_id() -> Option<String> {
         })
         .ok()
         .flatten()
+}
+
+pub async fn record_error(error: String) -> anyhow::Result<()> {
+    if let Some(journal) = JOURNAL.try_with(Clone::clone).ok().flatten() {
+        journal.record_error(error).await?;
+    }
+    Ok(())
 }

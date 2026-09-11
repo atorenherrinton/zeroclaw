@@ -56,18 +56,22 @@ async fn scope_delegate_session_key<F>(
     session_key: Option<String>,
     route: Option<zeroclaw_api::conversation::ConversationRoute>,
     deadline: Option<tokio::time::Instant>,
+    elicitation: Option<Arc<dyn zeroclaw_tools::mcp_protocol::McpElicitationHandler>>,
     future: F,
 ) -> F::Output
 where
     F: std::future::Future,
 {
-    zeroclaw_api::deadline::PARENT
-        .scope(
-            deadline,
-            zeroclaw_api::conversation::ACTIVE_CONVERSATION
-                .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future)),
-        )
-        .await
+    let scoped = zeroclaw_api::deadline::PARENT.scope(
+        deadline,
+        zeroclaw_api::conversation::ACTIVE_CONVERSATION
+            .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future)),
+    );
+    if let Some(handler) = elicitation {
+        zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
+    } else {
+        scoped.await
+    }
 }
 
 /// Serializable result of a background delegate task.
@@ -1624,8 +1628,7 @@ impl DelegateTool {
         // spawn, so a crash between here and the spawn is recoverable by the reaper. A
         // no-op when not running under a booted daemon (the plane is absent).
         if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
+            cp.store
                 .create(crate::control_plane::TaskRecord {
                     id: task_id.clone(),
                     kind: crate::control_plane::TaskKind::Delegate,
@@ -1635,15 +1638,17 @@ impl DelegateTool {
                     owner_boot_id: cp.boot_id.clone(),
                     heartbeat_at: None,
                     depth: self.depth,
-                    parent_id: None,
-                    originator_route: None,
+                    parent_id: zeroclaw_api::turn::trace_id(),
+                    originator_route: zeroclaw_api::conversation::current()
+                        .map(|route| serde_json::to_string(&route))
+                        .transpose()?,
                     delivered: false,
                     idem_key: None,
                     principal_id: None,
                     started_at: started_at.clone(),
                     finished_at: None,
                 })
-                .await;
+                .await?;
         }
 
         let agents = Arc::clone(&self.agents);
@@ -1680,10 +1685,11 @@ impl DelegateTool {
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
         let parent_deadline = zeroclaw_api::deadline::current();
+        let parent_elicitation = zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, parent_route, parent_deadline, async move {
+            scope_delegate_session_key(parent_session_key, parent_route, parent_deadline, parent_elicitation, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1804,7 +1810,7 @@ impl DelegateTool {
             output: format!(
                 "Background task started for agent '{agent_name}'.\n\
                  task_id: {task_id}\n\
-                 Use action='check_result' with task_id='{task_id}' to retrieve the result."
+                 Use action='check_result' or action='await_sessions' with task_id='{task_id}' to retrieve the result. The delegate owns the requested scope. Do not repeat its file, shell, or website checks; work only on a distinct subtask, or wait. Report its task_id and pending status if ending before it finishes."
             )
             .into(),
             error: None,
@@ -1901,6 +1907,7 @@ impl DelegateTool {
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
         let parent_deadline = zeroclaw_api::deadline::current();
+        let parent_elicitation = zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1934,6 +1941,7 @@ impl DelegateTool {
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let route = parent_route.clone();
+            let elicitation = parent_elicitation.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1965,6 +1973,7 @@ impl DelegateTool {
                         session_key,
                         route,
                         parent_deadline,
+                        elicitation,
                         async move {
                             crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                                 .scope(receipt_scope, async move {
@@ -5718,6 +5727,7 @@ mod tests {
                         session_key,
                         zeroclaw_api::conversation::current(),
                         zeroclaw_api::deadline::current(),
+                        zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler(),
                         async { current_tool_loop_session_key() },
                     )
                     .await
@@ -5728,6 +5738,57 @@ mod tests {
             .await;
 
         assert_eq!(seen.as_deref(), Some("channel_session"));
+    }
+
+    #[tokio::test]
+    async fn delegate_spawn_forwards_owning_elicitation_handler_and_conversation() {
+        use zeroclaw_tools::mcp_protocol::{
+            McpElicitationHandler, McpElicitationRequest, McpElicitationResult,
+            current_mcp_elicitation_handler, with_mcp_elicitation_handler,
+        };
+        struct Prompt;
+        #[async_trait]
+        impl McpElicitationHandler for Prompt {
+            async fn elicit(
+                &self,
+                _request: McpElicitationRequest,
+            ) -> anyhow::Result<McpElicitationResult> {
+                Ok(McpElicitationResult::Cancel)
+            }
+        }
+        let handler: Arc<dyn McpElicitationHandler> = Arc::new(Prompt);
+        let route = zeroclaw_api::conversation::ConversationRoute {
+            channel: "telegram.fixture".into(),
+            recipient: "room:thread".into(),
+            sender: "owner".into(),
+            thread: Some("thread".into()),
+            reply_to: "message".into(),
+        };
+        let expected_route = route.clone();
+        let expected_handler = handler.clone();
+        let (seen_route, seen_handler) = with_mcp_elicitation_handler(
+            handler,
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route), async {
+                let route = zeroclaw_api::conversation::current();
+                let handler = current_mcp_elicitation_handler();
+                zeroclaw_spawn::spawn!(async move {
+                    scope_delegate_session_key(None, route, None, handler, async {
+                        (
+                            zeroclaw_api::conversation::current(),
+                            current_mcp_elicitation_handler(),
+                        )
+                    })
+                    .await
+                })
+                .await
+                .unwrap()
+            }),
+        )
+        .await;
+        assert_eq!(seen_route, Some(expected_route));
+        assert!(Arc::ptr_eq(&seen_handler.unwrap(), &expected_handler));
+        assert!(current_mcp_elicitation_handler().is_none());
+        assert!(zeroclaw_api::conversation::current().is_none());
     }
 
     #[tokio::test]

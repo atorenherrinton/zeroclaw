@@ -17,12 +17,27 @@ use zeroclaw_config::schema::{
     ClaudeCodeConfig, ClaudeCodeRunnerConfig, CodexCliConfig, GeminiCliConfig, OpenCodeCliConfig,
 };
 
+// Codex uses `exec`; the other mocked coding CLIs use different subcommands.
+// Its configured test binary must reach the mock, never a PATH-resolved CLI.
+fn assert_test_local_codex_executable(command: &CodingCliCommand) {
+    if command.args.first().is_some_and(|arg| arg == "exec") {
+        assert_eq!(
+            Path::new(&command.program),
+            std::env::current_exe()
+                .expect("test executable")
+                .canonicalize()
+                .expect("canonical test executable")
+        );
+    }
+}
+
 #[derive(Debug)]
 struct SuccessfulExecutor;
 
 #[async_trait]
 impl CodingCliExecutor for SuccessfulExecutor {
-    async fn output(&self, _command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+    async fn output(&self, command: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+        assert_test_local_codex_executable(&command);
         Ok(Output {
             status: successful_exit_status(),
             stdout: b"ok".to_vec(),
@@ -116,6 +131,7 @@ fn coding_agent_cases(
             CodexCliTool::new_with_executor(
                 security.clone(),
                 CodexCliConfig {
+                    executable_path: Some(std::env::current_exe().expect("test executable")),
                     recovery_source_workspace: Some(workspace.to_path_buf()),
                     ..CodexCliConfig::default()
                 },
@@ -251,8 +267,12 @@ async fn completed_coding_commands_bound_both_streams_without_reexecution() {
     }
     #[async_trait]
     impl CodingCliExecutor for LargeExecutor {
-        async fn output(&self, _: CodingCliCommand) -> Result<Output, CodingCliExecutionError> {
+        async fn output(
+            &self,
+            command: CodingCliCommand,
+        ) -> Result<Output, CodingCliExecutionError> {
             use std::os::unix::process::ExitStatusExt;
+            assert_test_local_codex_executable(&command);
             self.calls.fetch_add(1, Ordering::SeqCst);
             let text = format!("START{}END", "\\\"\t😀".repeat(20_000));
             let stdout = if self.as_json {
@@ -285,6 +305,7 @@ async fn completed_coding_commands_bound_both_streams_without_reexecution() {
             Box::new(CodexCliTool::new_with_executor(
                 security.clone(),
                 CodexCliConfig {
+                    executable_path: Some(std::env::current_exe().expect("test executable")),
                     recovery_source_workspace: Some(workspace.path().to_path_buf()),
                     ..Default::default()
                 },

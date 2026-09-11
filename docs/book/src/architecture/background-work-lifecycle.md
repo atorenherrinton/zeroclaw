@@ -49,6 +49,18 @@ Declarative agent jobs may set `cron.<alias>.timeout_secs` to an integer from 1 
 
 The deadline drops the agent-run future and follows normal failure handling, including isolated-session memory cleanup, result persistence, and claim release. It is a per-attempt limit: `reliability.scheduler_retries` still controls retries, and setting it to `0` avoids repeated attempts for workflows with ambiguous external writes. Async cancellation cannot preempt code that never yields, roll back a completed request, or guarantee termination of an already-launched child process or detached task. Such tools need their own process/request bounds and idempotency or uncertain-write handling. Config edits apply through the existing scheduler reload boundary; deadlines are not copied into persistent jobs or a new live cache.
 
+Declarative agent jobs can also set `completion_check` to a read-only shell command
+that independently checks the work. It runs after every agent attempt, including
+an agent error or timeout, using the owning agent's existing shell security policy
+and a 30-second deadline. A nonzero exit, policy denial, spawn failure, or timeout
+makes the attempt fail and follows normal failed-run cleanup and retry handling.
+A successful check preserves the agent result, including a quiet `NO_REPLY`, and
+never turns an agent error into success. The command is resolved from current
+config; imperative jobs and shell jobs do not inherit it. Use
+`reliability.scheduler_retries = 0` when repeating the preceding work could cause
+ambiguous external writes. A check is evidence of the conditions it validates,
+not proof of all side effects or the model's interpretation.
+
 ## SOP runs
 
 SOP definitions live under the configured `sops` directory. `SopEngine` owns run progression, approval waits, checkpoints, terminal transitions, and the in-process status surface. `SopRunStore` is the concurrency source of truth when it admits and claims a run.

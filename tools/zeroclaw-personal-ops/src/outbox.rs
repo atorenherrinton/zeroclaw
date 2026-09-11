@@ -617,6 +617,40 @@ mod tests {
         assert!(raw.contains("aGVsbG8="));
         Ok(())
     }
+    #[test]
+    fn email_mime_preserves_exact_review_bytes_and_rejects_changed_attachment() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let dir = t.path().join("extensions/personal-ops/files");
+        crate::private_dir(&dir)?;
+        let bytes = b"exact fixture attachment\r\n";
+        let hash = digest(bytes);
+        let name = format!("{hash}.txt");
+        let path = dir.join(&name);
+        crate::private_write(&path, bytes)?;
+        let subject = "  Fixture subject ";
+        let body = "  Exact body 😀\r\nsecond line\n";
+        let args = json!({"recipients":["recipient@example.invalid"], "subject":subject,
+            "text":body, "attachments":[{"name":name,"sha256":hash}]});
+        let step = Step {
+            tool: "outbox_email".into(),
+            arguments: args.clone(),
+            irreversible: true,
+        };
+        validate_communication(t.path(), &step)?;
+        let rendered = mime(&args, "fixture-key", t.path())?;
+        assert!(rendered.contains(&format!(
+            "Subject: =?UTF-8?B?{}?=",
+            STANDARD.encode(subject)
+        )));
+        assert!(rendered.contains(&wrapped_base64(body.as_bytes())));
+        assert!(rendered.contains(&wrapped_base64(bytes)));
+        assert!(rendered.contains("To: recipient@example.invalid\r\n"));
+        std::fs::write(path, b"changed fixture")?;
+        assert!(validate_communication(t.path(), &step).is_err());
+        assert!(mime(&args, "fixture-key", t.path()).is_err());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn raw_transaction_rejects_attachment_escape_atomically() -> Result<()> {
         let t = tempfile::tempdir()?;

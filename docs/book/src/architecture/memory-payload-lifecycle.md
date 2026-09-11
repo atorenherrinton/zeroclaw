@@ -382,6 +382,21 @@ created: future commands needing complete output should redirect it to a file
 within their permitted workspace and inspect bounded sections. Preview text lives
 in the ordinary tool-result/session lifecycle, not a new persistent output store.
 
+## Session history page encoding
+
+`sessions_history` keeps the backend's raw `max_bytes` read limit and additionally
+bounds the JSON-encoded page string to 8 KiB before returning it. This reserves
+space for receipts and the runtime's nested history representation. Fitting pages
+retain their shape. Oversized pages defer their oldest rows using `next_before`;
+a single oversized row becomes a UTF-8-safe prefix with `truncated: true`.
+`content_bytes` counts the returned content, and the exclusive cursor always
+refers to the oldest retained row so deferred rows remain reachable.
+
+This is a tool-result projection; stored conversation rows are unchanged. No
+additional history copy is persisted, no tool is replayed, and runtime per-result
+and round admission checks remain in force. Very small configured limits, large
+batches, or oversized row metadata can still fail admission.
+
 ## Web page previews
 
 `web_fetch` bounds successful standard-fetch text and Firecrawl markdown to a
@@ -440,6 +455,15 @@ get their own scope, which restores its parent on completion. Existing MCP read,
 web-fetch, HTTP-read, and shell preview writers honor that allowance. It is a
 conservative presentation reservation, not a replacement for exact source and
 native/prompt history admission. No config fields or persistent state are added.
+
+MCP read annotations alone do not authorize previewing structured evidence.
+Results containing `structuredContent`, additional metadata, item annotations,
+errors, or JSON-looking text remain exact. This includes personal-ops outbox
+status reviews encoded inside MCP text: an incomplete JSON fragment must not be
+mistaken for the full draft the owner approved. Plain read-only text can still
+use marked previews. Source admission preflights the history envelopes without
+mutating the original output, typed data, failure reason, or receipt; a rejection
+moves all original evidence into its typed error before downstream step copies.
 
 The strict admission checks still reject oversized unannotated connector/write
 results, typed payloads, excessive envelopes or batches, and unusably small

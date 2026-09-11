@@ -94,8 +94,14 @@ tool-file-read = Read file contents with line numbers. Supports partial reading 
 
 tool-file-write = Write contents to a file in the workspace
 
-tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
+tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, push, stash, worktree). Provides parsed JSON output; large status/diff/log/branch reads return marked incomplete previews that may not be valid JSON. Narrow diffs with files or inspect source with file_read offset/limit. Push requires policy-authorized access to a configured remote and named branch; never force pushes. Integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.
+tool-git-operations-push-invalid-branch = Invalid branch name.
+tool-git-operations-push-invalid-remote = Invalid remote name. Use a configured remote name, not a URL.
+tool-git-operations-push-missing-branch = Missing 'branch' parameter for push.
+tool-git-operations-push-missing-remote = Missing 'remote' parameter for push.
+tool-git-operations-push-error = Push failed: { $error }
+tool-git-operations-push-success = Pushed branch '{ $branch }' to remote '{ $remote }'.
 
 tool-git-forge-error-requires-field = { $resource }.{ $action } requires '{ $field }'.
 tool-git-forge-error-requires-number = { $resource }.{ $action } requires 'number'.
@@ -210,3 +216,5 @@ exact-read-result-too-large = Exact read result is too large to return intact. N
 coding-cli-result-truncated = [Coding command output incomplete; middle content was omitted. The command already ran and may have changed files. Inspect the working tree and execution evidence before continuing. Do not rerun it because this output was truncated.]
 
 sessions-history-metadata-budget-exceeded = Session history metadata exceeds the output limit. Request fewer messages.
+
+tool-git-operations-push-reconcile = Git push exited without success. Inspect the exact execution receipt and reconcile the remote before any new attempt.

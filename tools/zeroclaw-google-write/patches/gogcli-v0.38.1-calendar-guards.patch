@@ -1,0 +1,314 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5e3a30ec..061f6ba5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,11 @@
+ # Changelog
+ 
++## 0.38.1-calendar-single-attempt - local maintenance patch
++
++- Calendar: serialize an explicitly supplied `--guests-can-modify=false` as JSON false on create rather than relying on the API default.
++
++- Calendar: disable HTTP retries for event inserts, including inserts that request attendee notifications. An error may follow a committed event; surface it rather than creating another event or repeating invitations. Normal base-transport authentication remains unchanged.
++
+ ## 0.38.1 - 2026-08-25
+ 
+ - Gmail: send exact prebuilt RFC822 messages with verified sender/account guards, normalized thread IDs, and content-safe offline dry runs. (#1032, #1029) — thanks @higginz777.
+diff --git a/internal/cmd/api.go b/internal/cmd/api.go
+index ac95fc49..e9fd0473 100644
+--- a/internal/cmd/api.go
++++ b/internal/cmd/api.go
+@@ -38,13 +38,15 @@ type APIDescribeCmd struct {
+ }
+ 
+ type APICallCmd struct {
+-	API        string `arg:"" name:"api" help:"Discovery API name"`
+-	Version    string `arg:"" name:"version" help:"Discovery API version"`
+-	Method     string `arg:"" name:"method" help:"Discovery method ID"`
+-	ParamsJSON string `name:"params" help:"JSON object of path and query parameters" default:"{}"`
+-	BodyJSON   string `name:"body" help:"JSON request body or @file"`
+-	Scope      string `name:"scope" help:"OAuth scope override (default: narrowest Discovery-listed scope)"`
+-	AllowWrite bool   `name:"allow-write" help:"Allow non-read HTTP methods (also requires confirmation or --force)"`
++	API           string `arg:"" name:"api" help:"Discovery API name"`
++	Version       string `arg:"" name:"version" help:"Discovery API version"`
++	Method        string `arg:"" name:"method" help:"Discovery method ID"`
++	ParamsJSON    string `name:"params" help:"JSON object of path and query parameters" default:"{}"`
++	BodyJSON      string `name:"body" help:"JSON request body or @file"`
++	Scope         string `name:"scope" help:"OAuth scope override (default: narrowest Discovery-listed scope)"`
++	AllowWrite    bool   `name:"allow-write" help:"Allow non-read HTTP methods (also requires confirmation or --force)"`
++	IfMatch       string `name:"if-match" help:"Require this exact resource ETag (If-Match HTTP precondition)"`
++	SingleAttempt bool   `name:"single-attempt" help:"Disable API retries and redirects; uncertain writes must be reconciled read-only"`
+ }
+ 
+ func discoveryClient() discoveryapi.Client {
+@@ -109,11 +111,17 @@ func (c *APICallCmd) Run(ctx context.Context, flags *RootFlags) error {
+ 	if err != nil {
+ 		return err
+ 	}
++	if c.SingleAttempt {
++		ctx = googleapi.WithoutRetries(ctx)
++	}
+ 	request, err := discoveryapi.NewRequest(ctx, method.Spec.HttpMethod, requestURL, body)
+ 	if err != nil {
+ 		return fmt.Errorf("build API request: %w", err)
+ 	}
+ 
++	if c.IfMatch != "" {
++		request.Header.Set("If-Match", c.IfMatch)
++	}
+ 	read := googleapi.ReadOnlyRequestAllowed(request)
+ 	if !read && !c.AllowWrite {
+ 		return usagef("method %s uses %s; pass --allow-write to opt in", method.ID, method.Spec.HttpMethod)
+@@ -159,6 +167,11 @@ func (c *APICallCmd) Run(ctx context.Context, flags *RootFlags) error {
+ 		return err
+ 	}
+ 	httpClient.CheckRedirect = validateDiscoveryRedirect
++	if c.SingleAttempt {
++		httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
++			return http.ErrUseLastResponse
++		}
++	}
+ 	response, err := httpClient.Do(request)
+ 	if err != nil {
+ 		return fmt.Errorf("call %s: %w", method.ID, err)
+diff --git a/internal/cmd/api_test.go b/internal/cmd/api_test.go
+index 2f301c88..554d50e6 100644
+--- a/internal/cmd/api_test.go
++++ b/internal/cmd/api_test.go
+@@ -5,12 +5,16 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"io"
++	"net"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
+ 
+ 	"github.com/openclaw/gogcli/internal/app"
++	"github.com/openclaw/gogcli/internal/authclient"
+ 	"github.com/openclaw/gogcli/internal/config"
+ 	"github.com/openclaw/gogcli/internal/googleapi"
+ 	"github.com/openclaw/gogcli/internal/outfmt"
+@@ -222,3 +226,86 @@ func TestDiscoveryScopesSelectsNarrowestAlternative(t *testing.T) {
+ 		t.Fatal("expected invalid override error")
+ 	}
+ }
++
++// The real raw client, OAuth transport and retry transport run against loopback
++// TLS only. No credentials, Google API calls, or exported tokens are involved.
++func TestAPICallCalendarPatchPreconditionAndSingleAttempt(t *testing.T) {
++	for _, status := range []int{200, 403, 412, 429, 503, 307, 308, 0} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			var patches atomic.Int32
++			const body = `{"summary":"Changed","description":"","location":"  retain whitespace  ","attendees":[]}`
++			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				if r.Method == http.MethodGet {
++					_, _ = fmt.Fprint(w, `{"rootUrl":"https://www.googleapis.com/","servicePath":"calendar/v3/","resources":{"events":{"methods":{"patch":{"id":"calendar.events.patch","httpMethod":"PATCH","path":"calendars/{calendarId}/events/{eventId}","parameters":{"calendarId":{"location":"path","required":true,"type":"string"},"eventId":{"location":"path","required":true,"type":"string"},"sendUpdates":{"location":"query","type":"string"}},"scopes":["https://www.googleapis.com/auth/calendar.events"]}}}}}`)
++					return
++				}
++				patches.Add(1)
++				if r.Method != http.MethodPatch || r.URL.Path != "/calendar/v3/calendars/exact#id@example.com/events/synthetic123" {
++					t.Errorf("unexpected target: %s %s", r.Method, r.URL.Path)
++				}
++				if r.Header.Get("If-Match") != `"version-1"` {
++					t.Error("missing exact ETag precondition")
++				}
++				if r.URL.Query().Get("sendUpdates") != "none" {
++					t.Error("missing explicit sendUpdates=none")
++				}
++				raw, err := io.ReadAll(r.Body)
++				if err != nil {
++					t.Error(err)
++				}
++				if string(raw) != body {
++					t.Errorf("body changed: %s", raw)
++				}
++				if status == 0 {
++					conn, _, err := w.(http.Hijacker).Hijack()
++					if err != nil {
++						t.Error(err)
++						return
++					}
++					_ = conn.Close()
++					return
++				}
++				w.Header().Set("Retry-After", "0")
++				if status == 307 || status == 308 {
++					w.Header().Set("Location", "https://www.googleapis.com/calendar/v3/calendars/exact%23id@example.com/events/synthetic123")
++				}
++				w.WriteHeader(status)
++				if status == 200 {
++					_, _ = fmt.Fprint(w, `{"id":"synthetic123","etag":"\"version-2\""}`)
++				} else {
++					_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"insufficient authentication scopes"}}`, status)
++				}
++			}))
++			defer server.Close()
++			transport := server.Client().Transport.(*http.Transport).Clone()
++			transport.TLSClientConfig.ServerName = "127.0.0.1"
++			transport.Proxy = nil
++			transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
++				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
++			}
++			original := http.DefaultTransport
++			http.DefaultTransport = transport
++			defer func() { http.DefaultTransport = original; transport.CloseIdleConnections() }()
++			t.Setenv("GOG_DISCOVERY_BASE_URL", "https://www.googleapis.com/discovery/v1")
++			var stdout bytes.Buffer
++			ctx := newCmdRuntimeJSONOutputContext(t, &stdout, &bytes.Buffer{})
++			ctx = authclient.WithAccessToken(ctx, "synthetic-not-a-real-token")
++			cmd := &APICallCmd{}
++			err := runKong(t, cmd, []string{"calendar", "v3", "calendar.events.patch", "--params", `{"calendarId":"exact#id@example.com","eventId":"synthetic123","sendUpdates":"none"}`, "--body", body, "--allow-write", "--single-attempt", "--if-match", `"version-1"`}, ctx, &RootFlags{Account: "synthetic@example.com", Force: true, NoInput: true, EnableCommandsExact: "api.call,api.calendar.events.patch", GmailNoSend: true})
++			if patches.Load() != 1 {
++				t.Fatalf("expected one PATCH, got %d; error=%v", patches.Load(), err)
++			}
++			if status == 200 {
++				if err != nil {
++					t.Fatal(err)
++				}
++				if !strings.Contains(stdout.String(), "version-2") {
++					t.Fatalf("missing receipt: %s", stdout.String())
++				}
++			} else if err == nil {
++				t.Fatalf("status %d must fail without replay", status)
++			}
++		})
++	}
++}
+diff --git a/internal/cmd/calendar_event_plan.go b/internal/cmd/calendar_event_plan.go
+index 81dc4c45..34ebd4a3 100644
+--- a/internal/cmd/calendar_event_plan.go
++++ b/internal/cmd/calendar_event_plan.go
+@@ -395,6 +395,8 @@ func buildCalendarCreatePlan(store *config.ConfigStore, input calendarCreateInpu
+ 	}
+ 	if input.GuestsCanModify != nil {
+ 		event.GuestsCanModify = *input.GuestsCanModify
++		// Preserve an explicitly requested false on the API wire as well.
++		event.ForceSendFields = append(event.ForceSendFields, "GuestsCanModify")
+ 	}
+ 	if input.GuestsCanSeeOthers != nil {
+ 		event.GuestsCanSeeOtherGuests = input.GuestsCanSeeOthers
+diff --git a/internal/cmd/calendar_mutation_helpers.go b/internal/cmd/calendar_mutation_helpers.go
+index f238a32e..7e26afc6 100644
+--- a/internal/cmd/calendar_mutation_helpers.go
++++ b/internal/cmd/calendar_mutation_helpers.go
+@@ -5,6 +5,7 @@ import (
+ 
+ 	"google.golang.org/api/calendar/v3"
+ 
++	"github.com/openclaw/gogcli/internal/googleapi"
+ 	"github.com/openclaw/gogcli/internal/outfmt"
+ 	"github.com/openclaw/gogcli/internal/ui"
+ )
+@@ -38,7 +39,10 @@ func newCalendarMutationContext(ctx context.Context, flags *RootFlags, calendarI
+ }
+ 
+ func (m *calendarMutationContext) insertEvent(ctx context.Context, event *calendar.Event, opts calendarInsertOptions) (*calendar.Event, error) {
+-	call := m.svc.Events.Insert(m.calendarID, event).Context(ctx)
++	// An insert may have committed (and sent attendee invitations) even when
++	// the response is an error. Never replay it through the retry transport.
++	// The base transport still owns normal authentication/token renewal.
++	call := m.svc.Events.Insert(m.calendarID, event).Context(googleapi.WithoutRetries(ctx))
+ 	if opts.sendUpdates != "" {
+ 		call = call.SendUpdates(opts.sendUpdates)
+ 	}
+diff --git a/internal/cmd/calendar_insert_single_attempt_test.go b/internal/cmd/calendar_insert_single_attempt_test.go
+new file mode 100644
+index 00000000..28e15bc6
+--- /dev/null
++++ b/internal/cmd/calendar_insert_single_attempt_test.go
+@@ -0,0 +1,90 @@
++package cmd
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"google.golang.org/api/calendar/v3"
++	"google.golang.org/api/option"
++
++	"github.com/openclaw/gogcli/internal/googleapi"
++)
++
++// Exercise the actual command and Google API client through the production
++// retry transport. The only server is a local mock, with no Google credentials.
++func TestCalendarCreateCmd_InsertSingleAttempt(t *testing.T) {
++	for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests, http.StatusForbidden} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			var inserts, refreshes atomic.Int32
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				path := strings.TrimPrefix(r.URL.Path, "/calendar/v3")
++				if r.Method != http.MethodPost || path != "/calendars/cal@example.com/events" {
++					t.Errorf("unexpected request: %s %s", r.Method, path)
++					http.NotFound(w, r)
++					return
++				}
++				inserts.Add(1)
++				if r.URL.Query().Get("sendUpdates") != "all" {
++					t.Error("missing sendUpdates=all")
++				}
++				var event map[string]json.RawMessage
++				if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
++					t.Errorf("decode event: %v", err)
++				}
++				var attendees []*calendar.EventAttendee
++				if err := json.Unmarshal(event["attendees"], &attendees); err != nil {
++					t.Errorf("decode attendees: %v", err)
++				}
++				if len(attendees) != 1 || attendees[0].Email != "invitee@example.com" {
++					t.Errorf("unexpected attendees: %+v", attendees)
++				}
++				for _, field := range []string{"guestsCanInviteOthers", "guestsCanModify"} {
++					if string(event[field]) != "false" {
++						t.Errorf("%s must explicitly be false, got %s", field, event[field])
++					}
++				}
++				w.Header().Set("Content-Type", "application/json")
++				w.Header().Set("Retry-After", "0")
++				w.WriteHeader(status)
++				_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"insufficient authentication scopes"}}`, status)
++			}))
++			defer srv.Close()
++
++			retry := googleapi.NewRetryTransport(srv.Client().Transport)
++			retry.BaseDelay = 0
++			retry.RefreshAuth = func(context.Context) error {
++				refreshes.Add(1)
++				return nil
++			}
++			svc, err := calendar.NewService(context.Background(),
++				option.WithoutAuthentication(),
++				option.WithHTTPClient(&http.Client{Transport: retry}),
++				option.WithEndpoint(srv.URL+"/"),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			ctx := withCalendarTestService(newCmdRuntimeJSONOutputContext(t, io.Discard, io.Discard), svc)
++			cmd := &CalendarCreateCmd{}
++			err = runKong(t, cmd, []string{
++				"cal@example.com", "--summary", "Synthetic invitation",
++				"--from", "2030-01-01T10:00:00Z", "--to", "2030-01-01T11:00:00Z",
++				"--attendees", "invitee@example.com", "--send-updates", "all",
++				"--guests-can-invite=false", "--guests-can-modify=false",
++			}, ctx, &RootFlags{Account: "owner@example.com"})
++			if err == nil {
++				t.Fatal("insert error must propagate")
++			}
++			if inserts.Load() != 1 || refreshes.Load() != 0 {
++				t.Fatalf("insert was retried: inserts=%d refreshes=%d", inserts.Load(), refreshes.Load())
++			}
++		})
++	}
++}

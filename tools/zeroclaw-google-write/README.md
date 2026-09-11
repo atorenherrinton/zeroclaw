@@ -203,6 +203,29 @@ Install the reviewed `v0.38.1-calendar-patch-guards` as `gog-calendar-patch` bes
 writer v0.3.0. Only updates use this sibling executable; existing reads, creates
 and drafts retain `/opt/homebrew/bin/gog` and its existing Keychain approval.
 Missing/old companions fail closed, without falling back to the shared client.
+
+A successful `google_read` request does not establish the companion's Keychain
+access: it is a different executable. A recognized token-read Keychain timeout
+now reaches the MCP error as `google_keychain_access_required`, retaining the
+pre-read's no-mutation context without exposing the account or raw provider
+credential advice. The owner must review/unlock access in the native macOS
+session; never export credentials, switch credential storage, or fall back to an
+unguarded writer to work around a prompt. Argument-only `calendar_validate`
+still performs no provider read and cannot certify authentication readiness.
+
+A failed mutation pre-read intentionally creates no action claim. Therefore
+`calendar_reconcile` returns `unknown action key` for that key; it is not evidence
+of a missing registration or an uncertain write. Successful pre-reads and request
+checks are followed by a durable claim **before** the one-attempt mutation.
+
+For an explicitly authorized **read-only** diagnosis, the ignored Rust test
+`live_exact_id_preread_is_readonly` accepts `GOG_ACCOUNT`,
+`GOOGLE_WRITE_TEST_READER` (absolute installed client path),
+`GOOGLE_WRITE_TEST_EVENT_ID`, and `GOOGLE_WRITE_TEST_ETAG` via the environment.
+It issues only `calendar.events.get --readonly`, checks ID and ETag, and never
+calls mutation or ledger code. Run it with `cargo test --locked
+live_exact_id_preread_is_readonly -- --ignored` using this connector's manifest.
+Normal test runs skip it; normal tests use synthetic provider/process fixtures.
 Keep the dependency safety patches on future upgrades. A bare `gog calendar update`
 remains outside the connector and is not the guarded write path. All feature logic
 and new permanent connector modules are Rust; only the existing Go dependency's

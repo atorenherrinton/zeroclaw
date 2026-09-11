@@ -11,11 +11,15 @@ use anyhow::{Context, Result, bail};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, oneshot};
+use tokio::sync::{Mutex, Notify, OwnedRwLockReadGuard, RwLock, mpsc, oneshot};
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 
-use crate::mcp_protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::mcp_protocol::{
+    INTERNAL_ERROR, INVALID_PARAMS, JSONRPC_VERSION, JsonRpcError, JsonRpcMessage, JsonRpcRequest,
+    JsonRpcResponse, METHOD_NOT_FOUND, McpElicitationHandler, McpElicitationRequest,
+    McpElicitationResult,
+};
 use zeroclaw_config::schema::{McpServerConfig, McpTransport};
 
 /// Maximum bytes for a single JSON-RPC response.
@@ -261,6 +265,7 @@ pub(crate) struct McpRequestLifecycle {
     epoch_gate: Option<Arc<RwLock<u64>>>,
     recovery_gate: Option<Arc<dyn McpRecoveryGate>>,
     fixed_epoch: u64,
+    elicitation_handler: Option<Arc<dyn McpElicitationHandler>>,
 }
 
 impl McpRequestLifecycle {
@@ -274,6 +279,7 @@ impl McpRequestLifecycle {
             epoch_gate: Some(epoch_gate),
             recovery_gate,
             fixed_epoch: 0,
+            elicitation_handler: None,
         }
     }
 
@@ -284,7 +290,16 @@ impl McpRequestLifecycle {
             epoch_gate: None,
             recovery_gate: None,
             fixed_epoch: epoch,
+            elicitation_handler: None,
         }
+    }
+
+    pub(crate) fn with_elicitation_handler(
+        mut self,
+        handler: Option<Arc<dyn McpElicitationHandler>>,
+    ) -> Self {
+        self.elicitation_handler = handler;
+        self
     }
 
     async fn begin_write(&self) -> McpWritePermit {
@@ -432,6 +447,13 @@ pub trait McpTransportConn: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait SharedMcpTransportConn: Send + Sync {
+    /// Only transports implementing bidirectional request dispatch may advertise
+    /// the runtime's form bridge. Session handlers remain scoped to calls.
+    fn enable_form_elicitation(&self) {}
+    fn form_elicitation_enabled(&self) -> bool {
+        false
+    }
+
     /// Send a JSON-RPC request and receive the response.
     async fn send_and_recv(
         &self,
@@ -461,14 +483,23 @@ pub(crate) trait SharedMcpTransportConn: Send + Sync {
 
 type PendingMap = Arc<ParkingMutex<HashMap<(u64, u64), oneshot::Sender<JsonRpcResponse>>>>;
 
+enum StdioServerEvent {
+    Request(JsonRpcRequest),
+    Cancel(serde_json::Value),
+}
+
+type StdioCalls = Arc<ParkingMutex<HashMap<(u64, u64), mpsc::Sender<StdioServerEvent>>>>;
+
 struct StdioPendingGuard {
     pending: PendingMap,
     key: (u64, u64),
+    calls: StdioCalls,
 }
 
 impl Drop for StdioPendingGuard {
     fn drop(&mut self) {
         self.pending.lock().remove(&self.key);
+        self.calls.lock().remove(&self.key);
     }
 }
 
@@ -478,7 +509,7 @@ struct StdioConn {
     /// reaper (`start_kill` + `wait`) can access the direct child without a
     /// second `Child` handle.
     child: Arc<tokio::sync::Mutex<Child>>,
-    stdin: tokio::process::ChildStdin,
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     reader: tokio::task::JoinHandle<()>,
     /// Set to `true` by the child-exit watcher when the *direct* child process
     /// exits, independent of whether its stdout pipe has reached EOF (a
@@ -509,8 +540,13 @@ struct StdioState {
 /// Stdio-based transport (spawn local process).
 pub struct StdioTransport {
     config: McpServerConfig,
+    // New identity for this transport, distinct from configuration display name.
+    // A replacement registry must not reuse consent from an earlier instance.
+    instance_id: String,
     state: Mutex<StdioState>,
     pending: PendingMap,
+    calls: StdioCalls,
+    form_elicitation: AtomicBool,
     alive: Arc<AtomicBool>,
     active_generation: Arc<AtomicU64>,
     /// Direct-child exit signal for the active connection, independent of
@@ -577,6 +613,7 @@ impl StdioWriteTestHook {
 impl StdioTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
         let pending = Arc::new(ParkingMutex::new(HashMap::new()));
+        let calls = Arc::new(ParkingMutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(false));
         let active_generation = Arc::new(AtomicU64::new(1));
         let child_exited = Arc::new(AtomicBool::new(false));
@@ -584,17 +621,21 @@ impl StdioTransport {
             config,
             1,
             Arc::clone(&pending),
+            Arc::clone(&calls),
             Arc::clone(&alive),
             Arc::clone(&active_generation),
             Arc::clone(&child_exited),
         )?;
         Ok(Self {
             config: config.clone(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
             state: Mutex::new(StdioState {
                 conn: Some(conn),
                 closed: false,
             }),
             pending,
+            calls,
+            form_elicitation: AtomicBool::new(false),
             alive,
             active_generation,
             child_exited,
@@ -612,6 +653,7 @@ impl StdioTransport {
         config: &McpServerConfig,
         generation: u64,
         pending: PendingMap,
+        calls: StdioCalls,
         alive: Arc<AtomicBool>,
         active_generation: Arc<AtomicU64>,
         child_exited: Arc<AtomicBool>,
@@ -656,14 +698,17 @@ impl StdioTransport {
         alive.store(true, Ordering::Release);
         child_exited.store(false, Ordering::Release);
         let server_name = config.name.clone();
-        let reader = zeroclaw_spawn::spawn!(stdio_read_loop(
+        let stdin = Arc::new(Mutex::new(stdin));
+        let reader_stdin = Arc::downgrade(&stdin);
+        let reader_context = StdioReaderContext {
             server_name,
             generation,
-            stdout,
             pending,
+            calls,
             alive,
             active_generation,
-        ));
+        };
+        let reader = zeroclaw_spawn::spawn!(stdio_read_loop(reader_context, stdout, reader_stdin));
 
         let child = Arc::new(tokio::sync::Mutex::new(child));
         let watcher_child = Arc::clone(&child);
@@ -955,33 +1000,356 @@ fn finish_stdio_generation(
     }
 }
 
-async fn stdio_read_loop(
+fn server_error(id: Option<serde_json::Value>, code: i32, message: &str) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: JSONRPC_VERSION.into(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }),
+    }
+}
+
+async fn write_server_response(
+    stdin: &Mutex<tokio::process::ChildStdin>,
+    response: &JsonRpcResponse,
+) -> Result<()> {
+    let mut writer = stdin.lock().await;
+    write_server_response_locked(&mut writer, response).await
+}
+
+async fn write_server_response_locked(
+    writer: &mut tokio::process::ChildStdin,
+    response: &JsonRpcResponse,
+) -> Result<()> {
+    let mut line = serde_json::to_vec(response)?;
+    line.push(b'\n');
+    writer
+        .write_all(&line)
+        .await
+        .context("failed to write MCP server response")?;
+    writer
+        .flush()
+        .await
+        .context("failed to flush MCP server response")
+}
+
+async fn elicit_response(
+    server_name: String,
+    server_instance_id: String,
+    generation: u64,
+    parent: JsonRpcRequest,
+    request: JsonRpcRequest,
+    handler: Option<Arc<dyn McpElicitationHandler>>,
+) -> JsonRpcResponse {
+    let id = request.id.clone();
+    let Some(handler) = handler else {
+        return server_error(
+            id,
+            METHOD_NOT_FOUND,
+            "MCP form elicitation has no active user interaction handler",
+        );
+    };
+    let Some(params) = request.params.as_ref().filter(|p| p.is_object()) else {
+        return server_error(
+            id,
+            INVALID_PARAMS,
+            "MCP form elicitation requires object parameters",
+        );
+    };
+    if params
+        .get("mode")
+        .is_some_and(|mode| mode.as_str() != Some("form"))
+    {
+        return server_error(id, INVALID_PARAMS, "Unsupported MCP elicitation mode");
+    }
+    let Some(message) = params.get("message").and_then(serde_json::Value::as_str) else {
+        return server_error(id, INVALID_PARAMS, "MCP elicitation requires a message");
+    };
+    let Some(schema) = params.get("requestedSchema").filter(|s| s.is_object()) else {
+        return server_error(
+            id,
+            INVALID_PARAMS,
+            "MCP form elicitation requires an object schema",
+        );
+    };
+    if schema.get("type").and_then(serde_json::Value::as_str) != Some("object")
+        || params.get("_meta").is_some_and(|meta| !meta.is_object())
+    {
+        return server_error(
+            id,
+            INVALID_PARAMS,
+            "Unsupported MCP elicitation schema or metadata",
+        );
+    }
+    let (Some(request_id), Some(originating_request_id)) = (id.clone(), parent.id) else {
+        return server_error(
+            id,
+            INVALID_PARAMS,
+            "MCP elicitation requires request identifiers",
+        );
+    };
+    let tool_name = parent
+        .params
+        .as_ref()
+        .and_then(|p| p.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let interaction = McpElicitationRequest {
+        server_name,
+        server_instance_id,
+        connection_epoch: generation,
+        originating_request_id,
+        request_id,
+        tool_name,
+        message: message.to_owned(),
+        requested_schema: schema.clone(),
+        meta: params.get("_meta").cloned(),
+    };
+    // The enclosing tool deadline may be shorter; dropping this future also
+    // drops the runtime interaction. Timeout never implies acceptance.
+    let decision = timeout(Duration::from_secs(120), handler.elicit(interaction)).await;
+    let result = match decision {
+        Ok(Ok(decision)) => decision.into_value(),
+        Err(_) => McpElicitationResult::Cancel.into_value(),
+        Ok(Err(_)) => {
+            return server_error(
+                id,
+                INVALID_PARAMS,
+                "MCP interaction handler rejected unsupported or unavailable interaction",
+            );
+        }
+    };
+    match result {
+        Ok(result) => JsonRpcResponse {
+            jsonrpc: JSONRPC_VERSION.into(),
+            id,
+            result: Some(result),
+            error: None,
+        },
+        Err(_) => server_error(
+            id,
+            INVALID_PARAMS,
+            "Invalid MCP elicitation response content",
+        ),
+    }
+}
+
+impl StdioTransport {
+    async fn receive_with_server_requests(
+        &self,
+        parent: &JsonRpcRequest,
+        lifecycle: &McpRequestLifecycle,
+        generation: u64,
+        mut receiver: oneshot::Receiver<JsonRpcResponse>,
+        mut events: Option<mpsc::Receiver<StdioServerEvent>>,
+    ) -> Result<JsonRpcResponse> {
+        use futures_util::future::BoxFuture;
+        let mut interaction: Option<BoxFuture<'static, JsonRpcResponse>> = None;
+        let mut interaction_id = None;
+        loop {
+            let mut reply = None;
+            tokio::select! {
+                biased;
+                response = &mut receiver => return response.map_err(|_| McpTransportError::TransportClosed.into()),
+                event = async {
+                    match events.as_mut() {
+                        Some(events) => events.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match event {
+                        Some(StdioServerEvent::Request(request)) => {
+                            if interaction.is_some() {
+                                if request.id == interaction_id {
+                                    // A duplicated server ID cannot receive a
+                                    // rejection now and a later acceptance from
+                                    // the original interaction.
+                                    interaction = None;
+                                    interaction_id = None;
+                                }
+                                reply = Some(server_error(request.id, INVALID_PARAMS, "MCP interaction already in progress"));
+                            } else {
+                                interaction_id = request.id.clone();
+                                let handler = self.form_elicitation_enabled()
+                                    .then(|| lifecycle.elicitation_handler.clone()).flatten();
+                                interaction = Some(Box::pin(elicit_response(
+                                    self.config.name.clone(), self.instance_id.clone(), generation, parent.clone(), request, handler,
+                                )));
+                            }
+                        }
+                        Some(StdioServerEvent::Cancel(id)) if interaction_id.as_ref() == Some(&id) => {
+                            interaction = None;
+                            interaction_id = None;
+                            reply = Some(JsonRpcResponse {
+                                jsonrpc: JSONRPC_VERSION.into(), id: Some(id),
+                                result: Some(serde_json::json!({"action": "cancel"})), error: None,
+                            });
+                        }
+                        Some(StdioServerEvent::Cancel(_)) => {}
+                        None => return Err(McpTransportError::TransportClosed.into()),
+                    }
+                }
+                response = async {
+                    match interaction.as_mut() {
+                        Some(interaction) => interaction.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    interaction = None;
+                    interaction_id = None;
+                    reply = Some(response);
+                }
+            }
+            if let Some(reply) = reply {
+                let state = self.state.lock().await;
+                lifecycle.check_writer_boundary()?;
+                let conn = state
+                    .conn
+                    .as_ref()
+                    .ok_or(McpTransportError::TransportClosed)?;
+                if conn.generation != generation
+                    || self.active_generation.load(Ordering::Acquire) != generation
+                    || !self.alive.load(Ordering::Acquire)
+                {
+                    return Err(McpTransportError::TransportClosed.into());
+                }
+                // Same writer and generation as the originating request. Parent
+                // cancellation drops this future before any later response can
+                // be accepted; session reset never replays either request.
+                let mut writer = conn.stdin.lock().await;
+                let parent_pending = parent
+                    .id
+                    .as_ref()
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|id| self.pending.lock().contains_key(&(generation, id)));
+                if !parent_pending {
+                    // A final parent response may race the handler. Consume it
+                    // on the next select; never send a decision after completion.
+                    continue;
+                }
+                write_server_response_locked(&mut writer, &reply).await?;
+            }
+        }
+    }
+}
+
+struct StdioReaderContext {
     server_name: String,
     generation: u64,
-    stdout: tokio::process::ChildStdout,
     pending: PendingMap,
+    calls: StdioCalls,
     alive: Arc<AtomicBool>,
     active_generation: Arc<AtomicU64>,
+}
+
+async fn stdio_read_loop(
+    context: StdioReaderContext,
+    stdout: tokio::process::ChildStdout,
+    stdin: std::sync::Weak<Mutex<tokio::process::ChildStdin>>,
 ) {
+    let StdioReaderContext {
+        server_name,
+        generation,
+        pending,
+        calls,
+        alive,
+        active_generation,
+    } = context;
     let mut reader = BufReader::new(stdout);
     loop {
         match read_bounded_line(&mut reader, MAX_LINE_BYTES).await {
             Ok(BoundedLine::Line { bytes: line, .. }) => {
-                let Ok(response) = serde_json::from_slice::<JsonRpcResponse>(&line) else {
-                    continue;
-                };
-                let response_id = response.id.as_ref().and_then(serde_json::Value::as_u64);
-                if !deliver_stdio_response(&pending, generation, response) {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "mcp_server": &server_name,
-                                "response_id": response_id,
-                                "generation": generation,
-                            })),
-                        "mcp_transport: dropped unknown or stale stdio response"
-                    );
+                match JsonRpcMessage::from_slice(&line) {
+                    Ok(JsonRpcMessage::Response(response)) => {
+                        let Some(stdin) = stdin.upgrade() else {
+                            break;
+                        };
+                        // Linearize parent completion against a nested decision
+                        // write. A completed parent can never receive a late
+                        // acceptance queued behind another writer.
+                        let _writer = stdin.lock().await;
+                        deliver_stdio_response(&pending, generation, response);
+                    }
+                    Ok(JsonRpcMessage::Request(request)) => {
+                        if request.id.is_none() {
+                            if request.method == "notifications/cancelled"
+                                && let Some(id) =
+                                    request.params.as_ref().and_then(|p| p.get("requestId"))
+                            {
+                                let cancellation_delivered =
+                                    calls.lock().iter().all(|((entry_generation, _), sender)| {
+                                        *entry_generation != generation
+                                            || sender
+                                                .try_send(StdioServerEvent::Cancel(id.clone()))
+                                                .is_ok()
+                                    });
+                                if !cancellation_delivered {
+                                    // A saturated queue must not lose cancellation
+                                    // and subsequently permit an approval.
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        // The protocol has no mandatory parent-id field. A single
+                        // live tool call is the only unambiguous implicit scope.
+                        // Elicitation-enabled clients serialize calls; unsolicited
+                        // or multiplexed requests are rejected instead of guessing.
+                        let target = {
+                            let calls = calls.lock();
+                            let mut matching = calls.iter().filter(|((g, _), _)| *g == generation);
+                            let first = matching.next().map(|(_, sender)| sender.clone());
+                            if matching.next().is_none() {
+                                first
+                            } else {
+                                None
+                            }
+                        };
+                        let reply = if request.method == "ping" {
+                            Some(JsonRpcResponse {
+                                jsonrpc: JSONRPC_VERSION.into(),
+                                id: request.id.clone(),
+                                result: Some(serde_json::json!({})),
+                                error: None,
+                            })
+                        } else if request.method != "elicitation/create" {
+                            Some(server_error(
+                                request.id.clone(),
+                                METHOD_NOT_FOUND,
+                                "Unsupported MCP server request",
+                            ))
+                        } else if let Some(sender) = target {
+                            let request_id = request.id.clone();
+                            match sender.try_send(StdioServerEvent::Request(request)) {
+                                Ok(()) => None,
+                                Err(_) => Some(server_error(
+                                    request_id,
+                                    INTERNAL_ERROR,
+                                    "MCP interaction unavailable or busy",
+                                )),
+                            }
+                        } else {
+                            Some(server_error(
+                                request.id.clone(),
+                                INVALID_PARAMS,
+                                "MCP elicitation requires one live originating tool call",
+                            ))
+                        };
+                        if let Some(reply) = reply {
+                            let Some(stdin) = stdin.upgrade() else {
+                                break;
+                            };
+                            if write_server_response(&stdin, &reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => continue,
                 }
             }
             Ok(BoundedLine::Oversized) => {
@@ -1000,11 +1368,22 @@ async fn stdio_read_loop(
         }
     }
 
+    calls
+        .lock()
+        .retain(|(entry_generation, _), _| *entry_generation != generation);
     finish_stdio_generation(&pending, generation, &alive, &active_generation);
 }
 
 #[async_trait::async_trait]
 impl SharedMcpTransportConn for StdioTransport {
+    fn enable_form_elicitation(&self) {
+        self.form_elicitation.store(true, Ordering::Release);
+    }
+
+    fn form_elicitation_enabled(&self) -> bool {
+        self.form_elicitation.load(Ordering::Acquire)
+    }
+
     async fn send_and_recv(
         &self,
         request: &JsonRpcRequest,
@@ -1037,13 +1416,21 @@ impl SharedMcpTransportConn for StdioTransport {
         }
 
         let request_id = request.id.as_ref().and_then(serde_json::Value::as_u64);
+        let mut server_events = None;
+        let generation = conn.generation;
         let receiver = if let Some(id) = request_id {
             let (sender, receiver) = oneshot::channel();
             register_pending(&self.pending, conn.generation, id, sender)?;
+            if request.method == TOOLS_CALL_METHOD {
+                let (sender, events) = mpsc::channel(8);
+                self.calls.lock().insert((conn.generation, id), sender);
+                server_events = Some(events);
+            }
             Some((
                 StdioPendingGuard {
                     pending: Arc::clone(&self.pending),
                     key: (conn.generation, id),
+                    calls: Arc::clone(&self.calls),
                 },
                 receiver,
             ))
@@ -1054,7 +1441,7 @@ impl SharedMcpTransportConn for StdioTransport {
         };
 
         lifecycle.mark_outcome_unknown(epoch_guard.epoch());
-        if let Err(error) = self.send_raw(&mut conn.stdin, &line).await {
+        if let Err(error) = self.send_raw(&mut *conn.stdin.lock().await, &line).await {
             self.alive.store(false, Ordering::Release);
             return Err(error);
         }
@@ -1071,9 +1458,9 @@ impl SharedMcpTransportConn for StdioTransport {
                 error: None,
             });
         };
-        let response = receiver
-            .await
-            .map_err(|_| McpTransportError::TransportClosed)?;
+        let response = self
+            .receive_with_server_requests(request, lifecycle, generation, receiver, server_events)
+            .await?;
         lifecycle.mark_completed();
         drop(write_boundary);
         Ok(response)
@@ -1088,6 +1475,9 @@ impl SharedMcpTransportConn for StdioTransport {
         let old_generation = self.active_generation.fetch_add(1, Ordering::AcqRel);
         self.alive.store(false, Ordering::Release);
         drain_pending_generation(&self.pending, old_generation);
+        self.calls
+            .lock()
+            .retain(|(generation, _), _| *generation != old_generation);
         if let Some(conn) = state.conn.take() {
             Self::reap_conn(conn, &self.config.name).await?;
         }
@@ -1097,6 +1487,7 @@ impl SharedMcpTransportConn for StdioTransport {
             &self.config,
             generation,
             Arc::clone(&self.pending),
+            Arc::clone(&self.calls),
             Arc::clone(&self.alive),
             Arc::clone(&self.active_generation),
             Arc::clone(&self.child_exited),
@@ -1114,6 +1505,9 @@ impl SharedMcpTransportConn for StdioTransport {
         let old_generation = self.active_generation.fetch_add(1, Ordering::AcqRel);
         self.alive.store(false, Ordering::Release);
         drain_pending_generation(&self.pending, old_generation);
+        self.calls
+            .lock()
+            .retain(|(generation, _), _| *generation != old_generation);
         if let Some(conn) = state.conn.take() {
             Self::reap_conn(conn, &self.config.name).await?;
         }
@@ -1733,12 +2127,9 @@ async fn handle_sse_event(
         return;
     }
 
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return;
-    };
-
-    let Ok(resp) = serde_json::from_value::<JsonRpcResponse>(value.clone()) else {
-        let _ = serde_json::from_value::<JsonRpcRequest>(value);
+    let Ok(JsonRpcMessage::Response(resp)) = JsonRpcMessage::from_slice(trimmed.as_bytes()) else {
+        // Remote transports do not advertise server-request capabilities. Never
+        // correlate an unsolicited request with an outbound response waiter.
         return;
     };
 
@@ -1830,9 +2221,16 @@ fn parse_jsonrpc_response_text(resp_text: &str) -> Result<JsonRpcResponse> {
         Cow::Borrowed(trimmed)
     };
 
-    let mcp_resp: JsonRpcResponse = serde_json::from_str(json_text.as_ref())
-        .with_context(|| format!("invalid JSON-RPC response: {}", resp_text))?;
-    Ok(mcp_resp)
+    parse_jsonrpc_response_payload(json_text.as_ref())
+}
+
+fn parse_jsonrpc_response_payload(payload: &str) -> Result<JsonRpcResponse> {
+    match JsonRpcMessage::from_slice(payload.as_bytes())? {
+        JsonRpcMessage::Response(response) => Ok(response),
+        JsonRpcMessage::Request(_) => {
+            bail!("MCP transport received an unsupported server request instead of a response")
+        }
+    }
 }
 
 fn looks_like_sse_text(text: &str) -> bool {
@@ -1914,7 +2312,7 @@ async fn read_first_jsonrpc_from_sse_response(
                 continue;
             }
             let json_str = extract_json_from_sse_text(trimmed);
-            if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(json_str.as_ref()) {
+            if let Ok(resp) = parse_jsonrpc_response_payload(json_str.as_ref()) {
                 return Ok(Some(resp));
             }
             continue;
@@ -2065,9 +2463,7 @@ impl SharedMcpTransportConn for SseTransport {
                             } else {
                                 Cow::Borrowed(trimmed)
                             };
-                        if let Ok(mcp_resp) =
-                            serde_json::from_str::<JsonRpcResponse>(json_str.as_ref())
-                        {
+                        if let Ok(mcp_resp) = parse_jsonrpc_response_payload(json_str.as_ref()) {
                             got_direct = Some(mcp_resp);
                         }
                     }

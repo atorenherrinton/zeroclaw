@@ -3,6 +3,7 @@ name = "zeroclaw-phone-extension"
 version = "0.1.0"
 edition = "2024"
 publish = false
+build = "../../build.rs"
 
 [dependencies]
 zeroclaw-config = { path = "../../crates/zeroclaw-config", default-features = false }

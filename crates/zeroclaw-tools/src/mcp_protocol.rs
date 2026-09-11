@@ -1,12 +1,12 @@
 //! MCP (Model Context Protocol) JSON-RPC 2.0 protocol types.
-//! Protocol version: 2024-11-05
+//! Protocol version: 2025-11-25
 //! Adapted from ops-mcp-server/src/protocol.rs for client use.
 //! Both Serialize and Deserialize are derived — the client both sends (Serialize)
 
 use serde::{Deserialize, Serialize};
 
 pub const JSONRPC_VERSION: &str = "2.0";
-pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+pub const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 // Standard JSON-RPC 2.0 error codes
 pub const PARSE_ERROR: i32 = -32700;
@@ -70,6 +70,107 @@ pub struct JsonRpcError {
     pub data: Option<serde_json::Value>,
 }
 
+/// An interaction nested inside one live `tools/call`. Transport-owned fields
+/// identify the server and call; the message, schema, and metadata are untrusted
+/// server content. They must never become instructions or automatic approval.
+#[derive(Debug, Clone)]
+pub struct McpElicitationRequest {
+    pub server_name: String,
+    pub server_instance_id: String,
+    pub connection_epoch: u64,
+    pub originating_request_id: serde_json::Value,
+    pub request_id: serde_json::Value,
+    pub tool_name: String,
+    pub message: String,
+    pub requested_schema: serde_json::Value,
+    pub meta: Option<serde_json::Value>,
+}
+
+/// A real user decision. Acceptance does not imply persistent approval. Only
+/// content explicitly supplied/reviewed by the user may be returned here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum McpElicitationResult {
+    Accept(serde_json::Value),
+    Decline,
+    Cancel,
+}
+
+impl McpElicitationResult {
+    pub(crate) fn into_value(self) -> anyhow::Result<serde_json::Value> {
+        match self {
+            Self::Accept(content) if content.is_object() => {
+                Ok(serde_json::json!({"action": "accept", "content": content}))
+            }
+            Self::Accept(_) => anyhow::bail!("MCP form elicitation content must be an object"),
+            Self::Decline => Ok(serde_json::json!({"action": "decline"})),
+            Self::Cancel => Ok(serde_json::json!({"action": "cancel"})),
+        }
+    }
+}
+
+/// Runtime-owned interaction surface for the authenticated originating turn.
+/// Implementations must preserve decline/cancel, validate supported schemas and
+/// metadata, and fail closed when they cannot show a request faithfully. Dropping
+/// the future cancels the interaction; no approval may outlive the parent call.
+#[async_trait::async_trait]
+pub trait McpElicitationHandler: Send + Sync {
+    async fn elicit(&self, request: McpElicitationRequest) -> anyhow::Result<McpElicitationResult>;
+}
+
+tokio::task_local! {
+    static ELICITATION_HANDLER: std::sync::Arc<dyn McpElicitationHandler>;
+}
+
+/// Scope the handler to an authenticated runtime execution. Spawned tasks must
+/// explicitly propagate this handle; a shared MCP registry never stores it.
+pub async fn with_mcp_elicitation_handler<F: std::future::Future>(
+    handler: std::sync::Arc<dyn McpElicitationHandler>,
+    future: F,
+) -> F::Output {
+    ELICITATION_HANDLER.scope(handler, future).await
+}
+
+pub fn current_mcp_elicitation_handler() -> Option<std::sync::Arc<dyn McpElicitationHandler>> {
+    ELICITATION_HANDLER.try_with(std::sync::Arc::clone).ok()
+}
+
+/// Distinguish message direction before correlating identifiers. Request IDs
+/// occupy a separate namespace from response IDs, including equal numeric IDs.
+pub(crate) enum JsonRpcMessage {
+    Request(JsonRpcRequest),
+    Response(JsonRpcResponse),
+}
+
+impl JsonRpcMessage {
+    pub(crate) fn from_slice(bytes: &[u8]) -> anyhow::Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        if value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some(JSONRPC_VERSION) {
+            anyhow::bail!("invalid MCP JSON-RPC version");
+        }
+        if let Some(id) = value.get("id")
+            && !id.is_string()
+            && !id.is_i64()
+            && !id.is_u64()
+        {
+            anyhow::bail!("invalid MCP JSON-RPC identifier");
+        }
+        if value.get("method").is_some() {
+            if value.get("result").is_some() || value.get("error").is_some() {
+                anyhow::bail!("MCP request cannot also contain a response");
+            }
+            Ok(Self::Request(serde_json::from_value(value)?))
+        } else {
+            if value.get("id").is_none()
+                || value.get("result").is_some() == value.get("error").is_some()
+                || value.get("error").is_some_and(|error| !error.is_object())
+            {
+                anyhow::bail!("invalid MCP JSON-RPC response envelope");
+            }
+            Ok(Self::Response(serde_json::from_value(value)?))
+        }
+    }
+}
+
 /// A tool advertised by an MCP server (from `tools/list` response).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolDef {
@@ -107,6 +208,35 @@ mod tests {
                 encoded.get("annotations").cloned().unwrap_or_default(),
                 annotations
             );
+        }
+    }
+
+    #[test]
+    fn frame_dispatch_rejects_ambiguous_envelopes_and_keeps_id_types() {
+        for invalid in [
+            r#"{"jsonrpc":"2.0","id":3,"method":"elicitation/create","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","id":3,"error":null}"#,
+            r#"{"jsonrpc":"2.0","id":3,"result":{},"error":{}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"elicitation/create"}"#,
+            r#"{"jsonrpc":"1.0","id":3,"result":{}}"#,
+        ] {
+            assert!(JsonRpcMessage::from_slice(invalid.as_bytes()).is_err());
+        }
+        for id in [
+            serde_json::json!(3),
+            serde_json::json!("3"),
+            serde_json::json!(-3),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "jsonrpc":"2.0", "id":id, "method":"elicitation/create", "params":{}
+            }))
+            .unwrap();
+            let JsonRpcMessage::Request(request) = JsonRpcMessage::from_slice(&bytes).unwrap()
+            else {
+                panic!("a request ID cannot be mistaken for an outbound response");
+            };
+            assert_eq!(request.id, Some(id));
         }
     }
 
@@ -195,7 +325,7 @@ mod tests {
 
     #[test]
     fn mcp_protocol_version_constant_is_correct() {
-        assert_eq!(MCP_PROTOCOL_VERSION, "2024-11-05");
+        assert_eq!(MCP_PROTOCOL_VERSION, "2025-11-25");
     }
 
     #[test]

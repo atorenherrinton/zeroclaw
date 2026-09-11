@@ -979,7 +979,7 @@ turn-codex-recovery-will-stop = ZeroClaw will report the stop without delegating
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
 channel-runtime-progress-received = Got it — checking the request…
 channel-runtime-progress-planning = Reviewing what I know and choosing the next step…
-channel-runtime-progress-waiting-on-model = Thinking through the next action…
+channel-runtime-progress-waiting-on-model = Waiting for the model response…
 channel-runtime-progress-running-tool = Using a tool to gather the next piece of information…
 channel-runtime-progress-compacting-context = Organizing the working context so I can continue…
 channel-runtime-progress-finalizing-response = Putting the result into a clear answer…
@@ -1001,7 +1001,7 @@ channel-runtime-stop-no-task = No in-flight task for this sender scope.
 channel-runtime-model-empty = Model ID cannot be empty. Use `/model <model-id>`.
 channel-runtime-model-switched = Model switched to `{ $model }` (model_provider: `{ $provider }`). Context preserved.
 channel-runtime-agent-scope-rejected = Sender `{ $sender }` is not authorized for `/model --agent` on agent `{ $agent }`. Use `/model --user { $model }` for a session-only override, or ask an admin to mark a peer group `admin_for_agent_scope = true` with you as a member.
-channel-runtime-request-timeout = ⚠️ Request timed out while waiting for the model. Please try again.
+channel-runtime-request-timeout = ⚠️ This run reached its deadline. An in-flight model or tool call was interrupted; verify any actions before retrying.
 channel-runtime-no-reply-refused = 🚫 I can't help with that request.
 channel-runtime-no-reply-failed = ⚠️ I couldn't complete that request.
 channel-runtime-repair-started = 🛠️ I’m starting repair or coding work for this request. I’ll keep you updated while it runs.
@@ -1286,5 +1286,35 @@ turn-tool-batch-failed = [tool stopped without a normal result; reconcile extern
 turn-tool-batch-cancelled = [cancelled before this tool returned a normal result]
 
 turn-tool-result-budget-exceeded = Tool results exceed the encoded output budget. The turn stopped; reconcile external effects before retrying.
+channel-elicitation-source = Request from MCP server { $server }, tool { $tool }
+channel-elicitation-warning = Notice: { $value }
+channel-elicitation-risk = Reported risk: { $value }
+channel-elicitation-operation = Operation: { $value }
+channel-elicitation-target = Target parameters: { $value }
+channel-elicitation-accept = Approve
+channel-elicitation-accept-task = Approve this app for this task
+channel-elicitation-decline = Decline
+channel-elicitation-cancel = Cancel
+channel-elicitation-yes = Yes
+channel-elicitation-no = No
+channel-elicitation-unsupported-form = This channel cannot safely display this form. Only empty consent forms and bounded boolean or text choices are supported; free-form and sensitive fields require another interface.
+channel-elicitation-prompt-too-large = This request is too large to display completely on the active channel; no approval was granted.
+channel-elicitation-terminal-required = Computer permission requests require an interactive terminal for this command.
+channel-elicitation-terminal-choice-only = This terminal surface supports permission choices only.
+channel-elicitation-terminal-prompt = Enter a choice number; any other response cancels:
+channel-elicitation-invalid-metadata = This permission request has unsupported or malformed approval details; no approval was granted.
 
 shell-output-preview-truncated = [Shell output truncated; the middle was omitted. The command already ran. This incomplete preview is not evidence that a write failed or did not occur. Do not rerun the command to recover output; reconcile effects first. Full output is not retained here. For future commands, redirect large output to a file and inspect bounded sections.]
+
+turn-provider-wait = Waiting for the model response ({ $seconds }s, round { $round }).
+channel-runtime-interrupted = This run was interrupted. Any in-flight action may have completed; verify its result before retrying.
+channel-runtime-partial = Partial response saved before the run stopped:
+channel-runtime-delegates = Delegated work saved for this conversation:
+
+turn-tool-error-too-large = Tool returned an oversized error. Execution status is uncertain; verify side effects before retrying. Full error omitted.
+
+turn-partial-checkpoint = Progress checkpoint: give a concise update of verified findings, remaining uncertainty, and pending delegate task IDs in your next response. Reuse delegated findings; do not repeat checks within a delegate's scope. Do not add tool calls solely to produce this update.
+
+channel-runtime-delegate-completed = Completed delegated work (task { $task_id }). Saved excerpt:
+    { $output }
+cli-cron-completion-check-failed = Scheduled task completion check failed: { $detail }

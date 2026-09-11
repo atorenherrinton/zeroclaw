@@ -37,6 +37,15 @@ impl Install {
     }
 
     fn invoke(&self) -> Value {
+        self.invoke_tool(
+            "calendar_update_event",
+            json!({
+                "calendar_id":"primary","event_id":"synthetic123","location":"New location"
+            }),
+        )
+    }
+
+    fn invoke_tool(&self, name: &str, arguments: Value) -> Value {
         let mut child = Command::new(self.0.join("install with spaces/relocated-writer"))
             .current_dir(self.0.join("other-cwd"))
             .env_clear()
@@ -50,10 +59,7 @@ impl Install {
             .spawn()
             .unwrap();
         let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-            "name":"calendar_update_event","arguments":{
-                "calendar_id":"primary","event_id":"synthetic123",
-                "location":"New location"
-            }
+            "name":name,"arguments":arguments
         }});
         writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
         let output = child.wait_with_output().unwrap();
@@ -140,5 +146,67 @@ fn failing_sibling_read_stops_without_fallback_or_write() {
     let calls = fs::read_to_string(install.0.join("install with spaces/calls")).unwrap();
     assert_eq!(calls.matches("--CALL--").count(), 1);
     assert!(calls.contains("calendar.events.get"));
+    assert!(!calls.contains("calendar.events.patch"));
+}
+
+#[test]
+fn attendee_preread_keychain_failure_survives_mcp_without_writing_or_registering() {
+    let install = Install::new();
+    executable(
+        &install.sibling(),
+        r##"#!/bin/sh
+set -eu
+dir=${0%/*}
+printf '%s\n' --CALL-- "$@" >> "$dir/calls"
+printf '%s\n' 'token source: get token for private@example.invalid: read token: keyring connection timed out after 30s; private diagnostic details' >&2
+exit 1
+"##,
+    );
+    let args = json!({
+        "action":"update","calendar_id":"primary","event_id":"_synthetic_exact_id",
+        "expected_etag":"\"v1\"","attendees":["guest@example.invalid"],
+        "attendees_owner_authorized":true,"send_updates":"all","scope":"single",
+        "idempotency_key":"fixture-attendee-invitation","owner_authorized":true
+    });
+    let validation = install.invoke_tool("calendar_validate", args.clone());
+    assert_eq!(validation["result"]["structuredContent"]["valid"], true);
+    assert_eq!(
+        validation["result"]["structuredContent"]["provider_read"],
+        false
+    );
+    assert!(!install.0.join("install with spaces/calls").exists());
+    let response = install.invoke_tool("calendar_mutate", args);
+    assert_eq!(response["result"]["isError"], true);
+    let message = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        message.starts_with("read failed; no mutation attempted: google_keychain_access_required:")
+    );
+    assert!(message.contains("native macOS session"));
+    assert!(!message.contains("private@example.invalid"));
+    assert!(!message.contains("private diagnostic details"));
+    let reconciled = install.invoke_tool(
+        "calendar_reconcile",
+        json!({"idempotency_key":"fixture-attendee-invitation"}),
+    );
+    assert_eq!(reconciled["result"]["isError"], true);
+    assert_eq!(
+        reconciled["result"]["content"][0]["text"],
+        "unknown action key"
+    );
+    let narrow = install.invoke();
+    assert!(
+        narrow["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with(
+                "Exact event read failed; no patch attempted: google_keychain_access_required:"
+            )
+    );
+    let calls = fs::read_to_string(install.0.join("install with spaces/calls")).unwrap();
+    assert_eq!(calls.matches("--CALL--").count(), 2);
+    assert!(calls.contains("\"eventId\":\"_synthetic_exact_id\""));
+    assert!(calls.contains("calendar.events.get"));
+    assert!(calls.contains("--readonly\n"));
+    assert!(!calls.contains("--allow-write"));
     assert!(!calls.contains("calendar.events.patch"));
 }
