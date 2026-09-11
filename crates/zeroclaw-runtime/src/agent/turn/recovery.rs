@@ -110,7 +110,6 @@ impl RecoveryTracker {
         }
 
         match outcome.failure_kind {
-<<<<<<< HEAD
             Some(kind @ (ToolFailureKind::PolicyDenied | ToolFailureKind::Ordinary)) => {
                 // A denied request is feedback the model can correct, not proof
                 // that the runtime is stuck. Require repeated unsuccessful rounds
@@ -130,23 +129,6 @@ impl RecoveryTracker {
                     &self.last_failure
                     && last_tool == &tool
                     && *last_kind == kind
-=======
-            Some(ToolFailureKind::PolicyDenied) => {
-                self.clear();
-                Some(RecoveryTrigger {
-                    kind: RecoveryTriggerKind::SecurityPolicyDenied,
-                    tool: sanitize_identifier(tool),
-                    occurrences: 1,
-                    iteration: iteration + 1,
-                })
-            }
-            Some(ToolFailureKind::Ordinary) => {
-                let reason = outcome.error_reason.as_deref().unwrap_or(&outcome.output);
-                let fingerprint = failure_fingerprint(reason);
-                let tool = sanitize_identifier(tool);
-                if let Some((last_tool, last_fingerprint, last_iteration)) = &self.last_failure
-                    && last_tool == &tool
->>>>>>> 0764059cf (fix(runtime): count failed retry rounds instead of batched calls)
                     && *last_fingerprint == fingerprint
                 {
                     if *last_iteration != iteration {
@@ -155,11 +137,7 @@ impl RecoveryTracker {
                 } else {
                     self.consecutive_failures = 1;
                 }
-<<<<<<< HEAD
                 self.last_failure = Some((tool.clone(), kind, fingerprint, iteration));
-=======
-                self.last_failure = Some((tool.clone(), fingerprint, iteration));
->>>>>>> 0764059cf (fix(runtime): count failed retry rounds instead of batched calls)
                 (self.consecutive_failures >= REPEATED_FAILURE_THRESHOLD).then_some(
                     RecoveryTrigger {
                         kind,
@@ -591,7 +569,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn policy_denials_count_retry_rounds_and_success_clears_them() {
         let mut tracker = RecoveryTracker::default();
         for iteration in 0..2 {
@@ -644,8 +621,6 @@ mod tests {
     }
 
     #[test]
-=======
->>>>>>> 0764059cf (fix(runtime): count failed retry rounds instead of batched calls)
     fn repair_prompt_contains_only_sanitized_zeroclaw_metadata() {
         let trigger = RecoveryTrigger {
             kind: RecoveryTriggerKind::RepeatedToolFailure,
