@@ -2510,22 +2510,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_mcp_reviews_and_receipts_remain_exact_despite_size() {
+        use crate::mcp_tool::McpToolWrapper;
+        use zeroclaw_api::tool::Tool;
+        let dir = tempfile::tempdir().unwrap();
+        let data = serde_json::json!({"review":{"body":"fixture".repeat(20000)},
+            "receipt":"fixture-exact-receipt", "review_hash":"fixture-hash"});
+        for result in [
+            serde_json::json!({"content":[{"type":"text","text":data.to_string()}],"isError":false}),
+            serde_json::json!({"content":[{"type":"text","text":"Prepared, not sent"}],"structuredContent":data,"isError":false}),
+        ] {
+            let server = server_with_tool_returning("review", result.clone());
+            let registry =
+                Arc::new(McpRegistry::connect_all_with_workspace(&[server], dir.path()).await);
+            let def: crate::mcp_protocol::McpToolDef = serde_json::from_value(serde_json::json!({
+                "name":"review", "description":"Fixture exact review", "inputSchema":{},
+                "annotations":{"readOnlyHint":true}
+            }))
+            .unwrap();
+            let wrapper = McpToolWrapper::new(
+                "fake__review".into(),
+                def,
+                registry,
+                Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                    workspace_dir: dir.path().to_path_buf(),
+                    ..Default::default()
+                }),
+            );
+            let out = wrapper.execute(serde_json::json!({})).await.unwrap();
+            assert!(out.success);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&out.output).unwrap(),
+                result
+            );
+            assert!(crate::output_budget::encoded_size(&out.output.as_str(), 32768).is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_read_preview_fits_native_history_and_keeps_write_results_intact() {
         use crate::mcp_tool::McpToolWrapper;
         use zeroclaw_api::tool::Tool as _;
         use zeroclaw_providers::ChatMessage;
 
         let dir = tempfile::tempdir().unwrap();
-        // The same JSON is returned in text and structured form, as by common
-        // search connectors. Control bytes exercise JSON's escaping expansion.
-        let data = serde_json::json!({
-            "messages":[{"id":"fixture-message", "body":"\u{0001}😀\"\\".repeat(20000)}],
-            "nextPageToken":"fixture-next-page",
-            "receipt":"fixture-source-receipt",
-        });
+        // Only ordinary read-only prose may become a marked preview. Exact
+        // structured reviews and receipts are covered separately below.
         let result = serde_json::json!({
-            "content":[{"type":"text", "text":data.to_string()}],
-            "structuredContent":data,
+            "content":[{"type":"text", "text":format!("Fixture document {}", "\u{0001}😀\"\\".repeat(20000))}],
             "isError":false,
         });
         let original = serde_json::to_string_pretty(&result).unwrap();
@@ -2560,8 +2592,6 @@ mod tests {
             assert!(out.success);
             if hint == Some(serde_json::json!(true)) {
                 assert!(out.output.contains("Read result truncated"));
-                assert!(out.output.contains("fixture-source-receipt"));
-                assert!(out.output.contains("fixture-next-page"));
                 for i in 0..3 {
                     // Receipt and name/call-ID envelopes are outside the preview.
                     let content = format!("{}\n\n[receipt: fixture-hmac-receipt]", out.output);
@@ -2576,7 +2606,6 @@ mod tests {
                 }
             } else {
                 assert_eq!(out.output.as_str(), original);
-                assert!(out.output.contains("fixture-source-receipt"));
                 assert!(crate::output_budget::encoded_size(&out.output.as_str(), 32768).is_none());
             }
         }
