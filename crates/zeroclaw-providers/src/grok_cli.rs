@@ -1821,7 +1821,7 @@ while IFS= read -r line; do :; done
         }
 
         async fn wait_for_pid(path: &Path) -> i32 {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(value) = tokio::fs::read_to_string(path).await
                     && let Ok(pid) = value.trim().parse::<i32>()
@@ -2097,7 +2097,11 @@ sleep 30 &
 printf '%s\n' "$!" > descendant.pid
 sleep 30
 "#;
-            let model_provider = fake_provider(&temp, body, 1);
+            // Process startup is a real OS operation. Give it room under suite
+            // load, then drive the provider deadline only after both processes
+            // exist so an early timeout cannot skip the cleanup precondition.
+            let timeout_secs = 60;
+            let model_provider = fake_provider(&temp, body, timeout_secs);
             let leader_path = temp.path().join("leader.pid");
             let descendant_path = temp.path().join("descendant.pid");
             let task = ::zeroclaw_spawn::spawn!(async move {
@@ -2105,12 +2109,27 @@ sleep 30
             });
             let leader = wait_for_pid(&leader_path).await;
             let descendant = wait_for_pid(&descendant_path).await;
+            assert!(
+                process_exists(leader),
+                "leader must be alive before timeout"
+            );
+            assert!(
+                process_exists(descendant),
+                "descendant must be alive before timeout"
+            );
+            assert!(!task.is_finished(), "provider must still be waiting");
+
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(timeout_secs + 1)).await;
+            // Reaping requires real process scheduling; do not auto-advance
+            // its cleanup timers while waiting for the kernel to report exit.
+            tokio::time::resume();
             let result = task.await.expect("provider task");
             assert!(
                 result
                     .expect_err("timeout expected")
                     .to_string()
-                    .contains("timed out")
+                    .contains("timed out after 60s")
             );
             assert_process_exits(leader).await;
             assert_process_exits(descendant).await;
