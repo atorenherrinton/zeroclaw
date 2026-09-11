@@ -159,6 +159,40 @@ async fn run_calendar_patch_gog(arguments: Vec<String>) -> Result<Value> {
     run_gog_at(&directory.join("gog-calendar-patch"), arguments).await
 }
 
+#[derive(Debug)]
+struct GoogleKeychainAccessRequired;
+
+impl std::fmt::Display for GoogleKeychainAccessRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("google_keychain_access_required: the selected Google client timed out reading its macOS Keychain token. The owner must review/unlock Keychain access for this executable in the native macOS session; do not bypass the prompt, export credentials, or switch credential storage. Verify with a read-only check before attempting the pending write.")
+    }
+}
+
+impl std::error::Error for GoogleKeychainAccessRequired {}
+
+fn google_operation_failure(stderr: &str) -> anyhow::Error {
+    if stderr.contains("read token:") && stderr.contains("keyring connection timed out") {
+        // Do not return the account, keyring item, or credential-storage advice
+        // from the provider's stderr. Preserve a typed cause through pre-read context.
+        GoogleKeychainAccessRequired.into()
+    } else {
+        anyhow::Error::msg(format!("Google operation failed: {}", stderr.trim()))
+    }
+}
+
+fn tool_error_message(error: &anyhow::Error) -> String {
+    let outer = error.to_string();
+    if error
+        .chain()
+        .skip(1)
+        .any(|cause| cause.is::<GoogleKeychainAccessRequired>())
+    {
+        format!("{outer}: {GoogleKeychainAccessRequired}")
+    } else {
+        outer
+    }
+}
+
 async fn run_gog_at(executable: &std::path::Path, arguments: Vec<String>) -> Result<Value> {
     let home =
         std::env::var_os("HOME").context("HOME is required for the owner's Google account")?;
@@ -177,7 +211,7 @@ async fn run_gog_at(executable: &std::path::Path, arguments: Vec<String>) -> Res
     }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("Google operation failed: {}", stderr.trim());
+        return Err(google_operation_failure(&stderr));
     }
     if output.stdout.is_empty() {
         return Ok(json!({}));
@@ -558,7 +592,7 @@ async fn respond(request: Value) -> Option<Value> {
         {
             Ok(value) => value,
             Err(error) => {
-                json!({"isError":true,"content":[{"type":"text","text":error.to_string()}]})
+                json!({"isError":true,"content":[{"type":"text","text":tool_error_message(&error)}]})
             }
         },
         _ => {
