@@ -1145,23 +1145,6 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if lower.contains("stream") || lower.contains("sse") {
-        return ProviderErrorDiagnostic {
-            kind: "stream_error",
-            phase: "response_stream",
-            hint: "provider stream did not complete; inspect the bounded operator diagnostic",
-            endpoint,
-        };
-    }
-    if lower.contains("decode") || lower.contains("parse") {
-        return ProviderErrorDiagnostic {
-            kind: "response_decode",
-            phase: "response_decode",
-            hint: "provider response could not be decoded; inspect the bounded operator diagnostic",
-            endpoint,
-        };
-    }
-
     ProviderErrorDiagnostic {
         kind: "provider_error",
         phase: "unknown",
@@ -3806,7 +3789,7 @@ mod tests {
             "OpenAI Codex SSE stream ended without completion; https://fixture.invalid?api_key=fixture-private-query; token=sk-abcdefghijklmnopqrstuvwxyz1234567890",
         );
         let diagnostic = provider_error_diagnostic(&cause);
-        assert_eq!(diagnostic.kind, "stream_error");
+        assert_eq!(diagnostic.kind, "provider_error");
         let failure = ReliableProviderTerminalFailure::with_cause(
             Some("fixture"),
             diagnostic,
