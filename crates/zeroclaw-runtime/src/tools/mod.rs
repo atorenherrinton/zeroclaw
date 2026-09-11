@@ -360,7 +360,11 @@ pub fn default_tools_with_runtime(
                     security.clone(),
                 )),
                 security.clone(),
-            ),
+            )
+            .with_extractor(|args| {
+                // Patterns are regex data; ContentSearchTool owns the default search path.
+                args.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+            }),
             security,
         )),
     ]
@@ -922,7 +926,11 @@ pub fn all_tools_with_runtime(
                     security.clone(),
                 )),
                 security.clone(),
-            ),
+            )
+            .with_extractor(|args| {
+                // Patterns are regex data; ContentSearchTool owns the default search path.
+                args.get("path").and_then(|v| v.as_str()).map(str::to_owned)
+            }),
             security.clone(),
         )),
         Arc::new(CronAddTool::new_with_runtime(
@@ -4019,6 +4027,48 @@ permissions = ["http_client"]
                 "Tool {} has empty description",
                 tool.name()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_content_search_guards_paths_not_patterns() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        std::fs::write(workspace.path().join("fixture.txt"), "../needle\n").unwrap();
+        std::fs::write(outside.path().join("fixture.txt"), "../needle\n").unwrap();
+        let tools = default_tools(security);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name() == "content_search")
+            .unwrap();
+
+        for args in [
+            serde_json::json!({"pattern": "../needle"}),
+            serde_json::json!({"pattern": "../needle", "path": "."}),
+        ] {
+            let result = tool.execute(args).await.unwrap();
+            assert!(result.success, "workspace search failed: {result:?}");
+            assert!(result.output.contains("../needle"));
+        }
+
+        for path in [
+            "..".to_string(),
+            outside.path().to_string_lossy().into_owned(),
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"pattern": "needle", "path": path}))
+                .await
+                .unwrap();
+            assert!(
+                !result.success,
+                "unauthorized path was searched: {result:?}"
+            );
+            assert!(result.output.is_empty());
+            assert!(result.error.unwrap().contains("security policy"));
         }
     }
 
