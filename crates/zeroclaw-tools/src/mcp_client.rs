@@ -15,7 +15,10 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use crate::mcp_prompt::{McpGetPromptResult, McpPromptsListResult};
-use crate::mcp_protocol::{JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult};
+use crate::mcp_protocol::{
+    JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult,
+    current_mcp_elicitation_handler,
+};
 use crate::mcp_resource::{McpResourceContents, McpResourcesListResult};
 use crate::mcp_transport::{
     McpRecoveryGate, McpRequestLifecycle, McpTransportError, SharedMcpTransportConn,
@@ -50,12 +53,16 @@ async fn handshake(
     server_name: &str,
     epoch: u64,
 ) -> Result<McpServerCapabilities> {
+    let mut client_capabilities = json!({ "resources": {}, "prompts": {} });
+    if transport.form_elicitation_enabled() {
+        client_capabilities["elicitation"] = json!({"form": {}});
+    }
     let init_req = JsonRpcRequest::new(
         1,
         "initialize",
         json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
-            "capabilities": { "resources": {}, "prompts": {} },
+            "capabilities": client_capabilities,
             "clientInfo": {
                 "name": "zeroclaw",
                 "version": env!("CARGO_PKG_VERSION")
@@ -349,12 +356,30 @@ impl Drop for OutcomeUnknownGuard {
 impl McpServer {
     /// Connect to the server, perform the initialize handshake, and fetch the tool list.
     pub async fn connect(config: McpServerConfig) -> Result<Self> {
-        // Admission is nested inside agent/delegate assembly. Keep the
-        // handshake future off those callers' native stacks.
-        run_inherited_phase(Phase::Tool, Box::pin(Self::connect_inner(config))).await
+        Self::connect_internal(config, current_mcp_elicitation_handler().is_some()).await
     }
 
-    async fn connect_inner(config: McpServerConfig) -> Result<Self> {
+    /// Connect a runtime that implements a scoped form interaction bridge.
+    /// This only advertises capability; calls still require an authenticated
+    /// handler installed with `with_mcp_elicitation_handler`. The registry never
+    /// retains a user's identity or approval handler. Remote transports remain
+    /// closed until they implement bidirectional dispatch.
+    pub async fn connect_with_form_elicitation(config: McpServerConfig) -> Result<Self> {
+        Self::connect_internal(config, true).await
+    }
+
+    async fn connect_internal(config: McpServerConfig, form_elicitation: bool) -> Result<Self> {
+        // Admission is nested inside agent/delegate assembly. Keep the
+        // handshake future off those callers' native stacks and preserve the
+        // installed runtime's inherited admission deadline.
+        run_inherited_phase(
+            Phase::Tool,
+            Box::pin(Self::connect_inner(config, form_elicitation)),
+        )
+        .await
+    }
+
+    async fn connect_inner(config: McpServerConfig, form_elicitation: bool) -> Result<Self> {
         // Create transport based on config
         let transport: Arc<dyn SharedMcpTransportConn> =
             Arc::from(create_shared_transport(&config).with_context(|| {
@@ -363,9 +388,16 @@ impl McpServer {
                     config.name
                 )
             })?);
+        if form_elicitation {
+            transport.enable_form_elicitation();
+        }
         let epoch_gate = Arc::new(RwLock::new(0));
-        let serial_gate =
-            (config.transport != McpTransport::Stdio).then(|| Arc::new(Mutex::new(())));
+        // Server-initiated elicitation does not carry a mandatory parent ID.
+        // Serialize these connections so a server request can only belong to
+        // one live tool call in one authenticated runtime scope.
+        let serial_gate = (config.transport != McpTransport::Stdio
+            || transport.form_elicitation_enabled())
+        .then(|| Arc::new(Mutex::new(())));
 
         // Initialize handshake (initialize + initialized notification)
         let capabilities = handshake(transport.as_ref(), &config.name, 0).await?;
@@ -707,10 +739,14 @@ impl McpServer {
             };
             let request = JsonRpcRequest::new(id, rpc_method, params.clone());
             let recovery_gate: Arc<dyn McpRecoveryGate> = self.recovery.clone();
-            let lifecycle = Arc::new(McpRequestLifecycle::coordinated(
-                Arc::clone(&self.epoch_gate),
-                Some(recovery_gate),
-            ));
+            let lifecycle = Arc::new(
+                McpRequestLifecycle::coordinated(Arc::clone(&self.epoch_gate), Some(recovery_gate))
+                    .with_elicitation_handler(
+                        (rpc_method == "tools/call")
+                            .then(current_mcp_elicitation_handler)
+                            .flatten(),
+                    ),
+            );
             let mut cancellation_guard = OutcomeUnknownGuard::new(
                 self.clone(),
                 Arc::clone(&lifecycle),
@@ -996,16 +1032,35 @@ impl McpRegistry {
     /// Connect to configured servers. Ordinary failures are logged and skipped;
     /// an inherited deadline aborts the aggregate without starting later servers.
     pub async fn connect_all(configs: &[McpServerConfig]) -> Result<Self> {
-        run_inherited_phase(Phase::Tool, Box::pin(Self::connect_all_inner(configs))).await
+        Self::connect_all_internal(configs, current_mcp_elicitation_handler().is_some()).await
     }
 
-    async fn connect_all_inner(configs: &[McpServerConfig]) -> Result<Self> {
+    /// Runtime bridge counterpart to `McpServer::connect_with_form_elicitation`.
+    pub async fn connect_all_with_form_elicitation(configs: &[McpServerConfig]) -> Result<Self> {
+        Self::connect_all_internal(configs, true).await
+    }
+
+    async fn connect_all_internal(
+        configs: &[McpServerConfig],
+        form_elicitation: bool,
+    ) -> Result<Self> {
+        run_inherited_phase(
+            Phase::Tool,
+            Box::pin(Self::connect_all_inner(configs, form_elicitation)),
+        )
+        .await
+    }
+
+    async fn connect_all_inner(
+        configs: &[McpServerConfig],
+        form_elicitation: bool,
+    ) -> Result<Self> {
         let mut servers = Vec::new();
         let mut tool_index = HashMap::new();
         let mut server_index = HashMap::new();
 
         for config in configs {
-            match McpServer::connect(config.clone()).await {
+            match McpServer::connect_internal(config.clone(), form_elicitation).await {
                 Ok(server) => {
                     let server_idx = servers.len();
                     server_index.insert(config.name.clone(), server_idx);
@@ -2622,6 +2677,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mcp_screenshot_resource_fits_native_history_without_losing_bytes() {
+        use crate::mcp_tool::McpToolWrapper;
+        use base64::Engine as _;
+        use zeroclaw_api::{model_provider::ChatMessage, tool::Tool as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Test the binary transport boundary; rendering is a provider concern.
+        let bytes = vec![42u8; 100_000];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let result = serde_json::json!({"content":[{"type":"resource","resource":{
+            "uri":"zeroclaw://public-browser/screenshot.png","mimeType":"image/png","blob":b64
+        }}]});
+        let server = server_with_tool_returning("browse", result);
+        let registry = Arc::new(McpRegistry {
+            servers: vec![server],
+            tool_index: HashMap::from([("public_browser__browse".into(), (0, "browse".into()))]),
+            server_index: HashMap::from([("fake".into(), 0)]),
+        });
+        let wrapper = McpToolWrapper::new(
+            "public_browser__browse".into(),
+            crate::mcp_protocol::McpToolDef {
+                name: "browse".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+                annotations: Some(serde_json::json!({"readOnlyHint":true})),
+            },
+            registry,
+            Arc::new(zeroclaw_config::policy::SecurityPolicy {
+                workspace_dir: dir.path().to_owned(),
+                ..Default::default()
+            }),
+        );
+        let out = wrapper
+            .execute(serde_json::json!({"action":"screenshot"}))
+            .await
+            .unwrap();
+        assert!(out.success, "{:?}", out.error);
+        let text = out.output.as_str();
+        assert!(text.contains("[IMAGE:"));
+        assert!(!text.contains(&b64));
+        assert!(!text.contains("Read result truncated"));
+        let message = ChatMessage::tool(
+            serde_json::json!({
+                "tool_call_id":"fixture-screenshot", "content":format!("{text}\nreceipt:fixture")
+            })
+            .to_string(),
+        );
+        assert!(crate::output_budget::encoded_size(&message, 32768).is_some());
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("uploads"))
+            .unwrap()
+            .map(|f| f.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), bytes);
+        assert_eq!(files[0].extension().unwrap(), "png");
+    }
+
     /// Like `server_returning`, but with explicit advertised capabilities.
     fn server_with_caps_returning(
         capabilities: McpServerCapabilities,
@@ -3571,3 +3684,7 @@ done
         assert!(err.to_string().contains("nope"), "got: {err}");
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "mcp_elicitation_tests.rs"]
+mod elicitation_tests;

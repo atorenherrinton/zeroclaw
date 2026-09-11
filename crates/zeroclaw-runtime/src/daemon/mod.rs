@@ -1555,7 +1555,7 @@ async fn connect_heartbeat_mcp_registry(
     // the "construct the registry once per worker" guarantee
     // still holds whenever the registry IS reachable — the healthy
     // case this targets.
-    match crate::tools::McpRegistry::connect_all(&servers).await {
+    match crate::tools::McpRegistry::connect_all_with_form_elicitation(&servers).await {
         Ok(registry) => Ok(Some(std::sync::Arc::new(registry))),
         Err(e) => {
             ::zeroclaw_log::record!(

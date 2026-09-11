@@ -149,7 +149,7 @@ pub(crate) fn enforce_tool_loop_budget() -> Result<()> {
 /// with non-streaming fallback, or plain non-streaming chat with optional
 /// per-step timeout and cancel select. See [`ProviderCallOutcome`] for the
 /// cancel asymmetry this function must preserve.
-pub(crate) async fn call_provider(
+async fn call_provider_inner(
     ctx: &TurnCtx<'_>,
     active_model_provider: &dyn ModelProvider,
     active_model: &str,
@@ -413,6 +413,64 @@ mod payload_capture_tests {
         fn alias(&self) -> &str {
             "stub-provider"
         }
+    }
+
+    struct SlowProvider(std::sync::atomic::AtomicUsize);
+    impl Attributable for SlowProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "slow-fixture"
+        }
+    }
+    #[async_trait]
+    impl ModelProvider for SlowProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(61)).await;
+            Ok("completed slow fixture".into())
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn slow_provider_reports_elapsed_wait_without_retrying_or_running_tools() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
+        let provider = SlowProvider(std::sync::atomic::AtomicUsize::new(0));
+        let result = super::call_provider(
+            &ctx,
+            &provider,
+            "fixture",
+            &[ChatMessage::user("hello")],
+            None,
+            false,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(result.chat_result.is_ok());
+        assert_eq!(provider.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut elapsed = Vec::new();
+        let mut waiting = 0;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamDelta::Status(text) => elapsed.push(text),
+                StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel) => waiting += 1,
+                _ => panic!("a provider wait must not claim tool activity"),
+            }
+        }
+        assert_eq!(waiting, 2);
+        assert_eq!(elapsed.len(), 2);
+        assert!(elapsed[0].contains("30"));
+        assert!(elapsed[1].contains("60"));
     }
 
     fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
@@ -1452,5 +1510,55 @@ mod streaming_fallback_tests {
             zeroclaw_providers::dispatch::AttemptUsageOutcome::Complete(usage)
                 if usage.input_tokens == Some(10) && usage.output_tokens == Some(5)
         ));
+    }
+}
+
+/// Report elapsed provider wait without claiming a tool is still executing.
+/// The model future is polled once; progress never retries a provider or tool.
+pub(crate) async fn call_provider(
+    ctx: &TurnCtx<'_>,
+    provider: &dyn ModelProvider,
+    model: &str,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolSpec]>,
+    streaming: bool,
+    iteration: usize,
+) -> Result<ProviderCallOutcome> {
+    let started = tokio::time::Instant::now();
+    let call = call_provider_inner(ctx, provider, model, messages, tools, streaming, iteration);
+    tokio::pin!(call);
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut call => {
+                let error = match &result { Ok(out) => out.chat_result.as_ref().err(), Err(e) => Some(e) };
+                if let Some(error) = error {
+                    let cause = error.chain().find_map(|cause| cause.downcast_ref::<zeroclaw_providers::reliable::ReliableProviderTerminalFailure>())
+                        .map(|failure| failure.operator_diagnostic())
+                        .unwrap_or_else(|| zeroclaw_providers::sanitize_api_error(&format!("{error:#}")));
+                    let detail = crate::security::scrub(&cause);
+                    ::zeroclaw_log::record!(WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                            .with_attrs(serde_json::json!({"trace_id":ctx.turn_id,"iteration":iteration+1,"model":model,"elapsed_ms":started.elapsed().as_millis() as u64,"error":detail})),
+                        "provider_call_failed");
+                }
+                return result;
+            }
+            _ = tick.tick() => {
+                if let Some(tx) = ctx.on_delta {
+                    let text = crate::i18n::get_required_cli_string_with_args(
+                        "turn-provider-wait", &[("seconds", started.elapsed().as_secs().to_string().as_str()), ("round", (iteration+1).to_string().as_str())]);
+                    let _ = tx.try_send(StreamDelta::Status(text));
+                    let _ = tx.try_send(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel));
+                }
+                ::zeroclaw_log::record!(INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Provider)
+                        .with_attrs(serde_json::json!({"trace_id":ctx.turn_id,"iteration":iteration+1,"model":model,"elapsed_ms":started.elapsed().as_millis() as u64})),
+                    "provider_call_waiting");
+            }
+        }
     }
 }

@@ -851,6 +851,14 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             use_native_tools,
         );
 
+        if iteration > 0 && iteration % 6 == 0 {
+            turn_state
+                .history
+                .push(ChatMessage::user(crate::i18n::get_required_cli_string(
+                    "turn-partial-checkpoint",
+                )));
+        }
+
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing

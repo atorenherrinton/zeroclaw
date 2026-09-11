@@ -238,6 +238,10 @@ impl TurnJournal for ChannelTurnJournal {
     fn trace_id(&self) -> Option<&str> {
         Some(&self.id)
     }
+    async fn record_error(&self, error: String) -> anyhow::Result<()> {
+        self.plane.store.record_channel_error(&self.id, error).await
+    }
+
     async fn checkpoint(
         &self,
         status: TaskStatus,

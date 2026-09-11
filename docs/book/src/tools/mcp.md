@@ -50,6 +50,46 @@ A server is reached over one of three transports (the `transport` field):
 
 Add a server through the gateway, zerocode, or `zeroclaw config set` (for example `zeroclaw config set mcp.servers.filesystem.command npx`). A stdio server needs `command` plus optional `args`/`env`; an http/sse server needs `url` plus optional `headers`. The per-field commands are in the field table below.
 
+## Server requests during a tool call
+
+The stdio client supports MCP `elicitation/create` form requests through the
+runtime's user interaction bridge. This is used by tools that need an actual
+user choice while an operation is running, including the Computer fallback's
+app-access request. The handshake advertises `elicitation.form` only when the
+client has a form bridge; HTTP and SSE currently do not advertise this capability.
+
+Each interaction belongs to one live tool call, transport instance, connection
+generation, and authenticated runtime handler. Elicitation-capable stdio
+connections serialize tool calls because the protocol does not require an
+originating-request identifier on server requests. The tool registry never
+stores a session's handler. A call without an active interaction surface fails
+closed. Server request IDs and client response IDs remain separate even when
+they contain the same number; string IDs are echoed without conversion.
+
+Accept, decline, and cancel are returned as distinct results. Empty forms still
+require a real user decision. Unsupported modes, schemas, and approval metadata
+must be rejected by the bridge. The client does not fabricate persistent
+approval metadata. Parent completion, cancellation, timeout, or connection reset
+ends pending interactions; requests whose outcome is unknown are not replayed.
+The interaction deadline is at most 120 seconds and is also bounded by the
+original tool-call timeout.
+
+On Telegram, the bridge uses native choice buttons bound to the authenticated
+conversation, sender, and thread. Delegated work inherits that same handler.
+Empty forms, booleans, and bounded string choices are supported; free-text,
+nested, or otherwise unsupported forms are rejected. A supported Computer app
+request offers approval once or explicit approval for this task. Task grants
+match the app, transport instance, connection generation, and approval context;
+they end when the owning turn ends and are never saved as permanent approval.
+Single-message CLI runs can use a terminal prompt when stdin and stdout are
+terminals. Interactive CLI input remains owned by the REPL.
+
+Library users can scope an `McpElicitationHandler` with
+`with_mcp_elicitation_handler`. Runtime-owned registry construction uses
+`connect_all_with_form_elicitation` to declare bridge availability, while each
+call still needs its own scoped handler. Direct `connect` remains closed unless
+called within such a scope.
+
 ## Editing servers
 
 Three surfaces edit the same `[[mcp.servers]]` table:

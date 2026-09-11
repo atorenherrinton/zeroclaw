@@ -1056,23 +1056,15 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // LLM task tool — registered using the calling agent's provider
-    if let Some((family, alias, entry)) = root_config.resolved_model_provider_for_agent(agent_alias)
+    // LLM task tool — the calling agent's profile owns auth and model selection.
+    if root_config
+        .resolved_model_provider_for_agent(agent_alias)
+        .is_some()
     {
-        let llm_task_provider = family.to_string();
-        let llm_task_model = entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
-        let llm_task_runtime_options =
-            zeroclaw_providers::provider_runtime_options_for_alias(root_config, family, alias);
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
-            llm_task_provider,
-            llm_task_model,
-            entry.temperature,
-            entry.api_key.clone(),
-            llm_task_runtime_options,
+            Arc::new(root_config.clone()),
+            agent_alias.to_string(),
         )));
     }
 

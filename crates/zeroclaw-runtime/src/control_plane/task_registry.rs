@@ -107,9 +107,29 @@ pub trait TaskRegistry: Send + Sync {
     ) -> anyhow::Result<()> {
         anyhow::bail!("channel turn checkpoint unavailable")
     }
+    async fn record_channel_error(&self, _id: &str, _error: String) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// Operator-only recovery evidence, not an instruction or permission to replay.
     async fn channel_turn_input(&self, _id: &str) -> anyhow::Result<Option<String>> {
         anyhow::bail!("channel turn input unavailable")
+    }
+    /// Bounded saved delegate evidence, resolved from durable tasks in the
+    /// trusted conversation. A read never marks a result delivered or replays it.
+    async fn conversation_delegates(
+        &self,
+        _route: &zeroclaw_api::conversation::ConversationRoute,
+        _parent: Option<&str>,
+    ) -> anyhow::Result<Vec<(String, String, String)>> {
+        Ok(Vec::new())
+    }
+    /// At-most-once notice admission. A lost acknowledgement leaves the claim
+    /// quarantined; reads remain available but may not authorize another send.
+    async fn claim_delegate_notice(&self, _id: &str, _parent: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn confirm_delegate_notice(&self, _id: &str) -> anyhow::Result<()> {
+        Ok(())
     }
     /// Stamp a liveness beat for `id` from the heart-beating owner.
     async fn heartbeat(&self, id: &str, owner_boot_id: &str) -> anyhow::Result<()>;

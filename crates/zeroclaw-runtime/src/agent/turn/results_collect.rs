@@ -93,6 +93,48 @@ pub(crate) fn admit_source_results(
             errors: Vec::new(),
         });
     }
+    // Preflight every rendered envelope before downstream copies, but never
+    // shorten execution evidence here. Read adapters own explicitly marked text
+    // previews; writes, typed reviews, failures, and receipts stay exact.
+    let individual: Vec<_> = ordered_results
+        .iter()
+        .flatten()
+        .map(|(_, id, out)| {
+            let mut text = out.output.clone();
+            if let Some(receipt) = &out.receipt {
+                text.push_str(&format!("\n\n[receipt: {receipt}]"));
+            }
+            (id.clone(), text)
+        })
+        .collect();
+    let blocks: String = ordered_results
+        .iter()
+        .flatten()
+        .zip(&individual)
+        .map(|((name, _, _), (_, text))| {
+            format!("<tool_result name=\"{name}\">\n{text}\n</tool_result>\n")
+        })
+        .collect();
+    let envelopes_fit =
+        history_results_fit(&individual, &blocks, per_result_limit)
+            && ordered_results.iter().flatten().zip(&individual).all(
+                |((name, _, _), (_, text))| {
+                    encoded_size(
+                    &ChatMessage::user(format!(
+                        "[Tool results]\n<tool_result name=\"{name}\">\n{text}\n</tool_result>\n"
+                    )),
+                    per_result_limit,
+                )
+                .is_some()
+                },
+            );
+    if !envelopes_fit {
+        record_budget_rejection(ordered_results, per_result_limit, "envelope");
+        return Err(ResultBudgetExceeded {
+            results: std::mem::take(ordered_results),
+            errors: Vec::new(),
+        });
+    }
     Ok(per_result_limit)
 }
 
@@ -955,6 +997,49 @@ mod tests {
         assert!(retained.output.ends_with(&body));
         assert_eq!(retained.output_data.as_ref().unwrap()["body"], body);
         assert_eq!(retained.receipt.as_deref(), Some("fixture-write-receipt"));
+    }
+
+    #[test]
+    fn exact_review_and_receipt_cannot_be_replaced_by_a_preview() {
+        let review = serde_json::json!({
+            "recipients": ["recipient@example.invalid"],
+            "subject": "Fixture review",
+            "text": "exact\u{0001}😀".repeat(5000),
+            "attachments": [{"name": "fixture.txt", "sha256": "fixture-digest"}],
+            "send_at_ms": 123456789,
+        });
+        let mut result = outcome("Prepared, not sent", true);
+        result.output_data = Some(review.clone());
+        result.receipt = Some("exact-review-receipt".into());
+        let error = collect_fixture(
+            vec![Some((
+                "outbox_prepare".into(),
+                Some("review-call".into()),
+                result,
+            ))],
+            32768,
+        )
+        .err()
+        .unwrap();
+        let rejected = error.downcast_ref::<ResultBudgetExceeded>().unwrap();
+        let retained = &rejected.results[0].as_ref().unwrap().2;
+        assert_eq!(retained.output_data.as_ref(), Some(&review));
+        assert_eq!(retained.output, "Prepared, not sent");
+        assert_eq!(retained.receipt.as_deref(), Some("exact-review-receipt"));
+    }
+
+    #[test]
+    fn small_previews_never_license_discarding_oversized_structured_read_evidence() {
+        let data = serde_json::json!({"exact": "fixture".repeat(10000)});
+        let mut result = outcome("[incomplete preview] fixture", true);
+        result.output_data = Some(data.clone());
+        let mut ordered = vec![Some(("read_fixture".into(), None, result))];
+        let rejected = admit_source_results(&mut ordered, 32768).unwrap_err();
+        assert!(ordered.is_empty());
+        assert_eq!(
+            rejected.results[0].as_ref().unwrap().2.output_data.as_ref(),
+            Some(&data)
+        );
     }
 
     #[test]

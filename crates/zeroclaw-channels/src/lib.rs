@@ -14,6 +14,7 @@ pub mod listing;
 pub mod login_events;
 pub mod login_probe;
 pub mod login_relink;
+pub mod mcp_elicitation;
 pub mod orchestrator;
 pub mod paced_channel;
 pub mod util;

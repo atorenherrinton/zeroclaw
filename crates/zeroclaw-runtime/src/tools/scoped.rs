@@ -334,7 +334,9 @@ impl ScopedToolRegistry {
                 if let Some(shared) = overrides_mcp_registry.as_ref() {
                     Some(Arc::clone(shared))
                 } else {
-                    match tools::McpRegistry::connect_all(&agent_mcp_servers).await {
+                    match tools::McpRegistry::connect_all_with_form_elicitation(&agent_mcp_servers)
+                        .await
+                    {
                         Ok(registry) => Some(Arc::new(registry)),
                         Err(err) => {
                             // Non-fatal (the assembly proceeds without MCP), but an ERROR
