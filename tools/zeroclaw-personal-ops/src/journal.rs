@@ -381,7 +381,7 @@ mod tests {
                 panic!("a future schedule must not call an adapter")
             })
             .await?;
-        assert_eq!(waiting["state"], "authorized");
+        assert_eq!(waiting["state"], "scheduled");
         let draft = email_draft(&o)?;
         o.operation_authorize(&send_args(&draft))?;
         let submitted = o
