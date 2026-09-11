@@ -88,6 +88,28 @@ class JobBoundaryTests(unittest.TestCase):
         self.manifest.write_text(json.dumps(sample(), indent=4))
         self.assertEqual(initial, studio.load_job(str(self.job))[2])
 
+    def test_fresh_render_pins_model_cache_before_import_and_cleans_failed_stage(self):
+        original_import = __import__
+        import_reached = []
+
+        def stop_before_model(name, *args, **kwargs):
+            if name == "numpy":
+                import_reached.append(name)
+                self.assertEqual(os.environ["HF_HOME"], str(studio.INSTALL_HOME / ".cache/huggingface"))
+                self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+                self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+                raise ImportError("synthetic unavailable model dependency")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"HF_HOME": "/untrusted/cache"}), \
+                mock.patch("builtins.__import__", side_effect=stop_before_model):
+            with self.assertRaisesRegex(ImportError, "synthetic unavailable model dependency"):
+                studio.render(str(self.job))
+        self.assertEqual(import_reached, ["numpy"])
+        self.assertFalse((self.job / ".render.lock").exists())
+        self.assertEqual(list(self.job.glob(".render-*")), [])
+        self.assertFalse((self.job / "final.mp4").exists())
+
     def test_rejects_relative_root_parent_and_outside_paths(self):
         for path in ("sample", str(self.root), str(self.root / ".." / "jobs" / "sample"), str(self.root.parent)):
             with self.subTest(path=path), self.assertRaises(studio.StudioError):

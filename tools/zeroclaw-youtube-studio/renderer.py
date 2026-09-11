@@ -333,7 +333,7 @@ def render(raw):
         stage = Path(tempfile.mkdtemp(prefix=".render-", dir=directory))
         os.environ.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                            "HF_HUB_DISABLE_TELEMETRY": "1", "TOKENIZERS_PARALLELISM": "false",
-                           "HF_HOME": str(HOME / ".cache/huggingface"),
+                           "HF_HOME": str(INSTALL_HOME / ".cache/huggingface"),
                            "PHONEMIZER_ESPEAK_LIBRARY": "/opt/homebrew/lib/libespeak-ng.dylib"})
         # All package logs must stay off the MCP stdout protocol channel.
         with contextlib.redirect_stdout(sys.stderr):
