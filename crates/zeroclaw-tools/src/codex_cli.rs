@@ -80,6 +80,43 @@ fn codex_exec_args<'a>(config: &'a CodexCliConfig, prompt: &'a str) -> Vec<&'a s
     args
 }
 
+fn canonical_codex_executable(config: &CodexCliConfig) -> Result<PathBuf, &'static str> {
+    let configured = config
+        .executable_path
+        .as_deref()
+        .ok_or("Codex recovery unavailable: codex_cli.executable_path is not configured")?;
+    if !configured.is_absolute() {
+        return Err(
+            "Codex recovery unavailable: codex_cli.executable_path must be an absolute path",
+        );
+    }
+
+    let executable = std::fs::canonicalize(configured).map_err(|_| {
+        "Codex recovery unavailable: codex_cli.executable_path does not resolve to an accessible file"
+    })?;
+    let metadata = std::fs::metadata(&executable).map_err(|_| {
+        "Codex recovery unavailable: codex_cli.executable_path does not resolve to an accessible file"
+    })?;
+    if !metadata.is_file() || !permissions_allow_execution(&metadata) {
+        return Err(
+            "Codex recovery unavailable: codex_cli.executable_path is not an executable regular file",
+        );
+    }
+    Ok(executable)
+}
+
+#[cfg(unix)]
+fn permissions_allow_execution(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn permissions_allow_execution(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
 fn canonical_zeroclaw_source_workspace(config: &CodexCliConfig) -> Result<PathBuf, &'static str> {
     let configured = config.recovery_source_workspace.as_deref().ok_or(
         "Codex recovery unavailable: codex_cli.recovery_source_workspace is not configured",
@@ -191,9 +228,13 @@ impl Tool for CodexCliTool {
             }
         };
 
-        // The typed operator config is the only working-directory source. The
-        // application workspace in SecurityPolicy and all model-authored
-        // arguments are deliberately ignored for directory selection.
+        // Typed operator config is the only executable and working-directory
+        // source. The ambient PATH, application workspace in SecurityPolicy,
+        // and all model-authored arguments are deliberately ignored.
+        let executable = match canonical_codex_executable(&self.config) {
+            Ok(executable) => executable,
+            Err(error) => return Ok(ToolResult::err(error)),
+        };
         let work_dir = match canonical_zeroclaw_source_workspace(&self.config) {
             Ok(work_dir) => work_dir,
             Err(error) => return Ok(ToolResult::err(error)),
@@ -205,7 +246,7 @@ impl Tool for CodexCliTool {
         }
 
         // Build CLI command: `codex exec [extra_args...] <prompt>`
-        let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
+        let mut cmd = CodingCliCommand::new(executable, work_dir.clone(), self.config.timeout_secs);
         cmd.args(codex_exec_args(&self.config, &prompt));
 
         add_coding_cli_env(&mut cmd, &self.config.env_passthrough);
@@ -235,22 +276,13 @@ impl Tool for CodexCliTool {
                     },
                 })
             }
-            Err(CodingCliExecutionError::Io(e)) => {
-                let err_msg = e.to_string();
-                let msg = if err_msg.contains("No such file or directory")
-                    || err_msg.contains("not found")
-                    || err_msg.contains("cannot find")
-                {
-                    "Codex CLI ('codex') not found in PATH. Install with: npm install -g @openai/codex".into()
-                } else {
-                    format!("Failed to execute codex: {e}")
-                };
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(msg),
-                })
-            }
+            Err(CodingCliExecutionError::Io(e)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Failed to execute configured Codex executable: {e}"
+                )),
+            }),
             Err(CodingCliExecutionError::Timeout) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -283,6 +315,9 @@ mod tests {
 
     fn recovery_config(workspace: &Path) -> CodexCliConfig {
         CodexCliConfig {
+            executable_path: Some(
+                std::env::current_exe().expect("test executable path should be available"),
+            ),
             recovery_source_workspace: Some(workspace.to_path_buf()),
             ..CodexCliConfig::default()
         }
@@ -448,6 +483,12 @@ version = "0.0.0"
         assert!(!result.success);
         let commands = executor.commands.lock().unwrap();
         assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].program,
+            std::fs::canonicalize(std::env::current_exe().expect("test executable path"))
+                .expect("canonical test executable path")
+                .into_os_string()
+        );
         assert_ne!(application_workspace.path(), source_workspace);
         assert_eq!(
             commands[0].working_dir,
@@ -468,7 +509,12 @@ version = "0.0.0"
         let executor = Arc::new(RecordingExecutor::default());
         let tool = CodexCliTool::new_with_executor(
             test_security_with_workspace(AutonomyLevel::Full, workspace.path().to_path_buf()),
-            test_config(),
+            CodexCliConfig {
+                executable_path: Some(
+                    std::env::current_exe().expect("test executable path should be available"),
+                ),
+                ..test_config()
+            },
             executor.clone(),
         );
 
@@ -483,6 +529,169 @@ version = "0.0.0"
                 .error
                 .unwrap_or_default()
                 .contains("recovery_source_workspace is not configured")
+        );
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_cli_recovery_without_a_configured_executable_fails_closed() {
+        let source = tempfile::TempDir::new().expect("source workspace");
+        mark_as_zeroclaw_source(source.path());
+        let executor = Arc::new(RecordingExecutor::default());
+        let tool = CodexCliTool::new_with_executor(
+            test_security(AutonomyLevel::Full),
+            CodexCliConfig {
+                recovery_source_workspace: Some(source.path().to_path_buf()),
+                ..CodexCliConfig::default()
+            },
+            executor.clone(),
+        );
+
+        let result =
+            scope_zeroclaw_recovery("repair ZeroClaw".to_string(), tool.execute(json!({})))
+                .await
+                .expect("executable rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("executable_path is not configured")
+        );
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn codex_cli_recovery_with_a_relative_executable_fails_closed() {
+        let source = tempfile::TempDir::new().expect("source workspace");
+        mark_as_zeroclaw_source(source.path());
+        let executor = Arc::new(RecordingExecutor::default());
+        let tool = CodexCliTool::new_with_executor(
+            test_security(AutonomyLevel::Full),
+            CodexCliConfig {
+                executable_path: Some(PathBuf::from("codex")),
+                recovery_source_workspace: Some(source.path().to_path_buf()),
+                ..CodexCliConfig::default()
+            },
+            executor.clone(),
+        );
+
+        let result =
+            scope_zeroclaw_recovery("repair ZeroClaw".to_string(), tool.execute(json!({})))
+                .await
+                .expect("executable rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("executable_path must be an absolute path")
+        );
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_cli_recovery_canonicalizes_the_configured_executable() {
+        use std::os::unix::fs::symlink;
+
+        let source = tempfile::TempDir::new().expect("source workspace");
+        mark_as_zeroclaw_source(source.path());
+        let executable_link = source.path().join("codex-link");
+        let test_executable = std::env::current_exe().expect("test executable path");
+        symlink(&test_executable, &executable_link).expect("executable symlink fixture");
+        let executor = Arc::new(RecordingExecutor::default());
+        let tool = CodexCliTool::new_with_executor(
+            test_security(AutonomyLevel::Full),
+            CodexCliConfig {
+                executable_path: Some(executable_link),
+                recovery_source_workspace: Some(source.path().to_path_buf()),
+                ..CodexCliConfig::default()
+            },
+            executor.clone(),
+        );
+
+        let result =
+            scope_zeroclaw_recovery("repair ZeroClaw".to_string(), tool.execute(json!({})))
+                .await
+                .expect("canonical executable should reach the executor");
+
+        assert!(!result.success, "recording executor returns timeout");
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].program,
+            std::fs::canonicalize(test_executable)
+                .expect("canonical test executable")
+                .into_os_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_cli_recovery_with_a_directory_executable_fails_closed() {
+        let source = tempfile::TempDir::new().expect("source workspace");
+        mark_as_zeroclaw_source(source.path());
+        let executor = Arc::new(RecordingExecutor::default());
+        let tool = CodexCliTool::new_with_executor(
+            test_security(AutonomyLevel::Full),
+            CodexCliConfig {
+                executable_path: Some(source.path().to_path_buf()),
+                recovery_source_workspace: Some(source.path().to_path_buf()),
+                ..CodexCliConfig::default()
+            },
+            executor.clone(),
+        );
+
+        let result =
+            scope_zeroclaw_recovery("repair ZeroClaw".to_string(), tool.execute(json!({})))
+                .await
+                .expect("executable rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("not an executable regular file")
+        );
+        assert!(executor.commands.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_cli_recovery_with_a_non_executable_file_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = tempfile::TempDir::new().expect("source workspace");
+        mark_as_zeroclaw_source(source.path());
+        let non_executable = source.path().join("codex");
+        std::fs::write(&non_executable, "not executable").expect("non-executable fixture");
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o600))
+            .expect("non-executable permissions");
+        let executor = Arc::new(RecordingExecutor::default());
+        let tool = CodexCliTool::new_with_executor(
+            test_security(AutonomyLevel::Full),
+            CodexCliConfig {
+                executable_path: Some(non_executable),
+                recovery_source_workspace: Some(source.path().to_path_buf()),
+                ..CodexCliConfig::default()
+            },
+            executor.clone(),
+        );
+
+        let result =
+            scope_zeroclaw_recovery("repair ZeroClaw".to_string(), tool.execute(json!({})))
+                .await
+                .expect("executable rejection should be a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("not an executable regular file")
         );
         assert!(executor.commands.lock().unwrap().is_empty());
     }
@@ -611,6 +820,7 @@ version = "0.0.0"
     fn codex_cli_default_config_values() {
         let config = CodexCliConfig::default();
         assert!(!config.enabled);
+        assert!(config.executable_path.is_none());
         assert!(config.recovery_source_workspace.is_none());
         assert_eq!(config.timeout_secs, 600);
         assert_eq!(config.max_output_bytes, 2_097_152);

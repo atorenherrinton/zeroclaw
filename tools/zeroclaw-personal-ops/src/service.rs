@@ -136,8 +136,6 @@ fn worker(root: PathBuf, rx: mpsc::Receiver<()>) -> Result<()> {
     let mut last_refresh = Instant::now() - Duration::from_secs(901);
     let mut last_probe = Instant::now() - Duration::from_secs(3601);
     let mut last_cron = Instant::now() - Duration::from_secs(61);
-    ops.health_record("gmail_push","not_configured","No Gmail Pub/Sub watch installed; timed reconciliation remains active. Authenticated /events accepts configured producer notifications.")?;
-    ops.health_record("calendar_push","not_configured","No externally reachable watch installed; timed reconciliation remains active. No public endpoint was opened.")?;
     ops.health_record("package_carriers","not_configured","Carrier API credentials are not configured. Uses attributed shipping emails and direct carrier tracking links.")?;
     loop {
         // Source events coalesce into a read refresh. Periodic reconciliation repairs
@@ -151,7 +149,7 @@ fn worker(root: PathBuf, rx: mpsc::Receiver<()>) -> Result<()> {
 
       last_cron=Instant::now();
     }
-    if last_probe.elapsed()>=Duration::from_secs(3600) {if let Err(e)=ops.refresh_routing_health().await{ops.health_record("conversation_routing","temporary_outage",&e.to_string())?;}last_probe=Instant::now();}
+    if last_probe.elapsed()>=Duration::from_secs(3600) {ops.refresh_google_push_health().await?;if let Err(e)=ops.refresh_routing_health().await{ops.health_record("conversation_routing","temporary_outage",&e.to_string())?;}last_probe=Instant::now();}
     ops.reminder_due_events()?;
     ops.process_events().await?;
     if last_refresh.elapsed()>=Duration::from_secs(900){

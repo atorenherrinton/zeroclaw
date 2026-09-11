@@ -659,6 +659,150 @@ mod tests {
     fn event() -> Value {
         json!({"id":"fixtureevent","etag":"\"1\"","status":"confirmed","location":"Old room","attendees":[{"email":"a@example.invalid","responseStatus":"accepted","optional":true}]})
     }
+    // Opt-in provider smoke test: this constructs only an exact-resource GET.
+    // No action ledger, mutation method, event contents, or credentials are emitted.
+    #[tokio::test]
+    #[ignore = "requires an explicitly selected live event and installed reader"]
+    async fn live_exact_id_preread_is_readonly() -> Result<()> {
+        let executable = std::env::var("GOOGLE_WRITE_TEST_READER")?;
+        let event_id = std::env::var("GOOGLE_WRITE_TEST_EVENT_ID")?;
+        let expected_etag = std::env::var("GOOGLE_WRITE_TEST_ETAG")?;
+        let read = command(
+            "get",
+            json!({"calendarId":"primary","eventId":event_id}),
+            None,
+            None,
+        )?;
+        assert!(read.contains(&"--readonly".to_owned()));
+        assert!(!read.contains(&"--allow-write".to_owned()));
+        let actual = run_gog_at(std::path::Path::new(&executable), read).await?;
+        ensure!(
+            actual["id"] == event_id,
+            "read returned a different event ID"
+        );
+        ensure!(
+            actual["etag"] == expected_etag,
+            "read returned a different ETag"
+        );
+        Ok(())
+    }
+
+    fn attendee_args() -> Value {
+        json!({"action":"update","calendar_id":"primary","event_id":"_synthetic_exact_id",
+            "expected_etag":"\"1\"","attendees":["guest@example.invalid"],
+            "attendees_owner_authorized":true,"send_updates":"all","scope":"single",
+            "idempotency_key":"fixture-attendee-invitation","owner_authorized":true})
+    }
+
+    #[tokio::test]
+    async fn attendee_preread_failure_has_safe_cause_and_no_action_to_reconcile() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let ops = Ops::open(t.path())?;
+        let args = attendee_args();
+        let mut calls = 0;
+        let error = mutate_using(&ops, &args, "owner@example.invalid", |cmd| {
+            calls += 1;
+            assert!(cmd.contains(&"calendar.events.get".to_owned()));
+            assert!(cmd.contains(&"--readonly".to_owned()));
+            assert!(cmd.contains(&"--enable-commands-exact=api.call,api.calendar.events.get".to_owned()));
+            assert!(!cmd.iter().any(|s| s == "--allow-write" || s.starts_with("--body=")));
+            let params: Value = serde_json::from_str(cmd.iter().find_map(|s| s.strip_prefix("--params=")).unwrap()).unwrap();
+            assert_eq!(params, json!({"calendarId":"primary","eventId":"_synthetic_exact_id"}));
+            async { Err(google_operation_failure("token source: get token for private@example.invalid: read token: keyring connection timed out after 30s; private diagnostic details")) }
+        }).await.unwrap_err();
+        assert_eq!(calls, 1);
+        let message = tool_error_message(&error);
+        assert!(
+            message.starts_with(
+                "read failed; no mutation attempted: google_keychain_access_required:"
+            )
+        );
+        assert!(!message.contains("private@example.invalid"));
+        assert!(!message.contains("private diagnostic details"));
+        let key = hash(&json!({"account":"owner@example.invalid","key":args["idempotency_key"]}))?;
+        assert!(saved(&ops, &key)?.is_none());
+        let error = reconcile_using(&ops, &key, &mut |_| async {
+            panic!("no action means no provider read")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.to_string(), "unknown action key");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attendee_update_registers_after_exact_preread_and_before_guarded_write() -> Result<()>
+    {
+        let t = tempfile::tempdir()?;
+        let ops = Ops::open(t.path())?;
+        let args = attendee_args();
+        let key = hash(&json!({"account":"owner@example.invalid","key":args["idempotency_key"]}))?;
+        let mut calls = 0;
+        let result = mutate_using(&ops, &args, "owner@example.invalid", |cmd| {
+            calls += 1;
+            let params: Value = serde_json::from_str(
+                cmd.iter()
+                    .find_map(|s| s.strip_prefix("--params="))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(params["eventId"], args["event_id"]);
+            assert_eq!(params["calendarId"], "primary");
+            let mut current = event();
+            current["id"] = args["event_id"].clone();
+            if calls == 1 {
+                assert!(saved(&ops, &key).unwrap().is_none());
+                assert!(cmd.contains(&"--readonly".to_owned()));
+                assert!(!cmd.contains(&"--results-only".to_owned()));
+            } else if calls == 2 {
+                let row = saved(&ops, &key).unwrap().unwrap();
+                assert_eq!(row["state"], "uncertain");
+                assert_eq!(row["request"], args);
+                assert!(cmd.contains(&"calendar.events.patch".to_owned()));
+                assert!(cmd.contains(&"--single-attempt".to_owned()));
+                assert!(cmd.contains(&"--if-match=\"1\"".to_owned()));
+                assert_eq!(params["sendUpdates"], "all");
+                let patch: Value = serde_json::from_str(
+                    cmd.iter().find_map(|s| s.strip_prefix("--body=")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    patch,
+                    json!({"attendees":[{"email":"guest@example.invalid"}]})
+                );
+            } else {
+                assert!(cmd.contains(&"calendar.events.get".to_owned()));
+                assert!(cmd.contains(&"--readonly".to_owned()));
+                current["etag"] = json!("\"2\"");
+                current["attendees"] = json!([{"email":"guest@example.invalid"}]);
+            }
+            async { Ok(current) }
+        })
+        .await?;
+        assert_eq!(calls, 3);
+        assert_eq!(result["state"], "verified");
+        let reconciled = reconcile_using(&ops, &key, &mut |_| async {
+            panic!("verified actions never replay")
+        })
+        .await?;
+        assert_eq!(reconciled["state"], "verified");
+        assert_eq!(reconciled["duplicate_prevented"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn only_recognized_keychain_cause_is_exposed_through_context() {
+        let error =
+            google_operation_failure("token source: read token: keyring connection timed out");
+        assert_eq!(tool_error_message(&error), error.to_string());
+        let error = google_operation_failure("unrecognized private provider details")
+            .context("read failed; no mutation attempted");
+        assert_eq!(
+            tool_error_message(&error),
+            "read failed; no mutation attempted"
+        );
+    }
+
     #[tokio::test]
     async fn lost_write_response_reconciles_without_replay() -> Result<()> {
         let t = tempfile::tempdir()?;

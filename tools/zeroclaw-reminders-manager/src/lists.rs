@@ -60,8 +60,14 @@ fn create_args(args: &Value) -> Result<Vec<String>> {
 
 pub async fn create(args: &Value) -> Result<Value> {
     let argv = create_args(args)?;
-    // All MCP processes at this installation share one OS lock. It releases
-    // automatically on exit; contention fails before any external mutation.
+    let _lock = mutation_lock()?;
+    run_script(CREATE_SCRIPT, &argv).await
+}
+
+pub(super) fn mutation_lock() -> Result<std::fs::File> {
+    // Creation and deletion share the existing lock path across MCP processes.
+    // Keep the path compatible with previously installed create-only binaries.
+    // It releases on exit; contention fails before any external mutation.
     let executable = std::env::current_exe()?;
     let lock = OpenOptions::new()
         .create(true)
@@ -75,9 +81,10 @@ pub async fn create(args: &Value) -> Result<Value> {
                 .context("Executable directory missing")?
                 .join(".list-create.lock"),
         )?;
-    lock.try_lock()
-        .context("Another list creation is in progress; inspect list_lists before retrying")?;
-    run_script(CREATE_SCRIPT, &argv).await
+    lock.try_lock().context(
+        "Another list mutation is in progress; inspect list_lists before any further action",
+    )?;
+    Ok(lock)
 }
 
 #[cfg(test)]

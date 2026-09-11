@@ -350,6 +350,7 @@ fn seed_declarative_job(config_dir: &Path) {
         model: None,
         timeout_secs: None,
         missed_run_policy: None,
+        completion_check: None,
         allowed_tools: None,
         uses_memory: true,
         session_target: None,
