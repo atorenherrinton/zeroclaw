@@ -697,28 +697,36 @@ impl GitOperationsTool {
             });
         }
 
-        match self
-            .run_git_command(&["push", "--", remote, branch], working_dir)
-            .await
-        {
-            Ok(_) => Ok(ToolResult {
-                success: true,
-                output: crate::i18n::get_required_tool_string_with_args(
-                    "tool-git-operations-push-success",
-                    &[("branch", branch), ("remote", remote)],
-                )
-                .into(),
-                error: None,
+        // A push is an external write. Never apply a read preview or discard its
+        // transcript: a nonzero exit or cancellation can still have remote effects.
+        let output = tokio::process::Command::new("git")
+            .args(["push", "--porcelain", "--", remote, branch])
+            .current_dir(working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        let evidence = |bytes: &[u8]| match std::str::from_utf8(bytes) {
+            Ok(text) => json!({"encoding":"utf8", "data":text}),
+            Err(_) => {
+                use base64::Engine as _;
+                json!({"encoding":"base64", "data":base64::engine::general_purpose::STANDARD.encode(bytes)})
+            }
+        };
+        Ok(ToolResult {
+            success: output.status.success(),
+            output: ToolOutput::json(json!({
+                "operation":"push", "remote":remote, "branch":branch,
+                "command_executed":true, "exit_code":output.status.code(),
+                "stdout":evidence(&output.stdout), "stderr":evidence(&output.stderr),
+                "retry_allowed":false,
+            })),
+            error: (!output.status.success()).then(|| {
+                crate::i18n::get_required_tool_string("tool-git-operations-push-reconcile")
             }),
-            Err(error) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(crate::i18n::get_required_tool_string_with_args(
-                    "tool-git-operations-push-error",
-                    &[("error", &error.to_string())],
-                )),
-            }),
-        }
+        })
     }
 
     async fn git_stash(
@@ -1694,6 +1702,16 @@ mod tests {
             .unwrap();
 
         assert!(result.success, "{:?}", result.error);
+        let receipt: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(receipt["command_executed"], true);
+        assert_eq!(receipt["retry_allowed"], false);
+        assert_eq!(receipt["stdout"]["encoding"], "utf8");
+        assert!(
+            receipt["stdout"]["data"]
+                .as_str()
+                .unwrap()
+                .contains("refs/heads/main")
+        );
         let output = std::process::Command::new("git")
             .args(["rev-parse", "refs/heads/main"])
             .current_dir(remote.path())

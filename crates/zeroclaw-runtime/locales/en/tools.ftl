@@ -212,3 +212,5 @@ exact-read-result-too-large = Exact read result is too large to return intact. N
 coding-cli-result-truncated = [Coding command output incomplete; middle content was omitted. The command already ran and may have changed files. Inspect the working tree and execution evidence before continuing. Do not rerun it because this output was truncated.]
 
 sessions-history-metadata-budget-exceeded = Session history metadata exceeds the output limit. Request fewer messages.
+
+tool-git-operations-push-reconcile = Git push exited without success. Inspect the exact execution receipt and reconcile the remote before any new attempt.
