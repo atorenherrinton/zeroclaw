@@ -13,7 +13,7 @@
 use axum::extract::ws::{Message as TwilioMessage, WebSocket};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -61,12 +61,15 @@ pub struct RealtimeOptions {
     /// Requires a server-controlled audible close check and a remote reply (or
     /// bounded silence) before an interactive call may end. Voicemail disables it.
     pub confirm_end_call: bool,
+    /// Signed ingress enables this only for inbound recorded calls. Caller
+    /// refusal or withdrawal discards the transcript and terminates immediately.
+    pub stop_on_recording_decline: bool,
 }
 
 /// Text is generated/transcribed, NOT a word-accurate record of what was heard.
 /// For an interrupted assistant entry, never assume all `text` reached the caller;
 /// `heard_audio_ms` is the conservative, mark-acknowledged amount actually played.
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct TranscriptEntry {
     pub speaker: String,
     pub text: String,
@@ -88,6 +91,7 @@ pub enum EndReason {
     ResourceLimit,
     IoTimeout,
     AssistantEnded,
+    RecordingDeclined,
 }
 
 // No Debug: transcript content must not accidentally enter service logs.
@@ -122,10 +126,27 @@ struct PlaybackMark {
 }
 
 struct EndCall {
+    tool: CallTool,
     item_id: String,
     response_id: String,
     argument_bytes: usize,
     arguments_done: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallTool {
+    EndCall,
+    DeclineRecording,
+}
+
+impl CallTool {
+    fn from_name(name: &str) -> BridgeResult<Self> {
+        match name {
+            "end_call" => Ok(Self::EndCall),
+            "decline_recording" => Ok(Self::DeclineRecording),
+            _ => Err(EndReason::ProtocolError),
+        }
+    }
 }
 
 #[derive(Default, PartialEq, Eq)]
@@ -161,6 +182,7 @@ struct State {
     transcript_bytes: usize,
     allow_end_call: bool,
     confirm_end_call: bool,
+    stop_on_recording_decline: bool,
     session_instructions: String,
     end_calls: BTreeMap<String, EndCall>,
     close_phase: ClosePhase,
@@ -210,8 +232,20 @@ fn decode_audio(encoded: &str) -> BridgeResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn end_call_tools() -> Value {
-    json!([{"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Invoke this as a tool call; never say the tool name aloud. Interactive calls may return a fixed confirmation requirement. Follow it, wait for the other party's reply, then invoke this tool again unless they continue the authorized task.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}])
+fn end_call_tool() -> Value {
+    json!({"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Invoke this as a tool call; never say the tool name aloud. Interactive calls may return a fixed confirmation requirement. Follow it, wait for the other party's reply, then invoke this tool again unless they continue the authorized task.","parameters":{"type":"object","additionalProperties":false,"properties":{}}})
+}
+
+fn session_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value {
+    let mut tools = if allow_end_call {
+        vec![end_call_tool()]
+    } else {
+        Vec::new()
+    };
+    if stop_on_recording_decline {
+        tools.push(json!({"type":"function","name":"decline_recording","description":"Immediately stop this call and discard its recording and transcript when the caller objects to being recorded or withdraws recording consent. Invoke this fixed no-argument tool immediately; do not say goodbye, ask for confirmation, or continue the conversation.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}));
+    }
+    json!(tools)
 }
 
 fn close_prompt_actions(call_id: &str, session_instructions: &str) -> Vec<Action> {
@@ -238,12 +272,12 @@ fn close_prompt_actions(call_id: &str, session_instructions: &str) -> Vec<Action
     ]
 }
 
-fn session_update(instructions: &str, allow_end_call: bool) -> Value {
-    let tools = if allow_end_call {
-        end_call_tools()
-    } else {
-        json!([])
-    };
+fn session_update(
+    instructions: &str,
+    allow_end_call: bool,
+    stop_on_recording_decline: bool,
+) -> Value {
+    let tools = session_tools(allow_end_call, stop_on_recording_decline);
     json!({
         "type": "session.update",
         "session": {
@@ -265,13 +299,13 @@ fn session_update(instructions: &str, allow_end_call: bool) -> Value {
             "reasoning": {"effort": "low"},
             "max_output_tokens": 1024,
             "tools": tools,
-            "tool_choice": if allow_end_call { "auto" } else { "none" },
+            "tool_choice": if allow_end_call || stop_on_recording_decline { "auto" } else { "none" },
             "tracing": null
         }
     })
 }
 
-fn verify_session(event: &Value, allow_end_call: bool) -> bool {
+fn verify_session(event: &Value, allow_end_call: bool, stop_on_recording_decline: bool) -> bool {
     let s = &event["session"];
     s["type"] == "realtime"
         && s["model"] == MODEL
@@ -287,14 +321,22 @@ fn verify_session(event: &Value, allow_end_call: bool) -> bool {
         && s["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 500
         && s["reasoning"]["effort"] == "low"
         && s["output_modalities"] == json!(["audio"])
-        && if allow_end_call {
-            s["tools"] == end_call_tools() && s["tool_choice"] == "auto"
+        && if allow_end_call || stop_on_recording_decline {
+            s["tools"] == session_tools(allow_end_call, stop_on_recording_decline)
+                && s["tool_choice"] == "auto"
         } else {
             s["tools"].as_array().is_some_and(Vec::is_empty) && s["tool_choice"] == "none"
         }
 }
 
 impl State {
+    fn tool_allowed(&self, tool: CallTool) -> bool {
+        match tool {
+            CallTool::EndCall => self.allow_end_call,
+            CallTool::DeclineRecording => self.stop_on_recording_decline,
+        }
+    }
+
     fn start(&mut self, value: &Value, options: &RealtimeOptions) -> BridgeResult<()> {
         if self.stream_sid.is_some() || value["event"] != "start" {
             return Err(EndReason::ProtocolError);
@@ -508,7 +550,7 @@ impl State {
             return Err(EndReason::UpstreamError);
         }
         if event_type == "session.updated" {
-            if !verify_session(&value, self.allow_end_call) {
+            if !verify_session(&value, self.allow_end_call, self.stop_on_recording_decline) {
                 return Err(EndReason::SetupFailed);
             }
             if self.ready || self.draining {
@@ -562,8 +604,12 @@ impl State {
                 Ok(Vec::new())
             }
             "conversation.item.input_audio_transcription.completed" => {
+                let text = string(&value, "transcript")?;
+                if self.stop_on_recording_decline && crate::protocol::recording_declined(text) {
+                    return Err(EndReason::RecordingDeclined);
+                }
                 let index = self.ensure_item(item_id(&value, "item_id")?, "caller")?;
-                self.transcript(index, string(&value, "transcript")?)?;
+                self.transcript(index, text)?;
                 Ok(Vec::new())
             }
             "conversation.item.input_audio_transcription.failed" => {
@@ -598,7 +644,8 @@ impl State {
             "response.output_item.added" => {
                 let item = &value["item"];
                 if item["type"] == "function_call" {
-                    if !self.allow_end_call || item["name"] != "end_call" {
+                    let tool = CallTool::from_name(string(item, "name")?)?;
+                    if !self.tool_allowed(tool) {
                         return Err(EndReason::ProtocolError);
                     }
                     let response_id = item_id(&value, "response_id")?;
@@ -613,6 +660,7 @@ impl State {
                     self.end_calls.insert(
                         call_id,
                         EndCall {
+                            tool,
                             item_id: output_item_id,
                             response_id,
                             argument_bytes: 0,
@@ -720,14 +768,18 @@ impl State {
                                 .end_calls
                                 .get(&call_id)
                                 .ok_or(EndReason::ProtocolError)?;
-                            if !self.allow_end_call
-                                || item["name"] != "end_call"
+                            let tool = CallTool::from_name(string(item, "name")?)?;
+                            if !self.tool_allowed(tool)
+                                || binding.tool != tool
                                 || binding.item_id != output_item_id
                                 || binding.response_id != response_id
                                 || !binding.arguments_done
                                 || arguments != json!({})
                             {
                                 return Err(EndReason::ProtocolError);
+                            }
+                            if status == "completed" && tool == CallTool::DeclineRecording {
+                                return Err(EndReason::RecordingDeclined);
                             }
                             if status == "completed"
                                 && completed_end_call.replace(call_id).is_some()
@@ -811,12 +863,15 @@ impl State {
                 }
                 let arguments: Value =
                     serde_json::from_str(raw_arguments).map_err(|_| EndReason::ProtocolError)?;
+                let tool = CallTool::from_name(string(&value, "name")?)?;
+                if !self.tool_allowed(tool) {
+                    return Err(EndReason::ProtocolError);
+                }
                 let binding = self
                     .end_calls
                     .get_mut(&call_id)
                     .ok_or(EndReason::ProtocolError)?;
-                if !self.allow_end_call
-                    || string(&value, "name")? != "end_call"
+                if binding.tool != tool
                     || arguments != json!({})
                     || binding.response_id != response_id
                     || binding.item_id != output_item_id
@@ -824,6 +879,13 @@ impl State {
                     return Err(EndReason::ProtocolError);
                 }
                 binding.arguments_done = true;
+                if tool == CallTool::DeclineRecording {
+                    // Unlike ordinary end_call, a refusal must not wait for
+                    // response completion, playback marks, or a close check.
+                    // Caller barge-in may cancel this response after the tool
+                    // was bound. That cannot invalidate its verified refusal.
+                    return Err(EndReason::RecordingDeclined);
+                }
                 Ok(Vec::new())
             }
             name if name.contains("function_call") || name.contains("mcp") => {
@@ -836,6 +898,14 @@ impl State {
     }
 
     fn outcome(self, reason: EndReason, duration_ms: u64) -> BridgeOutcome {
+        if reason == EndReason::RecordingDeclined {
+            return BridgeOutcome {
+                transcript: Vec::new(),
+                reason,
+                duration_ms,
+                model_session_ready: self.ready,
+            };
+        }
         let transcript = self
             .items
             .into_iter()
@@ -1032,9 +1102,13 @@ where
     send_model(
         model,
         ModelMessage::Text(
-            session_update(&options.instructions, options.allow_end_call)
-                .to_string()
-                .into(),
+            session_update(
+                &options.instructions,
+                options.allow_end_call,
+                options.stop_on_recording_decline,
+            )
+            .to_string()
+            .into(),
         ),
         setup_deadline,
     )
@@ -1065,9 +1139,13 @@ where
 
 /// Small, bounded post-hangup grace period for asynchronous caller transcripts.
 /// No audio is forwarded and no new model response is allowed during this phase.
-async fn drain_transcripts(model: &mut Upstream, state: &mut State, deadline: Instant) {
+async fn drain_transcripts(
+    model: &mut Upstream,
+    state: &mut State,
+    deadline: Instant,
+) -> Option<EndReason> {
     if !state.ready || Instant::now() >= deadline {
-        return;
+        return None;
     }
     state.draining = true;
     let grace = deadline.min(Instant::now() + Duration::from_millis(1500));
@@ -1094,8 +1172,10 @@ async fn drain_transcripts(model: &mut Upstream, state: &mut State, deadline: In
         let Ok(value) = next_model(model, grace).await else {
             break;
         };
-        let Ok(events) = state.model(value) else {
-            break;
+        let events = match state.model(value) {
+            Ok(events) => events,
+            Err(EndReason::RecordingDeclined) => return Some(EndReason::RecordingDeclined),
+            Err(_) => break,
         };
         for event in events {
             // Only cancellation may leave the bridge after the caller disconnects.
@@ -1107,6 +1187,45 @@ async fn drain_transcripts(model: &mut Upstream, state: &mut State, deadline: In
             }
         }
     }
+    None
+}
+
+async fn finish_bridge(
+    socket: &mut WebSocket,
+    upstream: &mut Option<Upstream>,
+    state: &mut State,
+    mut reason: EndReason,
+    deadline: Instant,
+) -> EndReason {
+    if let Some(model) = upstream.as_mut()
+        && matches!(
+            reason,
+            EndReason::CallEnded | EndReason::PeerClosed | EndReason::AssistantEnded
+        )
+        && let Some(drain_reason) = drain_transcripts(model, state, deadline).await
+    {
+        reason = drain_reason;
+    }
+    if reason == EndReason::RecordingDeclined {
+        // Stop the carrier before waiting on the model. Do not drain transcripts
+        // after a refusal, and discard the whole call when constructing outcome.
+        let _ = timeout_at(
+            Instant::now() + Duration::from_millis(250),
+            socket.send(TwilioMessage::Close(None)),
+        )
+        .await;
+    }
+    if let Some(model) = upstream.as_mut() {
+        let _ = timeout_at(
+            Instant::now() + Duration::from_millis(250),
+            model.close(None),
+        )
+        .await;
+    }
+    if reason != EndReason::RecordingDeclined {
+        let _ = timeout_at(Instant::now() + Duration::from_millis(250), socket.close()).await;
+    }
+    reason
 }
 
 /// Bridge one already-authorized call. The hard cap can be shortened, not raised.
@@ -1117,6 +1236,7 @@ pub async fn bridge(mut socket: WebSocket, options: RealtimeOptions) -> BridgeOu
     let mut state = State {
         allow_end_call: options.allow_end_call,
         confirm_end_call: options.confirm_end_call,
+        stop_on_recording_decline: options.stop_on_recording_decline,
         session_instructions: options.instructions.clone(),
         ..State::default()
     };
@@ -1148,20 +1268,7 @@ pub async fn bridge(mut socket: WebSocket, options: RealtimeOptions) -> BridgeOu
     } else {
         reason
     };
-    if let Some(model) = upstream.as_mut() {
-        if matches!(
-            reason,
-            EndReason::CallEnded | EndReason::PeerClosed | EndReason::AssistantEnded
-        ) {
-            drain_transcripts(model, &mut state, deadline).await;
-        }
-        let _ = timeout_at(
-            Instant::now() + Duration::from_millis(250),
-            model.close(None),
-        )
-        .await;
-    }
-    let _ = timeout_at(Instant::now() + Duration::from_millis(250), socket.close()).await;
+    let reason = finish_bridge(&mut socket, &mut upstream, &mut state, reason, deadline).await;
     state.outcome(
         reason,
         started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -1183,6 +1290,7 @@ pub async fn probe(api_key: &str) -> Result<(), &'static str> {
                 session_update(
                     "Configuration validation only. Do not speak or invoke tools.",
                     false,
+                    false,
                 )
                 .to_string()
                 .into(),
@@ -1196,7 +1304,7 @@ pub async fn probe(api_key: &str) -> Result<(), &'static str> {
                 .await
                 .map_err(|_| "realtime configuration response unavailable")?;
             match value["type"].as_str() {
-                Some("session.updated") if verify_session(&value, false) => return Ok(()),
+                Some("session.updated") if verify_session(&value, false, false) => return Ok(()),
                 Some("session.created" | "rate_limits.updated") => {}
                 _ => return Err("realtime session configuration rejected"),
             }
@@ -1225,6 +1333,7 @@ mod tests {
             max_duration_secs: 180,
             allow_end_call: false,
             confirm_end_call: false,
+            stop_on_recording_decline: false,
         }
     }
 
@@ -1239,7 +1348,7 @@ mod tests {
     }
 
     fn ready_event() -> Value {
-        let mut event = session_update("Synthetic isolated instructions", false);
+        let mut event = session_update("Synthetic isolated instructions", false, false);
         event["type"] = json!("session.updated");
         event["session"]["model"] = json!(MODEL);
         event
@@ -1318,14 +1427,14 @@ mod tests {
 
     #[test]
     fn session_is_exact_and_tool_free_greeting_only_after_ack() {
-        let update = session_update("Screen only", false);
+        let update = session_update("Screen only", false, false);
         assert_eq!(update["session"]["tools"], json!([]));
         assert_eq!(update["session"]["tool_choice"], "none");
         assert!(update["session"]["audio"]["input"]["format"]["rate"].is_null());
-        assert!(verify_session(&ready_event(), false));
+        assert!(verify_session(&ready_event(), false, false));
         let mut bad = ready_event();
         bad["session"]["tools"] = json!([{"type":"function","name":"private_memory"}]);
-        assert!(!verify_session(&bad, false));
+        assert!(!verify_session(&bad, false, false));
         let mut state = State::default();
         assert!(
             state
@@ -1341,12 +1450,12 @@ mod tests {
 
     #[test]
     fn outbound_session_exposes_only_end_call_and_waits_for_response_completion() {
-        let update = session_update("One bounded outbound task", true);
+        let update = session_update("One bounded outbound task", true, false);
         let mut ready = update.clone();
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
-        assert!(verify_session(&ready, true));
-        assert_eq!(update["session"]["tools"], end_call_tools());
+        assert!(verify_session(&ready, true, false));
+        assert_eq!(update["session"]["tools"], json!([end_call_tool()]));
 
         let mut outbound = State {
             allow_end_call: true,
@@ -1399,9 +1508,166 @@ mod tests {
         ));
     }
 
+    fn inbound_recording_state() -> State {
+        let mut inbound = State {
+            allow_end_call: true,
+            stop_on_recording_decline: true,
+            ..State::default()
+        };
+        inbound.start(&start_event(), &options()).unwrap();
+        let mut ready = session_update("Synthetic inbound recording", true, true);
+        ready["type"] = json!("session.updated");
+        ready["session"]["model"] = json!(MODEL);
+        inbound.model(ready).unwrap();
+        inbound
+    }
+
+    fn decline_tool_added() -> Value {
+        json!({"type":"response.output_item.added","response_id":"resp_decline",
+            "item":{"id":"item_decline","type":"function_call",
+                "name":"decline_recording","call_id":"call_decline"}})
+    }
+
+    fn decline_tool_arguments() -> Value {
+        json!({"type":"response.function_call_arguments.done","response_id":"resp_decline",
+            "item_id":"item_decline","name":"decline_recording",
+            "call_id":"call_decline","arguments":"{}"})
+    }
+
+    #[test]
+    fn inbound_recording_tool_schema_is_exact_and_outbound_cannot_use_it() {
+        let mut ready = session_update("Synthetic inbound recording", true, true);
+        ready["type"] = json!("session.updated");
+        ready["session"]["model"] = json!(MODEL);
+        assert!(verify_session(&ready, true, true));
+        assert!(!verify_session(&ready, true, false));
+        assert_eq!(ready["session"]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(ready["session"]["tools"][1]["name"], "decline_recording");
+        ready["session"]["tools"][1]["parameters"]["properties"] = json!({"url":{"type":"string"}});
+        assert!(!verify_session(&ready, true, true));
+
+        let mut outbound = state();
+        outbound.allow_end_call = true;
+        start_response(&mut outbound, "resp_decline");
+        assert!(matches!(
+            outbound.model(decline_tool_added()),
+            Err(EndReason::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn caller_recording_refusal_discards_whole_transcript_only_when_enabled() {
+        let previous = json!({"type":"conversation.item.input_audio_transcription.completed",
+            "item_id":"caller_previous","transcript":"A synthetic earlier message"});
+        let refusal = json!({"type":"conversation.item.input_audio_transcription.completed",
+            "item_id":"caller_refusal","transcript":"Please stop recording me."});
+        let mut inbound = inbound_recording_state();
+        inbound.model(previous.clone()).unwrap();
+        assert!(matches!(
+            inbound.model(refusal.clone()),
+            Err(EndReason::RecordingDeclined)
+        ));
+        assert_eq!(inbound.items.len(), 1);
+        assert!(
+            inbound
+                .outcome(EndReason::RecordingDeclined, 0)
+                .transcript
+                .is_empty()
+        );
+
+        let mut outbound = state();
+        outbound.allow_end_call = true;
+        outbound.model(previous).unwrap();
+        outbound.model(refusal).unwrap();
+        assert_eq!(
+            outbound.outcome(EndReason::CallEnded, 0).transcript.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn bound_recording_decline_tool_bypasses_close_confirmation_and_playback() {
+        let mut inbound = inbound_recording_state();
+        inbound.confirm_end_call = true;
+        start_response(&mut inbound, "resp_decline");
+        inbound
+            .model(delta("resp_decline", "assistant_1", 800))
+            .unwrap();
+        inbound.model(decline_tool_added()).unwrap();
+        assert!(matches!(
+            inbound.model(decline_tool_arguments()),
+            Err(EndReason::RecordingDeclined)
+        ));
+        assert!(!inbound.marks.is_empty());
+        assert!(inbound.close_phase == ClosePhase::Open);
+        assert!(
+            inbound
+                .outcome(EndReason::RecordingDeclined, 0)
+                .transcript
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_and_unbound_recording_decline_tools_fail_closed() {
+        for (field, value) in [
+            ("name", json!("end_call")),
+            ("name", json!("read_memory")),
+            ("response_id", json!("another_response")),
+            ("item_id", json!("another_item")),
+            ("call_id", json!("another_call")),
+            ("arguments", json!("{\"destination\":\"private\"}")),
+            ("arguments", json!("not json")),
+        ] {
+            let mut inbound = inbound_recording_state();
+            start_response(&mut inbound, "resp_decline");
+            inbound.model(decline_tool_added()).unwrap();
+            let mut event = decline_tool_arguments();
+            event[field] = value;
+            assert!(matches!(
+                inbound.model(event),
+                Err(EndReason::ProtocolError)
+            ));
+        }
+        let mut unbound = inbound_recording_state();
+        start_response(&mut unbound, "resp_decline");
+        assert!(matches!(
+            unbound.model(decline_tool_arguments()),
+            Err(EndReason::ProtocolError)
+        ));
+    }
+
+    #[test]
+    fn caller_barge_in_cannot_invalidate_a_bound_recording_decline() {
+        let mut cancelled = inbound_recording_state();
+        cancelled
+            .model(
+                json!({"type":"conversation.item.input_audio_transcription.completed",
+                "item_id":"caller_previous","transcript":"A synthetic earlier message"}),
+            )
+            .unwrap();
+        start_response(&mut cancelled, "resp_decline");
+        cancelled.model(decline_tool_added()).unwrap();
+        cancelled
+            .model(json!({"type":"input_audio_buffer.speech_started"}))
+            .unwrap();
+        assert!(cancelled.active_response.is_none());
+        assert!(cancelled.cancelled_responses.contains("resp_decline"));
+        assert!(matches!(
+            cancelled.model(decline_tool_arguments()),
+            Err(EndReason::RecordingDeclined)
+        ));
+        assert!(
+            cancelled
+                .outcome(EndReason::RecordingDeclined, 0)
+                .transcript
+                .is_empty()
+        );
+    }
+
     #[test]
     fn interactive_end_call_authorization_survives_separate_goodbye_and_tool_responses() {
-        let mut ready = session_update("One bounded outbound task", true);
+        let mut ready = session_update("One bounded outbound task", true, false);
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
         let mut outbound = State {
@@ -1745,6 +2011,204 @@ mod tests {
             state.twilio(media(&state.stream_sid, 800)),
             Err(EndReason::ResourceLimit)
         ));
+    }
+
+    #[tokio::test]
+    async fn mock_recording_decline_closes_carrier_without_playback_or_transcript_drain() {
+        use axum::{Router, extract::ws::WebSocketUpgrade, routing::get};
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+
+        let test = async {
+            for semantic_tool in [false, true] {
+                let model_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let model_address = model_listener.local_addr().unwrap();
+                let model_task = zeroclaw_spawn::spawn!(async move {
+                    let (tcp, _) = model_listener.accept().await.unwrap();
+                    let mut model = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    let update = model.next().await.unwrap().unwrap().into_text().unwrap();
+                    let mut ready: Value = serde_json::from_str(&update).unwrap();
+                    assert_eq!(ready["session"]["tools"], session_tools(true, true));
+                    ready["type"] = json!("session.updated");
+                    ready["session"]["model"] = json!(MODEL);
+                    model
+                        .send(ModelMessage::Text(ready.to_string().into()))
+                        .await
+                        .unwrap();
+                    let greeting = model.next().await.unwrap().unwrap().into_text().unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&greeting).unwrap()["type"],
+                        "response.create"
+                    );
+                    let mut events = vec![
+                        json!({"type":"conversation.item.input_audio_transcription.completed",
+                            "item_id":"caller_previous","transcript":"A synthetic earlier message"}),
+                        json!({"type":"response.created","response":{"id":"resp_decline"}}),
+                        delta("resp_decline", "assistant_1", 800),
+                    ];
+                    if semantic_tool {
+                        events.extend([decline_tool_added(), decline_tool_arguments()]);
+                    } else {
+                        events.push(
+                            json!({"type":"conversation.item.input_audio_transcription.completed",
+                            "item_id":"caller_decline","transcript":"Please stop recording me."}),
+                        );
+                    }
+                    // A late event must never be drained into the returned call.
+                    events.push(
+                        json!({"type":"conversation.item.input_audio_transcription.completed",
+                        "item_id":"caller_late","transcript":"Synthetic text after withdrawal"}),
+                    );
+                    for event in events {
+                        if model
+                            .send(ModelMessage::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    assert!(matches!(
+                        model.next().await.unwrap().unwrap(),
+                        ModelMessage::Close(_)
+                    ));
+                });
+
+                let twilio_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let twilio_address = twilio_listener.local_addr().unwrap();
+                let (result_sender, mut result_receiver) = mpsc::channel(1);
+                let router = Router::new().route(
+                    "/ws",
+                    get(move |upgrade: WebSocketUpgrade| {
+                        let sender = result_sender.clone();
+                        async move {
+                            upgrade.on_upgrade(move |mut socket| async move {
+                                let mut options = options();
+                                options.allow_end_call = true;
+                                options.confirm_end_call = true;
+                                options.stop_on_recording_decline = true;
+                                let mut state = State {
+                                    allow_end_call: true,
+                                    confirm_end_call: true,
+                                    stop_on_recording_decline: true,
+                                    ..State::default()
+                                };
+                                let mut model = None;
+                                let connection = async move {
+                                    tokio_tungstenite::connect_async(format!(
+                                        "ws://{model_address}"
+                                    ))
+                                    .await
+                                    .map(|(ws, _)| ws)
+                                    .map_err(|_| "mock connect failed")
+                                };
+                                let deadline = Instant::now() + Duration::from_secs(4);
+                                let reason = run_bridge(
+                                    &mut socket,
+                                    &options,
+                                    &mut state,
+                                    &mut model,
+                                    deadline,
+                                    connection,
+                                )
+                                .await
+                                .err()
+                                .unwrap();
+                                let reason = finish_bridge(
+                                    &mut socket,
+                                    &mut model,
+                                    &mut state,
+                                    reason,
+                                    deadline,
+                                )
+                                .await;
+                                sender.send(state.outcome(reason, 0)).await.unwrap();
+                            })
+                        }
+                    }),
+                );
+                let twilio_task = zeroclaw_spawn::spawn!(async move {
+                    axum::serve(twilio_listener, router).await.unwrap();
+                });
+                let (mut twilio, _) =
+                    tokio_tungstenite::connect_async(format!("ws://{twilio_address}/ws"))
+                        .await
+                        .unwrap();
+                twilio
+                    .send(ModelMessage::Text(start_event().to_string().into()))
+                    .await
+                    .unwrap();
+                // Leave playback unacknowledged: refusal must close it promptly.
+                for expected in ["media", "mark"] {
+                    let received = twilio.next().await.unwrap().unwrap().into_text().unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&received).unwrap()["event"],
+                        expected
+                    );
+                }
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), twilio.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    ModelMessage::Close(_)
+                ));
+                let outcome = result_receiver.recv().await.unwrap();
+                assert_eq!(outcome.reason, EndReason::RecordingDeclined);
+                assert!(outcome.transcript.is_empty());
+                assert!(outcome.model_session_ready);
+                model_task.await.unwrap();
+                twilio_task.abort();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(6), test)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mock_late_recording_refusal_during_hangup_drain_discards_transcript() {
+        let test = async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = zeroclaw_spawn::spawn!(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                socket.send(ModelMessage::Text(json!({
+                    "type":"conversation.item.input_audio_transcription.completed",
+                    "item_id":"caller_late_refusal","transcript":"I do not consent to recording."
+                }).to_string().into())).await.unwrap();
+                assert!(matches!(
+                    socket.next().await.unwrap().unwrap(),
+                    ModelMessage::Close(_)
+                ));
+            });
+            let (mut model, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+                .await
+                .unwrap();
+            let mut state = inbound_recording_state();
+            state
+                .model(
+                    json!({"type":"conversation.item.input_audio_transcription.completed",
+                "item_id":"caller_previous","transcript":"A synthetic earlier message"}),
+                )
+                .unwrap();
+            let reason = drain_transcripts(
+                &mut model,
+                &mut state,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reason, EndReason::RecordingDeclined);
+            assert!(state.outcome(reason, 0).transcript.is_empty());
+            model.close(None).await.unwrap();
+            server.await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(4), test)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

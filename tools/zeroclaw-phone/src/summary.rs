@@ -243,15 +243,37 @@ fn memory_category(job: &Job) -> SafeResult<&'static str> {
 
 fn skip_unavailable(conn: &Connection, now: i64) -> SafeResult<()> {
     // A status callback can end the call before the bridge persists its final
-    // transcript. Wait five minutes from admission before treating NULL as final;
+    // transcript/outcome. Wait five minutes from admission before treating NULL as final;
     // the live bridge itself has a hard three-minute cap.
     conn.execute(
         "UPDATE calls SET summary_status='skipped' WHERE summary_status='pending'
-        AND phase IN ('ended','expired') AND transcript IS NULL AND created_ms<?1",
+        AND phase IN ('ended','expired')
+        AND (transcript IS NULL OR outcome IS NULL OR outcome='service_interrupted') AND created_ms<?1",
         [now.saturating_sub(300_000)],
     )
     .map_err(|_| "summary_skip_failed")?;
     Ok(())
+}
+
+fn pending_call_ids(conn: &Connection) -> SafeResult<Vec<String>> {
+    // Calls may be marked ended by a callback before the bridge writes its
+    // transcript. A notice-mode first utterance is already in calls.transcript;
+    // only the bridge's final outcome admits a summary job.
+    let mut statement = conn
+        .prepare(
+            "SELECT call_sid FROM calls
+        WHERE phase IN ('ended','expired') AND transcript IS NOT NULL AND summary_status='pending'
+          AND outcome IS NOT NULL
+          AND outcome!='service_interrupted'
+          AND call_sid NOT IN (SELECT call_sid FROM summary_outbox)
+        ORDER BY created_ms LIMIT 8",
+        )
+        .map_err(|_| "summary_lookup_failed")?;
+    statement
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|_| "summary_lookup_failed")?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "summary_lookup_failed")
 }
 
 fn enqueue(root: &Path, settings: &Settings) -> SafeResult<()> {
@@ -261,22 +283,7 @@ fn enqueue(root: &Path, settings: &Settings) -> SafeResult<()> {
     )?;
     let conn = common::open_db(root)?;
     skip_unavailable(&conn, Utc::now().timestamp_millis())?;
-    // Calls may be marked ended by a callback before the bridge writes its
-    // transcript; only the presence of that final transcript admits a job.
-    let mut statement = conn
-        .prepare(
-            "SELECT call_sid FROM calls
-        WHERE phase IN ('ended','expired') AND transcript IS NOT NULL AND summary_status='pending'
-          AND call_sid NOT IN (SELECT call_sid FROM summary_outbox)
-        ORDER BY created_ms LIMIT 8",
-        )
-        .map_err(|_| "summary_lookup_failed")?;
-    let ids = statement
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|_| "summary_lookup_failed")?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "summary_lookup_failed")?;
-    drop(statement);
+    let ids = pending_call_ids(&conn)?;
     for id in ids {
         if !crate::protocol::valid_sid(&id, "CA") {
             conn.execute(
@@ -1912,5 +1919,29 @@ mod tests {
                 .unwrap();
             assert_eq!(status, expected);
         }
+    }
+
+    #[test]
+    fn notice_opening_cannot_be_summarized_before_bridge_finishes() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            temp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let conn = common::open_db(temp.path()).unwrap();
+        initialize(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calls(call_sid,account_sid,from_candidate,consent_token,created_ms,phase,transcript)
+             VALUES ('synthetic','account','caller','nonce',0,'ended','[{\"speaker\":\"caller\",\"text\":\"hello\"}]')",
+            [],
+        ).unwrap();
+        assert!(pending_call_ids(&conn).unwrap().is_empty());
+        conn.execute("UPDATE calls SET outcome='service_interrupted'", [])
+            .unwrap();
+        assert!(pending_call_ids(&conn).unwrap().is_empty());
+        conn.execute("UPDATE calls SET outcome='call_ended'", [])
+            .unwrap();
+        assert_eq!(pending_call_ids(&conn).unwrap(), vec!["synthetic"]);
     }
 }

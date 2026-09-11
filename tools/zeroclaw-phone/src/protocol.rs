@@ -106,12 +106,131 @@ pub fn websocket_signature_ok(token: &str, https_url: &str, signature: &str) -> 
 pub const EMPTY: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response/>";
 pub const REJECT: &str =
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Reject reason=\"rejected\"/></Response>";
+pub const HANGUP: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Hangup/></Response>";
 
 pub fn consent_xml(base: &str, nonce: &str) -> String {
     let action = xml(&format!("{base}/voice/consent/{nonce}"));
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Gather input=\"dtmf\" numDigits=\"1\" timeout=\"10\" actionOnEmptyResult=\"true\" action=\"{action}\" method=\"POST\"><Say>You have reached an AI call-screening assistant. This call will be transcribed to take a message. With your permission, the conversation will also be recorded and privately sent to the person you called. Press 1 to agree to recording, or press 2 to continue without recording. If you do not want transcription, please hang up.</Say></Gather><Hangup/></Response>"
     )
+}
+
+pub fn notice_xml(base: &str, nonce: &str) -> String {
+    let action = xml(&format!("{base}/voice/notice/{nonce}"));
+    // Keep disclosure outside Gather: caller speech must not interrupt it.
+    // Only the following speech gate is transcribed; no call audio is recorded here.
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Hi, I am an AI assistant taking a message for the person you called. This conversation will be recorded and transcribed, and privately sent to them. By continuing after this notice, you agree. If you do not agree, please hang up now.</Say><Gather input=\"speech\" timeout=\"10\" speechTimeout=\"auto\" actionOnEmptyResult=\"true\" action=\"{action}\" method=\"POST\"><Say>Please go ahead.</Say></Gather><Hangup/></Response>"
+    )
+}
+
+/// Deterministic stop signal for recognizable recording/transcription objections.
+/// This is deliberately independent of model behavior, not a general intent classifier.
+pub fn recording_declined(text: &str) -> bool {
+    let words = normalized_words(text);
+    let contains = |phrase: &str| words.contains(&format!(" {phrase} "));
+    if [
+        "i do not consent",
+        "i dont consent",
+        "i refuse consent",
+        "i withdraw consent",
+        "i revoke consent",
+    ]
+    .iter()
+    .any(|phrase| contains(phrase))
+        || ["i do not agree", "i dont agree", "i decline"].contains(&words.trim())
+    {
+        return true;
+    }
+    recording_subject(&words)
+        && [
+            "do not record",
+            "dont record",
+            "do not transcribe",
+            "dont transcribe",
+            "do not want",
+            "dont want",
+            "not to",
+            "no recording",
+            "no transcription",
+            "stop",
+            "turn off",
+            "without",
+            "not comfortable",
+            "not okay",
+            "not ok",
+            "not agree",
+            "dont agree",
+            "never agreed",
+            "not consent",
+            "not consenting",
+            "object",
+            "refuse",
+            "decline",
+            "rather not",
+            "avoid",
+            "wasnt",
+            "was not",
+            "isnt",
+            "is not",
+            "off the record",
+        ]
+        .iter()
+        .any(|phrase| contains(phrase))
+}
+
+/// A privacy question at the notice gate is not affirmative continuation.
+/// The bridge uses recording_declined only; normal in-call questions are not withdrawals.
+pub fn recording_question(text: &str) -> bool {
+    let words = normalized_words(text);
+    recording_subject(&words)
+        && (text.contains('?')
+            || [
+                "are you",
+                "are we",
+                "is this",
+                "is it",
+                "will you",
+                "will this",
+                "can you",
+                "could you",
+                "why",
+                "who",
+                "what",
+                "where",
+                "how",
+            ]
+            .iter()
+            .any(|phrase| words.contains(&format!(" {phrase} "))))
+}
+
+fn recording_subject(words: &str) -> bool {
+    [
+        "record",
+        "recorded",
+        "recording",
+        "recorder",
+        "transcribe",
+        "transcribed",
+        "transcribing",
+        "transcription",
+    ]
+    .iter()
+    .any(|word| words.contains(&format!(" {word} ")))
+}
+
+fn normalized_words(text: &str) -> String {
+    let normalized: String = text
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            '\'' | '’' => None,
+            c if c.is_alphanumeric() => Some(c),
+            _ => Some(' '),
+        })
+        .collect();
+    let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!(" {normalized} ")
 }
 
 pub fn connect_xml(base: &str, nonce: &str, record: bool) -> String {
@@ -204,5 +323,77 @@ mod tests {
         let xml = connect_xml("https://test.invalid", "nonce", true);
         assert!(xml.find("<Recording").unwrap() < xml.find("<Connect").unwrap());
         assert!(xml.contains("channels=\"dual\""));
+    }
+
+    #[test]
+    fn notice_finishes_before_speech_gate_and_never_records() {
+        let notice = notice_xml("https://test.invalid", "nonce");
+        assert!(notice.find("</Say>").unwrap() < notice.find("<Gather").unwrap());
+        assert!(notice.contains("input=\"speech\""));
+        assert!(notice.contains("actionOnEmptyResult=\"true\""));
+        assert!(notice.contains("/voice/notice/nonce"));
+        assert!(!notice.contains("dtmf") && !notice.contains("Press"));
+        assert!(!notice.contains("<Recording") && !notice.contains("<Connect"));
+        assert!(notice.ends_with("</Gather><Hangup/></Response>"));
+    }
+
+    #[test]
+    fn natural_recording_and_transcription_refusals_stop() {
+        for speech in [
+            "Please don't record this call.",
+            "I don’t want to be recorded",
+            "Do not transcribe me",
+            "I do not consent.",
+            "No recording please",
+            "Can you stop recording?",
+            "I'd rather not have this transcribed",
+            "I'm not comfortable with recording",
+            "I object to being recorded",
+            "Can we continue without transcription?",
+            "Please turn off the recorder",
+            "I withdraw consent to recording",
+            "I am not consenting to being recorded",
+            "I never agreed to recording",
+            "Please avoid recording me",
+            "I would prefer this wasn't recorded",
+            "I do not agree.",
+            "I don't agree to recording",
+            "I decline",
+            "I decline to be recorded",
+            "Please keep this off the record",
+            "Off the record, please",
+        ] {
+            assert!(recording_declined(speech), "missed refusal: {speech}");
+        }
+        for speech in [
+            "Hi, this is Alex calling about the appointment",
+            "Recording is fine",
+            "I don't mind being recorded",
+            "Please don't forget to record my callback number",
+            "No, Tuesday works better",
+            "Nope",
+            "Nah",
+            "No, please",
+            "I do not agree with the appointment time",
+            "I don't agree with that estimate",
+            "I decline the invitation",
+        ] {
+            assert!(!recording_declined(speech), "false refusal: {speech}");
+        }
+    }
+
+    #[test]
+    fn privacy_questions_are_not_notice_continuation_or_runtime_withdrawal() {
+        for speech in [
+            "Are you recording me?",
+            "Is this being recorded",
+            "Who gets this recording",
+            "Will you transcribe my call?",
+        ] {
+            assert!(recording_question(speech));
+            assert!(!recording_declined(speech));
+        }
+        assert!(!recording_question("Recording is fine. My name is Alex."));
+        assert!(!recording_question("Can you please tell them Alex called?"));
     }
 }
