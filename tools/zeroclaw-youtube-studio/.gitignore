@@ -1,0 +1,7 @@
+/target/
+/venv/
+__pycache__/
+*.pyc
+/jobs/
+/installation.json
+/zeroclaw-youtube-studio
