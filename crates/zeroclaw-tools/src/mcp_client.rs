@@ -2521,8 +2521,11 @@ mod tests {
             serde_json::json!({"content":[{"type":"text","text":"Prepared, not sent"}],"structuredContent":data,"isError":false}),
         ] {
             let server = server_with_tool_returning("review", result.clone());
-            let registry =
-                Arc::new(McpRegistry::connect_all_with_workspace(&[server], dir.path()).await);
+            let registry = Arc::new(McpRegistry {
+                servers: vec![server],
+                tool_index: HashMap::from([("fake__review".into(), (0, "review".into()))]),
+                server_index: HashMap::from([("fake".into(), 0)]),
+            });
             let def: crate::mcp_protocol::McpToolDef = serde_json::from_value(serde_json::json!({
                 "name":"review", "description":"Fixture exact review", "inputSchema":{},
                 "annotations":{"readOnlyHint":true}
