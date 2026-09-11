@@ -668,6 +668,16 @@ impl GitOperationsTool {
             ));
         }
 
+        // Git also accepts local paths such as `.` or a bare directory name
+        // in this position. Only configured remote names belong to this tool's
+        // declared interface; list names without reading credential-bearing URLs.
+        let configured_remotes = self.run_git_command(&["remote"], working_dir).await?;
+        if !configured_remotes.lines().any(|name| name == remote) {
+            anyhow::bail!(crate::i18n::get_required_tool_string(
+                "tool-git-operations-push-invalid-remote"
+            ));
+        }
+
         let branch_args = self.sanitize_git_args(branch)?;
         if branch_args.len() != 1 || branch_args[0].starts_with('-') {
             anyhow::bail!(crate::i18n::get_required_tool_string(
@@ -1616,6 +1626,7 @@ mod tests {
     async fn push_is_closed_when_policy_requires_approval() {
         let tmp = TempDir::new().unwrap();
         git_init_no_sign(tmp.path(), &[]);
+        fixture_git(tmp.path(), &["remote", "add", "origin", "."]);
         let tool = test_tool(tmp.path());
 
         let result = tool
@@ -1653,6 +1664,33 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("Invalid remote name"));
+    }
+
+    #[tokio::test]
+    async fn push_rejects_unconfigured_names_and_local_repository_paths() {
+        let source = TempDir::new().unwrap();
+        git_init_no_sign(source.path(), &[]);
+        let local_remote = source.path().join("unconfigured.git");
+        std::fs::create_dir(&local_remote).unwrap();
+        fixture_git(&local_remote, &["init", "--bare"]);
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: source.path().to_path_buf(),
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, source.path().to_path_buf());
+
+        for remote in ["origin", ".", "unconfigured.git"] {
+            let error = tool
+                .execute(json!({"operation":"push", "remote":remote, "branch":"main"}))
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid remote name"),
+                "{remote}: {error}"
+            );
+        }
     }
 
     #[tokio::test]
