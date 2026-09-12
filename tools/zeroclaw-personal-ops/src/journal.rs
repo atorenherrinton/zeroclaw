@@ -50,7 +50,11 @@ impl Outcome {
 pub fn allowed(tool: &str) -> bool {
     matches!(
         tool,
-        "calendar_mutate" | "outbox_imessage" | "outbox_email" | "outbox_telegram"
+        "calendar_mutate"
+            | "outbox_imessage"
+            | "outbox_email"
+            | "outbox_telegram"
+            | crate::group_text::TOOL
     )
 }
 impl Ops {
@@ -79,6 +83,7 @@ impl Ops {
             })
             .transpose()?;
         let payload = json!({"steps":steps,"send_at_ms":at,"title":args.get("title").cloned().unwrap_or(json!(""))});
+        crate::group_text::validate_review(&payload)?;
         let serialized = serde_json::to_string(&payload)?;
         ensure!(serialized.len() <= 256 * 1024, "operation too large");
         let hash = digest(serialized.as_bytes());
@@ -129,7 +134,16 @@ impl Ops {
     }
     pub fn operation_status(&self, id: &str) -> Result<Value> {
         let (hash,payload,created,authorized,at,cancelled):(String,String,i64,Option<i64>,Option<i64>,bool)=self.db.query_row("SELECT request_hash,payload,created_ms,authorized_ms,send_at_ms,cancelled FROM operations WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+        ensure!(
+            digest(payload.as_bytes()) == hash,
+            "operation payload integrity check failed"
+        );
         let payload: Value = serde_json::from_str(&payload)?;
+        ensure!(
+            payload["send_at_ms"] == json!(at),
+            "operation schedule integrity check failed"
+        );
+        crate::group_text::validate_review(&payload)?;
         let steps=self.db.prepare("SELECT ordinal,state,receipt,updated_ms FROM operation_steps WHERE operation_id=?1 ORDER BY ordinal")?.query_map([id],|r|Ok((r.get::<_,usize>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,i64>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().map(|(ordinal,state,receipt,updated)|Ok(json!({"ordinal":ordinal,"state":state,"receipt":receipt.map(|s|serde_json::from_str::<Value>(&s)).transpose()?,"updated_ms":updated,"intent":payload["steps"][ordinal]}))).collect::<Result<Vec<_>>>()?;
         let state = if cancelled {
             "cancelled"
@@ -172,6 +186,14 @@ impl Ops {
             "contents or timing changed; review the exact prepared operation"
         );
         ensure!(status["state"] != "cancelled", "operation was cancelled");
+        if crate::group_text::is_group(&status["review"]) && status["authorized_ms"].is_null() {
+            ensure!(
+                status["send_at_ms"]
+                    .as_i64()
+                    .is_some_and(|at| at > Utc::now().timestamp_millis()),
+                "group text deadline reached; cannot authorize a late send"
+            );
+        }
         self.db.execute("UPDATE operations SET authorized_ms=COALESCE(authorized_ms,?2) WHERE id=?1 AND cancelled=0",params![id,Utc::now().timestamp_millis()])?;
         self.receipt(
             id,
@@ -500,9 +522,15 @@ mod tests {
         let o = Ops::open(t.path())?;
         let v = prepare(&o);
         authorize(&o, &v);
+        // Synthetic old schedule: update the fixture's immutable intent and
+        // its hash together, rather than corrupting only the indexed due time.
+        let at = Utc::now().timestamp_millis() - 16 * 60_000;
+        let mut review = v["review"].clone();
+        review["send_at_ms"] = json!(at);
+        let payload = serde_json::to_string(&review)?;
         o.db.execute(
-            "UPDATE operations SET send_at_ms=?1 WHERE id='fixture'",
-            [Utc::now().timestamp_millis() - 16 * 60_000],
+            "UPDATE operations SET send_at_ms=?1,payload=?2,request_hash=?3 WHERE id='fixture'",
+            params![at, payload, digest(payload.as_bytes())],
         )?;
         let v = o
             .operation_execute_using("fixture", |_, _, _| async {

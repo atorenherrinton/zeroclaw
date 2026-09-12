@@ -648,11 +648,15 @@ pub fn upgrade_operations(root: &Path) -> Result<()> {
                 !matches!(
                     n.as_str(),
                     "personal_ops__outbox_send"
+                        | "personal_ops__imessage_group_text_schedule"
                         | "personal_ops__contact_destination_set"
                         | "personal_ops__shipment_update"
                         | "personal_ops__event_ingest"
                 )
             });
+        }
+        if !matches!(alias, "main" | "communications") {
+            names.retain(|n| n != "personal_ops__imessage_group_text_prepare");
         }
         if alias == "main" {
             names.extend([

@@ -9,6 +9,25 @@ pub fn schema() -> Vec<Value> {
     let obj = json!({"type":"object"});
     vec![
         tool(
+            "imessage_group_text_prepare",
+            "Prepare immutable plain text scheduled to one existing Messages group. Only an opaque group_token from group lookup is accepted. Revalidates exact chat and participants; never sends or creates a group. Exact text, group and RFC3339 time are bound to the review. Reuse the same idempotency key for retries. Missed dispatch is failed closed, never caught up later.",
+            json!({"idempotency_key":id,"group_token":{"type":"string"},"text":{"type":"string"},"send_at":{"type":"string"}}),
+            json!(["idempotency_key", "group_token", "text", "send_at"]),
+            false,
+        ),
+        tool(
+            "imessage_group_text_schedule",
+            "Authorize an existing immutable future group-text operation only for the explicit owner request covering exact group, text and time. Main only. Never dispatches immediately. Reuses durable outbox status/cancel/receipts. Once claimed, uncertainty is never replayed.",
+            json!({"operation_id":id,"review_hash":{"type":"string"},"review":obj,"owner_requested_send":{"type":"boolean"}}),
+            json!([
+                "operation_id",
+                "review_hash",
+                "review",
+                "owner_requested_send"
+            ]),
+            false,
+        ),
+        tool(
             "transaction_prepare",
             "Prepare an immutable ordered batch of related Calendar or communication actions. Does not execute. Durable idempotency key binds exact contents and schedule. A failed/uncertain step stops later steps; external effects are not atomically reversible.",
             json!({"idempotency_key":id,"title":{"type":"string"},"send_at":{"type":"string"},"steps":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","properties":{"tool":{"type":"string","enum":["calendar_mutate","outbox_email","outbox_imessage","outbox_telegram"]},"arguments":obj,"irreversible":{"type":"boolean"}},"required":["tool","arguments"],"additionalProperties":false}}}),
@@ -143,6 +162,8 @@ pub fn schema() -> Vec<Value> {
 }
 pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "imessage_group_text_prepare" => ops.group_text_prepare(args),
+        "imessage_group_text_schedule" => ops.group_text_schedule(args),
         "transaction_prepare" => ops.prepare_transaction(args).await,
         "outbox_prepare" => ops.outbox_prepare(args),
         "outbox_send" => {

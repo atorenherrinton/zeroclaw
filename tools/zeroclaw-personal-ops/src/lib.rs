@@ -18,6 +18,7 @@ pub mod contacts;
 pub mod continuity;
 pub mod events;
 mod google_push_health;
+mod group_text;
 mod imessage;
 mod imessage_history;
 pub mod install;

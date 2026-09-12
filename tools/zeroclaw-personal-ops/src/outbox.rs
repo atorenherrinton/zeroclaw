@@ -420,7 +420,9 @@ impl Ops {
         self.operation_prepare(args)
     }
     async fn validate_step(&self, step: &Step) -> Result<()> {
-        if step.tool == "calendar_mutate" {
+        if step.tool == crate::group_text::TOOL {
+            crate::group_text::validate(step, imessage::resolve_group_token)?;
+        } else if step.tool == "calendar_mutate" {
             let mut args = step.arguments.clone();
             args["idempotency_key"] = json!("preflight");
             writer(&self.root, "calendar_validate", args).await?;
@@ -458,6 +460,16 @@ impl Ops {
         .await
     }
     async fn execute_step(&self, step: Step, key: String, reconcile: bool) -> Result<Outcome> {
+        if step.tool == crate::group_text::TOOL {
+            return crate::group_text::execute_using(
+                step,
+                reconcile,
+                || chrono::Utc::now().timestamp_millis(),
+                imessage::resolve_group_token,
+                imessage::send_item,
+            )
+            .await;
+        }
         let a = &step.arguments;
         match step.tool.as_str() {
             "calendar_mutate" => {
@@ -592,6 +604,14 @@ impl Ops {
             _ => bail!("unsupported operation"),
         }
     }
+    pub(crate) fn next_dispatch_delay(&self) -> Result<Duration> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let at: Option<i64> = self.db.query_row("SELECT MIN(send_at_ms) FROM operations WHERE authorized_ms IS NOT NULL AND cancelled=0 AND send_at_ms>?1 AND EXISTS(SELECT 1 FROM operation_steps WHERE operation_id=operations.id AND state='prepared') AND NOT EXISTS(SELECT 1 FROM operation_steps WHERE operation_id=operations.id AND state IN ('failed','uncertain'))", [now], |r| r.get(0))?;
+        Ok(Duration::from_millis(
+            at.map_or(15_000, |at| (at - now).clamp(1, 15_000)) as u64,
+        ))
+    }
+
     pub async fn dispatch_operations(&self) -> Result<Value> {
         let ids=self.db.prepare("SELECT id FROM operations WHERE authorized_ms IS NOT NULL AND cancelled=0 AND COALESCE(send_at_ms,authorized_ms)<=?1 AND EXISTS(SELECT 1 FROM operation_steps WHERE operation_id=operations.id AND state='prepared') AND NOT EXISTS(SELECT 1 FROM operation_steps WHERE operation_id=operations.id AND state IN ('failed','uncertain')) ORDER BY COALESCE(send_at_ms,authorized_ms) LIMIT 20")?.query_map([chrono::Utc::now().timestamp_millis()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut results = Vec::new();
