@@ -243,6 +243,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolated_agent_cron_does_not_borrow_parent_journal_or_replay_tools() {
+        use crate::control_plane::{
+            SqliteTaskStore, TaskKind, TaskRecord, TaskRegistry, TaskStatus,
+        };
+        use axum::{Json, Router, routing::post};
+        use zeroclaw_api::turn::{JOURNAL, TurnJournal};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        struct ParentJournal(Arc<SqliteTaskStore>);
+        #[async_trait::async_trait]
+        impl TurnJournal for ParentJournal {
+            async fn checkpoint(
+                &self,
+                status: TaskStatus,
+                output: Option<String>,
+                delivered: bool,
+            ) -> anyhow::Result<()> {
+                self.0
+                    .checkpoint_channel_turn("parent", status, output, delivered)
+                    .await
+            }
+        }
+        let store = Arc::new(SqliteTaskStore::new_in_memory().unwrap());
+        store
+            .create(TaskRecord {
+                id: "parent".into(),
+                kind: TaskKind::ChannelTurn,
+                agent: TEST_AGENT.into(),
+                status: TaskStatus::Running,
+                owner_pid: std::process::id(),
+                owner_boot_id: "fixture".into(),
+                heartbeat_at: None,
+                depth: 0,
+                parent_id: None,
+                originator_route: None,
+                delivered: false,
+                idem_key: None,
+                principal_id: None,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                finished_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .checkpoint_channel_turn("parent", TaskStatus::WaitingOnTool, None, false)
+            .await
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = requests.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                captured.lock().unwrap().push(body.clone());
+                async move {
+                    let results = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count();
+                    let message = if results == 2 {
+                        json!({"content":"done"})
+                    } else {
+                        assert!(results < 2);
+                        json!({"content":null,"tool_calls":[{
+                            "id":format!("call-{results}"),"type":"function",
+                            "function":{"name":"shell","arguments":json!({
+                                "command":format!("echo step-{results}")
+                            }).to_string()}
+                        }]})
+                    };
+                    Json(json!({"choices":[{"message":message}]}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let tmp = TempDir::new().unwrap();
+        let mut config = (*test_config(&tmp).await).clone();
+        config.memory.backend = "none".into();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 2;
+        config.providers.models.ollama.insert(
+            "default".into(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-fixture".into()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level = AutonomyLevel::Full;
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            cron::Schedule::Cron {
+                expr: "0 * * * *".into(),
+                tz: None,
+            },
+            "Run the two fixture tools and return their results",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["shell".into()]),
+            false,
+        )
+        .unwrap();
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .cron_jobs
+            .push(job.id.clone());
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let args = json!({"job_id":job.id,"request_id":"isolated-two-tools"});
+        let result = JOURNAL
+            .scope(
+                Some(Arc::new(ParentJournal(store.clone()))),
+                tool.execute(args.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "{} {:?}", result.output, result.error);
+        assert_eq!(
+            store.get("parent").await.unwrap().unwrap().status,
+            TaskStatus::WaitingOnTool
+        );
+        store
+            .checkpoint_channel_turn("parent", TaskStatus::Running, None, false)
+            .await
+            .unwrap();
+        let duplicate = tool.execute(args).await.unwrap();
+        assert!(duplicate.success);
+        let duplicate: serde_json::Value = serde_json::from_str(&duplicate.output).unwrap();
+        assert_eq!(duplicate["duplicate"], true);
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            3,
+            "retry must not invoke the provider or tools again"
+        );
+        let requests = requests.lock().unwrap();
+        let outputs: Vec<_> = requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert_eq!(outputs.len(), 2);
+        assert!(outputs[0]["content"].to_string().contains("step-0"));
+        assert!(outputs[1]["content"].to_string().contains("step-1"));
+        assert_eq!(cron::list_runs(&cfg, &job.id, 10).unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn force_runs_job_and_records_history() {
         let tmp = TempDir::new().unwrap();
         // Build the config so we can wire the imperative job's UUID

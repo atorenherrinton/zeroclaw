@@ -1273,6 +1273,7 @@ cron-manual-receipt-unavailable = The saved cron receipt could not be read. A pr
 cron-occurrences-invalid-query = Invalid occurrence query. Use a nonempty job ID, a limit from 1 to 100, and either an exact occurrence ID or a before cursor. IDs must be at most 512 bytes without control characters.
 cron-occurrences-storage-unavailable = Cron occurrence storage is unavailable or invalid; no empty-history result can be established.
 
+cron-enable-requires-reconciliation = This job is quarantined because a prior occurrence is uncertain. Operator reconciliation is required before enabling it; ordinary updates cannot authorize replay.
 cron-missed-run-policy-config-owned = This job’s missed-run policy is owned by its cron declaration in config.toml. Edit the declaration to change it.
 
 # Tool evidence retained after a failed return or an aborted batch.

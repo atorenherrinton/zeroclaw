@@ -72,8 +72,10 @@ default until patched. Updates govern subsequent startup admission; they do not
 cancel or change already admitted work.
 
 Policy patches do not run jobs, alter receipts, release claims, or reset
-quarantine. An uncertain job remains disabled even when the same patch requests
-`enabled: true`. Startup disposition refuses stale policy or owner snapshots.
+quarantine. A patch requesting `enabled: true` on an uncertain job is rejected
+atomically with a reconciliation error, rather than silently leaving it disabled.
+Re-enabling a safely disabled job computes its next future schedule occurrence;
+it does not replay missed work. Startup disposition refuses stale policy or owner snapshots.
 See [Background work lifecycle](../architecture/background-work-lifecycle.md)
 for the three policies and recovery semantics.
 
