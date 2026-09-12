@@ -393,6 +393,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabling_disabled_job_persists_future_next_run() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "0 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let disabled = tool
+            .execute(json!({"job_id":job.id,"patch":{"enabled":false}}))
+            .await
+            .unwrap();
+        assert!(disabled.success);
+        let conn = rusqlite::Connection::open(cfg.data_dir.join("cron/jobs.db")).unwrap();
+        conn.execute(
+            "UPDATE cron_jobs SET next_run='2020-01-01T00:00:00+00:00' WHERE id=?1",
+            [&job.id],
+        )
+        .unwrap();
+        let before = chrono::Utc::now();
+        let enabled = tool
+            .execute(json!({"job_id":job.id,"patch":{"enabled":true}}))
+            .await
+            .unwrap();
+        assert!(enabled.success, "{:?}", enabled.error);
+        let persisted = cron::get_job(&cfg, &job.id).unwrap();
+        assert!(persisted.enabled);
+        assert!(persisted.next_run > before, "{}", persisted.next_run);
+        assert!(cron::due_jobs(&cfg, before).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn enabling_uncertain_job_is_explicitly_rejected_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "0 * * * *", "echo ok").unwrap();
+        let conn = rusqlite::Connection::open(cfg.data_dir.join("cron/jobs.db")).unwrap();
+        conn.execute(
+            "UPDATE cron_jobs SET enabled=0,last_status='uncertain' WHERE id=?1",
+            [&job.id],
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool
+            .execute(json!({"job_id":job.id,"patch":{"enabled":true,"name":"must-not-persist"}}))
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "quarantine must not silently turn a successful enable into false"
+        );
+        assert!(result.error.unwrap().contains("reconciliation"));
+        let persisted = cron::get_job(&cfg, &job.id).unwrap();
+        assert!(!persisted.enabled);
+        assert_eq!(persisted.name, job.name);
+        assert_eq!(persisted.next_run, job.next_run);
+        assert_eq!(persisted.last_status.as_deref(), Some("uncertain"));
+    }
+
+    #[tokio::test]
     async fn updates_enabled_flag() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;

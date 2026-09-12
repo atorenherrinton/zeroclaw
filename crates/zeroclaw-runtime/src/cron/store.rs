@@ -555,6 +555,14 @@ fn update_job_inner(
         if owner.is_some_and(|alias| alias != job.agent_alias) {
             anyhow::bail!("Cron job '{job_id}' not found");
         }
+        // An ordinary update is not evidence that an uncertain occurrence was
+        // reconciled. Reject explicitly instead of silently undoing enabled=true.
+        if patch.enabled == Some(true) && job.last_status.as_deref() == Some("uncertain") {
+            anyhow::bail!(crate::i18n::get_required_cli_string(
+                "cron-enable-requires-reconciliation"
+            ));
+        }
+        let reenabled = patch.enabled == Some(true) && !job.enabled;
         let mut schedule_changed = false;
 
         if let Some(schedule) = patch.schedule {
@@ -648,7 +656,7 @@ fn update_job_inner(
             job.missed_run_policy = policy;
         }
 
-        if schedule_changed {
+        if schedule_changed || reenabled {
             job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
         }
 

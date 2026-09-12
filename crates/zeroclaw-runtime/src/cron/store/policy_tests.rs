@@ -180,11 +180,19 @@ async fn imperative_policy_edits_preserve_owner_claim_and_quarantine_evidence() 
         .is_err()
     );
     for value in [serde_json::json!("catch_up_once"), serde_json::Value::Null] {
-        let updated = update_job_for_agent(
+        let error = update_job_for_agent(
             &config,
             &job.id,
             "synthetic-owner",
             patch(serde_json::json!({"enabled":true,"missed_run_policy":value})),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reconciliation"));
+        let updated = update_job_for_agent(
+            &config,
+            &job.id,
+            "synthetic-owner",
+            patch(serde_json::json!({"missed_run_policy":value})),
         )
         .unwrap();
         assert!(!updated.enabled);

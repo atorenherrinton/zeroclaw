@@ -1077,30 +1077,37 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            await_cron_agent_run(
-                config,
-                job,
-                Box::pin(
-                    crate::agent::run(
-                        cron_config,
-                        agent_alias,
-                        Some(prefixed_prompt),
-                        None,
-                        model_override,
-                        config
-                            .model_provider_for_agent(agent_alias)
-                            .and_then(|e| e.temperature),
-                        vec![],
-                        false,
-                        Some(session_path.clone()),
-                        job.allowed_tools.clone(),
-                        zeroclaw_api::ingress::TurnOrigin::Cron,
-                        run_overrides,
-                    )
-                    .instrument(subagent_span),
-                ) as futures_util::future::BoxFuture<'_, Result<String>>,
-            )
-            .await
+            // The occurrence ledger owns this child run. A synchronous cron_run
+            // tool must not lend its waiting parent channel journal to the agent.
+            zeroclaw_api::turn::JOURNAL
+                .scope(
+                    None,
+                    await_cron_agent_run(
+                        config,
+                        job,
+                        Box::pin(
+                            crate::agent::run(
+                                cron_config,
+                                agent_alias,
+                                Some(prefixed_prompt),
+                                None,
+                                model_override,
+                                config
+                                    .model_provider_for_agent(agent_alias)
+                                    .and_then(|e| e.temperature),
+                                vec![],
+                                false,
+                                Some(session_path.clone()),
+                                job.allowed_tools.clone(),
+                                zeroclaw_api::ingress::TurnOrigin::Cron,
+                                run_overrides,
+                            )
+                            .instrument(subagent_span),
+                        )
+                            as futures_util::future::BoxFuture<'_, Result<String>>,
+                    ),
+                )
+                .await
         }
     };
 
@@ -4164,7 +4171,7 @@ mod tests {
             let reviewed = cron::get_job(&config, &jobs[2].id).unwrap();
             assert_eq!(reviewed.last_status.as_deref(), Some("uncertain"));
             assert!(!reviewed.enabled);
-            cron::update_job(
+            let error = cron::update_job(
                 &config,
                 &reviewed.id,
                 serde_json::from_value(
@@ -4172,7 +4179,8 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .unwrap();
+            .unwrap_err();
+            assert!(error.to_string().contains("reconciliation"));
             clear_stale_locks(&config).unwrap();
             let again = prepare_startup_jobs(&config, now).unwrap();
             assert_eq!(
