@@ -186,7 +186,10 @@ impl Ops {
             "contents or timing changed; review the exact prepared operation"
         );
         ensure!(status["state"] != "cancelled", "operation was cancelled");
-        if crate::group_text::is_group(&status["review"]) && status["authorized_ms"].is_null() {
+        if crate::group_text::is_group(&status["review"])
+            && status["send_at_ms"].is_i64()
+            && status["authorized_ms"].is_null()
+        {
             ensure!(
                 status["send_at_ms"]
                     .as_i64()

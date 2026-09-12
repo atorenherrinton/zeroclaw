@@ -383,3 +383,174 @@ fn registration_uses_dedicated_closed_schema() {
         .unwrap();
     assert!(!transaction.to_string().contains(TOOL));
 }
+
+fn immediate(ops: &Ops, key: &str) -> Result<Value> {
+    let mut a = args(key, 0);
+    a.as_object_mut().unwrap().remove("send_at");
+    ops.immediate_group_text_prepare_using(&a, resolve)
+}
+
+#[test]
+fn immediate_prepare_exact_idempotent_no_schedule_or_recipient_fallback() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let ops = Ops::open(tmp.path())?;
+    let first = immediate(&ops, "immediate")?;
+    assert_eq!(first, immediate(&ops, "immediate")?);
+    assert!(first["send_at_ms"].is_null());
+    assert!(first["review"]["steps"][0]["arguments"]["send_at"].is_null());
+    assert_eq!(
+        first["review"]["steps"][0]["arguments"]["text"],
+        "Exact “review” — no rewrite."
+    );
+    assert!(ops.group_text_schedule(&auth(&first)).is_err());
+    let mut a = args("new", 0);
+    a.as_object_mut().unwrap().remove("send_at");
+    for field in ["recipients", "chat_id", "send_at", "owner_requested_send"] {
+        let mut bad = a.clone();
+        bad[field] = json!("not allowed");
+        assert!(
+            ops.immediate_group_text_prepare_using(&bad, resolve)
+                .is_err()
+        );
+    }
+    let mut changed = group();
+    changed.participants.push("third@example.invalid".into());
+    assert!(
+        ops.immediate_group_text_prepare_using(&a, |_| Ok(changed))
+            .is_err()
+    );
+    a["idempotency_key"] = json!("immediate");
+    a["text"] = json!("changed");
+    assert!(ops.immediate_group_text_prepare_using(&a, resolve).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn immediate_authorization_review_cancel_and_uncertain_no_replay() -> Result<()> {
+    for uncertain in [false, true] {
+        let tmp = tempfile::tempdir()?;
+        let ops = Ops::open(tmp.path())?;
+        let status = immediate(&ops, "now")?;
+        let counter = Arc::new(AtomicUsize::new(0));
+        assert!(
+            mock_dispatch(&ops, "now", 0, counter.clone(), uncertain)
+                .await
+                .is_err()
+        );
+        let mut bad = auth(&status);
+        bad["owner_requested_send"] = json!(false);
+        assert!(ops.operation_authorize(&bad).is_err());
+        for field in ["text", "group_token", "group", "send_at"] {
+            let mut bad = auth(&status);
+            bad["review"]["steps"][0]["arguments"][field] = json!("changed");
+            assert!(ops.operation_authorize(&bad).is_err());
+        }
+        ops.operation_authorize(&auth(&status))?;
+        let result = mock_dispatch(&ops, "now", 0, counter.clone(), uncertain).await?;
+        assert_eq!(
+            result["steps"][0]["state"],
+            if uncertain { "uncertain" } else { "submitted" }
+        );
+        mock_dispatch(&ops, "now", i64::MAX, counter.clone(), uncertain).await?;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(ops.operation_cancel("now").is_err());
+        let cancelled = immediate(&ops, "cancel")?;
+        ops.operation_cancel("cancel")?;
+        assert!(ops.operation_authorize(&auth(&cancelled)).is_err());
+        assert_eq!(ops.operation_status("cancel")?["state"], "cancelled");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn immediate_dispatch_rejects_every_identity_drift() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let ops = Ops::open(tmp.path())?;
+    let status = immediate(&ops, "drift-now")?;
+    let step: Step = serde_json::from_value(status["review"]["steps"][0].clone())?;
+    for field in [
+        "chat_id",
+        "chat_identifier",
+        "chat_guid",
+        "service",
+        "participants",
+    ] {
+        let mut value = serde_json::to_value(group())?;
+        value[field] = match field {
+            "chat_id" => json!(43),
+            "participants" => json!(["third@example.invalid"]),
+            _ => json!("changed"),
+        };
+        let current: GroupTarget = serde_json::from_value(value)?;
+        let result = execute_using(
+            step.clone(),
+            false,
+            || 0,
+            |_| Ok(current),
+            |_, _| async { panic!("no fallback or group creation") },
+        )
+        .await?;
+        assert_eq!(result.state, "failed");
+        assert_eq!(result.evidence["write_attempted"], false);
+    }
+    Ok(())
+}
+
+#[test]
+fn immediate_concurrent_execute_has_one_external_attempt() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let ops = Ops::open(tmp.path())?;
+    let status = immediate(&ops, "race-now")?;
+    ops.operation_authorize(&auth(&status))?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(Barrier::new(2));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let path = tmp.path().to_path_buf();
+            let count = count.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || -> Result<()> {
+                let ops = Ops::open(&path)?;
+                barrier.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(mock_dispatch(&ops, "race-now", 0, count, false))?;
+                Ok(())
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap()?;
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[test]
+fn immediate_schema_is_group_only_and_uses_existing_owner_authorized_send() {
+    let schemas = crate::schema();
+    let schemas = schemas.as_array().unwrap();
+    let schema = schemas
+        .iter()
+        .find(|s| s["name"] == "group_text_prepare")
+        .unwrap();
+    assert_eq!(schema["inputSchema"]["additionalProperties"], false);
+    assert_eq!(
+        schema["inputSchema"]["required"],
+        json!(["idempotency_key", "group_token", "text"])
+    );
+    assert!(
+        schema["inputSchema"]["properties"]
+            .get("recipients")
+            .is_none()
+    );
+    assert!(schema["inputSchema"]["properties"].get("send_at").is_none());
+    let send = schemas.iter().find(|s| s["name"] == "outbox_send").unwrap();
+    assert!(
+        send["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("owner_requested_send"))
+    );
+}

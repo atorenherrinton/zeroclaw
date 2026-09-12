@@ -656,7 +656,13 @@ pub fn upgrade_operations(root: &Path) -> Result<()> {
             });
         }
         if !matches!(alias, "main" | "communications") {
-            names.retain(|n| n != "personal_ops__imessage_group_text_prepare");
+            names.retain(|n| {
+                !matches!(
+                    n.as_str(),
+                    "personal_ops__imessage_group_text_prepare"
+                        | "personal_ops__group_text_prepare"
+                )
+            });
         }
         if alias == "main" {
             names.extend([
