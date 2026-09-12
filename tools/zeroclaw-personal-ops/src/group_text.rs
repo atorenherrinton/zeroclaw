@@ -1,4 +1,4 @@
-//! Scheduled plain text to one existing group. The operations ledger is the
+//! Immediate or scheduled plain text to one existing group. The operations ledger is the
 //! sole authority for immutable intent, review, authorization, claim and receipt.
 //! No individual-recipient adapter, attachment or group creation is reachable.
 use crate::{
@@ -27,14 +27,22 @@ struct Request {
     send_at: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImmediateRequest {
+    idempotency_key: String,
+    group_token: String,
+    text: String,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Prepared {
     group_token: String,
     group: GroupTarget,
     text: String,
-    // Preserve the exact reviewed RFC3339 string, including its UTC offset.
-    send_at: String,
+    // None binds immediate dispatch; Some preserves scheduled RFC3339 bytes.
+    send_at: Option<String>,
 }
 
 fn instant(value: &str) -> Result<i64> {
@@ -55,7 +63,9 @@ pub(crate) fn validate(
         prepared.group.token()? == prepared.group_token,
         "group token changed"
     );
-    instant(&prepared.send_at)?;
+    if let Some(at) = &prepared.send_at {
+        instant(at)?;
+    }
     let current = resolve(&prepared.group_token)?;
     imessage::validate_group_snapshot(&prepared.group, &current)
 }
@@ -69,7 +79,7 @@ pub(crate) fn validate_review(review: &Value) -> Result<()> {
         );
         let prepared: Prepared = serde_json::from_value(steps[0]["arguments"].clone())?;
         ensure!(
-            review["send_at_ms"].as_i64() == Some(instant(&prepared.send_at)?),
+            review["send_at_ms"] == json!(prepared.send_at.as_deref().map(instant).transpose()?),
             "group text schedule changed"
         );
     }
@@ -81,6 +91,34 @@ pub(crate) fn is_group(review: &Value) -> bool {
 }
 
 impl Ops {
+    pub fn immediate_group_text_prepare(&self, args: &Value) -> Result<Value> {
+        self.immediate_group_text_prepare_using(args, imessage::resolve_group_token)
+    }
+
+    fn immediate_group_text_prepare_using(
+        &self,
+        args: &Value,
+        resolve: impl FnOnce(&str) -> Result<GroupTarget>,
+    ) -> Result<Value> {
+        let request: ImmediateRequest = serde_json::from_value(args.clone())?;
+        text(args, "idempotency_key", 128)?;
+        text(args, "text", 12000)?;
+        text(args, "group_token", 512)?;
+        let mut group = resolve(&request.group_token)?;
+        ensure!(
+            group.token()? == request.group_token,
+            "group token does not match current group"
+        );
+        group.name.clear();
+        let prepared = Prepared {
+            group_token: request.group_token,
+            group,
+            text: request.text,
+            send_at: None,
+        };
+        self.operation_prepare(&json!({"idempotency_key":request.idempotency_key,"title":"Immediate existing-group text","steps":[{"tool":TOOL,"arguments":prepared,"irreversible":true}]}))
+    }
+
     pub fn group_text_prepare(&self, args: &Value) -> Result<Value> {
         self.group_text_prepare_using(
             args,
@@ -120,7 +158,7 @@ impl Ops {
             group_token: request.group_token,
             group,
             text: request.text,
-            send_at: request.send_at.clone(),
+            send_at: Some(request.send_at.clone()),
         };
         self.operation_prepare(&json!({"idempotency_key":request.idempotency_key,"send_at":request.send_at,"title":"Scheduled existing-group text","steps":[{"tool":TOOL,"arguments":prepared,"irreversible":true}]}))
     }
@@ -128,6 +166,10 @@ impl Ops {
     pub fn group_text_schedule(&self, args: &Value) -> Result<Value> {
         let status = self.operation_status(text(args, "operation_id", 128)?)?;
         ensure!(is_group(&status["review"]), "not a group text operation");
+        ensure!(
+            status["send_at_ms"].is_i64(),
+            "immediate group text requires outbox_send, not scheduling"
+        );
         // This only authorizes the durable future row; it never dispatches.
         self.operation_authorize(args)
     }
@@ -153,11 +195,13 @@ where
         validate(&step, resolve)?;
         let prepared: Prepared = serde_json::from_value(step.arguments)?;
         let now = clock();
-        let at = instant(&prepared.send_at)?;
-        ensure!(
-            now >= at && now <= at + DISPATCH_BUDGET_MS,
-            "group text dispatch time missed; no early or late catch-up send"
-        );
+        if let Some(at) = &prepared.send_at {
+            let at = instant(at)?;
+            ensure!(
+                now >= at && now <= at + DISPATCH_BUDGET_MS,
+                "group text dispatch time missed; no early or late catch-up send"
+            );
+        }
         Ok(prepared)
     })();
     let prepared = match preflight {

@@ -9,6 +9,13 @@ pub fn schema() -> Vec<Value> {
     let obj = json!({"type":"object"});
     vec![
         tool(
+            "group_text_prepare",
+            "Prepare exact plain text for immediate delivery to one existing Messages group. Only an opaque group_token; no recipients, group creation, fallback or schedule. Revalidates group identity and participants. Does not send. Review exact bytes and immediate timing, then main may call outbox_send only for an explicit owner send request. Reuse the idempotency key; use outbox_status/cancel; never replay uncertainty. Submitted is not delivered.",
+            json!({"idempotency_key":id,"group_token":{"type":"string","maxLength":512},"text":{"type":"string","maxLength":12000}}),
+            json!(["idempotency_key", "group_token", "text"]),
+            false,
+        ),
+        tool(
             "imessage_group_text_prepare",
             "Prepare immutable plain text scheduled to one existing Messages group. Only an opaque group_token from group lookup is accepted. Revalidates exact chat and participants; never sends or creates a group. Exact text, group and RFC3339 time are bound to the review. Reuse the same idempotency key for retries. Missed dispatch is failed closed, never caught up later.",
             json!({"idempotency_key":id,"group_token":{"type":"string"},"text":{"type":"string"},"send_at":{"type":"string"}}),
@@ -162,6 +169,7 @@ pub fn schema() -> Vec<Value> {
 }
 pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "group_text_prepare" => ops.immediate_group_text_prepare(args),
         "imessage_group_text_prepare" => ops.group_text_prepare(args),
         "imessage_group_text_schedule" => ops.group_text_schedule(args),
         "transaction_prepare" => ops.prepare_transaction(args).await,

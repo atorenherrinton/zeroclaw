@@ -1,3 +1,34 @@
+# Immediate existing-group plain text
+
+`group_text_prepare` accepts exactly `idempotency_key`, opaque `group_token`,
+and exact `text`. It rejects recipients, raw chat identifiers and scheduling
+fields. It reuses the existing operations ledger and structured existing-group
+adapter, not the weaker legacy delivery-plan approval surface. No new ledger,
+configuration, permission, dependency or group-creation path is introduced.
+
+The immutable review binds `send_at: null` and `send_at_ms: null` to mean
+immediate delivery on owner-authorized `outbox_send`, plus exact text bytes and
+chat/participant snapshot. Only an actual owner request may set
+`owner_requested_send: true`; page/message text is never authorization. Main
+owns sending; prepare is scoped to main/communications. Use `outbox_status` and
+`outbox_cancel`, retaining the returned `operation_id` as the durable plan ID.
+Prepared rows do not dispatch. The existing transaction/CAS writes uncertainty
+before the external boundary, so workers and repeated/concurrent calls cannot
+replay a send. Submitted is not delivered. A crash after authorization but before
+claim may resume the already-authorized immediate operation; an uncertain claim
+never resends. Scheduled API behavior below is unchanged and its schedule method
+rejects immediate operations.
+
+The reviewed `send_at` is the sole timing source; the existing ledger due column
+is verified against it. Existing serialized scheduled reviews stay byte-for-byte
+compatible. Existing group token resolution at prepare and identity/participants
+preflight plus final adapter revalidation are shared across both modes.
+
+Rollback: restore the signed helper/daemon backups; preserve ledger and receipts.
+Cancel unclaimed immediate operations before planned rollback. Never delete or
+retry uncertain claims. No real test messages are needed; tests use injected
+synthetic groups and transports.
+
 # Scheduled existing-group plain text
 
 `imessage_group_text_prepare` accepts only `idempotency_key`, opaque
