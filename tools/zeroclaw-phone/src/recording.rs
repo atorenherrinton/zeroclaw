@@ -198,12 +198,17 @@ fn claim_job(root: &Path, settings: &Settings) -> SafeResult<Option<Job>> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|_| "recording_transaction_failed")?;
+    suppress_declined(&tx)?;
     let job = tx
         .query_row(
-            "SELECT recording_sid,account_sid,call_sid,state,created_ms,attempts,
-                    preflight_attempts,recipient_id,bot_username,local_name
-             FROM recording_outbox WHERE state IN ('queued','ready') AND next_attempt_ms<=?1
-             ORDER BY next_attempt_ms,created_ms LIMIT 1",
+            "SELECT r.recording_sid,r.account_sid,r.call_sid,r.state,r.created_ms,r.attempts,
+                    r.preflight_attempts,r.recipient_id,r.bot_username,r.local_name
+             FROM recording_outbox r JOIN calls c
+               ON c.call_sid=r.call_sid AND c.account_sid=r.account_sid
+             WHERE r.state IN ('queued','ready') AND r.next_attempt_ms<=?1
+               AND c.consent=1 AND c.phase='ended' AND c.outcome IS NOT NULL
+               AND c.outcome!='service_interrupted'
+             ORDER BY r.next_attempt_ms,r.created_ms LIMIT 1",
             [Utc::now().timestamp_millis()],
             |row| {
                 Ok(Job {
@@ -263,6 +268,37 @@ fn claim_job(root: &Path, settings: &Settings) -> SafeResult<Option<Job>> {
     }
     tx.commit().map_err(|_| "recording_commit_failed")?;
     Ok(Some(job))
+}
+
+// A carrier completion callback can arrive before the bridge's final outcome.
+// The calls row remains authoritative: never download or send until that outcome
+// has been persisted, including any withdrawal of recording consent.
+fn suppress_declined(conn: &Connection) -> SafeResult<()> {
+    conn.execute(
+        "UPDATE recording_outbox SET state='failed',last_error='recording_consent_withdrawn'
+         WHERE state IN ('waiting','queued','ready','downloading') AND EXISTS (
+           SELECT 1 FROM calls c WHERE c.call_sid=recording_outbox.call_sid
+             AND c.account_sid=recording_outbox.account_sid
+             AND (c.consent=0 OR c.outcome='service_interrupted'))",
+        [],
+    )
+    .map_err(|_| "recording_consent_update_failed")?;
+    Ok(())
+}
+
+fn claim_send(conn: &Connection, recording_sid: &str) -> SafeResult<bool> {
+    let claimed = conn
+        .execute(
+            "UPDATE recording_outbox SET state='sending',updated_ms=?2,last_error=NULL
+         WHERE recording_sid=?1 AND state='ready' AND EXISTS (
+           SELECT 1 FROM calls c WHERE c.call_sid=recording_outbox.call_sid
+             AND c.account_sid=recording_outbox.account_sid AND c.consent=1
+             AND c.phase='ended' AND c.outcome IS NOT NULL
+             AND c.outcome!='service_interrupted')",
+            params![recording_sid, Utc::now().timestamp_millis()],
+        )
+        .map_err(|_| "recording_send_claim_failed")?;
+    Ok(claimed == 1)
 }
 
 enum FetchFailure {
@@ -623,15 +659,9 @@ async fn send_job(root: &Path, client: &Client, settings: &Settings, job: &Job) 
         .build()
         .map_err(|_| "recording_send_request_failed")?;
     let conn = common::open_db(root)?;
-    let claimed = conn
-        .execute(
-            "UPDATE recording_outbox SET state='sending',updated_ms=?2,last_error=NULL
-         WHERE recording_sid=?1 AND state='ready'",
-            params![job.recording_sid, Utc::now().timestamp_millis()],
-        )
-        .map_err(|_| "recording_send_claim_failed")?;
+    let claimed = claim_send(&conn, &job.recording_sid)?;
     drop(conn);
-    if claimed != 1 {
+    if !claimed {
         return Err("recording_send_claim_lost");
     }
     // From this point onward even a timeout can mean Telegram accepted the file.
@@ -782,6 +812,69 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
+    }
+
+    #[test]
+    fn recording_delivery_waits_for_bridge_outcome_and_respects_withdrawal() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calls (
+            call_sid TEXT, account_sid TEXT, consent INTEGER, phase TEXT, outcome TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calls VALUES (?1,?2,1,'active',NULL)",
+            params![CALL, ACCOUNT],
+        )
+        .unwrap();
+        enqueue(&conn, ACCOUNT, CALL, RECORDING, "completed").unwrap();
+        conn.execute("UPDATE recording_outbox SET state='ready'", [])
+            .unwrap();
+        assert!(!claim_send(&conn, RECORDING).unwrap());
+        // The carrier status alone must not release the recording for delivery.
+        conn.execute("UPDATE calls SET phase='ended'", []).unwrap();
+        assert!(!claim_send(&conn, RECORDING).unwrap());
+        conn.execute("UPDATE calls SET outcome='service_interrupted'", [])
+            .unwrap();
+        assert!(!claim_send(&conn, RECORDING).unwrap());
+        conn.execute(
+            "UPDATE calls SET outcome='recording_declined',consent=0",
+            [],
+        )
+        .unwrap();
+        assert!(!claim_send(&conn, RECORDING).unwrap());
+        suppress_declined(&conn).unwrap();
+        let state: (String, String) = conn
+            .query_row("SELECT state,last_error FROM recording_outbox", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            state,
+            ("failed".into(), "recording_consent_withdrawn".into())
+        );
+    }
+
+    #[test]
+    fn completed_consented_call_can_deliver_exactly_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE calls (
+            call_sid TEXT, account_sid TEXT, consent INTEGER, phase TEXT, outcome TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calls VALUES (?1,?2,1,'ended','call_ended')",
+            params![CALL, ACCOUNT],
+        )
+        .unwrap();
+        enqueue(&conn, ACCOUNT, CALL, RECORDING, "completed").unwrap();
+        conn.execute("UPDATE recording_outbox SET state='ready'", [])
+            .unwrap();
+        assert!(claim_send(&conn, RECORDING).unwrap());
+        assert!(!claim_send(&conn, RECORDING).unwrap());
     }
 
     #[test]

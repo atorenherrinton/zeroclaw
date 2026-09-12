@@ -2001,7 +2001,7 @@ mod tests {
             &config,
             &security,
             &job,
-            Err(anyhow::anyhow!("provider failed")),
+            Err(anyhow::Error::msg("provider failed")),
         )
         .await;
         let error = result.unwrap_err().to_string();
@@ -2022,7 +2022,7 @@ mod tests {
                 &config,
                 &security,
                 &job,
-                Err(anyhow::anyhow!("provider failed"))
+                Err(anyhow::Error::msg("provider failed"))
             )
             .await
             .unwrap_err()

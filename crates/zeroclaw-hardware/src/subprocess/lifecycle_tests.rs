@@ -114,21 +114,34 @@ async fn cancellation_during_blocked_stdin_reaps_direct_child() {
 async fn parent_expiry_after_effect_reaps_child_without_replay() {
     let fixture =
         Fixture::new("cat >/dev/null\nprintf effect >>\"$0.effects\"\nexec tail -f /dev/null");
-    let result = PARENT
-        .scope(
-            Some(tokio::time::Instant::now() + Duration::from_secs(1)),
-            fixture.tool.execute(json!({})),
-        )
+    // Native startup must finish before this test expires the parent. A short
+    // wall-clock deadline can correctly kill the child before its first effect
+    // under load, which would not exercise the post-effect lifecycle at all.
+    let parent_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(SUBPROCESS_TIMEOUT_SECS - 1);
+    let mut execution =
+        Box::pin(PARENT.scope(Some(parent_deadline), fixture.tool.execute(json!({}))));
+    let effects = fixture.marker("effects");
+    tokio::select! {
+        () = wait_for_file(&effects) => {},
+        result = &mut execution => panic!("fixture must reach its effect before expiry: {result:?}"),
+    }
+    let pid = fixture.pid().await;
+    assert!(alive(pid));
+
+    // Advance only after the effect, and stop before the tool's local timeout.
+    // Resume wall time before checking native process cleanup.
+    tokio::time::pause();
+    tokio::time::advance(parent_deadline.saturating_duration_since(tokio::time::Instant::now()))
         .await;
+    let result = execution.await;
+    tokio::time::resume();
     let error = result.unwrap_err();
     let deadline = error.downcast_ref::<DeadlineExceeded>().unwrap();
+    assert_eq!(deadline.phase, Phase::Tool);
     assert!(deadline.started);
-    wait_for_file(&fixture.marker("effects")).await;
-    assert_reaped(fixture.pid().await).await;
-    assert_eq!(
-        std::fs::read_to_string(fixture.marker("effects")).unwrap(),
-        "effect"
-    );
+    assert_reaped(pid).await;
+    assert_eq!(std::fs::read_to_string(effects).unwrap(), "effect");
 }
 
 #[tokio::test]

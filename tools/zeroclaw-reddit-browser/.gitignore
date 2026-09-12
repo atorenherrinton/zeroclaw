@@ -1,0 +1,5 @@
+/target/
+/adapter-token
+/*.log
+/*.plist
+/zeroclaw-reddit-browser

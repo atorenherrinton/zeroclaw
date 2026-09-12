@@ -755,6 +755,7 @@ mod tests {
         let store = SecretStore::new(&native, true);
         let config = common::PhoneConfig {
             voicemail: None,
+            recording_consent: common::RecordingConsentMode::Explicit,
             enabled: true,
             port: 43335,
             public_base: "https://phone.test.invalid".into(),

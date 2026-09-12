@@ -87,6 +87,9 @@ pub struct PhoneConfig {
     pub from_number: String,
     pub forwarded_from: String,
     pub max_duration_secs: u64,
+    /// Canonical admission policy for new inbound calls; legacy installs keep keypad consent.
+    #[serde(default)]
+    pub recording_consent: RecordingConsentMode,
     pub telegram_alias: String,
     pub telegram_peer_group: String,
     pub telegram_bot_username: String,
@@ -94,6 +97,14 @@ pub struct PhoneConfig {
     /// Optional owner-only private channel for inbound voicemail deliveries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voicemail: Option<VoicemailConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingConsentMode {
+    #[default]
+    Explicit,
+    Notice,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -113,6 +124,7 @@ pub struct Settings {
     pub from_number: String,
     pub forwarded_from: String,
     pub max_duration_secs: u64,
+    pub recording_consent: RecordingConsentMode,
     pub telegram_token: String,
     pub telegram_chat_id: String,
     pub telegram_owner_id: String,
@@ -286,6 +298,7 @@ fn load_delivery(root: &Path, voicemail: bool) -> SafeResult<Settings> {
         from_number: p.from_number,
         forwarded_from: p.forwarded_from,
         max_duration_secs: p.max_duration_secs,
+        recording_consent: p.recording_consent,
         telegram_token,
         telegram_chat_id,
         telegram_owner_id: owner.to_owned(),
