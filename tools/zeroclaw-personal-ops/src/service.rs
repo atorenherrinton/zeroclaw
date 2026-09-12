@@ -177,7 +177,7 @@ fn dispatch_worker(root: PathBuf) -> Result<()> {
             Ok(_) => ops.health_record("outbox_dispatch", "healthy", "durable queue checked")?,
             Err(e) => ops.health_record("outbox_dispatch", "temporary_outage", &e.to_string())?,
         }
-        std::thread::sleep(Duration::from_secs(15));
+        std::thread::sleep(ops.next_dispatch_delay()?);
     }
 }
 pub async fn serve(root: &Path) -> Result<()> {
