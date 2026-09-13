@@ -706,6 +706,28 @@ impl CronDeliveryArgs {
 /// Cron subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
+    /// Read exact operator reconciliation status (never enables or runs work).
+    ReconciliationStatus {
+        id: String,
+        #[arg(long)]
+        run_id: i64,
+        #[arg(long)]
+        occurrence_id: String,
+    },
+    /// Record no-external-effect operator evidence; never enable, run or replay.
+    Reconcile {
+        id: String,
+        #[arg(long)]
+        run_id: i64,
+        #[arg(long)]
+        occurrence_id: String,
+        #[arg(long)]
+        expected_state: String,
+        #[arg(long, value_parser = ["no_external_effect"])]
+        disposition: String,
+        #[arg(long)]
+        evidence: String,
+    },
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
@@ -1119,4 +1141,50 @@ pub enum SopGraphFormat {
     Adjacency,
     /// Pretty-printed JSON of the whole projection.
     Json,
+}
+
+#[cfg(test)]
+mod cron_operator_cli_tests {
+    use super::CronCommands;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: CronCommands,
+    }
+    #[test]
+    fn reconciliation_requires_exact_ids_state_disposition_and_evidence() {
+        let args = [
+            "cron",
+            "reconcile",
+            "exact-job",
+            "--run-id",
+            "42",
+            "--occurrence-id",
+            "manual:exact",
+            "--expected-state",
+            "state",
+            "--disposition",
+            "no_external_effect",
+            "--evidence",
+            "operator evidence",
+        ];
+        assert!(Cli::try_parse_from(args).is_ok());
+        assert!(Cli::try_parse_from(&args[..11]).is_err());
+        let mut uncertain = args;
+        uncertain[10] = "possibly_applied";
+        assert!(Cli::try_parse_from(uncertain).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cron",
+                "reconciliation-status",
+                "job",
+                "--run-id",
+                "latest",
+                "--occurrence-id",
+                "exact"
+            ])
+            .is_err()
+        );
+    }
 }

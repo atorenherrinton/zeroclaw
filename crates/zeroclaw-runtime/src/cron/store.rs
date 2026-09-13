@@ -12,6 +12,11 @@ use zeroclaw_config::schema::{Config, CronMissedRunPolicy, CronShellOutputFormat
 pub(crate) const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 mod manual;
 mod occurrences;
+mod reconciliation;
+pub use reconciliation::{
+    ReconciliationDisposition, ReconciliationReceipt, ReconciliationRequest, ReconciliationStatus,
+    reconcile_no_external_effect, reconciliation_status,
+};
 #[cfg(test)]
 mod policy_tests;
 pub(crate) use manual::{
@@ -1929,6 +1934,15 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             output TEXT,
             updated_at TEXT NOT NULL,
             PRIMARY KEY(job_id, scheduled_at)
+        );
+        CREATE TABLE IF NOT EXISTS cron_reconciliations (
+            job_id TEXT NOT NULL,
+            run_id INTEGER NOT NULL,
+            occurrence_id TEXT NOT NULL,
+            occurrence_updated_at TEXT NOT NULL,
+            receipt TEXT NOT NULL,
+            PRIMARY KEY(job_id, run_id),
+            UNIQUE(job_id, occurrence_id)
         );
         CREATE INDEX IF NOT EXISTS idx_cron_occurrences_pending ON cron_occurrences(delivery_state, updated_at);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
