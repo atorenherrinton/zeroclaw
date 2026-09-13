@@ -146,6 +146,49 @@ fn print_delivery_line(job: &CronJob) {
 
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
+        crate::CronCommands::ReconciliationStatus {
+            id,
+            run_id,
+            occurrence_id,
+        } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&reconciliation_status(
+                    config,
+                    &id,
+                    run_id,
+                    &occurrence_id
+                )?)?
+            );
+            Ok(())
+        }
+        crate::CronCommands::Reconcile {
+            id,
+            run_id,
+            occurrence_id,
+            expected_state,
+            disposition,
+            evidence,
+        } => {
+            let disposition = serde_json::from_value(serde_json::Value::String(disposition))?;
+            let request = ReconciliationRequest {
+                occurrence_id,
+                expected_state,
+                disposition,
+                evidence,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&reconcile_no_external_effect(
+                    config,
+                    &id,
+                    run_id,
+                    &request,
+                    "local_operator:native_cli"
+                )?)?
+            );
+            Ok(())
+        }
         crate::CronCommands::List => {
             let jobs = list_jobs(config)?;
             if jobs.is_empty() {

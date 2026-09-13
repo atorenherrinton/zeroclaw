@@ -1319,3 +1319,5 @@ turn-partial-checkpoint = Progress checkpoint: give a concise update of verified
 channel-runtime-delegate-completed = Completed delegated work (task { $task_id }). Saved excerpt:
     { $output }
 cli-cron-completion-check-failed = Scheduled task completion check failed: { $detail }
+
+cron-reconcile-rejected = Reconciliation rejected: exact current quarantined job/run/occurrence and non-conflicting operator evidence are required. No replay is authorized.

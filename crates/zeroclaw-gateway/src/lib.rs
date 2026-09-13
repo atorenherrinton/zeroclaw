@@ -34,6 +34,7 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
+mod cron_reconciliation;
 pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
@@ -1606,6 +1607,7 @@ pub async fn run_gateway(
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
+        .route("/admin/cron/{id}/runs/{run_id}/reconciliation", get(cron_reconciliation::status).post(cron_reconciliation::reconcile))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))

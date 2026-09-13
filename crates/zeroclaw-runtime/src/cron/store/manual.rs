@@ -119,7 +119,8 @@ pub(crate) fn claim_manual_run_with_key(
             return Err(ManualAdmissionError::InFlight.into());
         }
         let uncertain: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM cron_occurrences WHERE job_id=?1 AND
+            "SELECT EXISTS(SELECT 1 FROM cron_occurrences o WHERE job_id=?1 AND
+             NOT EXISTS(SELECT 1 FROM cron_reconciliations r WHERE r.job_id=o.job_id AND r.occurrence_id=o.scheduled_at AND r.occurrence_updated_at=o.updated_at) AND
              (execution_state='possibly_applied' OR delivery_state IN
               ('submitting','submitted','uncertain','possibly_applied','partially_applied','reconciliation_required')))",
             [&expected.id], |r| r.get(0))?;
