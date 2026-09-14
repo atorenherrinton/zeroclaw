@@ -88,6 +88,23 @@ Controls are prioritized by viewport so scrolling changes the useful controls
 returned. Respect `controlsTruncated`, `optionsTruncated`, `labelTruncated`, and
 `valueOmitted`; never guess an omitted option. Form field values are not returned.
 
+Large page observations use a marked preview. The helper measures the complete
+MCP result, including both text and structured copies, pretty printing and two
+further JSON escaping layers, against a 24 KiB presentation allowance. This
+leaves space for two ordinary results plus their history envelopes and receipts
+under the daemon's 64 KiB round ceiling. Runtime configured limits still apply.
+The current DOM remains the source; no page cache or full-output file is created.
+
+When a preview is needed, the requested `selector` or `expected_selector` takes
+priority, then the existing viewport order. Retained selectors and option values
+stay exact. Omitted whole controls/options, shortened text/title, and an omitted
+oversized page URL are explicit. `outputTruncated` and `outputNotice` explain
+that missing content is not evidence of absence. Scroll or request an observed
+control to change the view; do not repeat a mutation because the observation was
+shortened. Action, completion, verification, readiness and persistence evidence
+outside the page remain exact. Unexpected oversized evidence outside the page
+retains the daemon's existing strict rejection behavior.
+
 ## Latency and boundaries
 
 ### Display wake
