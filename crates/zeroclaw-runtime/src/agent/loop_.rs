@@ -7759,6 +7759,33 @@ mod tests {
         }
     }
 
+    struct CompletionCheckpointJournal {
+        statuses: Mutex<Vec<zeroclaw_api::turn::TaskStatus>>,
+        fail_completion: bool,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::turn::TurnJournal for CompletionCheckpointJournal {
+        async fn checkpoint(
+            &self,
+            status: zeroclaw_api::turn::TaskStatus,
+            _: Option<String>,
+            _: bool,
+        ) -> anyhow::Result<()> {
+            let mut statuses = self.statuses.lock().unwrap();
+            let after_tools =
+                statuses.last() == Some(&zeroclaw_api::turn::TaskStatus::WaitingOnTool);
+            statuses.push(status);
+            if self.fail_completion
+                && after_tools
+                && status == zeroclaw_api::turn::TaskStatus::Running
+            {
+                anyhow::bail!("fixture completion checkpoint failed");
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -7796,56 +7823,71 @@ mod tests {
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
-        let _ = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    temperature: Some(0.0),
-                },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: Some(&approval_mgr),
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 4,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: true,
-                max_tool_result_chars: 0,
-                context_token_budget: 0,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-            },
-            history: &mut history,
-            channel_name: "telegram",
-            channel_reply_target: None,
-            cancellation_token: Some(token.clone()),
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: Some(event_tx),
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            // Phase 1: stamp Internal/Trusted until per-transport
-            // stamping lands.
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: None,
-            turn_id: &turn_id,
-        })
-        .await;
+        let journal = Arc::new(CompletionCheckpointJournal {
+            statuses: Mutex::new(Vec::new()),
+            fail_completion: false,
+        });
+        let result = zeroclaw_api::turn::JOURNAL
+            .scope(
+                Some(journal.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: Some(&approval_mgr),
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 4,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: true,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "telegram",
+                    channel_reply_target: None,
+                    cancellation_token: Some(token.clone()),
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted until per-transport
+                    // stamping lands.
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
+                }),
+            )
+            .await;
+        assert!(is_tool_loop_cancelled(&result.unwrap_err()));
+        let statuses = journal.statuses.lock().unwrap();
+        assert_eq!(
+            statuses.last(),
+            Some(&zeroclaw_api::turn::TaskStatus::WaitingOnTool)
+        );
+        drop(statuses);
 
         drop(tools_registry);
         let mut results_by_id: std::collections::HashMap<String, Vec<String>> =
@@ -12974,72 +13016,102 @@ This is an example, not an invocation."#;
             .expect("test runtime should initialize");
 
         runtime.block_on(async {
-            let model_provider = ScriptedModelProvider::from_text_responses(vec![
-                r#"<tool_call>
+            for fail_completion in [false, true] {
+                let journal = Arc::new(CompletionCheckpointJournal {
+                    statuses: Mutex::new(Vec::new()),
+                    fail_completion,
+                });
+                let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                    r#"<tool_call>
 {"name":"verbose_checker","arguments":{"value":"check"}}
 </tool_call>"#,
-                "done",
-            ]);
+                    "done",
+                ]);
 
-            let invocations = Arc::new(AtomicUsize::new(0));
-            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
-                "verbose_checker",
-                500, // produce 500+ chars of output
-                Arc::clone(&invocations),
-            ));
-            let tools_registry =
-                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
-            let mut history = vec![
-                ChatMessage::system("test-system"),
-                ChatMessage::user("check"),
-            ];
-            let observer = NoopObserver;
+                let invocations = Arc::new(AtomicUsize::new(0));
+                let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                    "verbose_checker",
+                    500, // produce 500+ chars of output
+                    Arc::clone(&invocations),
+                ));
+                let tools_registry =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
+                let mut history = vec![
+                    ChatMessage::system("test-system"),
+                    ChatMessage::user("check"),
+                ];
+                let observer = NoopObserver;
 
-            let result = agent_turn(
-                None,
-                &model_provider,
-                &mut history,
-                &tools_registry,
-                &observer,
-                "mock-provider",
-                "mock-model",
-                Some(0.0),
-                true,
-                "daemon",
-                None,
-                &zeroclaw_config::schema::MultimodalConfig::default(),
-                4,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                false,
-                false,
-                100, // too small for the full encoded result envelope
-                0,   // context_token_budget: disabled
-                None,
-                TurnOrigin::SubTurn,
-                None,
-                None, // agent_alias: not under test here
-                None, // turn_id: self-minted
-            )
-            .await
-            .expect_err("a tiny budget must not silently admit a larger result");
+                let result = zeroclaw_api::turn::JOURNAL
+                    .scope(
+                        Some(journal.clone()),
+                        agent_turn(
+                            None,
+                            &model_provider,
+                            &mut history,
+                            &tools_registry,
+                            &observer,
+                            "mock-provider",
+                            "mock-model",
+                            Some(0.0),
+                            true,
+                            "daemon",
+                            None,
+                            &zeroclaw_config::schema::MultimodalConfig::default(),
+                            4,
+                            None,
+                            &[],
+                            &[],
+                            None,
+                            None,
+                            false,
+                            false,
+                            100, // too small for the full encoded result envelope
+                            0,   // context_token_budget: disabled
+                            None,
+                            TurnOrigin::SubTurn,
+                            None,
+                            None, // agent_alias: not under test here
+                            None, // turn_id: self-minted
+                        ),
+                    )
+                    .await
+                    .expect_err("a tiny budget must not silently admit a larger result");
 
-            assert_eq!(
-                invocations.load(Ordering::SeqCst),
-                1,
-                "tool should be called once"
-            );
+                assert_eq!(
+                    invocations.load(Ordering::SeqCst),
+                    1,
+                    "tool should be called once"
+                );
 
-            assert!(result.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
-            assert_eq!(history.len(), 2, "no partially admitted tool round");
-            assert_eq!(
-                model_provider.responses.lock().unwrap().len(),
-                1,
-                "no follow-up model request"
-            );
+                let rejected = result
+                    .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                    .expect("budget evidence must survive checkpoint failure");
+                let outcome = &rejected.results[0].as_ref().unwrap().2;
+                assert!(outcome.success);
+                assert_eq!(
+                    outcome.output,
+                    format!("verbose-start-verbose_checker-{}", "X".repeat(500))
+                );
+                let statuses = journal.statuses.lock().unwrap();
+                assert!(statuses.ends_with(&[
+                    zeroclaw_api::turn::TaskStatus::WaitingOnTool,
+                    zeroclaw_api::turn::TaskStatus::Running,
+                ]));
+                if fail_completion {
+                    assert!(
+                        result
+                            .to_string()
+                            .contains("fixture completion checkpoint failed")
+                    );
+                }
+                assert_eq!(history.len(), 2, "no partially admitted tool round");
+                assert_eq!(
+                    model_provider.responses.lock().unwrap().len(),
+                    1,
+                    "no follow-up model request"
+                );
+            }
         });
     }
 

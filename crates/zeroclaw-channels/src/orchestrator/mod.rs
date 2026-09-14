@@ -17838,11 +17838,17 @@ api_key = "anthropic-key"
     }
     #[tokio::test]
     async fn oversized_write_stops_truthfully_while_marked_read_preview_continues_without_replay() {
-        for preview_read in [false, true] {
+        use zeroclaw_api::turn::TurnJournal;
+        use zeroclaw_runtime::control_plane::ControlPlaneHandle;
+        for (preview_read, confirmed) in [(false, true), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let plane = ControlPlaneHandle::start_with_boot_id(dir.path(), "fixture".into())
+                .await
+                .unwrap();
             let channel = Arc::new(ConfirmingTerminalChannel {
                 text: Default::default(),
                 attempts: AtomicUsize::new(0),
-                confirmed: true,
+                confirmed,
             });
             let invocations = Arc::new(AtomicUsize::new(0));
             let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
@@ -17860,12 +17866,59 @@ api_key = "anthropic-key"
                     preview_read,
                 ))],
             );
-            process_channel_message(
-                ctx,
-                message_sent_hook_test_message(),
-                CancellationToken::new(),
-            )
-            .await;
+            let msg = message_sent_hook_test_message();
+            let journal = turn_journal::ChannelTurnJournal::admit(&plane, &ctx.agent_alias, &msg)
+                .await
+                .unwrap()
+                .unwrap();
+            journal
+                .checkpoint(TaskStatus::Queued, None, false)
+                .await
+                .unwrap();
+            journal
+                .checkpoint(TaskStatus::Running, None, false)
+                .await
+                .unwrap();
+            let id = journal.trace_id().unwrap().to_owned();
+            zeroclaw_api::turn::JOURNAL
+                .scope(
+                    Some(journal),
+                    zeroclaw_api::delivery::SUMMARY.scope(
+                        Mutex::new(None),
+                        process_channel_message(ctx, msg, CancellationToken::new()),
+                    ),
+                )
+                .await;
+            let task = plane.store.get(&id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                if confirmed {
+                    TaskStatus::Delivered
+                } else {
+                    TaskStatus::Uncertain
+                }
+            );
+            assert_eq!(task.delivered, confirmed);
+            let conn = rusqlite::Connection::open(dir.path().join("control_plane.db")).unwrap();
+            let events: String = conn
+                .query_row(
+                    "SELECT group_concat(state) FROM task_turn_events WHERE task_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                events.contains("waiting_on_tool,running,response_ready,submitting"),
+                "{events}"
+            );
+            if !preview_read {
+                let error: String = conn
+                    .query_row("SELECT error FROM tasks WHERE id=?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert!(error.contains("reconcile external effects"), "{error}");
+            }
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
             assert_eq!(channel.attempts.load(Ordering::SeqCst), 1);
             let messages = channel.text.lock().await;

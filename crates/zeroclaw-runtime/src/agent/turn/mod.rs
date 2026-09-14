@@ -1396,7 +1396,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut terminal_error = terminal_failures.into_error();
 
-        record_executed_outcomes(
+        let collected = record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
@@ -1408,38 +1408,66 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             !stopped_mid_batch,
         )
         .await
-        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))?;
-        // Source admission already checks the actual batch size. Keep the
-        // canonical outcomes intact through final history admission: an equal
-        // per-call excerpt can discard evidence from a batch that fits, or
-        // replace the original source just before a wrapping rejection.
+        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))
+        .and_then(|()| {
+            // Source admission already checks the actual batch size. Keep the
+            // canonical outcomes intact through final history admission: an equal
+            // per-call excerpt can discard evidence from a batch that fits, or
+            // replace the original source just before a wrapping rejection.
 
+            collect_tool_results(
+                ordered_results,
+                &tool_calls,
+                turn_state.history,
+                &mut loop_detector,
+                &mut recovery_tracker,
+                &loop_ignore_tools,
+                max_tool_result_chars,
+                collected_receipts,
+                model,
+                iteration,
+                turn_id,
+            )
+            .map_err(|error| {
+                // Retain both typed errors: a size failure cannot erase a sibling's
+                // already-known delivery/deadline/cancellation evidence.
+                match error.downcast::<results_collect::ResultBudgetExceeded>() {
+                    Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
+                    Err(error) => error,
+                }
+            })
+        });
+
+        // Retain admitted results in history before any fallible checkpoint.
+        // Rejected results remain owned by the typed error in `collected`.
+        if let Ok(results) = &collected {
+            turn_state.append_tool_round(
+                assistant_history_content,
+                &native_tool_calls,
+                &results.individual_results,
+                &results.tool_results,
+                use_native_tools,
+            );
+        }
+        // A fully completed dispatch is no longer waiting on tools, even when
+        // its results cannot fit history. Record that fact before propagating
+        // admission errors so the channel can legally submit a terminal notice.
+        // Interrupted batches keep their lifecycle and original typed cause.
+        if !stopped_mid_batch
+            && let Err(checkpoint_error) =
+                zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
+                    .await
+        {
+            return Err(match collected {
+                Ok(_) => checkpoint_error,
+                Err(result_error) => result_error.context(checkpoint_error),
+            });
+        }
         let CollectedResults {
-            individual_results,
-            tool_results,
             detection_relevant_output,
             mut recovery_trigger,
-        } = collect_tool_results(
-            ordered_results,
-            &tool_calls,
-            turn_state.history,
-            &mut loop_detector,
-            &mut recovery_tracker,
-            &loop_ignore_tools,
-            max_tool_result_chars,
-            collected_receipts,
-            model,
-            iteration,
-            turn_id,
-        )
-        .map_err(|error| {
-            // Retain both typed errors: a size failure cannot erase a sibling's
-            // already-known delivery/deadline/cancellation evidence.
-            match error.downcast::<results_collect::ResultBudgetExceeded>() {
-                Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
-                Err(error) => error,
-            }
-        })?;
+            ..
+        } = collected?;
 
         if !stopped_mid_batch && recovery_trigger.is_none() {
             recovery_trigger = check_identical_output_abort(
@@ -1454,24 +1482,12 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             );
         }
 
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
-
         if let Some(error) = terminal_error {
             return Err(error);
         }
         if stopped_mid_batch {
             return Err(ToolLoopCancelled.into());
         }
-        // Checkpoint failures also leave the completed round in history.
-        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
-            .await?;
-
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {
             // Box the drive future: it inlines the full per-agent re-assembly
