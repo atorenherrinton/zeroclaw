@@ -50,13 +50,16 @@ recording_consent = "notice"
 Notice mode first identifies the AI assistant, explains that the conversation
 will be recorded and transcribed and privately sent to the person called, and
 instructs anyone who disagrees to hang up. The entire disclosure plays before a
-speech-only prompt says “Please go ahead.” There is no keypad step. Nonempty
+speech-only prompt asks “Do you agree?” Callers are asked to say “I agree” and
+wait for the invitation to leave their message. There is no keypad step. Nonempty
 caller speech after the notice admits the call; silence, a recognized objection,
 or a recognized recording/transcription question ends it without starting audio
 recording. Twilio transcribes this first utterance without saving its audio;
 the text is preserved at the start of the voicemail transcript. Audio recording
-begins when the realtime conversation connects, so that first utterance is not
-part of the audio attachment.
+starts before the realtime message session connects, so that first utterance is
+not part of the audio attachment. The assistant then invites the full message.
+If a caller started their message early, the assistant is instructed to ask them
+to repeat it for the recording; the original transcription remains available.
 
 Recognized later objections immediately end the call and suppress its recording
 and transcript delivery. Deterministic phrase checks and the realtime assistant's
@@ -97,3 +100,7 @@ chat delivery is unchanged.
 Changing routes does not resend old outbox entries or silently redirect claimed
 work. Migrate historical messages as a separately authorized, receipt-tracked
 copy from the archive; preserve the original messages and delivery records.
+
+Regression fixtures check agreement admission, recording before the message
+session, and the early-message recovery instruction. A telephone call is still
+needed to verify caller timing and spoken model behavior end to end.

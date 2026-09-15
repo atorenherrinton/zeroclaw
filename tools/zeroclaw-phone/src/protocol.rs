@@ -120,7 +120,7 @@ pub fn notice_xml(base: &str, nonce: &str) -> String {
     // Keep disclosure outside Gather: caller speech must not interrupt it.
     // Only the following speech gate is transcribed; no call audio is recorded here.
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Hi, I am an AI assistant taking a message for the person you called. This conversation will be recorded and transcribed, and privately sent to them. By continuing after this notice, you agree. If you do not agree, please hang up now.</Say><Gather input=\"speech\" timeout=\"10\" speechTimeout=\"auto\" actionOnEmptyResult=\"true\" action=\"{action}\" method=\"POST\"><Say>Please go ahead.</Say></Gather><Hangup/></Response>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response><Say>Hi, I am an AI assistant taking a message for the person you called. This conversation will be recorded and transcribed, and privately sent to them. Before leaving your message, please say I agree, then wait for me to ask for your message. If you do not agree, please hang up now.</Say><Gather input=\"speech\" timeout=\"10\" speechTimeout=\"auto\" actionOnEmptyResult=\"true\" action=\"{action}\" method=\"POST\"><Say>Do you agree?</Say></Gather><Hangup/></Response>"
     )
 }
 
@@ -330,6 +330,9 @@ mod tests {
         let notice = notice_xml("https://test.invalid", "nonce");
         assert!(notice.find("</Say>").unwrap() < notice.find("<Gather").unwrap());
         assert!(notice.contains("input=\"speech\""));
+        assert!(notice.contains("please say I agree, then wait"));
+        assert!(notice.contains("<Say>Do you agree?</Say>"));
+        assert!(!notice.contains("Please go ahead"));
         assert!(notice.contains("actionOnEmptyResult=\"true\""));
         assert!(notice.contains("/voice/notice/nonce"));
         assert!(!notice.contains("dtmf") && !notice.contains("Press"));
