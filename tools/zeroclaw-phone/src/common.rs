@@ -34,10 +34,12 @@ pub fn private_dir(path: &Path) -> SafeResult<()> {
     )
 }
 
+const MAX_PRIVATE_READ: u64 = 2 * 1024 * 1024;
+
 pub fn private_read(path: &Path) -> SafeResult<String> {
     let mut f = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .map_err(|_| "private_read_open_failed")?;
     let m = f.metadata().map_err(|_| "private_read_metadata_failed")?;
@@ -45,12 +47,18 @@ pub fn private_read(path: &Path) -> SafeResult<String> {
         m.is_file()
             && m.uid() == unsafe { libc::geteuid() }
             && m.mode() & 0o077 == 0
-            && m.len() <= 2 * 1024 * 1024,
+            && m.len() <= MAX_PRIVATE_READ,
         "unsafe_private_file",
     )?;
     let mut value = String::new();
-    f.read_to_string(&mut value)
+    (&mut f)
+        .take(MAX_PRIVATE_READ + 1)
+        .read_to_string(&mut value)
         .map_err(|_| "private_read_failed")?;
+    check(
+        value.len() as u64 <= MAX_PRIVATE_READ,
+        "private_read_too_large",
+    )?;
     Ok(value)
 }
 
@@ -97,6 +105,9 @@ pub struct PhoneConfig {
     /// Optional owner-only private channel for inbound voicemail deliveries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voicemail: Option<VoicemailConfig>,
+    /// Owner-private opt-in; resolved again before every scheduling attempt/write.
+    #[serde(default)]
+    pub tentative_rescheduling: bool,
     /// Which engine bridges call audio. Absent means the integrated Realtime session.
     #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
     pub voice: VoiceConfig,
@@ -468,6 +479,10 @@ pub fn e164(s: &str) -> bool {
 }
 
 pub fn open_db(root: &Path) -> SafeResult<Connection> {
+    open_db_with_timeout(root, Duration::from_secs(5))
+}
+
+pub fn open_db_with_timeout(root: &Path, busy_timeout: Duration) -> SafeResult<Connection> {
     private_dir(root)?;
     let path = root.join("phone.sqlite");
     if path.exists() {
@@ -488,7 +503,7 @@ pub fn open_db(root: &Path) -> SafeResult<Connection> {
             .map_err(|_| "database_create_failed")?;
     }
     let c = Connection::open(path).map_err(|_| "database_open_failed")?;
-    c.busy_timeout(Duration::from_secs(5))
+    c.busy_timeout(busy_timeout)
         .map_err(|_| "database_timeout_failed")?;
     c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
         CREATE TABLE IF NOT EXISTS calls (
@@ -498,6 +513,53 @@ pub fn open_db(root: &Path) -> SafeResult<Connection> {
             summary_status TEXT NOT NULL DEFAULT 'pending', summary_text TEXT, summary_message_id INTEGER
         );").map_err(|_| "database_initialize_failed")?;
     Ok(c)
+}
+
+/// Canonical feature policy; never retain it in a long-lived call handle.
+pub fn tentative_rescheduling_enabled(root: &Path) -> SafeResult<bool> {
+    let policy: PhoneConfig = toml::from_str(&private_read(&root.join("phone.toml"))?)
+        .map_err(|_| "phone_config_invalid")?;
+    Ok(policy.enabled && policy.tentative_rescheduling)
+}
+
+#[cfg(test)]
+mod bounded_private_io_tests {
+    use super::*;
+    use std::{ffi::CString, time::Instant};
+
+    #[test]
+    fn fifo_is_rejected_before_read_and_oversize_private_files_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("policy-fifo");
+        let encoded = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(private_read(&fifo).is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let large = dir.path().join("large-policy");
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&large)
+            .unwrap();
+        f.set_len(MAX_PRIVATE_READ + 1).unwrap();
+        assert!(private_read(&large).is_err());
+    }
+
+    #[test]
+    fn short_database_budget_applies_to_initial_pragmas() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("private");
+        private_dir(&root).unwrap();
+        let db = open_db(&root).unwrap();
+        db.execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+            .unwrap();
+        let started = Instant::now();
+        assert!(open_db_with_timeout(&root, Duration::from_millis(40)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(600));
+        db.execute_batch("ROLLBACK;").unwrap();
+    }
 }
 
 #[cfg(test)]

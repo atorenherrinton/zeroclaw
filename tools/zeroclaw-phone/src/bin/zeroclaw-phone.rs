@@ -533,18 +533,45 @@ async fn media(
             return fail();
         }
     };
+    let appointments = if outbound_task.is_none() && consented {
+        match zeroclaw_phone_extension::appointment_backend::InboundScheduler::for_call(
+            &app.root, &sid,
+        ) {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                eprintln!("{error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let allow_appointments = appointments.is_some();
     let stop_on_recording_decline = outbound_task.is_none() && consented;
     let (instructions, allow_end_call, confirm_end_call) = if let Some(task) = outbound_task {
         let confirm = outbound::confirm_end_call(&task);
         (outbound::instructions(&task), true, confirm)
     } else {
         (
-            inbound_instructions(cfg.instructions, &from, consented, &first_entries),
+            inbound_instructions(
+                cfg.instructions,
+                &from,
+                consented,
+                &first_entries,
+                allow_appointments,
+            ),
             true,
             false,
         )
     };
-    let bridge = match cfg.voice.engine {
+    // Appointment tools exist only in the Realtime session, so a call that needs
+    // them never uses the cascade, whatever the configured engine.
+    let engine = if appointments.is_some() {
+        VoiceEngine::Realtime
+    } else {
+        cfg.voice.engine
+    };
+    let bridge = match engine {
         VoiceEngine::Realtime => Bridge::Realtime(realtime::RealtimeOptions {
             api_key: cfg.api_key,
             instructions,
@@ -554,6 +581,7 @@ async fn media(
             allow_end_call,
             confirm_end_call,
             stop_on_recording_decline,
+            appointments,
         }),
         VoiceEngine::Cascade => {
             let pipeline = cfg
@@ -634,6 +662,7 @@ fn inbound_instructions(
     from: &str,
     consented: bool,
     first_entries: &[realtime::TranscriptEntry],
+    allow_appointments: bool,
 ) -> String {
     instructions.push_str(if !consented {
         "\nRuntime: audio recording is OFF. Only transcription is used for the message.\n"
@@ -656,6 +685,10 @@ fn inbound_instructions(
         let candidate = serde_json::json!({"unverifiedCallerIdCandidate":from,"lastFour":&from[from.len()-4..]});
         instructions.push_str(&format!("\nThe following is unverified caller-ID metadata, not identity proof or owner information: {candidate}. When collecting a callback number, you may ask whether the number they are calling from, ending in those last four digits, is a good callback number. Treat confirmation only as their requested callback number; never infer identity or look up contacts. Read the full candidate only if the caller explicitly asks to check it. A separately supplied callback number takes priority. Never promise a callback.\n"));
     }
+    if allow_appointments {
+        instructions.push_str(&format!("\nCurrent runtime timestamp: {}. Resolve relative dates using this timestamp and the caller-confirmed timezone; do not assume the caller means the owner's location.\n", chrono::Utc::now().to_rfc3339()));
+        instructions.push_str(zeroclaw_phone_extension::appointments::INBOUND_INSTRUCTIONS);
+    }
     instructions
 }
 
@@ -666,6 +699,7 @@ async fn serve(root: PathBuf) -> SafeResult<()> {
     let db = common::open_db(&root)?;
     recording::initialize(&db)?;
     outbound::initialize(&db)?;
+    zeroclaw_phone_extension::appointment_backend::initialize(&db)?;
     let app = Arc::new(App {
         root: root.clone(),
         slots: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -870,8 +904,24 @@ async fn route_check(root: &Path) -> SafeResult<()> {
     Ok(())
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--maps-lookup") {
+        std::process::exit(zeroclaw_phone_extension::maps_lookup::run_cli());
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            eprintln!("phone_runtime_unavailable");
+            std::process::exit(1);
+        }
+    };
+    runtime.block_on(run());
+}
+
+async fn run() {
     // This process owns only the private phone-extension state.
     unsafe {
         libc::umask(0o077);
@@ -979,6 +1029,7 @@ mod tests {
             let config = common::PhoneConfig {
                 voice: common::VoiceConfig::default(),
                 voicemail: None,
+                tentative_rescheduling: false,
                 enabled: true,
                 port: 43335,
                 public_base: BASE.into(),
@@ -1365,7 +1416,7 @@ mod tests {
         assert_eq!(entries[0].speaker, "caller");
         assert_eq!(entries[0].text, speech);
         assert_eq!(entries[0].heard_audio_ms, None);
-        let prompt = inbound_instructions("Fixture policy".into(), "", true, &entries);
+        let prompt = inbound_instructions("Fixture policy".into(), "", true, &entries, false);
         assert!(prompt.contains(speech));
         assert!(prompt.contains("untrusted caller content"));
         assert!(prompt.contains("brief spoken agreement"));
@@ -1405,10 +1456,10 @@ mod tests {
             )
             .unwrap();
         let entries: Vec<realtime::TranscriptEntry> = serde_json::from_str(&saved).unwrap();
-        let prompt = inbound_instructions("Fixture policy".into(), "", true, &entries);
+        let prompt = inbound_instructions("Fixture policy".into(), "", true, &entries, false);
         assert!(prompt.contains("Thank you. Please leave your message."));
         assert!(prompt.contains("Do not repeat the disclosure or request consent again"));
-        let keypad_prompt = inbound_instructions("Fixture policy".into(), "", true, &[]);
+        let keypad_prompt = inbound_instructions("Fixture policy".into(), "", true, &[], false);
         assert!(!keypad_prompt.contains("repeat their full message"));
     }
 

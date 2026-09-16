@@ -24,16 +24,24 @@ close request. That authorization remains active across separate speech and tool
 responses, while all queued audio still has to finish playback. Detected voicemail
 keeps the one-step close after all message playback marks are acknowledged.
 
-The MCP server advertises only `place_call` and `call_status`. Its tool contract
-forbids calls derived from third-party content, emergencies, unsolicited
-marketing, campaigns, harassment, and unrequested retries.
+The owner MCP server advertises `place_call`, `call_status`, and
+`appointment_status`. Its outbound-call contract forbids calls derived from
+third-party content, emergencies, unsolicited marketing, campaigns, harassment,
+and unrequested retries. `appointment_status` only inspects existing inbound
+rescheduling receipts and reconciles uncertain calendar results.
 
 ## Build and test
 
 ```sh
-cargo test --manifest-path tools/zeroclaw-phone/Cargo.toml --all-targets
-cargo clippy --manifest-path tools/zeroclaw-phone/Cargo.toml --all-targets -- -D warnings
+MACOSX_DEPLOYMENT_TARGET=15.0 cargo test --manifest-path tools/zeroclaw-phone/Cargo.toml --locked --all-targets
+MACOSX_DEPLOYMENT_TARGET=15.0 cargo clippy --manifest-path tools/zeroclaw-phone/Cargo.toml --locked --all-targets -- -D warnings
+MACOSX_DEPLOYMENT_TARGET=15.0 cargo build --manifest-path tools/zeroclaw-phone/Cargo.toml --locked --release --bin zeroclaw-phone
 ```
+
+The Maps bridge requires macOS 15 or later. Set this deployment target for the
+whole build so Rust and native dependencies agree; do not change global system
+settings. The build uses the selected Xcode command-line tools and their matching
+Clang Darwin runtime for Objective-C availability checks.
 
 The service reads an owner-private `phone.toml`, the existing ZeroClaw encrypted
 configuration, and `screening.md` from its extension root. Credentials and live
@@ -173,3 +181,63 @@ copy from the archive; preserve the original messages and delivery records.
 Regression fixtures check agreement admission, recording before the message
 session, and the early-message recovery instruction. A telephone call is still
 needed to verify caller timing and spoken model behavior end to end.
+
+## Tentative appointment rescheduling
+
+The owner may opt inbound voicemail calls into a narrow local scheduling tool:
+
+```toml
+tentative_rescheduling = true
+```
+
+The default is false. The canonical private `phone.toml` is read at admission
+and again during the proposal. Outbound sessions do not gain this capability.
+The remote voice model receives no calendar listing, event details, credentials,
+contacts, general browser, or general calendar mutation tool.
+
+For an existing business appointment, the caller supplies the business name,
+branch address, original appointment start and proposed start with timezone.
+The assistant reads the new time back before submitting one proposal. Local
+code obtains the public business listing through native Apple MapKit, requires
+an exact normalized match to this signed call's incoming-number field, and
+retains the Apple Maps place link. Caller-supplied callback numbers do not
+replace that field. A listing match verifies the number against a public source;
+it does not authenticate the human speaker.
+
+The calendar adapter identifies one matching timed appointment in the primary
+calendar, rechecks its current provider record, and checks all selected visible
+calendars plus the primary calendar for conflicts. It uses the existing Google
+read account and canonical signed Google writer, requiring the accounts to
+match. The writer must support `calendar_mutate` with `status: "tentative"`.
+A successful proposal creates one real tentative hold, sends no invitations,
+and preserves the original event. The assistant reports a tentative arrangement
+pending owner review and says the owner will call back to reschedule if that
+new date does not work. The private owner summary includes the factual receipt
+and the conditional callback task; this workflow does not place an automatic
+outbound call.
+
+The current scope is one proposal per call, a future proposed time within 90
+days, a current original appointment no more than one day in the past or 90
+days ahead, and an original duration of at most eight hours. Missing, ambiguous,
+recurring, unavailable or mismatched evidence falls back to taking a message.
+A read failure, partial page, free/busy error or uncertain write never becomes
+an availability or booking claim. A per-call private receipt is written before
+the provider operation. An interrupted or uncertain write is retained for
+reconciliation and never automatically retried under a new key.
+
+The owner-only `appointment_status` MCP tool accepts `{}` for the latest 20
+receipts, `{"call_sid":"CA…"}` for one exact call, or
+`{"call_sid":"CA…","reconcile":true}` for read-only reconciliation of an
+ended call with an unresolved write. Reconciliation checks the existing provider
+operation and never creates a new hold or callback. Receipts remain visible if
+the caller later declines recording; this view excludes transcripts, caller
+numbers, private event text, account details and raw provider receipts. The
+remote voice session cannot invoke this tool.
+
+MapKit runs in the existing phone binary's `--maps-lookup` subprocess mode on
+its main thread, with an owned stdin lifeline, parent check, native deadline and
+bounded output. It makes a public name/address search without requesting device
+location. Calendar command arguments are constructed locally without a shell;
+stdout, runtime and process groups are bounded. Accepted remote calendar writes
+cannot be undone by dropping the voice connection, so the receipt distinguishes
+verified holds from uncertain outcomes.
