@@ -84,15 +84,60 @@ arguments retain their restrictions, including the 14-day maximum duration.
   becoming instructions. An exact existing event returns `created=false`,
   `duplicate_prevented=true`, and `invitations_requested=false`, regardless of
   attendee differences. Do not update or re-invite it.
-- Fail closed if the duplicate scan fails. Insert once; missing event ID, transport
-  failure, cancellation or timeout can mean an uncertain committed event. Preserve
-  the result/receipts and inspect Calendar read-only; never blindly retry.
+- Fail closed if the initial duplicate scan fails. Once an immutable intent has
+  been claimed, recover that exact saved action before doing any title scan.
+  A changed payload under the same key fails closed; it never re-invites guests.
 
-The compatibility create/update tools now route actual writes through the durable
-Calendar adapter below. The title/time duplicate preflight remains an additional
-read guard; stable Google event IDs and the shared durable ledger prevent racing
-retries through this adapter. Other clients remain external owners of their own
-writes. Gmail draft creation remains separate from the personal-ops email outbox.
+The compatibility create/update tools route actual writes through the durable
+Calendar adapter below. `calendar_actions` in the existing personal-ops SQLite
+ledger is the canonical source of immutable intent and provider event identity;
+there is no second receipt store. For create, the deployed account + original
+summary/start/end key algorithm is preserved so upgrading cannot replay an old
+uncertain action. Stable Google IDs and the write-ahead claim prevent concurrent
+or restarted calls from issuing a second insert. Other clients remain external
+owners of their own writes. Gmail draft creation is unchanged.
+
+### Create receipts and read-only recovery
+
+After a durable claim, create returns a structured receipt even if the insert
+response, exact-resource read, or post-claim receipt persistence fails:
+
+- `state=verified` requires an exact GET matching the saved ID and intended
+  fields, including the private action marker. An insert response alone is not
+  sufficient. `created=true` is only returned for a new, verified attempt.
+- `state=uncertain` is **not success or proof of absence**. `created=false` means
+  creation has not been confirmed by this call, not that the provider did nothing.
+- `event_id`, `calendar_id`, and the public `idempotency_key` identify the saved
+  operation. `reconcile.arguments` can be passed to `calendar_reconcile` (the MCP
+  prefix is `google_write__`). `retry_allowed=false` applies even after a 404.
+- `evidence.read_error` and `evidence.write_error` expose bounded error categories,
+  not arbitrary provider stderr. `google_keychain_access_required` means the
+  owner must review/unlock the selected client's native macOS Keychain access.
+  Do not bypass prompts, export credentials, or fall back to another credential
+  store/client. Verify access read-only before making any new write decision.
+- Invitation requests are not proof of invitation delivery. Recovery never
+  inserts, patches, deletes, or sends notifications; it only GETs the saved ID.
+
+If the original response was lost, recover without calling create again:
+
+```json
+{
+  "create_identity": {
+    "summary": "Synthetic appointment",
+    "start": "2030-01-01T10:00:00-08:00",
+    "end": "2030-01-01T11:00:00-08:00"
+  }
+}
+```
+
+Use either this selector or `{"idempotency_key":"key-from-receipt"}`, not both.
+Identity lookup resolves the original saved intent; it does not search Calendar
+by title or register a new operation. Unknown selectors fail closed. A cancelled,
+missing, or mismatching resource stays uncertain; do not clear its claim, change
+its key, or replay it to force creation. Preserve the journal through rollback.
+Any later write requires a separate authorized no-effect/retry decision, not an
+inference from an empty list response. Existing events are never removed during
+reconciliation.
 
 ## Callable parameters
 
