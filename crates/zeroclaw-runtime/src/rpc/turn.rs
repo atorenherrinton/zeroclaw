@@ -28,6 +28,9 @@ pub enum TurnError {
     OwnedTerminal {
         error: anyhow::Error,
         user_message: String,
+        /// Exact committed turn evidence from the agent, kept through persistence.
+        partial_text: String,
+        messages: Vec<ConversationMessage>,
     },
     TerminalCompletion {
         diagnostic: String,
@@ -239,7 +242,11 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => {
+        Err(StreamedTurnError {
+            error,
+            committed_response,
+            new_messages,
+        }) => {
             if crate::agent::tool_execution::is_terminal_tool_error(&error) {
                 let key = if typed_stop_cause(&error)
                     == Some(crate::rpc::types::TurnStopCause::Deadline)
@@ -251,6 +258,12 @@ fn outcome_from_task_result(
                 return Err(TurnError::OwnedTerminal {
                     error,
                     user_message: crate::i18n::get_required_cli_string(key),
+                    partial_text: if committed_response.is_empty() {
+                        accumulated_text
+                    } else {
+                        committed_response
+                    },
+                    messages: new_messages,
                 });
             }
             if let Some(user_message) =
@@ -367,10 +380,16 @@ mod tests {
         let mapped = outcome_from_task_result(
             Err(StreamedTurnError {
                 error,
-                committed_response: String::new(),
-                new_messages: Vec::new(),
+                committed_response: "completed child response".into(),
+                new_messages: vec![ConversationMessage::ToolResults(vec![
+                    zeroclaw_api::model_provider::ToolResultMessage {
+                        tool_call_id: "completed-child".into(),
+                        tool_name: "delegate".into(),
+                        content: r#"{"completed":true,"value":7}"#.into(),
+                    },
+                ])],
             }),
-            String::new(),
+            "uncommitted stream tail".into(),
         );
         assert_eq!(
             stop_cause(&mapped, None),
@@ -379,6 +398,8 @@ mod tests {
         let Err(TurnError::OwnedTerminal {
             error,
             user_message,
+            partial_text,
+            messages,
         }) = mapped
         else {
             panic!("typed terminal owner missing")
@@ -389,6 +410,32 @@ mod tests {
             "private original deadline payload"
         );
         assert!(!user_message.contains("private original"));
+        assert_eq!(partial_text, "completed child response");
+        let ConversationMessage::ToolResults(results) = &messages[0] else {
+            panic!("completed child result lost")
+        };
+        assert_eq!(results[0].tool_call_id, "completed-child");
+        assert_eq!(results[0].content, r#"{"completed":true,"value":7}"#);
+    }
+
+    #[test]
+    fn rpc_owned_terminal_uses_stream_text_only_without_committed_text() {
+        let mapped = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error: zeroclaw_api::deadline::DeadlineExceeded {
+                    phase: zeroclaw_api::deadline::Phase::Turn,
+                    started: true,
+                }
+                .into(),
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            "partial stream".into(),
+        );
+        let Err(TurnError::OwnedTerminal { partial_text, .. }) = mapped else {
+            panic!("typed terminal owner missing")
+        };
+        assert_eq!(partial_text, "partial stream");
     }
 
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {

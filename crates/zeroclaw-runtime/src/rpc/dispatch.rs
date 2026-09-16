@@ -2322,19 +2322,7 @@ impl RpcDispatcher {
             }
             crate::rpc::types::ChatMode::Chat => {
                 if let Some(ref backend) = self.ctx.session_backend {
-                    let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
-                    match &outcome {
-                        Ok(TurnOutcome::Completed { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
-                        }
-                        Ok(TurnOutcome::Cancelled { partial_text, .. })
-                            if !partial_text.is_empty() =>
-                        {
-                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
-                        }
-                        _ => {}
-                    }
+                    persist_chat_turn(backend.as_ref(), sid, &prompt, &outcome);
                 }
             }
         }
@@ -5270,8 +5258,34 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
-/// Persist the exact turn delta captured before structured history trimming.
-/// Empty and failed turns intentionally remain no-ops.
+/// Persist the existing chat projection, including text committed before an
+/// owned terminal error. Structured tool history belongs to the ACP store.
+fn persist_chat_turn(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_id: &str,
+    prompt: &str,
+    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+) {
+    let key = format!("rpc_{session_id}");
+    let _ = backend.append(&key, &ChatMessage::user(prompt));
+    let text = match outcome {
+        Ok(TurnOutcome::Completed { text, .. }) => Some(text),
+        Ok(TurnOutcome::Cancelled { partial_text, .. })
+        | Err(crate::rpc::turn::TurnError::OwnedTerminal { partial_text, .. })
+            if !partial_text.is_empty() =>
+        {
+            Some(partial_text)
+        }
+        _ => None,
+    };
+    if let Some(text) = text {
+        let _ = backend.append(&key, &ChatMessage::assistant(text));
+    }
+}
+
+/// Persist the exact turn delta captured before structured history trimming,
+/// including committed results carried by owned terminal errors. Empty deltas
+/// and unowned failures remain no-ops.
 async fn persist_acp_turn(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
@@ -5280,6 +5294,7 @@ async fn persist_acp_turn(
     let messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
+        | Err(crate::rpc::turn::TurnError::OwnedTerminal { messages, .. })
             if !messages.is_empty() =>
         {
             messages.clone()
@@ -9244,6 +9259,76 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&restored.messages[50..]).unwrap(),
             serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_deadline_persists_completed_child_delta_and_chat_text() {
+        use crate::rpc::turn::TurnError;
+        use zeroclaw_api::model_provider::ToolResultMessage;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let chat = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+        let sid = "owned-deadline";
+        store
+            .create_session(sid, "fixture", tmp.path().to_str().unwrap())
+            .unwrap();
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("fixture request")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("delegating fixture child".into()),
+                tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "completed-child".into(),
+                    name: "delegate".into(),
+                    arguments: r#"{"agent":"fixture","prompt":"fixture"}"#.into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "completed-child".into(),
+                tool_name: "delegate".into(),
+                content: r#"{"completed":true,"value":7}"#.into(),
+            }]),
+            ConversationMessage::Chat(ChatMessage::assistant("completed child response")),
+        ];
+        let outcome = Err(TurnError::OwnedTerminal {
+            error: anyhow::Error::msg("private nested owner evidence").context(
+                zeroclaw_api::deadline::DeadlineExceeded {
+                    phase: zeroclaw_api::deadline::Phase::Turn,
+                    started: true,
+                },
+            ),
+            user_message: crate::i18n::get_required_cli_string("rpc-turn-deadline"),
+            partial_text: "completed child response".into(),
+            messages: messages.clone(),
+        });
+        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+        persist_chat_turn(&chat, sid, "fixture request", &outcome);
+        drop(store);
+        drop(chat);
+        let store = zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap();
+        let chat = zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.load_session(sid).unwrap().unwrap().messages).unwrap(),
+            serde_json::to_value(messages).unwrap()
+        );
+        let restored = chat.load(&format!("rpc_{sid}"));
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].content, "fixture request");
+        assert_eq!(restored[1].content, "completed child response");
+        assert_eq!(
+            crate::rpc::turn::stop_cause(&outcome, None),
+            Some(crate::rpc::types::TurnStopCause::Deadline)
+        );
+        let Err(TurnError::OwnedTerminal { error, .. }) = outcome else {
+            panic!("persistence must not reclassify the failed terminal")
+        };
+        assert!(error.is::<zeroclaw_api::deadline::DeadlineExceeded>());
+        assert_eq!(
+            error.root_cause().to_string(),
+            "private nested owner evidence"
         );
     }
 
