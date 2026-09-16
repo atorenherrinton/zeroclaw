@@ -1,8 +1,9 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
@@ -65,12 +66,146 @@ pub struct StepResult {
     pub output: String,
 }
 
+/// Invocation-owned authority supplied by the runtime, not pipeline policy state.
+/// Resolve before spawning; each child receives the same authority handle.
+#[async_trait]
+pub trait PipelineExecutionContext: Send + Sync {
+    async fn execute(&self, tool: &dyn Tool, args: serde_json::Value) -> Result<ToolResult>;
+    fn is_terminal_error(&self, error: &anyhow::Error) -> bool;
+    fn check_interrupted(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn interrupted(&self) -> anyhow::Error {
+        std::future::pending().await
+    }
+}
+
+const CHILD_SETTLEMENT_LIMIT: Duration = Duration::from_millis(500);
+
+pub type PipelineExecutionContextResolver =
+    Arc<dyn Fn() -> Option<Arc<dyn PipelineExecutionContext>> + Send + Sync>;
+
+/// Original child error retained without flattening its typed cause.
+pub struct PipelineStepFailure {
+    pub index: usize,
+    pub tool: String,
+    pub error: anyhow::Error,
+}
+
+/// Completed child result retained in its original structured representation.
+pub struct PipelineStepOutcome {
+    pub index: usize,
+    pub tool: String,
+    pub result: ToolResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineUnsettledReason {
+    Aborted,
+    SettlementTimeout,
+}
+
+/// Execution ended without a returned result; completed external effects are
+/// unknown. This is separate from both completed results and unstarted tails.
+#[derive(Debug)]
+pub struct PipelineUnsettledStep {
+    pub index: usize,
+    pub tool: String,
+    pub reason: PipelineUnsettledReason,
+}
+
+/// Terminal execution retains completed sibling outcomes and all child errors.
+/// Display/Debug never expand completed tool payloads; the first source is the
+/// terminal cause so callers can keep their existing typed cancellation routing.
+pub struct PipelineTerminalError {
+    pub completed: Vec<PipelineStepOutcome>,
+    pub failures: Vec<PipelineStepFailure>,
+    pub outer_interruption: Option<anyhow::Error>,
+    pub unsettled: Vec<PipelineUnsettledStep>,
+}
+
+impl std::fmt::Debug for PipelineTerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipelineTerminalError")
+            .field("completed_count", &self.completed.len())
+            .field("failure_count", &self.failures.len())
+            .field("unsettled_count", &self.unsettled.len())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for PipelineTerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self
+            .outer_interruption
+            .as_ref()
+            .or_else(|| self.failures.first().map(|failure| &failure.error))
+        {
+            Some(error) => std::fmt::Display::fmt(error, f),
+            None => f.write_str("Pipeline interrupted"),
+        }
+    }
+}
+
+impl std::error::Error for PipelineTerminalError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.outer_interruption
+            .as_ref()
+            .or_else(|| self.failures.first().map(|failure| &failure.error))
+            .map(|error| error.as_ref())
+    }
+}
+
+enum PipelineExecutionError {
+    Ordinary(PipelineError),
+    Terminal(PipelineTerminalError),
+}
+
+impl From<PipelineError> for PipelineExecutionError {
+    fn from(error: PipelineError) -> Self {
+        Self::Ordinary(error)
+    }
+}
+
+fn current_interruption(
+    context: &Option<Arc<dyn PipelineExecutionContext>>,
+) -> Option<anyhow::Error> {
+    context
+        .as_ref()
+        .and_then(|context| context.check_interrupted().err())
+}
+
+async fn invocation_interrupted(
+    context: &Option<Arc<dyn PipelineExecutionContext>>,
+) -> anyhow::Error {
+    if let Some(context) = context {
+        context.interrupted().await
+    } else {
+        std::future::pending().await
+    }
+}
+
+fn interrupted_execution(
+    completed: Vec<PipelineStepOutcome>,
+    failures: Vec<PipelineStepFailure>,
+    outer_interruption: Option<anyhow::Error>,
+    unsettled: Vec<PipelineUnsettledStep>,
+) -> PipelineExecutionError {
+    PipelineExecutionError::Terminal(PipelineTerminalError {
+        completed,
+        failures,
+        outer_interruption,
+        unsettled,
+    })
+}
+
 /// The execute_pipeline tool that runs multi-step tool chains.
 pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
     access_policy: Option<ToolAccessPolicy>,
+    execution_context: Option<PipelineExecutionContextResolver>,
 }
 
 impl PipelineTool {
@@ -91,7 +226,16 @@ impl PipelineTool {
             tools,
             allowed_set,
             access_policy,
+            execution_context: None,
         }
+    }
+
+    pub fn with_execution_context_resolver(
+        mut self,
+        resolver: PipelineExecutionContextResolver,
+    ) -> Self {
+        self.execution_context = Some(resolver);
+        self
     }
 
     /// Find a tool by name in the registry.
@@ -144,25 +288,104 @@ impl PipelineTool {
     async fn execute_sequential(
         &self,
         steps: &[PipelineStep],
-    ) -> std::result::Result<Vec<StepResult>, PipelineError> {
-        let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
+        context: Option<Arc<dyn PipelineExecutionContext>>,
+    ) -> std::result::Result<Vec<PipelineStepOutcome>, PipelineExecutionError> {
+        let mut results: Vec<PipelineStepOutcome> = Vec::with_capacity(steps.len());
 
         for (i, step) in steps.iter().enumerate() {
+            if let Some(error) = current_interruption(&context) {
+                return Err(interrupted_execution(
+                    results,
+                    Vec::new(),
+                    Some(error),
+                    Vec::new(),
+                ));
+            }
             let tool = self
                 .find_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
             // Interpolate previous step results into args.
-            let interpolated_args = interpolate_args(&step.args, &results);
+            let outputs: Vec<(usize, &str)> = results
+                .iter()
+                .map(|step| (step.index, step.result.output.as_str()))
+                .collect();
+            let interpolated_args = interpolate_from_outputs(&step.args, &outputs);
 
-            let tool_result =
-                tool.execute(interpolated_args)
-                    .await
-                    .map_err(|e| PipelineError::StepFailed {
+            let execution = async {
+                if let Some(context) = &context {
+                    context.execute(tool, interpolated_args).await
+                } else {
+                    tool.execute(interpolated_args).await
+                }
+            };
+            tokio::pin!(execution);
+            let execution = tokio::select! {
+                biased;
+                result = &mut execution => result,
+                cause = invocation_interrupted(&context) => {
+                    let mut failures = Vec::new();
+                    let mut unsettled = Vec::new();
+                    if tool.supports_cooperative_settlement() {
+                        match tokio::time::timeout(CHILD_SETTLEMENT_LIMIT, &mut execution).await {
+                            Ok(Ok(result)) => results.push(PipelineStepOutcome { index: i, tool: step.tool.clone(), result }),
+                            Ok(Err(error)) => failures.push(PipelineStepFailure { index: i, tool: step.tool.clone(), error }),
+                            Err(_) => unsettled.push(PipelineUnsettledStep { index: i, tool: step.tool.clone(), reason: PipelineUnsettledReason::SettlementTimeout }),
+                        }
+                    } else {
+                        unsettled.push(PipelineUnsettledStep { index: i, tool: step.tool.clone(), reason: PipelineUnsettledReason::Aborted });
+                    }
+                    return Err(interrupted_execution(results, failures, Some(cause), unsettled));
+                }
+            };
+            if let Some(cause) = current_interruption(&context) {
+                let mut failures = Vec::new();
+                match execution {
+                    Ok(result) => results.push(PipelineStepOutcome {
                         index: i,
                         tool: step.tool.clone(),
-                        message: e.to_string(),
-                    })?;
+                        result,
+                    }),
+                    Err(error) => failures.push(PipelineStepFailure {
+                        index: i,
+                        tool: step.tool.clone(),
+                        error,
+                    }),
+                }
+                return Err(interrupted_execution(
+                    results,
+                    failures,
+                    Some(cause),
+                    Vec::new(),
+                ));
+            }
+            let tool_result = match execution {
+                Ok(result) => result,
+                Err(error)
+                    if context
+                        .as_ref()
+                        .is_some_and(|c| c.is_terminal_error(&error)) =>
+                {
+                    return Err(interrupted_execution(
+                        results,
+                        vec![PipelineStepFailure {
+                            index: i,
+                            tool: step.tool.clone(),
+                            error,
+                        }],
+                        None,
+                        Vec::new(),
+                    ));
+                }
+                Err(error) => {
+                    return Err(PipelineError::StepFailed {
+                        index: i,
+                        tool: step.tool.clone(),
+                        message: error.to_string(),
+                    }
+                    .into());
+                }
+            };
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -171,14 +394,14 @@ impl PipelineTool {
                     message: tool_result
                         .error
                         .unwrap_or_else(|| tool_result.output.clone().into_string()),
-                });
+                }
+                .into());
             }
 
-            results.push(StepResult {
+            results.push(PipelineStepOutcome {
                 index: i,
                 tool: step.tool.clone(),
-                success: true,
-                output: tool_result.output.into_string(),
+                result: tool_result,
             });
         }
 
@@ -189,73 +412,241 @@ impl PipelineTool {
     async fn execute_parallel(
         &self,
         steps: &[PipelineStep],
-    ) -> std::result::Result<Vec<StepResult>, PipelineError> {
-        use tokio::task::JoinSet;
+        context: Option<Arc<dyn PipelineExecutionContext>>,
+    ) -> std::result::Result<Vec<PipelineStepOutcome>, PipelineExecutionError> {
+        use tokio::task::{AbortHandle, JoinSet};
 
         let mut join_set = JoinSet::new();
-
-        for (i, step) in steps.iter().enumerate() {
+        let mut pending: BTreeMap<usize, (String, bool, AbortHandle)> = BTreeMap::new();
+        let mut outer_interruption = current_interruption(&context);
+        for (index, step) in steps.iter().enumerate() {
+            if outer_interruption.is_none() {
+                outer_interruption = current_interruption(&context);
+            }
+            if outer_interruption.is_some() {
+                break;
+            }
             let tool = self
-                .find_tool(&step.tool)
+                .tools
+                .iter()
+                .find(|tool| tool.name() == step.tool)
+                .cloned()
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
-
-            // Clone what we need for the spawned task.
-            let tool_name = step.tool.clone();
+            let cooperative = tool.supports_cooperative_settlement();
+            let name = step.tool.clone();
             let args = step.args.clone();
+            let child_context = context.clone();
+            let handle = join_set.spawn(async move {
+                let result = if let Some(context) = child_context {
+                    context.execute(tool.as_ref(), args).await
+                } else {
+                    tool.execute(args).await
+                };
+                (index, result)
+            });
+            pending.insert(index, (name, cooperative, handle));
+        }
 
-            // We need a reference that lives long enough — use Arc.
-            let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
-
-            if let Some(tool_arc) = tool_arc {
-                join_set.spawn(async move {
-                    let result = tool_arc.execute(args).await;
-                    (i, tool_name, result)
-                });
+        let mut results = Vec::with_capacity(steps.len());
+        let mut first_failure = None;
+        let mut terminal = Vec::new();
+        let mut other_errors = Vec::new();
+        let mut unsettled = Vec::new();
+        let mut fast_stop = false;
+        let mut settlement_timed_out = false;
+        let mut settlement_deadline = outer_interruption
+            .as_ref()
+            .map(|_| tokio::time::Instant::now() + CHILD_SETTLEMENT_LIMIT);
+        if outer_interruption.is_some() {
+            for (_, cooperative, handle) in pending.values() {
+                if !cooperative {
+                    handle.abort();
+                }
             }
         }
 
-        let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
+        loop {
+            let joined = if fast_stop {
+                // Retain ready outcomes even when a child misses its settlement
+                // budget. Never wait indefinitely on synchronous child code.
+                join_set.try_join_next()
+            } else if let Some(deadline) = settlement_deadline {
+                tokio::select! {
+                    biased;
+                    result = join_set.join_next() => result,
+                    () = tokio::time::sleep_until(deadline) => {
+                        settlement_timed_out = true;
+                        fast_stop = true;
+                        join_set.abort_all();
+                        continue;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    cause = invocation_interrupted(&context) => {
+                        outer_interruption = Some(cause);
+                        settlement_deadline = Some(tokio::time::Instant::now() + CHILD_SETTLEMENT_LIMIT);
+                        // Cooperative children need to return their own nested
+                        // evidence. Ordinary children retain immediate abort.
+                        for (_, cooperative, handle) in pending.values() {
+                            if !cooperative { handle.abort(); }
+                        }
+                        continue;
+                    }
+                    result = join_set.join_next() => result,
+                }
+            };
+            let Some(joined) = joined else { break };
+            let (index, tool_name, returned) = match joined {
+                Ok((index, returned)) => {
+                    let Some((name, _, _)) = pending.remove(&index) else {
+                        continue;
+                    };
+                    (index, name, returned)
+                }
+                Err(error) => {
+                    let index = pending.iter().find_map(|(index, (_, _, handle))| {
+                        (handle.id() == error.id()).then_some(*index)
+                    });
+                    let Some((index, (name, _, _))) =
+                        index.and_then(|index| pending.remove(&index).map(|entry| (index, entry)))
+                    else {
+                        continue;
+                    };
+                    if error.is_cancelled() {
+                        unsettled.push(PipelineUnsettledStep {
+                            index,
+                            tool: name,
+                            reason: if settlement_timed_out {
+                                PipelineUnsettledReason::SettlementTimeout
+                            } else {
+                                PipelineUnsettledReason::Aborted
+                            },
+                        });
+                    } else {
+                        first_failure.get_or_insert_with(|| PipelineError::StepFailed {
+                            index,
+                            tool: name.clone(),
+                            message: format!("Task join error: {error}"),
+                        });
+                        other_errors.push(PipelineStepFailure {
+                            index,
+                            tool: name,
+                            error: error.into(),
+                        });
+                        if outer_interruption.is_none() {
+                            fast_stop = true;
+                            join_set.abort_all();
+                        }
+                    }
+                    continue;
+                }
+            };
 
-        while let Some(join_result) = join_set.join_next().await {
-            let (index, tool_name, tool_result) =
-                join_result.map_err(|e| PipelineError::StepFailed {
-                    index: 0,
-                    tool: "unknown".to_string(),
-                    message: format!("Task join error: {e}"),
-                })?;
-
-            let tool_result = tool_result.map_err(|e| PipelineError::StepFailed {
-                index,
-                tool: tool_name.clone(),
-                message: e.to_string(),
-            })?;
-
-            if !tool_result.success {
-                return Err(PipelineError::StepFailed {
-                    index,
-                    tool: tool_name,
-                    message: tool_result
-                        .error
-                        .unwrap_or_else(|| tool_result.output.clone().into_string()),
-                });
+            match returned {
+                Ok(result) => {
+                    let failed = !result.success;
+                    if failed {
+                        first_failure.get_or_insert_with(|| PipelineError::StepFailed {
+                            index,
+                            tool: tool_name.clone(),
+                            message: result
+                                .error
+                                .as_deref()
+                                .unwrap_or(result.output.as_str())
+                                .to_owned(),
+                        });
+                    }
+                    results.push(PipelineStepOutcome {
+                        index,
+                        tool: tool_name,
+                        result,
+                    });
+                    if failed && outer_interruption.is_none() {
+                        fast_stop = true;
+                        join_set.abort_all();
+                    }
+                }
+                Err(error) => {
+                    let is_terminal = context
+                        .as_ref()
+                        .is_some_and(|context| context.is_terminal_error(&error));
+                    if !is_terminal {
+                        first_failure.get_or_insert_with(|| PipelineError::StepFailed {
+                            index,
+                            tool: tool_name.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                    let failure = PipelineStepFailure {
+                        index,
+                        tool: tool_name,
+                        error,
+                    };
+                    if is_terminal {
+                        terminal.push(failure);
+                    } else {
+                        other_errors.push(failure);
+                    }
+                    if outer_interruption.is_none() {
+                        outer_interruption = current_interruption(&context);
+                        if outer_interruption.is_some() {
+                            settlement_deadline =
+                                Some(tokio::time::Instant::now() + CHILD_SETTLEMENT_LIMIT);
+                            for (_, cooperative, handle) in pending.values() {
+                                if !cooperative {
+                                    handle.abort();
+                                }
+                            }
+                        } else {
+                            fast_stop = true;
+                            join_set.abort_all();
+                        }
+                    }
+                }
             }
+        }
 
-            results.push(StepResult {
+        for (index, (tool, _, handle)) in pending {
+            handle.abort();
+            unsettled.push(PipelineUnsettledStep {
                 index,
-                tool: tool_name,
-                success: true,
-                output: tool_result.output.into_string(),
+                tool,
+                reason: if settlement_timed_out {
+                    PipelineUnsettledReason::SettlementTimeout
+                } else {
+                    PipelineUnsettledReason::Aborted
+                },
             });
         }
-
-        // Sort by index for deterministic output.
-        results.sort_by_key(|r| r.index);
+        results.sort_by_key(|step| step.index);
+        unsettled.sort_by_key(|step| step.index);
+        if outer_interruption.is_none() {
+            outer_interruption = current_interruption(&context);
+        }
+        if outer_interruption.is_some() || !terminal.is_empty() {
+            terminal.extend(other_errors);
+            return Err(interrupted_execution(
+                results,
+                terminal,
+                outer_interruption,
+                unsettled,
+            ));
+        }
+        if let Some(error) = first_failure {
+            return Err(error.into());
+        }
         Ok(results)
     }
 }
 
 #[async_trait]
 impl Tool for PipelineTool {
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.execution_context.is_some()
+    }
+
     fn name(&self) -> &str {
         Self::NAME
     }
@@ -327,14 +718,29 @@ impl Tool for PipelineTool {
             });
         }
 
+        let context = self
+            .execution_context
+            .as_ref()
+            .and_then(|resolve| resolve());
         let results = if request.parallel {
-            self.execute_parallel(&request.steps).await
+            self.execute_parallel(&request.steps, context).await
         } else {
-            self.execute_sequential(&request.steps).await
+            self.execute_sequential(&request.steps, context).await
         };
 
         match results {
-            Ok(step_results) => {
+            Ok(outcomes) => {
+                // Materialize the existing text-only success contract only
+                // after completion. Terminal errors retain original results.
+                let step_results: Vec<StepResult> = outcomes
+                    .into_iter()
+                    .map(|step| StepResult {
+                        index: step.index,
+                        tool: step.tool,
+                        success: step.result.success,
+                        output: step.result.output.into_string(),
+                    })
+                    .collect();
                 let output = match request.result {
                     PipelineResultMode::Last => step_results
                         .last()
@@ -349,7 +755,8 @@ impl Tool for PipelineTool {
                     error: None,
                 })
             }
-            Err(e) => Ok(ToolResult {
+            Err(PipelineExecutionError::Terminal(error)) => Err(error.into()),
+            Err(PipelineExecutionError::Ordinary(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(e.to_string()),
@@ -365,22 +772,33 @@ pub fn interpolate_args(
     args: &serde_json::Value,
     prior_results: &[StepResult],
 ) -> serde_json::Value {
+    let outputs: Vec<(usize, &str)> = prior_results
+        .iter()
+        .map(|step| (step.index, step.output.as_str()))
+        .collect();
+    interpolate_from_outputs(args, &outputs)
+}
+
+fn interpolate_from_outputs(
+    args: &serde_json::Value,
+    prior_outputs: &[(usize, &str)],
+) -> serde_json::Value {
     match args {
         serde_json::Value::String(s) => {
-            let interpolated = interpolate_string(s, prior_results);
+            let interpolated = interpolate_string(s, prior_outputs);
             serde_json::Value::String(interpolated)
         }
         serde_json::Value::Object(map) => {
             let new_map: serde_json::Map<String, serde_json::Value> = map
                 .iter()
-                .map(|(k, v)| (k.clone(), interpolate_args(v, prior_results)))
+                .map(|(k, v)| (k.clone(), interpolate_from_outputs(v, prior_outputs)))
                 .collect();
             serde_json::Value::Object(new_map)
         }
         serde_json::Value::Array(arr) => {
             let new_arr: Vec<serde_json::Value> = arr
                 .iter()
-                .map(|v| interpolate_args(v, prior_results))
+                .map(|v| interpolate_from_outputs(v, prior_outputs))
                 .collect();
             serde_json::Value::Array(new_arr)
         }
@@ -389,7 +807,7 @@ pub fn interpolate_args(
 }
 
 /// Perform single-pass interpolation of `{{step[N].result}}` in a string.
-fn interpolate_string(s: &str, prior_results: &[StepResult]) -> String {
+fn interpolate_string(s: &str, prior_outputs: &[(usize, &str)]) -> String {
     let mut result = String::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
 
@@ -401,7 +819,7 @@ fn interpolate_string(s: &str, prior_results: &[StepResult]) -> String {
             let rest = &s[i..];
             if let Some(end) = find_template_end(rest) {
                 let template = &rest[2..end]; // strip {{ and }}
-                if let Some(value) = resolve_template(template, prior_results) {
+                if let Some(value) = resolve_template_output(template, prior_outputs) {
                     // Strip any `{{` in the resolved value to prevent injection.
                     result.push_str(&value.replace("{{", ""));
                     // Skip past the closing `}}`
@@ -425,7 +843,7 @@ fn find_template_end(s: &str) -> Option<usize> {
 }
 
 /// Resolve a template reference like `step[0].result`.
-fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<String> {
+fn resolve_template_output(template: &str, prior_outputs: &[(usize, &str)]) -> Option<String> {
     let template = template.trim();
     if !template.starts_with("step[") || !template.ends_with(".result") {
         return None;
@@ -435,10 +853,10 @@ fn resolve_template(template: &str, prior_results: &[StepResult]) -> Option<Stri
     let index_str = &template[5..bracket_end];
     let index: usize = index_str.parse().ok()?;
 
-    prior_results
+    prior_outputs
         .iter()
-        .find(|r| r.index == index)
-        .map(|r| r.output.clone())
+        .find(|(step_index, _)| *step_index == index)
+        .map(|(_, output)| (*output).to_owned())
 }
 
 #[cfg(test)]
@@ -809,28 +1227,23 @@ mod tests {
 
     #[test]
     fn resolve_valid_template() {
-        let results = vec![StepResult {
-            index: 0,
-            tool: "a".to_string(),
-            success: true,
-            output: "hello".to_string(),
-        }];
+        let results = vec![(0, "hello")];
         assert_eq!(
-            resolve_template("step[0].result", &results),
+            resolve_template_output("step[0].result", &results),
             Some("hello".to_string())
         );
     }
 
     #[test]
     fn resolve_invalid_template_format() {
-        assert_eq!(resolve_template("invalid", &[]), None);
-        assert_eq!(resolve_template("step.result", &[]), None);
-        assert_eq!(resolve_template("step[abc].result", &[]), None);
+        assert_eq!(resolve_template_output("invalid", &[]), None);
+        assert_eq!(resolve_template_output("step.result", &[]), None);
+        assert_eq!(resolve_template_output("step[abc].result", &[]), None);
     }
 
     #[test]
     fn resolve_out_of_range_index() {
-        assert_eq!(resolve_template("step[5].result", &[]), None);
+        assert_eq!(resolve_template_output("step[5].result", &[]), None);
     }
 
     // ── Result mode ────────────────────────────────────────

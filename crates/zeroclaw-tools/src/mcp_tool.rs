@@ -125,7 +125,12 @@ impl Tool for McpToolWrapper {
                     }),
                 }
             }
-            Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
+            Err(e)
+                if e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || crate::mcp_lifecycle::is_lifecycle_interrupted(&e) =>
+            {
+                Err(e)
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),

@@ -1,5 +1,9 @@
 //! Tool execution helpers extracted from `loop_`.
 
+#[cfg(test)]
+#[path = "tool_execution/estop_tests.rs"]
+mod estop_tests;
+
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,10 +17,30 @@ use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
 use zeroclaw_api::attribution::Attributable;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
+use super::loop_::{ParsedToolCall, is_tool_loop_cancelled, scrub_credentials};
 use super::turn::{ModelSwitchCallback, TurnMeta, scope_model_switch_state};
 
 const OBSERVER_TEXT_BYTES: usize = 4096;
+
+/// These errors own execution or settlement evidence. Their original objects
+/// must reach the caller; ordinary error rendering would discard that evidence
+/// and permit recovery to retry work whose disposition is still unknown.
+pub(crate) fn is_terminal_tool_error(error: &anyhow::Error) -> bool {
+    fn contains<T: std::error::Error + Send + Sync + 'static>(error: &anyhow::Error) -> bool {
+        error.is::<T>() || error.chain().any(|cause| cause.is::<T>())
+    }
+    is_tool_loop_cancelled(error)
+        || contains::<zeroclaw_api::deadline::DeadlineExceeded>(error)
+        || contains::<zeroclaw_api::delivery::DeliveryFailure>(error)
+        || contains::<super::turn::results_collect::ResultBudgetExceeded>(error)
+        || contains::<super::turn::sop_settlement::SopDriveInterrupted>(error)
+        || contains::<super::turn::sop_settlement::SopPhaseIncomplete>(error)
+        || contains::<super::turn::owned_cancellation::TurnSettlementIncomplete>(error)
+        || contains::<super::turn::owned_cancellation::TurnCompletedAfterInterruption>(error)
+        || contains::<crate::tools::delegate::settlement::DelegateTerminalError>(error)
+        || contains::<crate::tools::delegate::settlement::DelegateAgenticError>(error)
+        || contains::<zeroclaw_tools::pipeline::PipelineTerminalError>(error)
+}
 
 pub(crate) fn bounded_observer_text(text: &str) -> String {
     // Reject oversized bodies before scrubbing/allocation. Cutting a secret at
@@ -227,6 +251,26 @@ pub enum ToolFailureKind {
 
 // ── Single tool execution ────────────────────────────────────────────────
 
+/// Presentation may be dropped on cancellation, but never the completed outcome
+/// held by execute_one_tool while this awaits a slow consumer.
+async fn publish_tool_event(
+    tx: &Sender<TurnEvent>,
+    event: TurnEvent,
+    token: Option<&CancellationToken>,
+    estop: Option<&crate::security::estop_runtime::EstopRuntime>,
+    tool_name: &str,
+) -> anyhow::Result<()> {
+    let publish = async {
+        let _ = super::turn::outcome::until_cancelled(token, tx.send(event)).await?;
+        Ok(())
+    };
+    if let Some(estop) = estop {
+        estop.run(Some(tool_name), publish).await
+    } else {
+        publish.await
+    }
+}
+
 pub(crate) async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -362,36 +406,33 @@ pub(crate) async fn execute_one_tool(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+    let estop = crate::security::estop_runtime::current();
     if let Some(tx) = event_tx {
-        let _ = tx
-            .send(TurnEvent::ToolCall {
+        publish_tool_event(
+            tx,
+            TurnEvent::ToolCall {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
                 args: call_arguments.clone(),
-            })
-            .await;
+            },
+            cancellation_token,
+            estop.as_ref(),
+            tool.name(),
+        )
+        .await?;
     }
 
-    let tool_future = zeroclaw_api::deadline::run_inherited_phase(
-        zeroclaw_api::deadline::Phase::Tool,
+    let execute = crate::security::estop_runtime::run_tool(
+        tool,
+        cancellation_token,
         tool.execute(call_arguments.clone())
             .instrument(tool_span.clone()),
     );
-    let execute = async {
-        if let Some(token) = cancellation_token {
-            tokio::select! {
-                () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
-                result = tool_future => Ok(result),
-            }
-        } else {
-            Ok(tool_future.await)
-        }
-    };
     let tool_result = if let Some(model_switch_callback) = dispatch.model_switch_callback {
         scope_model_switch_state(Arc::clone(model_switch_callback), execute).await
     } else {
         execute.await
-    }?;
+    };
 
     let outcome = {
         let _result_guard = tool_span.entered();
@@ -500,11 +541,7 @@ pub(crate) async fn execute_one_tool(
             Err(e) => {
                 // These carry durable/phase evidence. Flattening them would let
                 // recovery treat uncertain delivery as an ordinary retryable error.
-                if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
-                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
-                    || e.is::<super::turn::results_collect::ResultBudgetExceeded>()
-                    || is_tool_loop_cancelled(&e)
-                {
+                if is_terminal_tool_error(&e) {
                     return Err(e);
                 }
                 let duration = start.elapsed();
@@ -584,8 +621,9 @@ pub(crate) async fn execute_one_tool(
     if let Some(tx) = event_tx
         && let Ok(out) = &outcome
     {
-        let _ = tx
-            .send(TurnEvent::ToolResult {
+        let _ = publish_tool_event(
+            tx,
+            TurnEvent::ToolResult {
                 id: event_call_id.clone(),
                 name: call_name.to_string(),
                 output: bounded_observer_text(&out.output),
@@ -599,8 +637,12 @@ pub(crate) async fn execute_one_tool(
                             zeroclaw_tools::output_budget::ROUND_PAYLOAD_BYTES,
                         )
                     }),
-            })
-            .await;
+            },
+            cancellation_token,
+            estop.as_ref(),
+            tool.name(),
+        )
+        .await;
     }
 
     // After the ToolResult card closes, publish the plan if this was a
@@ -610,7 +652,14 @@ pub(crate) async fn execute_one_tool(
         && let Ok(out) = &outcome
         && let Some(plan_event) = maybe_plan_event(call_name, out.success, &call_arguments)
     {
-        let _ = tx.send(plan_event).await;
+        let _ = publish_tool_event(
+            tx,
+            plan_event,
+            cancellation_token,
+            estop.as_ref(),
+            tool.name(),
+        )
+        .await;
     }
 
     outcome

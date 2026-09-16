@@ -1322,3 +1322,13 @@ channel-runtime-delegate-completed = Completed delegated work (task { $task_id }
 cli-cron-completion-check-failed = Scheduled task completion check failed: { $detail }
 
 cron-reconcile-rejected = Reconciliation rejected: exact current quarantined job/run/occurrence and non-conflicting operator evidence are required. No replay is authorized.
+estop-runtime-interrupted = Emergency stop interrupted this operation. Inspect the stop status and explicitly resume before starting new work. An external action already accepted by a service may still complete.
+
+estop-tool-settlement-incomplete = The tool stopped before its completed results could be fully collected. Check its recorded effects before retrying.
+
+# Owned delegate cancellation settlement
+delegate-settlement-incomplete = Delegated execution did not settle.
+delegate-cancellation-requested = Cancellation requested for task '{ $task_id }'; its owner is settling pending work.
+delegate-cancellation-owner-missing = Task '{ $task_id }' has no live owner; its execution outcome is unknown. The stored result was not changed.
+turn-settlement-incomplete = The turn stopped before all pending work could settle. Some results may be incomplete; reconcile recorded effects before retrying.
+sop-settlement-incomplete = The workflow stopped with unfinished cleanup or persistence. Its recorded results remain available; reconcile its pending work before restarting it.

@@ -91,43 +91,47 @@ pub(crate) async fn record_executed_outcomes(
         if !publish_auxiliary {
             continue;
         }
-        // ── Hook: after_tool_call (void) ─────────────────
-        if let Some(hooks) = ctx.hooks {
-            let tool_result_obj = crate::tools::ToolResult {
-                success: outcome.success,
-                output: outcome.output.clone().into(),
-                error: None,
-            };
-            hooks
-                .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
-                .await;
-        }
-
-        // ── Progress: tool completion ───────────────────────
-        send_progress(ctx.on_delta, ProgressEvent::Planning).await;
-        if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
-            let secs = outcome.duration.as_secs();
-            ::zeroclaw_log::record!(
-                DEBUG,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_attrs(::serde_json::json!({"tool": call.name, "secs": secs})),
-                "Sending progress complete to draft"
-            );
-            let _ = tx
-                .send(StreamDelta::ToolComplete {
-                    tool: call.name.clone(),
-                    arguments: std::sync::Arc::clone(&stream_call.arguments),
-                    tool_provenance: stream_call.tool_provenance,
-                    secs,
+        // Cancelling auxiliary consumers must still settle every completed slot.
+        let _ = super::outcome::until_cancelled(ctx.cancellation_token, async {
+            // ── Hook: after_tool_call (void) ─────────────────
+            if let Some(hooks) = ctx.hooks {
+                let tool_result_obj = crate::tools::ToolResult {
                     success: outcome.success,
-                    error: outcome
-                        .error_reason
-                        .as_deref()
-                        .map(crate::agent::tool_execution::bounded_observer_text),
-                })
-                .await;
-        }
+                    output: outcome.output.clone().into(),
+                    error: None,
+                };
+                hooks
+                    .fire_after_tool_call(&call.name, &tool_result_obj, outcome.duration)
+                    .await;
+            }
+
+            // ── Progress: tool completion ───────────────────────
+            send_progress(ctx.on_delta, ProgressEvent::Planning).await;
+            if let (Some(tx), Some(stream_call)) = (ctx.on_delta, stream_call) {
+                let secs = outcome.duration.as_secs();
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_attrs(::serde_json::json!({"tool": call.name, "secs": secs})),
+                    "Sending progress complete to draft"
+                );
+                let _ = tx
+                    .send(StreamDelta::ToolComplete {
+                        tool: call.name.clone(),
+                        arguments: std::sync::Arc::clone(&stream_call.arguments),
+                        tool_provenance: stream_call.tool_provenance,
+                        secs,
+                        success: outcome.success,
+                        error: outcome
+                            .error_reason
+                            .as_deref()
+                            .map(crate::agent::tool_execution::bounded_observer_text),
+                    })
+                    .await;
+            }
+        })
+        .await;
     }
     Ok(())
 }

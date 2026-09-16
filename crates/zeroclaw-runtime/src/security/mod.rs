@@ -11,6 +11,10 @@ pub mod docker;
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
+pub(crate) mod estop_pipeline;
+pub(crate) mod estop_runtime;
+#[cfg(test)]
+mod estop_runtime_mcp_tests;
 pub mod external_content;
 #[cfg(target_os = "linux")]
 pub mod firejail;

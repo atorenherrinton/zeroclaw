@@ -408,6 +408,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.target_tool.supports_cooperative_settlement()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -449,7 +453,14 @@ impl Tool for SkillBuiltinTool {
             "skill-scoped elevated tool invoked"
         );
         let merged = merge_locked_args(&self.locked_args, args);
-        self.target_tool.execute(merged).await
+        // The outer skill alias is not the delegated capability's name. Reuse
+        // the current invocation's authority at this actual dispatch boundary.
+        crate::security::estop_runtime::run_tool(
+            self.target_tool.as_ref(),
+            None,
+            self.target_tool.execute(merged),
+        )
+        .await
     }
 }
 

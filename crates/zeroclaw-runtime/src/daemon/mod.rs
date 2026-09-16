@@ -649,6 +649,10 @@ pub async fn run(
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
 
+    // One live configuration authority for this daemon iteration, including
+    // maintenance when no RPC transport is configured. RPC edits update this
+    // same Arc; recovery handles resolve it rather than retaining stop policy.
+    let live_config = std::sync::Arc::new(parking_lot::RwLock::new(config.clone()));
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
         use crate::rpc::session::SessionStore;
@@ -775,7 +779,7 @@ pub async fn run(
         };
 
         Some(std::sync::Arc::new(RpcContext {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config.clone())),
+            config: std::sync::Arc::clone(&live_config),
             config_write_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             sessions,
             session_backend,
@@ -952,6 +956,9 @@ pub async fn run(
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_estop = crate::security::estop_runtime::EstopRuntime::from_live_config(
+            std::sync::Arc::clone(&live_config),
+        );
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -959,7 +966,16 @@ pub async fn run(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let estop = heartbeat_estop.clone();
+                // Scope authority without cancelling the worker's registry
+                // ownership or cleanup when a stop is engaged.
+                async move {
+                    crate::security::estop_runtime::scope(
+                        Some(estop),
+                        Box::pin(run_heartbeat_worker(cfg)),
+                    )
+                    .await
+                }
             },
         ));
     }
@@ -1508,7 +1524,7 @@ fn missing_or_dead_servers(
     let healthy_names: std::collections::HashSet<String> = cur
         .server_handles()
         .into_iter()
-        .filter(|(name, _)| !dead.contains(name))
+        .filter(|(name, server)| !dead.contains(name) || server.check_replacement().is_err())
         .map(|(name, _)| name)
         .collect();
     granted
@@ -1522,6 +1538,13 @@ async fn connect_heartbeat_mcp_registry(
     agent_alias: &str,
     current: Option<&std::sync::Arc<crate::tools::McpRegistry>>,
 ) -> Result<Option<std::sync::Arc<crate::tools::McpRegistry>>> {
+    if let Some(control) = zeroclaw_tools::mcp_lifecycle::current_mcp_lifecycle_control()
+        && control.check().is_err()
+    {
+        // Defer maintenance while preserving the current registry and its
+        // originating per-tool recovery authority.
+        return Ok(None);
+    }
     // Only (re)connect what `current` doesn't already have healthy --
     // a healthy server must never be respawned/re-handshaked just
     // because a sibling grant is missing or dead (see
@@ -1621,7 +1644,7 @@ async fn reconcile_heartbeat_mcp_registry(
     let current_handles = current_arc.server_handles();
     let healthy_handles: Vec<(String, crate::tools::McpServer)> = current_handles
         .into_iter()
-        .filter(|(name, _)| !dead.contains(name))
+        .filter(|(name, server)| !dead.contains(name) || server.check_replacement().is_err())
         .collect();
     let healthy_names: std::collections::HashSet<String> =
         healthy_handles.iter().map(|(n, _)| n.clone()).collect();
@@ -1664,7 +1687,7 @@ async fn reconcile_heartbeat_mcp_registry(
     let mut current_by_name: std::collections::HashMap<String, crate::tools::McpServer> =
         current_after_drop
             .into_iter()
-            .filter(|(name, _)| !dead.contains(name))
+            .filter(|(name, server)| !dead.contains(name) || server.check_replacement().is_err())
             .collect();
     let mut churn = false;
     for (name, server) in &merged {
@@ -4847,6 +4870,132 @@ mod tests {
 
         // `_hook_guard` drops here, releasing the serialising lock and
         // clearing the global hook for the next test.
+    }
+
+    #[tokio::test]
+    async fn estop_heartbeat_retry_retains_originating_stop_and_healthy_peer_until_resume() {
+        use crate::security::estop::{EstopLevel, EstopManager, ResumeSelector};
+        use crate::security::estop_runtime::{self, EstopRuntime};
+        use std::sync::Arc;
+        use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.security.estop.enabled = true;
+        config.security.estop.require_otp_to_resume = false;
+        config.security.estop.state_file = "estop-state.json".into();
+        config.mcp.enabled = true;
+        config.mcp.servers = ["server-a", "server-b", "server-c"]
+            .into_iter()
+            .map(test_server_config)
+            .collect();
+        config.mcp_bundles.insert(
+            "abc".into(),
+            McpBundleConfig {
+                servers: vec!["server-a".into(), "server-b".into(), "server-c".into()],
+                exclude: vec![],
+            },
+        );
+        config.agents.insert(
+            "ops".into(),
+            AliasedAgentConfig {
+                mcp_bundles: vec!["abc".into()],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        assert_eq!(config.install_root_dir(), tmp.path());
+        let mut manager = EstopManager::load(&config.security.estop, tmp.path()).unwrap();
+        let live = Arc::new(parking_lot::RwLock::new(config.clone()));
+        let runtime = EstopRuntime::from_live_config(live.clone());
+        let originating = runtime
+            .run(Some("server-a__effect"), async {
+                Ok(zeroclaw_tools::mcp_lifecycle::current_mcp_lifecycle_control().unwrap())
+            })
+            .await
+            .unwrap();
+        let retired = make_test_server_handle("server-a");
+        retired.for_test_retire_with_control(originating);
+        let healthy = make_test_server_handle("server-b");
+        manager
+            .engage(EstopLevel::ToolFreeze(vec!["server-a__effect".into()]))
+            .unwrap();
+        let mut shared = Some(Arc::new(
+            crate::tools::McpRegistry::for_test_with_server_handles(vec![
+                ("server-a".into(), retired.clone()),
+                ("server-b".into(), healthy.clone()),
+            ]),
+        ));
+        let requested = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let observed = requested.clone();
+        let _hook = set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, servers| {
+            observed
+                .lock()
+                .unwrap()
+                .push(servers.iter().map(|s| s.name.clone()).collect());
+            Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
+                servers
+                    .iter()
+                    .map(|s| (s.name.clone(), make_test_server_handle(&s.name)))
+                    .collect(),
+            ))
+        }))
+        .await;
+        estop_runtime::scope(
+            Some(runtime.clone()),
+            retry_heartbeat_mcp_registry(&mut shared, &config, "ops"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requested.lock().unwrap()[0], ["server-c"]);
+        let handles: std::collections::HashMap<_, _> = shared
+            .as_ref()
+            .unwrap()
+            .server_handles()
+            .into_iter()
+            .collect();
+        assert!(handles["server-a"].ptr_eq(&retired));
+        assert!(handles["server-b"].ptr_eq(&healthy));
+        let added = handles["server-c"].clone();
+
+        // A global stop defers the maintenance scope, including fresh connect.
+        manager.engage(EstopLevel::KillAll).unwrap();
+        estop_runtime::scope(
+            Some(runtime.clone()),
+            retry_heartbeat_mcp_registry(&mut shared, &config, "ops"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requested.lock().unwrap().len(), 1);
+        manager.resume(ResumeSelector::KillAll, None, None).unwrap();
+
+        // The stored originating control resolves the same live enablement.
+        live.write().security.estop.enabled = false;
+        retired.check_replacement().unwrap();
+        live.write().security.estop.enabled = true;
+        assert!(retired.check_replacement().is_err());
+        manager
+            .resume(
+                ResumeSelector::Tools(vec!["server-a__effect".into()]),
+                None,
+                None,
+            )
+            .unwrap();
+        estop_runtime::scope(
+            Some(runtime),
+            retry_heartbeat_mcp_registry(&mut shared, &config, "ops"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(requested.lock().unwrap()[1], ["server-a"]);
+        let handles: std::collections::HashMap<_, _> = shared
+            .as_ref()
+            .unwrap()
+            .server_handles()
+            .into_iter()
+            .collect();
+        assert!(!handles["server-a"].ptr_eq(&retired));
+        assert!(handles["server-b"].ptr_eq(&healthy));
+        assert!(handles["server-c"].ptr_eq(&added));
     }
 
     /// When every granted server already has a healthy current handle,

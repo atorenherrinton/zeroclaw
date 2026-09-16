@@ -467,6 +467,16 @@ pub(crate) trait SharedMcpTransportConn: Send + Sync {
         Ok(())
     }
 
+    /// Preserve mandatory cleanup inside reset; implementations that spawn a
+    /// replacement must check again at that actual spawn boundary.
+    async fn reset_with_control(
+        &self,
+        control: Option<&dyn crate::mcp_lifecycle::McpLifecycleControl>,
+    ) -> Result<()> {
+        crate::mcp_lifecycle::check(control)?;
+        self.reset().await
+    }
+
     /// Check whether the underlying transport is still alive without sending a
     /// real request.  The HTTP and SSE transports always return `Ok(true)` —
     /// connection drops surface through `send_and_recv` errors.  The stdio
@@ -477,6 +487,12 @@ pub(crate) trait SharedMcpTransportConn: Send + Sync {
 
     /// Close the connection.
     async fn close(&self) -> Result<()>;
+
+    /// A cancelled constructor never published a usable session. Stdio can
+    /// skip courtesy delay, while still awaiting owned child reaping.
+    async fn close_cancelled_construction(&self) -> Result<()> {
+        self.close().await
+    }
 }
 
 // ── Stdio Transport ──────────────────────────────────────────────────────
@@ -746,6 +762,14 @@ impl StdioTransport {
     }
 
     async fn reap_conn(conn: StdioConn, server_name: &str) -> Result<()> {
+        Self::reap_conn_with_grace(conn, server_name, STDIO_CLOSE_GRACE).await
+    }
+
+    async fn reap_conn_with_grace(
+        conn: StdioConn,
+        server_name: &str,
+        grace: Duration,
+    ) -> Result<()> {
         // Clone the shared handles needed after the connection is gone.
         let child = Arc::clone(&conn.child);
         let child_exited = Arc::clone(&conn.child_exited);
@@ -763,7 +787,7 @@ impl StdioTransport {
         // saw. A server that honors EOF exits near-instantly, so this only adds
         // latency when a server ignores EOF and must be signalled regardless.
         // Escalate to a signal only if the child is still running afterward.
-        if timeout(STDIO_CLOSE_GRACE, child.wait()).await.is_err() {
+        if grace.is_zero() || timeout(grace, child.wait()).await.is_err() {
             child
                 .start_kill()
                 .with_context(|| format!("failed to kill MCP server `{server_name}` child"))?;
@@ -774,6 +798,24 @@ impl StdioTransport {
         }
         // The direct child is now gone regardless of stdout pipe state.
         child_exited.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    async fn close_with_grace(&self, grace: Duration) -> Result<()> {
+        let mut state = self.state.lock().await;
+        if state.closed {
+            return Ok(());
+        }
+        state.closed = true;
+        let old_generation = self.active_generation.fetch_add(1, Ordering::AcqRel);
+        self.alive.store(false, Ordering::Release);
+        drain_pending_generation(&self.pending, old_generation);
+        self.calls
+            .lock()
+            .retain(|(generation, _), _| *generation != old_generation);
+        if let Some(conn) = state.conn.take() {
+            Self::reap_conn_with_grace(conn, &self.config.name, grace).await?;
+        }
         Ok(())
     }
 }
@@ -1467,6 +1509,13 @@ impl SharedMcpTransportConn for StdioTransport {
     }
 
     async fn reset(&self) -> Result<()> {
+        self.reset_with_control(None).await
+    }
+
+    async fn reset_with_control(
+        &self,
+        control: Option<&dyn crate::mcp_lifecycle::McpLifecycleControl>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
         if state.closed {
             bail!("MCP stdio transport is closed");
@@ -1482,6 +1531,9 @@ impl SharedMcpTransportConn for StdioTransport {
             Self::reap_conn(conn, &self.config.name).await?;
         }
 
+        // A stop during old-child cleanup must not interrupt reaping or create
+        // a replacement helper afterward.
+        crate::mcp_lifecycle::check(control)?;
         let generation = old_generation.wrapping_add(1);
         let conn = Self::spawn(
             &self.config,
@@ -1497,21 +1549,11 @@ impl SharedMcpTransportConn for StdioTransport {
     }
 
     async fn close(&self) -> Result<()> {
-        let mut state = self.state.lock().await;
-        if state.closed {
-            return Ok(());
-        }
-        state.closed = true;
-        let old_generation = self.active_generation.fetch_add(1, Ordering::AcqRel);
-        self.alive.store(false, Ordering::Release);
-        drain_pending_generation(&self.pending, old_generation);
-        self.calls
-            .lock()
-            .retain(|(generation, _), _| *generation != old_generation);
-        if let Some(conn) = state.conn.take() {
-            Self::reap_conn(conn, &self.config.name).await?;
-        }
-        Ok(())
+        self.close_with_grace(STDIO_CLOSE_GRACE).await
+    }
+
+    async fn close_cancelled_construction(&self) -> Result<()> {
+        self.close_with_grace(Duration::ZERO).await
     }
 
     fn health_check(&self) -> bool {

@@ -254,15 +254,20 @@ impl ScopedToolRegistry {
             .cloned()
             .collect();
         let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
-                config.pipeline.clone(),
-                context_filtered_tool_arcs.clone(),
-                zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                    security.allowed_tools.as_deref(),
-                    security.excluded_tools.as_deref(),
-                    caller_allowed,
-                ),
-            )) as Arc<dyn Tool>
+            Arc::new(
+                tools::PipelineTool::with_access_policy(
+                    config.pipeline.clone(),
+                    context_filtered_tool_arcs.clone(),
+                    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                        security.allowed_tools.as_deref(),
+                        security.excluded_tools.as_deref(),
+                        caller_allowed,
+                    ),
+                )
+                .with_execution_context_resolver(Arc::new(
+                    crate::security::estop_pipeline::current_context,
+                )),
+            ) as Arc<dyn Tool>
         });
         if let Some(tool) = pipeline_tool.as_ref() {
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));

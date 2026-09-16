@@ -100,7 +100,12 @@ impl Tool for McpPromptsTool {
                                     }
                                 }
                             }
-                            Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
+                            Err(e)
+                                if e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                                    || crate::mcp_lifecycle::is_lifecycle_interrupted(&e) =>
+                            {
+                                Err(e)
+                            }
                             Err(e) => Ok(Self::fail(e.to_string())),
                         }
                     }
@@ -134,7 +139,12 @@ impl Tool for McpPromptsTool {
                             crate::mcp_context::render_prompt_messages(&server, &name, &result);
                         Ok(Self::ok(rendered))
                     }
-                    Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
+                    Err(e)
+                        if e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                            || crate::mcp_lifecycle::is_lifecycle_interrupted(&e) =>
+                    {
+                        Err(e)
+                    }
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

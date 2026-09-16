@@ -221,7 +221,7 @@ pub struct SlackChannel {
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
     /// Emoji reaction name (without colons) that cancels an in-flight request.
     cancel_reaction: Option<String>,
-    pending_approvals: Arc<AsyncMutex<HashMap<String, crate::util::PendingApproval>>>,
+    pending_approvals: Arc<crate::util::PendingApprovalMap>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -480,7 +480,7 @@ impl SlackChannel {
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
             cancel_reaction: None,
-            pending_approvals: Arc::new(AsyncMutex::new(HashMap::new())),
+            pending_approvals: Arc::new(crate::util::PendingApprovalMap::default()),
             approval_timeout_secs: 300,
             cached_bot_user_id: Mutex::new(None),
         }
@@ -6011,9 +6011,11 @@ impl Channel for SlackChannel {
         let token = crate::util::new_approval_token();
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
+        self.pending_approvals.lock().insert(
             token.clone(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-telegram", test))]
+                registration_id: uuid::Uuid::new_v4(),
                 sender: tx,
                 destination: recipient.to_string(),
                 tool_name: request.tool_name.clone(),
@@ -6068,7 +6070,7 @@ impl Channel for SlackChannel {
         };
 
         if let Err(err) = send_result {
-            self.pending_approvals.lock().await.remove(&token);
+            self.pending_approvals.lock().remove(&token);
             return Err(err);
         }
 
@@ -6078,14 +6080,14 @@ impl Channel for SlackChannel {
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
                 Ok(Ok(resp)) => zeroclaw_api::channel::AttributedApprovalResponse::operator(resp),
                 Ok(Err(_)) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    self.pending_approvals.lock().remove(&token);
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::Unreachable,
                     )
                 }
                 Err(_) => {
-                    self.pending_approvals.lock().await.remove(&token);
+                    self.pending_approvals.lock().remove(&token);
                     zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
                         ChannelApprovalResponse::Deny,
                         zeroclaw_api::channel::ApprovalSource::TimedOut,
@@ -8819,9 +8821,11 @@ mod tests {
             Arc::new(|| vec!["U_OPERATOR".into()]),
         );
         let (tx, rx) = oneshot::channel();
-        ch.pending_approvals.lock().await.insert(
+        ch.pending_approvals.lock().insert(
             "abc123".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-telegram", test))]
+                registration_id: uuid::Uuid::new_v4(),
                 sender: tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
@@ -8844,7 +8848,7 @@ mod tests {
                 .await,
                 crate::util::PendingApprovalResolution::Rejected,
             );
-            assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+            assert!(ch.pending_approvals.lock().contains_key("abc123"));
         }
         assert_eq!(
             crate::util::resolve_pending_approval(
@@ -8857,7 +8861,7 @@ mod tests {
             .await,
             crate::util::PendingApprovalResolution::Rejected,
         );
-        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+        assert!(ch.pending_approvals.lock().contains_key("abc123"));
 
         assert_eq!(
             crate::util::resolve_pending_approval(
@@ -8873,9 +8877,11 @@ mod tests {
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
 
         let (approve_tx, approve_rx) = oneshot::channel();
-        ch.pending_approvals.lock().await.insert(
+        ch.pending_approvals.lock().insert(
             "def456".to_string(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-telegram", test))]
+                registration_id: uuid::Uuid::new_v4(),
                 sender: approve_tx,
                 destination: "C_ORIGIN".to_string(),
                 tool_name: "tool".to_string(),
@@ -8935,10 +8941,12 @@ mod tests {
         let (wrong_tx, _wrong_rx) = oneshot::channel();
         let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
         {
-            let mut approvals = pending.lock().await;
+            let mut approvals = pending.lock();
             approvals.insert(
                 "auth01".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -8947,6 +8955,8 @@ mod tests {
             approvals.insert(
                 "wrong1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: wrong_tx,
                     destination: "C_OTHER".into(),
                     tool_name: "tool".to_string(),
@@ -8955,6 +8965,8 @@ mod tests {
             approvals.insert(
                 "other1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -8978,10 +8990,11 @@ mod tests {
                 .is_err(),
             "approval-shaped messages must not reach agent dispatch"
         );
-        let approvals = pending.lock().await;
-        assert!(approvals.contains_key("wrong1"));
-        assert!(approvals.contains_key("other1"));
-        drop(approvals);
+        {
+            let approvals = pending.lock();
+            assert!(approvals.contains_key("wrong1"));
+            assert!(approvals.contains_key("other1"));
+        }
 
         listener.abort();
         let _ = listener.await;
@@ -9012,10 +9025,12 @@ mod tests {
         let (wrong_tx, _wrong_rx) = oneshot::channel();
         let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
         {
-            let mut approvals = pending.lock().await;
+            let mut approvals = pending.lock();
             approvals.insert(
                 "auth01".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: approved_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -9024,6 +9039,8 @@ mod tests {
             approvals.insert(
                 "wrong1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: wrong_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -9032,6 +9049,8 @@ mod tests {
             approvals.insert(
                 "other1".into(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: unauthorized_tx,
                     destination: "C_ORIGIN".into(),
                     tool_name: "tool".to_string(),
@@ -9086,7 +9105,7 @@ mod tests {
                 .is_err(),
             "approval-shaped Socket Mode payloads must not reach agent dispatch"
         );
-        let approvals = pending.lock().await;
+        let approvals = pending.lock();
         assert!(approvals.contains_key("wrong1"));
         assert!(approvals.contains_key("other1"));
     }

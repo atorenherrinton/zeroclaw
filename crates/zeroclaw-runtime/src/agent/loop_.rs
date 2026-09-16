@@ -1207,6 +1207,9 @@ pub async fn run(
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
 ) -> Result<String> {
+    crate::security::estop_runtime::current()
+        .unwrap_or_else(|| crate::security::estop_runtime::EstopRuntime::from_config(&config))
+        .check(None)?;
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);

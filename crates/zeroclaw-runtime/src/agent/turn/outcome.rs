@@ -37,7 +37,27 @@ impl std::fmt::Display for ToolLoopCancelled {
 impl std::error::Error for ToolLoopCancelled {}
 
 pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
-    err.chain().any(|source| source.is::<ToolLoopCancelled>())
+    err.is::<ToolLoopCancelled>()
+        || crate::security::estop_runtime::is_estop_interrupted(err)
+        || err.chain().any(|source| source.is::<ToolLoopCancelled>())
+}
+
+/// Await an owned preparation or presentation future without stranding a turn
+/// on a stopped hook/consumer. Execution result settlement must stay outside
+/// this scope so already completed tool evidence is retained.
+pub(crate) async fn until_cancelled<T>(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    future: impl std::future::Future<Output = T>,
+) -> anyhow::Result<T> {
+    if let Some(token) = token {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+            result = future => Ok(result),
+        }
+    } else {
+        Ok(future.await)
+    }
 }
 
 #[derive(Debug)]

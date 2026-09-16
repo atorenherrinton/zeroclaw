@@ -2,6 +2,8 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
+mod async_cli;
+
 use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
@@ -254,6 +256,17 @@ impl ApprovalManager {
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
+
+    /// Task-owned terminal I/O for the async tool loop. Dropping this future
+    /// closes its reader; it never leaves a blocking stdin task behind.
+    /// No controlling terminal (including piped-only input), or a platform
+    /// without the owned nonblocking backend, is an unavailable approval route.
+    pub(crate) async fn prompt_cli_async(
+        &self,
+        request: &ApprovalRequest,
+    ) -> io::Result<ApprovalResponse> {
+        async_cli::prompt(request).await
+    }
 }
 
 // ── CLI prompt ───────────────────────────────────────────────────
@@ -261,18 +274,7 @@ impl ApprovalManager {
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
-    let summary = summarize_args(&request.arguments);
-    let tool_args = [("tool", request.tool_name.as_str())];
-    eprintln!();
-    eprintln!(
-        "{}",
-        crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
-    );
-    eprintln!("   {summary}");
-    eprint!(
-        "{}",
-        crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
-    );
+    eprint!("{}", format_cli_approval_prompt(request));
     let _ = io::stderr().flush();
 
     let Ok(line) = read_cli_approval_line() else {
@@ -280,6 +282,16 @@ fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     };
 
     parse_cli_approval_response(&line)
+}
+
+fn format_cli_approval_prompt(request: &ApprovalRequest) -> String {
+    let tool_args = [("tool", request.tool_name.as_str())];
+    format!(
+        "\n{}\n   {}\n{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args),
+        summarize_args(&request.arguments),
+        crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args),
+    )
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {

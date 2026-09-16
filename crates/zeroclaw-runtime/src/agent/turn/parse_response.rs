@@ -298,14 +298,16 @@ pub(crate) async fn record_accepted_chat_response(
     if let Some(tx) = ctx.event_tx
         && let Some(usage) = usage
     {
-        let _ = tx
-            .send(TurnEvent::Usage {
+        let _ = super::outcome::until_cancelled(
+            ctx.cancellation_token,
+            tx.send(TurnEvent::Usage {
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd,
-            })
-            .await;
+            }),
+        )
+        .await;
     }
     ::zeroclaw_log::record!(
         INFO,

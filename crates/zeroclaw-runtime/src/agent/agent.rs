@@ -310,9 +310,19 @@ impl HistoryTrimNotice {
 async fn forward_history_trim_notice(
     event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     notice: Option<HistoryTrimNotice>,
+    token: Option<&tokio_util::sync::CancellationToken>,
+    estop: Option<crate::security::estop_runtime::EstopRuntime>,
 ) {
     if let Some(notice) = notice {
-        let _ = event_tx.send(notice.into_turn_event()).await;
+        let publish = crate::agent::turn::outcome::until_cancelled(
+            token,
+            event_tx.send(notice.into_turn_event()),
+        );
+        if let Some(estop) = estop {
+            let _ = estop.run(None, publish).await;
+        } else {
+            let _ = publish.await;
+        }
     }
 }
 
@@ -335,6 +345,8 @@ pub struct Agent {
     /// Daemon-backed sessions capture the shared live config handle so reloads
     /// affect existing sessions without duplicating config-derived state.
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    /// Resolves emergency-stop authority from canonical live daemon config.
+    estop_runtime: Option<crate::security::estop_runtime::EstopRuntime>,
     multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     model_name: String,
     model_provider_name: String,
@@ -515,6 +527,7 @@ pub struct AgentBuilder {
     memory_inject_cfg: Option<crate::agent::memory_inject::MemoryInjectConfig>,
     config: Option<zeroclaw_config::schema::AliasedAgentConfig>,
     structured_history_cap_resolver: Option<Arc<dyn Fn() -> usize + Send + Sync>>,
+    estop_runtime: Option<crate::security::estop_runtime::EstopRuntime>,
     multimodal_config: Option<zeroclaw_config::schema::MultimodalConfig>,
     model_name: Option<String>,
     model_provider_name: Option<String>,
@@ -568,6 +581,7 @@ impl AgentBuilder {
             memory_inject_cfg: None,
             config: None,
             structured_history_cap_resolver: None,
+            estop_runtime: None,
             multimodal_config: None,
             model_name: None,
             model_provider_name: None,
@@ -663,6 +677,11 @@ impl AgentBuilder {
         resolver: Arc<dyn Fn() -> usize + Send + Sync>,
     ) -> Self {
         self.structured_history_cap_resolver = Some(resolver);
+        self
+    }
+
+    fn estop_runtime(mut self, runtime: crate::security::estop_runtime::EstopRuntime) -> Self {
+        self.estop_runtime = Some(runtime);
         self
     }
 
@@ -946,6 +965,7 @@ impl AgentBuilder {
             }),
             config,
             structured_history_cap_resolver: self.structured_history_cap_resolver,
+            estop_runtime: self.estop_runtime,
             multimodal_config: self.multimodal_config.unwrap_or_default(),
             model_name: self.model_name.unwrap_or_else(|| "<unconfigured>".into()),
             model_provider_name: self
@@ -1194,20 +1214,19 @@ impl Agent {
         user_message: &str,
         new_msgs: &mut Vec<ConversationMessage>,
         turn_id: &str,
-    ) {
+    ) -> Result<()> {
         // Memory context is injected once in the engine, keyed on the
         // ingress origin (agent::memory_inject).
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
-                .memory
-                .store(
+                .await_turn_setup(self.memory.store(
                     "user_msg",
                     user_message,
                     MemoryCategory::Conversation,
                     self.memory_session_id.as_deref(),
-                )
-                .await;
+                ))
+                .await?;
             self.observer.record_event(&ObserverEvent::MemoryStore {
                 category: MemoryCategory::Conversation.to_string(),
                 backend: self.memory.name().to_string(),
@@ -1224,6 +1243,7 @@ impl Agent {
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
         self.history.push(user_msg);
+        Ok(())
     }
 
     pub fn set_memory_session_id(&mut self, session_id: Option<String>) {
@@ -1529,6 +1549,16 @@ impl Agent {
         canvas_store: Option<tools::CanvasStore>,
         live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     ) -> Result<Self> {
+        let estop_runtime = live_config.as_ref().map_or_else(
+            || {
+                crate::security::estop_runtime::current().unwrap_or_else(|| {
+                    crate::security::estop_runtime::EstopRuntime::from_config(config)
+                })
+            },
+            |live| crate::security::estop_runtime::EstopRuntime::from_live_config(Arc::clone(live)),
+        );
+        // Own setup through admission and cancellation, including MCP handshakes.
+        estop_runtime.run(None, async {
         let agent_cfg = config
             .agent(agent_alias)
             .with_context(|| format!("agents.{agent_alias} is not configured"))?;
@@ -1827,6 +1857,7 @@ impl Agent {
                     .unwrap_or_else(|| agent_cfg.clone()),
             )
             .structured_history_cap_resolver(structured_history_cap_resolver)
+            .estop_runtime(estop_runtime.clone())
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
@@ -1872,6 +1903,7 @@ impl Agent {
         };
 
         Ok(agent)
+        }).await
     }
 
     fn trim_history(&mut self, turn_id: Option<&str>) -> Option<HistoryTrimNotice> {
@@ -2368,7 +2400,33 @@ impl Agent {
         replayed
     }
 
+    fn estop_authority(&self) -> Option<crate::security::estop_runtime::EstopRuntime> {
+        self.estop_runtime
+            .clone()
+            .or_else(crate::security::estop_runtime::current)
+            .or_else(|| {
+                self.full_config()
+                    .map(crate::security::estop_runtime::EstopRuntime::from_config)
+            })
+    }
+
+    fn check_estop(&self) -> Result<()> {
+        if let Some(estop) = self.estop_authority() {
+            estop.check(None)?;
+        }
+        Ok(())
+    }
+
+    async fn await_turn_setup<T>(&self, future: impl std::future::Future<Output = T>) -> Result<T> {
+        if let Some(estop) = self.estop_authority() {
+            estop.run(None, async { Ok(future.await) }).await
+        } else {
+            Ok(future.await)
+        }
+    }
+
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        self.check_estop()?;
         if user_message.trim().is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2413,14 +2471,13 @@ impl Agent {
         if self.auto_save {
             let store_start = std::time::Instant::now();
             let store_result = self
-                .memory
-                .store(
+                .await_turn_setup(self.memory.store(
                     "user_msg",
                     user_message,
                     MemoryCategory::Conversation,
                     self.memory_session_id.as_deref(),
-                )
-                .await;
+                ))
+                .await?;
             self.observer.record_event(&ObserverEvent::MemoryStore {
                 category: MemoryCategory::Conversation.to_string(),
                 backend: self.memory.name().to_string(),
@@ -2614,7 +2671,10 @@ impl Agent {
         // independently from final-response fallback attribution. Box before
         // entering either task-local scope: boxing inside a nested async block
         // still captures the large turn-loop future on the worker stack.
-        let turn_loop = Box::pin(turn_loop);
+        let turn_loop = Box::pin(crate::security::estop_runtime::scope(
+            self.estop_runtime.clone(),
+            Box::pin(turn_loop),
+        ));
         let (loop_result, turn_provider_recovery, turn_provider_context_truncated) =
             zeroclaw_providers::reliable::scope_provider_fallback(async {
                 let result = crate::agent::turn::scope_tool_protocol_prompts(
@@ -2721,6 +2781,11 @@ impl Agent {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         mut steering_rx: Option<&mut tokio::sync::mpsc::Receiver<String>>,
     ) -> std::result::Result<StreamedTurnSuccess, StreamedTurnError> {
+        self.check_estop().map_err(|error| StreamedTurnError {
+            error,
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        })?;
         // See `Agent::turn` for the rationale. Same guard: blank input would
         // push a timestamp-only user message into history and the model would
         // narrate the trailing prompt-template sentinel instead of replying.
@@ -2781,8 +2846,16 @@ impl Agent {
             self.observer_agent_alias(),
             Some(turn_id.clone()),
         );
-        self.append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
-            .await;
+        if let Err(error) = self
+            .append_streamed_user_message_to_history(user_message, &mut new_msgs, &turn_id)
+            .await
+        {
+            return Err(StreamedTurnError {
+                error,
+                committed_response,
+                new_messages: new_msgs,
+            });
+        }
 
         let active_dispatcher = {
             let base_provider_messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -2798,7 +2871,13 @@ impl Agent {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
+                        forward_history_trim_notice(
+                            &event_tx,
+                            notice,
+                            cancel_token.as_ref(),
+                            self.estop_authority(),
+                        )
+                        .await;
                         return Err(StreamedTurnError {
                             error,
                             committed_response: String::new(),
@@ -2816,7 +2895,13 @@ impl Agent {
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
             let notice = self.trim_history(Some(&turn_id));
-            forward_history_trim_notice(&event_tx, notice).await;
+            forward_history_trim_notice(
+                &event_tx,
+                notice,
+                cancel_token.as_ref(),
+                self.estop_authority(),
+            )
+            .await;
             return Err(StreamedTurnError {
                 error,
                 committed_response: String::new(),
@@ -2827,7 +2912,13 @@ impl Agent {
             Ok(prompts) => prompts,
             Err(error) => {
                 let notice = self.trim_history(Some(&turn_id));
-                forward_history_trim_notice(&event_tx, notice).await;
+                forward_history_trim_notice(
+                    &event_tx,
+                    notice,
+                    cancel_token.as_ref(),
+                    self.estop_authority(),
+                )
+                .await;
                 return Err(StreamedTurnError {
                     error,
                     committed_response: String::new(),
@@ -2849,7 +2940,13 @@ impl Agent {
                 new_msgs.push(cached_msg.clone());
                 self.history.push(cached_msg);
                 let notice = self.trim_history(Some(&turn_id));
-                forward_history_trim_notice(&event_tx, notice).await;
+                forward_history_trim_notice(
+                    &event_tx,
+                    notice,
+                    cancel_token.as_ref(),
+                    self.estop_authority(),
+                )
+                .await;
                 self.observer.record_event(&ObserverEvent::TurnComplete);
                 committed_response.push_str(&cached);
                 return Ok(StreamedTurnSuccess {
@@ -2905,6 +3002,13 @@ impl Agent {
 
         // ── Round loop: one tool-call-loop run per steering round ──────────
         for round in 0..self.config.resolved.max_tool_iterations {
+            if let Err(error) = self.check_estop() {
+                return Err(StreamedTurnError {
+                    error,
+                    committed_response,
+                    new_messages: new_msgs,
+                });
+            }
             // Early exit if the caller cancelled this turn (e.g. user abort)
             if cancel_token
                 .as_ref()
@@ -2917,7 +3021,13 @@ impl Agent {
                 self.history.push(interruption);
                 committed_response.push_str(&marker);
                 let notice = self.trim_history(Some(&turn_id));
-                forward_history_trim_notice(&event_tx, notice).await;
+                forward_history_trim_notice(
+                    &event_tx,
+                    notice,
+                    cancel_token.as_ref(),
+                    self.estop_authority(),
+                )
+                .await;
                 return Err(StreamedTurnError {
                     error: crate::agent::loop_::ToolLoopCancelled.into(),
                     committed_response,
@@ -2939,14 +3049,40 @@ impl Agent {
                 if self.auto_save {
                     let store_start = std::time::Instant::now();
                     let store_result = self
-                        .memory
-                        .store(
-                            "user_msg",
-                            &steering_message,
-                            MemoryCategory::Conversation,
-                            self.memory_session_id.as_deref(),
-                        )
-                        .await;
+                        .await_turn_setup(crate::agent::turn::outcome::until_cancelled(
+                            cancel_token.as_ref(),
+                            self.memory.store(
+                                "user_msg",
+                                &steering_message,
+                                MemoryCategory::Conversation,
+                                self.memory_session_id.as_deref(),
+                            ),
+                        ))
+                        .await
+                        .and_then(|result| result);
+                    let store_result = match store_result {
+                        Ok(result) => result,
+                        Err(error) => {
+                            // Preserve the messages already accepted in this
+                            // drain; the interrupted autosave is not retried.
+                            let already_committed = if round == 0 {
+                                user_msg_for_loop.len()
+                            } else {
+                                0
+                            };
+                            for message in
+                                Self::replay_loop_messages(&round_added[already_committed..])
+                            {
+                                self.history.push(message.clone());
+                                new_msgs.push(message);
+                            }
+                            return Err(StreamedTurnError {
+                                error,
+                                committed_response,
+                                new_messages: new_msgs,
+                            });
+                        }
+                    };
                     self.observer.record_event(&ObserverEvent::MemoryStore {
                         category: MemoryCategory::Conversation.to_string(),
                         backend: self.memory.name().to_string(),
@@ -3057,7 +3193,10 @@ impl Agent {
             // then read it immediately. Box before adding the prompt scope so
             // the nested task-locals do not capture the full round future on
             // the worker stack in debug builds.
-            let round_loop = Box::pin(round_loop);
+            let round_loop = Box::pin(crate::security::estop_runtime::scope(
+                self.estop_runtime.clone(),
+                Box::pin(round_loop),
+            ));
             let (loop_result, round_fallback, round_context_truncated) =
                 zeroclaw_providers::reliable::scope_provider_fallback(async {
                     let result = crate::agent::turn::scope_tool_protocol_prompts(
@@ -3115,7 +3254,13 @@ impl Agent {
                     // before any steering continuation is folded in.
                     committed_response.push_str(&response);
                     let notice = self.trim_history(Some(&turn_id));
-                    forward_history_trim_notice(&event_tx, notice).await;
+                    forward_history_trim_notice(
+                        &event_tx,
+                        notice,
+                        cancel_token.as_ref(),
+                        self.estop_authority(),
+                    )
+                    .await;
 
                     let has_more_steering =
                         steering_rx.as_deref_mut().is_some_and(|rx| !rx.is_empty());
@@ -3138,12 +3283,21 @@ impl Agent {
                     self.observer.record_event(&ObserverEvent::TurnComplete);
                     let committed_response =
                         self.append_receipts_block(committed_response, receipt_scope.as_ref());
-                    let committed_response = Self::append_model_fallback_notice(
-                        committed_response,
+                    let with_notice = Self::format_model_fallback_notice(
+                        committed_response.clone(),
                         turn_provider_recovery.as_ref(),
-                        &event_tx,
-                    )
-                    .await;
+                    );
+                    let _ = self
+                        .await_turn_setup(crate::agent::turn::outcome::until_cancelled(
+                            cancel_token.as_ref(),
+                            Self::append_model_fallback_notice(
+                                committed_response,
+                                turn_provider_recovery.as_ref(),
+                                &event_tx,
+                            ),
+                        ))
+                        .await;
+                    let committed_response = with_notice;
                     return Ok(StreamedTurnSuccess {
                         response: committed_response,
                         new_messages: new_msgs,
@@ -3171,7 +3325,13 @@ impl Agent {
                             .rebuild_streamed_system_prompt_for_active_provider(&mut loop_history)
                         {
                             let notice = self.trim_history(Some(&turn_id));
-                            forward_history_trim_notice(&event_tx, notice).await;
+                            forward_history_trim_notice(
+                                &event_tx,
+                                notice,
+                                cancel_token.as_ref(),
+                                self.estop_authority(),
+                            )
+                            .await;
                             return Err(StreamedTurnError {
                                 error,
                                 committed_response,
@@ -3179,7 +3339,13 @@ impl Agent {
                             });
                         }
                         let notice = self.trim_history(Some(&turn_id));
-                        forward_history_trim_notice(&event_tx, notice).await;
+                        forward_history_trim_notice(
+                            &event_tx,
+                            notice,
+                            cancel_token.as_ref(),
+                            self.estop_authority(),
+                        )
+                        .await;
                         effective_model = new_effective_model;
                         continue;
                     }
@@ -3206,8 +3372,13 @@ impl Agent {
                         // literal, so suffix-matching round_added would
                         // misfire. Synthesize the bare marker only when no
                         // interruption text was persisted this round.
-                        let marker =
-                            crate::i18n::get_required_cli_string("turn-interrupted-by-user");
+                        let marker = crate::i18n::get_required_cli_string(
+                            if crate::security::estop_runtime::is_estop_interrupted(&error) {
+                                "estop-runtime-interrupted"
+                            } else {
+                                "turn-interrupted-by-user"
+                            },
+                        );
                         let persisted_interruption = error
                             .downcast_ref::<crate::agent::loop_::StreamCancelledAfterOutput>()
                             .map(|cancelled| format!("{}\n\n{marker}", cancelled.partial_text));
@@ -3229,7 +3400,11 @@ impl Agent {
                                 self.history.push(interruption);
                             }
                         }
-                        crate::agent::loop_::ToolLoopCancelled.into()
+                        if crate::security::estop_runtime::is_estop_interrupted(&error) {
+                            error
+                        } else {
+                            crate::agent::loop_::ToolLoopCancelled.into()
+                        }
                     } else {
                         // Mark the interruption only when nothing was committed —
                         // prior-round text must round-trip unmodified.
@@ -3241,7 +3416,13 @@ impl Agent {
                         error
                     };
                     let notice = self.trim_history(Some(&turn_id));
-                    forward_history_trim_notice(&event_tx, notice).await;
+                    forward_history_trim_notice(
+                        &event_tx,
+                        notice,
+                        cancel_token.as_ref(),
+                        self.estop_authority(),
+                    )
+                    .await;
                     return Err(StreamedTurnError {
                         error,
                         committed_response,
@@ -3252,7 +3433,13 @@ impl Agent {
         }
 
         let notice = self.trim_history(Some(&turn_id));
-        forward_history_trim_notice(&event_tx, notice).await;
+        forward_history_trim_notice(
+            &event_tx,
+            notice,
+            cancel_token.as_ref(),
+            self.estop_authority(),
+        )
+        .await;
         Err(StreamedTurnError {
             error: anyhow::Error::msg(format!(
                 "Agent exceeded maximum tool iterations ({})",
@@ -3476,6 +3663,422 @@ mod tests {
     }
 
     const BLANK_TURN_ERROR: &str = "empty user message: refusing to dispatch a blank turn";
+
+    #[tokio::test]
+    async fn estop_agent_admission_precedes_constructor_and_turn_history_mutations() {
+        use crate::security::estop::{EstopLevel, EstopManager, ResumeSelector};
+        use crate::security::estop_runtime::{EstopRuntime, is_estop_interrupted};
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.security.estop.enabled = true;
+        config.security.estop.state_file = "estop-state.json".into();
+        config.security.estop.require_otp_to_resume = false;
+        let mut manager = EstopManager::load(&config.security.estop, dir.path()).unwrap();
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let error = Agent::from_config(&config, "fixture")
+            .await
+            .err()
+            .expect("constructor must stop before setup");
+        assert!(is_estop_interrupted(&error));
+        assert!(!dir.path().join("agents").exists());
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = blank_input_agent(Box::new(ModelCaptureModelProvider {
+            responses: Mutex::new(Vec::new()),
+            seen_models: calls.clone(),
+        }));
+        let live = Arc::new(parking_lot::RwLock::new(config));
+        agent.estop_runtime = Some(EstopRuntime::from_live_config(live));
+        assert!(is_estop_interrupted(
+            &agent.turn("fixture").await.unwrap_err()
+        ));
+        let (tx, mut events) = tokio::sync::mpsc::channel(8);
+        let error = agent
+            .turn_streamed_with_steering_state("fixture", tx, None, None)
+            .await
+            .unwrap_err();
+        assert!(is_estop_interrupted(&error.error));
+        assert!(agent.history.is_empty());
+        assert!(calls.lock().is_empty());
+        assert!(events.try_recv().is_err());
+        manager.resume(ResumeSelector::KillAll, None, None).unwrap();
+        assert_eq!(agent.turn("fixture").await.unwrap(), "done");
+        assert_eq!(calls.lock().len(), 1);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum EstopHookPhase {
+        BeforeLlm,
+        LlmInput,
+        AfterTool,
+        WaitingCheckpoint,
+        RunningCheckpoint,
+    }
+
+    struct EstopAwaitingHook {
+        phase: EstopHookPhase,
+        ready: Arc<tokio::sync::Notify>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl EstopAwaitingHook {
+        async fn wait(&self) {
+            struct OnDrop(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for OnDrop {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = OnDrop(self.dropped.clone());
+            self.ready.notify_one();
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for EstopAwaitingHook {
+        fn name(&self) -> &str {
+            "estop-awaiting-fixture"
+        }
+        async fn before_llm_call(
+            &self,
+            _: &mut Vec<ChatMessage>,
+            _: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            if self.phase == EstopHookPhase::BeforeLlm {
+                self.wait().await;
+            }
+            crate::hooks::HookResult::Continue(())
+        }
+        async fn on_llm_input(&self, _: &[ChatMessage], _: &str) {
+            if self.phase == EstopHookPhase::LlmInput {
+                self.wait().await;
+            }
+        }
+        async fn on_after_tool_call(
+            &self,
+            _: &str,
+            _: &crate::tools::ToolResult,
+            _: std::time::Duration,
+        ) {
+            if self.phase == EstopHookPhase::AfterTool {
+                self.wait().await;
+            }
+        }
+    }
+
+    struct EstopAwaitingJournal(EstopAwaitingHook);
+
+    #[async_trait]
+    impl zeroclaw_api::turn::TurnJournal for EstopAwaitingJournal {
+        async fn checkpoint(
+            &self,
+            status: zeroclaw_api::turn::TaskStatus,
+            _: Option<String>,
+            _: bool,
+        ) -> Result<()> {
+            if matches!(
+                (self.0.phase, status),
+                (
+                    EstopHookPhase::WaitingCheckpoint,
+                    zeroclaw_api::turn::TaskStatus::WaitingOnTool
+                ) | (
+                    EstopHookPhase::RunningCheckpoint,
+                    zeroclaw_api::turn::TaskStatus::Running
+                )
+            ) {
+                self.0.wait().await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn estop_agent_cancels_stalled_hooks_and_retains_completed_tool_history() {
+        use crate::security::estop::{EstopLevel, EstopManager, ResumeSelector};
+        use crate::security::estop_runtime::{EstopRuntime, is_estop_interrupted};
+        for (streamed, phase) in [false, true].into_iter().flat_map(|streamed| {
+            [
+                EstopHookPhase::BeforeLlm,
+                EstopHookPhase::LlmInput,
+                EstopHookPhase::AfterTool,
+                EstopHookPhase::WaitingCheckpoint,
+                EstopHookPhase::RunningCheckpoint,
+            ]
+            .into_iter()
+            .map(move |phase| (streamed, phase))
+        }) {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                config_path: directory.path().join("config.toml"),
+                ..Config::default()
+            };
+            config.security.estop.enabled = true;
+            config.security.estop.state_file = "estop-state.json".into();
+            config.security.estop.require_otp_to_resume = false;
+            let mut manager = EstopManager::load(&config.security.estop, directory.path()).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let runs_provider = matches!(
+                phase,
+                EstopHookPhase::AfterTool
+                    | EstopHookPhase::WaitingCheckpoint
+                    | EstopHookPhase::RunningCheckpoint
+            );
+            let completes_tool = matches!(
+                phase,
+                EstopHookPhase::AfterTool | EstopHookPhase::RunningCheckpoint
+            );
+            let responses = if runs_provider {
+                vec![zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "completed-before-stop".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                }]
+            } else {
+                vec![]
+            };
+            let mut agent = blank_input_agent(Box::new(ModelCaptureModelProvider {
+                responses: Mutex::new(responses),
+                seen_models: seen.clone(),
+            }));
+            agent.tools =
+                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                    MockTool,
+                )]);
+            agent.estop_runtime = Some(EstopRuntime::from_live_config(Arc::new(
+                parking_lot::RwLock::new(config),
+            )));
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut hooks = crate::hooks::HookRunner::new();
+            hooks.register(Box::new(EstopAwaitingHook {
+                phase,
+                ready: ready.clone(),
+                dropped: dropped.clone(),
+            }));
+            agent.hook_runner = Some(Arc::new(hooks));
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let turn = async {
+                    if streamed {
+                        let (tx, _events) = tokio::sync::mpsc::channel(128);
+                        agent
+                            .turn_streamed_with_steering_state("fixture", tx, None, None)
+                            .await
+                            .map(|result| result.response)
+                            .map_err(|error| error.error)
+                    } else {
+                        agent.turn("fixture").await
+                    }
+                };
+                let journal: Arc<dyn zeroclaw_api::turn::TurnJournal> = Arc::new(EstopAwaitingJournal(EstopAwaitingHook {
+                    phase, ready: ready.clone(), dropped: dropped.clone(),
+                }));
+                let turn = zeroclaw_api::turn::JOURNAL.scope(Some(journal), turn);
+                tokio::pin!(turn);
+                tokio::select! {
+                    result = &mut turn => panic!("streamed={streamed} phase={phase:?}: turn ended before fixture hook: {result:?}"),
+                    () = ready.notified() => {},
+                }
+                manager.engage(EstopLevel::KillAll).unwrap();
+                turn.await
+            })
+            .await
+            .unwrap_or_else(|_| panic!("streamed={streamed} phase={phase:?}: stop must settle the actual Agent turn"));
+            let error = result.unwrap_err();
+            assert!(
+                is_estop_interrupted(&error),
+                "streamed={streamed} phase={phase:?}: {error:#}"
+            );
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            let expected_calls = usize::from(runs_provider);
+            assert_eq!(seen.lock().len(), expected_calls);
+            let stopped_history = agent.tool_dispatcher.to_provider_messages(&agent.history);
+            assert_eq!(
+                stopped_history
+                    .iter()
+                    .filter(|m| m.content.contains("tool-out"))
+                    .count(),
+                usize::from(completes_tool)
+            );
+            // Clearing the latch admits one explicit new turn; no prior call is replayed.
+            agent.hook_runner = None;
+            manager.resume(ResumeSelector::KillAll, None, None).unwrap();
+            assert_eq!(agent.turn("new explicit turn").await.unwrap(), "done");
+            assert_eq!(seen.lock().len(), expected_calls + 1);
+        }
+    }
+
+    struct EstopStoreMemory {
+        blocked_message: &'static str,
+        wait: EstopAwaitingHook,
+    }
+    impl zeroclaw_api::attribution::Attributable for EstopStoreMemory {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Memory(zeroclaw_api::attribution::MemoryKind::InMemory)
+        }
+        fn alias(&self) -> &str {
+            "estop-store-fixture"
+        }
+    }
+    #[async_trait]
+    impl Memory for EstopStoreMemory {
+        fn name(&self) -> &str {
+            "none"
+        }
+        async fn store(
+            &self,
+            _: &str,
+            content: &str,
+            _: MemoryCategory,
+            _: Option<&str>,
+        ) -> Result<()> {
+            if content == self.blocked_message {
+                self.wait.wait().await;
+            }
+            Ok(())
+        }
+        async fn recall(
+            &self,
+            _: &str,
+            _: usize,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _: &str) -> Result<Option<zeroclaw_memory::MemoryEntry>> {
+            Ok(None)
+        }
+        async fn list(
+            &self,
+            _: Option<&MemoryCategory>,
+            _: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn forget(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn forget_for_agent(&self, _: &str, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session: Option<&str>,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<&str>,
+        ) -> Result<()> {
+            self.store(key, content, category, session).await
+        }
+        async fn recall_for_agents(
+            &self,
+            _: &[&str],
+            _: &str,
+            _: usize,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<Vec<zeroclaw_memory::MemoryEntry>> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn estop_agent_cancels_autosave_and_keeps_already_accepted_steering() {
+        use crate::security::estop::{EstopLevel, EstopManager};
+        use crate::security::estop_runtime::{EstopRuntime, is_estop_interrupted};
+        for steering in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut config = Config {
+                config_path: directory.path().join("config.toml"),
+                ..Config::default()
+            };
+            config.security.estop.enabled = true;
+            config.security.estop.state_file = "estop-state.json".into();
+            let mut manager = EstopManager::load(&config.security.estop, directory.path()).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut agent = blank_input_agent(Box::new(ModelCaptureModelProvider {
+                responses: Mutex::new(vec![]),
+                seen_models: seen.clone(),
+            }));
+            agent.estop_runtime = Some(EstopRuntime::from_config(&config));
+            let ready = Arc::new(tokio::sync::Notify::new());
+            let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            agent.auto_save = true;
+            agent.memory = Arc::new(EstopStoreMemory {
+                blocked_message: if steering {
+                    "blocked steering"
+                } else {
+                    "initial"
+                },
+                wait: EstopAwaitingHook {
+                    phase: EstopHookPhase::BeforeLlm,
+                    ready: ready.clone(),
+                    dropped: dropped.clone(),
+                },
+            });
+            let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(2);
+            if steering {
+                steer_tx.send("accepted steering".into()).await.unwrap();
+                steer_tx.send("blocked steering".into()).await.unwrap();
+            }
+            let (tx, _events) = tokio::sync::mpsc::channel(128);
+            let error = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let turn = agent.turn_streamed_with_steering_state(
+                    "initial",
+                    tx,
+                    None,
+                    steering.then_some(&mut steer_rx),
+                );
+                tokio::pin!(turn);
+                tokio::select! {
+                    result = &mut turn => panic!("turn ended before autosave: {result:?}"),
+                    () = ready.notified() => {},
+                }
+                manager.engage(EstopLevel::KillAll).unwrap();
+                turn.await.unwrap_err()
+            })
+            .await
+            .expect("stopped autosave must settle");
+            assert!(is_estop_interrupted(&error.error));
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(seen.lock().is_empty());
+            let messages = agent.tool_dispatcher.to_provider_messages(&agent.history);
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m.content.contains("accepted steering"))
+                    .count(),
+                usize::from(steering)
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.content.contains("blocked steering"))
+            );
+            assert_eq!(error.new_messages.iter().filter(|m| matches!(m, ConversationMessage::Chat(c) if c.content.contains("accepted steering"))).count(), usize::from(steering));
+        }
+    }
 
     fn blank_input_agent(model_provider: Box<dyn ModelProvider>) -> Agent {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -11979,7 +12582,8 @@ mod tests {
         let mut new_msgs = Vec::new();
         agent
             .append_streamed_user_message_to_history("hello there", &mut new_msgs, "test-turn")
-            .await;
+            .await
+            .unwrap();
 
         let stored = stored_user_message(&agent);
         assert!(
@@ -12012,7 +12616,8 @@ mod tests {
         let mut new_msgs = Vec::new();
         streamed_agent
             .append_streamed_user_message_to_history("same message", &mut new_msgs, "turn-a")
-            .await;
+            .await
+            .unwrap();
         let streamed_content = stored_user_message(&streamed_agent);
 
         let mut non_streamed_agent = turn_datetime_agent(
@@ -12282,3 +12887,7 @@ mod approval_route_tests {
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "estop_constructor_tests.rs"]
+mod estop_constructor_tests;

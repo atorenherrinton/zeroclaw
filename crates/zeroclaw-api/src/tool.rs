@@ -422,6 +422,13 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Whether this tool can cooperatively return owned partial results after
+    /// invocation cancellation. The runtime still enforces admission and a
+    /// bounded settlement deadline. Delegating wrappers must forward this flag.
+    fn supports_cooperative_settlement(&self) -> bool {
+        false
+    }
+
     /// Assemble this tool's spec. The default recomposes it from
     /// `parameters_schema()` and allocates a fresh `Arc` per call, so tools
     /// with large stored schemas override it to hand out `Arc::clone`
