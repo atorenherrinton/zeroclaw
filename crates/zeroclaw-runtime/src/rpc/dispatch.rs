@@ -2057,6 +2057,7 @@ impl RpcDispatcher {
                         sid,
                         crate::rpc::types::TurnCompletionOutcome::Failed,
                         "turn cancelled by daemon: session_not_found".to_string(),
+                        None,
                     )
                     .await;
                     return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
@@ -2234,6 +2235,7 @@ impl RpcDispatcher {
         // cause map). Every cancel firing site records its cause before firing;
         // a cancel with no recorded cause is a bug, not user attribution.
         let cancel_cause = cancel_registration.finish();
+        let stop_cause = crate::rpc::turn::stop_cause(&outcome, cancel_cause);
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -2253,7 +2255,7 @@ impl RpcDispatcher {
                     ::zeroclaw_log::EventOutcome::Unknown,
                     Some(
                         ::serde_json::json!({
-                            "cancel_cause": cancel_cause.map(|c| c.as_str()),
+                            "cancel_cause": stop_cause.map(|c| c.as_str()),
                         })
                         .to_string(),
                     ),
@@ -2346,6 +2348,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
                     text.clone(),
+                    None,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2358,7 +2361,16 @@ impl RpcDispatcher {
                 if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
                     let _ = backend.set_session_state(&session_key, "idle", None);
                 }
-                let cancel_message = match cancel_cause {
+                let cancel_message = match stop_cause {
+                    Some(crate::rpc::types::TurnStopCause::EmergencyStop) => {
+                        crate::i18n::get_required_cli_string("rpc-turn-emergency-stop")
+                    }
+                    Some(crate::rpc::types::TurnStopCause::Deadline) => {
+                        crate::i18n::get_required_cli_string("rpc-turn-deadline")
+                    }
+                    Some(crate::rpc::types::TurnStopCause::SettlementIncomplete) => {
+                        crate::i18n::get_required_cli_string("rpc-turn-settlement-incomplete")
+                    }
                     Some(cause) => {
                         format!(
                             "turn cancelled via {} in RPC_SESSION {}",
@@ -2384,7 +2396,7 @@ impl RpcDispatcher {
                             "model_provider": attribution_model_provider,
                             "model": attribution_model,
                             "chat_mode": format!("{chat_mode:?}"),
-                            "cancel_cause": cancel_cause.map(|c| c.as_str()),
+                            "cancel_cause": stop_cause.map(|c| c.as_str()),
                         })),
                     "turn cancelled; emitting attributed TurnComplete so the client exits the working state"
                 );
@@ -2392,6 +2404,7 @@ impl RpcDispatcher {
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Cancelled,
                     cancel_message,
+                    stop_cause,
                 )
                 .await;
                 to_result(SessionPromptResult {
@@ -2426,6 +2439,7 @@ impl RpcDispatcher {
                     user_message
                         .clone()
                         .unwrap_or_else(|| format!("turn failed: {e}")),
+                    stop_cause,
                 )
                 .await;
                 Err(rpc_err(
@@ -2444,11 +2458,13 @@ impl RpcDispatcher {
         session_id: &str,
         outcome: crate::rpc::types::TurnCompletionOutcome,
         content: String,
+        stop_cause: Option<crate::rpc::types::TurnStopCause>,
     ) {
         let update = SessionUpdateEvent::TurnComplete {
             session_id: session_id.to_string(),
             outcome,
             content,
+            stop_cause,
         };
         if let Ok(params) = serde_json::to_value(update) {
             let n = JsonRpcNotification::new(notification::SESSION_UPDATE, params);
@@ -9240,6 +9256,7 @@ mod tests {
         store.create_session(sid, "agent", "/tmp").unwrap();
 
         let empty = Ok(TurnOutcome::Cancelled {
+            cause: None,
             partial_text: String::new(),
             messages: Vec::new(),
         });
@@ -11811,6 +11828,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_stop_projection_emits_only_allowlisted_categories() {
+        use crate::rpc::types::{TurnCompletionOutcome, TurnStopCause};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (dispatcher, mut rx, _) = make_dispatcher_with_capture(make_acp_test_config(&tmp));
+        for cause in [
+            TurnStopCause::EmergencyStop,
+            TurnStopCause::Deadline,
+            TurnStopCause::ClientRpc,
+        ] {
+            let outcome = if cause == TurnStopCause::Deadline {
+                TurnCompletionOutcome::Failed
+            } else {
+                TurnCompletionOutcome::Cancelled
+            };
+            dispatcher
+                .emit_turn_complete(
+                    "synthetic-session",
+                    outcome,
+                    "safe terminal text".into(),
+                    Some(cause),
+                )
+                .await;
+            let raw = rx.try_recv().unwrap();
+            let value: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(value["method"], notification::SESSION_UPDATE);
+            assert_eq!(value["params"]["stop_cause"], cause.as_str());
+            assert_eq!(
+                value["params"]["outcome"],
+                serde_json::to_value(outcome).unwrap()
+            );
+            assert_eq!(value["params"]["content"], "safe terminal text");
+            assert!(
+                serde_json::from_value::<TurnStopCause>(json!("private runtime payload")).is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn session_prompt_on_missing_session_emits_turn_complete_failed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -12883,12 +12938,12 @@ mod tests {
         .await;
 
         let ctx = RpcContext::for_persistence_tests(
-            zeroclaw_config::schema::Config::default(),
+            make_acp_test_config(&tmp),
             Arc::clone(&sessions),
             Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
             None,
         );
-        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-owner-cancel:pid=1".into());
         dispatcher.set_tui_id_for_test(Some(owner.to_string()));
 
@@ -12925,6 +12980,17 @@ mod tests {
             .expect("prompt task must not panic")
             .expect("cancelled prompt must settle normally");
         assert_eq!(prompt_result["stop_reason"], "cancelled");
+        let mut terminal = None;
+        while let Ok(raw) = rx.try_recv() {
+            let value: Value = serde_json::from_str(&raw).unwrap();
+            if value["params"]["type"] == "turn_complete" {
+                terminal = Some(value);
+            }
+        }
+        let terminal = terminal.expect("actual dispatcher emits terminal notification");
+        assert_eq!(terminal["params"]["stop_cause"], "client_rpc");
+        assert_eq!(terminal["params"]["outcome"], "cancelled");
+
         assert!(
             release_tx.send(()).is_err(),
             "cancellation must drop the gated provider future"

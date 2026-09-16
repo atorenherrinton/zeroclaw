@@ -14,6 +14,8 @@ pub enum TurnOutcome {
         messages: Vec<ConversationMessage>,
     },
     Cancelled {
+        /// Preserve original typed execution evidence until the caller handles it.
+        cause: Option<anyhow::Error>,
         partial_text: String,
         messages: Vec<ConversationMessage>,
     },
@@ -23,6 +25,10 @@ pub enum TurnOutcome {
 pub enum TurnError {
     Panicked(String),
     AgentError(String),
+    OwnedTerminal {
+        error: anyhow::Error,
+        user_message: String,
+    },
     TerminalCompletion {
         diagnostic: String,
         user_message: String,
@@ -34,6 +40,7 @@ impl std::fmt::Display for TurnError {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
             Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::OwnedTerminal { error, .. } => write!(f, "Agent turn failed: {error}"),
             Self::TerminalCompletion { diagnostic, .. } => {
                 write!(f, "Agent turn failed: {diagnostic}")
             }
@@ -41,16 +48,70 @@ impl std::fmt::Display for TurnError {
     }
 }
 
-impl std::error::Error for TurnError {}
+impl std::error::Error for TurnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OwnedTerminal { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl TurnError {
     /// Localized text is carried only for a client-delivery boundary. Display
     /// remains the stable diagnostic form used by logs and durable audit rows.
     pub fn user_message(&self) -> Option<&str> {
         match self {
-            Self::TerminalCompletion { user_message, .. } => Some(user_message),
+            Self::TerminalCompletion { user_message, .. }
+            | Self::OwnedTerminal { user_message, .. } => Some(user_message),
             Self::Panicked(_) | Self::AgentError(_) => None,
         }
+    }
+}
+
+#[derive(Debug)]
+struct RpcTurnSettlementIncomplete;
+impl std::fmt::Display for RpcTurnSettlementIncomplete {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RPC turn settlement incomplete")
+    }
+}
+impl std::error::Error for RpcTurnSettlementIncomplete {}
+
+fn typed_stop_cause(error: &anyhow::Error) -> Option<crate::rpc::types::TurnStopCause> {
+    use crate::rpc::types::TurnStopCause;
+    if crate::security::estop_runtime::is_estop_interrupted(error) {
+        Some(TurnStopCause::EmergencyStop)
+    } else if error.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+        || error
+            .chain()
+            .any(|cause| cause.is::<zeroclaw_api::deadline::DeadlineExceeded>())
+    {
+        Some(TurnStopCause::Deadline)
+    } else if error.is::<RpcTurnSettlementIncomplete>() {
+        Some(TurnStopCause::SettlementIncomplete)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn stop_cause(
+    outcome: &Result<TurnOutcome, TurnError>,
+    external: Option<crate::rpc::session::CancelCause>,
+) -> Option<crate::rpc::types::TurnStopCause> {
+    use crate::rpc::{session::CancelCause, types::TurnStopCause};
+    match outcome {
+        Ok(TurnOutcome::Cancelled { cause, .. }) => {
+            cause.as_ref().and_then(typed_stop_cause).or_else(|| {
+                external.map(|cause| match cause {
+                    CancelCause::ClientRpc => TurnStopCause::ClientRpc,
+                    CancelCause::AdminKill => TurnStopCause::AdminKill,
+                    CancelCause::SessionRemoved => TurnStopCause::SessionRemoved,
+                })
+            })
+        }
+        Err(TurnError::OwnedTerminal { error, .. }) => typed_stop_cause(error),
+        _ => None,
     }
 }
 
@@ -135,6 +196,7 @@ where
                 Err(_) => {
                     turn_handle.abort();
                     Ok(TurnOutcome::Cancelled {
+                        cause: Some(RpcTurnSettlementIncomplete.into()),
                         partial_text: accumulated_text,
                         messages: Vec::new(),
                     })
@@ -169,6 +231,7 @@ fn outcome_from_task_result(
             committed_response,
             new_messages,
         }) if is_tool_loop_cancelled(&error) => Ok(TurnOutcome::Cancelled {
+            cause: Some(error),
             partial_text: if committed_response.is_empty() {
                 accumulated_text
             } else {
@@ -177,6 +240,19 @@ fn outcome_from_task_result(
             messages: new_messages,
         }),
         Err(StreamedTurnError { error, .. }) => {
+            if crate::agent::tool_execution::is_terminal_tool_error(&error) {
+                let key = if typed_stop_cause(&error)
+                    == Some(crate::rpc::types::TurnStopCause::Deadline)
+                {
+                    "rpc-turn-deadline"
+                } else {
+                    "rpc-turn-settlement-incomplete"
+                };
+                return Err(TurnError::OwnedTerminal {
+                    error,
+                    user_message: crate::i18n::get_required_cli_string(key),
+                });
+            }
             if let Some(user_message) =
                 crate::agent::terminal_completion_error_message(&error, None)
             {
@@ -236,6 +312,84 @@ where
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn rpc_stop_projection_retains_original_estop_evidence_and_registered_client_cause() {
+        use crate::rpc::{session::CancelCause, types::TurnStopCause};
+        let error = anyhow::Error::msg("private nested evidence")
+            .context(crate::security::estop_runtime::EstopInterrupted);
+        let mapped = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: "committed partial".into(),
+                new_messages: vec![ConversationMessage::Chat(
+                    zeroclaw_providers::ChatMessage::assistant("committed message"),
+                )],
+            }),
+            "stream partial".into(),
+        );
+        assert_eq!(
+            stop_cause(&mapped, Some(CancelCause::ClientRpc)),
+            Some(TurnStopCause::EmergencyStop)
+        );
+        let Ok(TurnOutcome::Cancelled {
+            cause: Some(error),
+            partial_text,
+            messages,
+        }) = mapped
+        else {
+            panic!("cancelled owner missing")
+        };
+        assert!(crate::security::estop_runtime::is_estop_interrupted(&error));
+        assert_eq!(error.root_cause().to_string(), "private nested evidence");
+        assert_eq!(partial_text, "committed partial");
+        assert_eq!(messages.len(), 1);
+        let external = Ok(TurnOutcome::Cancelled {
+            cause: Some(crate::agent::loop_::ToolLoopCancelled.into()),
+            partial_text: String::new(),
+            messages: Vec::new(),
+        });
+        assert_eq!(
+            stop_cause(&external, Some(CancelCause::ClientRpc)),
+            Some(TurnStopCause::ClientRpc)
+        );
+        assert_eq!(stop_cause(&external, None), None);
+    }
+
+    #[test]
+    fn rpc_stop_projection_retains_deadline_owned_error_without_private_wire_payload() {
+        use zeroclaw_api::deadline::{DeadlineExceeded, Phase};
+        let error =
+            anyhow::Error::msg("private original deadline payload").context(DeadlineExceeded {
+                phase: Phase::Turn,
+                started: true,
+            });
+        let mapped = outcome_from_task_result(
+            Err(StreamedTurnError {
+                error,
+                committed_response: String::new(),
+                new_messages: Vec::new(),
+            }),
+            String::new(),
+        );
+        assert_eq!(
+            stop_cause(&mapped, None),
+            Some(crate::rpc::types::TurnStopCause::Deadline)
+        );
+        let Err(TurnError::OwnedTerminal {
+            error,
+            user_message,
+        }) = mapped
+        else {
+            panic!("typed terminal owner missing")
+        };
+        assert!(error.is::<DeadlineExceeded>());
+        assert_eq!(
+            error.root_cause().to_string(),
+            "private original deadline payload"
+        );
+        assert!(!user_message.contains("private original"));
+    }
 
     fn noop(_e: TurnEvent) -> std::future::Ready<()> {
         std::future::ready(())
@@ -358,6 +512,7 @@ mod tests {
             TurnOutcome::Cancelled {
                 partial_text,
                 messages,
+                ..
             } => {
                 assert_eq!(
                     partial_text, "partial",

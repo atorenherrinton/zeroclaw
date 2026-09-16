@@ -1332,3 +1332,8 @@ delegate-cancellation-requested = Cancellation requested for task '{ $task_id }'
 delegate-cancellation-owner-missing = Task '{ $task_id }' has no live owner; its execution outcome is unknown. The stored result was not changed.
 turn-settlement-incomplete = The turn stopped before all pending work could settle. Some results may be incomplete; reconcile recorded effects before retrying.
 sop-settlement-incomplete = The workflow stopped with unfinished cleanup or persistence. Its recorded results remain available; reconcile its pending work before restarting it.
+
+# RPC terminal control-flow projection; raw owned evidence stays internal.
+rpc-turn-emergency-stop = Turn stopped by emergency stop. Resume explicitly before starting a new turn.
+rpc-turn-deadline = Turn stopped because its deadline expired.
+rpc-turn-settlement-incomplete = Turn stopped with incomplete execution evidence. Review completed and uncertain work before retrying.
