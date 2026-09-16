@@ -219,7 +219,19 @@ fn check_tool_registry(config: &crate::config::Config) -> CheckResult {
 fn check_channel_config(config: &crate::config::Config) -> CheckResult {
     let channels = zeroclaw_channels::listing::compiled_channels(&config.channels);
     let configured = channels.iter().filter(|e| e.configured).count();
-    let uncompiled = zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels);
+    // Saved disabled entries are useful when switching channels. Only enabled
+    // aliases require their implementation to be present in this build; the
+    // channel inventory deliberately reports configuration presence separately.
+    let aliases = config.channels_by_alias();
+    let uncompiled: Vec<_> =
+        zeroclaw_channels::listing::configured_uncompiled_channels(&config.channels)
+            .into_iter()
+            .filter(|entry| {
+                aliases
+                    .iter()
+                    .any(|alias| alias.enabled && alias.channel_type == entry.kind)
+            })
+            .collect();
     if !uncompiled.is_empty() {
         let names = uncompiled
             .iter()
@@ -443,10 +455,9 @@ async fn check_websocket_handshake(config: &crate::config::Config) -> CheckResul
     if config.gateway.require_pairing && token.is_none() {
         return CheckResult::fail(
             "websocket",
-            format!(
-                "pairing required but no bearer token available for self-test \
-                 (set ZEROCLAW_GATEWAY_TOKEN or keep a plaintext zc_* entry in \
-                 gateway.paired_tokens): {display_url}"
+            get_required_cli_string_with_args(
+                "cli-selftest-websocket-auth-unavailable",
+                &[("url", &display_url)],
             ),
         );
     }
@@ -543,6 +554,43 @@ mod tests {
     use zeroclaw_config::schema::Config;
     #[cfg(unix)]
     use zeroclaw_config::schema::LucidStorageConfig;
+
+    #[test]
+    fn channel_self_test_ignores_disabled_uncompiled_channel() {
+        let mut config = crate::config::Config::default();
+        config.channels.signal.insert(
+            "saved".into(),
+            zeroclaw_config::schema::SignalConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let result = super::check_channel_config(&config);
+        assert!(result.passed, "{}", result.detail);
+    }
+
+    #[cfg(not(feature = "channel-signal"))]
+    #[test]
+    fn channel_self_test_rejects_enabled_uncompiled_channel() {
+        let mut config = crate::config::Config::default();
+        config.channels.signal.insert(
+            "active".into(),
+            zeroclaw_config::schema::SignalConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.channels.signal.insert(
+            "saved".into(),
+            zeroclaw_config::schema::SignalConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let result = super::check_channel_config(&config);
+        assert!(!result.passed);
+        assert!(result.detail.contains("Signal"), "{}", result.detail);
+    }
 
     #[cfg(unix)]
     #[tokio::test]

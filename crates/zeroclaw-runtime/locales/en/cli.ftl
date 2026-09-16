@@ -910,6 +910,7 @@ cli-update-not-writable = install directory {$dir} is not writable ({$error}); r
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
+cli-selftest-websocket-auth-unavailable = Authenticated handshake not verified: pairing requires a client bearer token. Supply an existing token through ZEROCLAW_GATEWAY_TOKEN for this diagnostic process; keep gateway.paired_tokens hashed and pairing enabled. Endpoint: {$url}
 cli-selftest-some-failed = {$failed}/{$total} checks failed.
 cli-selftest-channel-config-uncompiled = {$compiled} compiled channel types, {$configured} compiled/configured; configured but not compiled: {$names}. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 
