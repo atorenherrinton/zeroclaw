@@ -160,16 +160,20 @@ async fn run(browser: &mut Option<Browser>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--watch-driver-group") {
-        let group: i32 = std::env::args()
-            .nth(2)
-            .ok_or_else(|| anyhow::Error::msg("Missing driver group"))?
-            .parse()?;
-        let parent: i32 = std::env::args()
-            .nth(3)
+    if std::env::args().nth(1).as_deref() == Some("--supervise-driver") {
+        let mut args = std::env::args().skip(2);
+        let parent: i32 = args
+            .next()
             .ok_or_else(|| anyhow::Error::msg("Missing browser owner process"))?
             .parse()?;
-        return lifecycle::watch_driver(group, parent).await;
+        let port: u16 = args
+            .next()
+            .ok_or_else(|| anyhow::Error::msg("Missing dedicated browser port"))?
+            .parse()?;
+        if args.next().is_some() {
+            bail!("Unexpected browser supervisor argument");
+        }
+        return lifecycle::supervise_driver(parent, port).await;
     }
     let mut browser = None;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
