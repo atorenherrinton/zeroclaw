@@ -15,9 +15,18 @@ fn signal_group(group: i32, signal: i32) -> Result<bool> {
     if unsafe { libc::kill(-group, signal) } == 0 {
         return Ok(true);
     }
-    let error = io::Error::last_os_error();
+    signal_error(signal, io::Error::last_os_error())
+}
+
+fn signal_error(signal: i32, error: io::Error) -> Result<bool> {
     if error.raw_os_error() == Some(libc::ESRCH) {
         return Ok(false);
+    }
+    // A presence probe can briefly see EPERM while a group exits. It proves
+    // presence, not successful delivery: keep waiting, but never mask an
+    // actual TERM/KILL permission failure as successful cleanup.
+    if signal == 0 && error.raw_os_error() == Some(libc::EPERM) {
+        return Ok(true);
     }
     Err(error).context("Cannot signal dedicated browser process group")
 }
@@ -74,7 +83,9 @@ pub async fn watch_driver(group: i32, expected_parent: i32) -> Result<()> {
     }
     // The spawning helper supplies its PID. Capturing getppid() here could
     // capture PID 1 if the helper died before this process was scheduled.
-    signal_group(group, 0)?;
+    if !signal_group(group, 0)? {
+        return Ok(());
+    }
     loop {
         if unsafe { libc::getppid() } != expected_parent {
             return terminate_group(group).await;
@@ -94,6 +105,18 @@ mod tests {
         process::Stdio,
     };
     use tokio::io::{AsyncBufReadExt, BufReader};
+
+    #[test]
+    fn permission_denied_probe_means_present_but_real_signals_still_fail() {
+        assert!(signal_error(0, io::Error::from_raw_os_error(libc::EPERM)).unwrap());
+        for signal in [libc::SIGTERM, libc::SIGKILL] {
+            assert!(signal_error(signal, io::Error::from_raw_os_error(libc::EPERM)).is_err());
+        }
+        for signal in [0, libc::SIGTERM, libc::SIGKILL] {
+            assert!(!signal_error(signal, io::Error::from_raw_os_error(libc::ESRCH)).unwrap());
+        }
+        assert!(signal_error(0, io::Error::from_raw_os_error(libc::EINVAL)).is_err());
+    }
 
     #[tokio::test]
     async fn close_escalates_and_reaps_a_term_resistant_driver() {
