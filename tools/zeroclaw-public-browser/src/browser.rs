@@ -1,4 +1,4 @@
-use crate::{policy::validate_url, proxy};
+use crate::{lifecycle, policy::validate_url, proxy};
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method};
 use serde::Deserialize;
@@ -140,9 +140,7 @@ impl Drop for Browser {
         // The driver was started in its own process group, which contains only
         // the ephemeral Chrome it launched. Never target an existing browser.
         if self.driver_group > 0 {
-            unsafe {
-                libc::kill(-self.driver_group, libc::SIGTERM);
-            }
+            lifecycle::force_stop(self.driver_group);
         }
         let _ = self.watchdog.start_kill();
     }
@@ -183,7 +181,11 @@ impl Browser {
             .context("Dedicated ChromeDriver has no process ID")? as i32;
         let mut watchdog_command = Command::new(std::env::current_exe()?);
         watchdog_command
-            .args(["--watch-driver-group", &driver_group.to_string()])
+            .args([
+                "--watch-driver-group",
+                &driver_group.to_string(),
+                &std::process::id().to_string(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -439,7 +441,7 @@ impl Browser {
         self.summary(0).await.map_err(|error| anyhow::Error::msg(format!("Browser action was attempted; do not repeat it. Read the page to reconcile the outcome. Observation failed: {error}")))
     }
 
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> Result<()> {
         if let Some(sid) = self.session.take() {
             let _ = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -448,14 +450,17 @@ impl Browser {
             .await;
         }
         if self.driver_group > 0 {
-            unsafe {
-                libc::kill(-self.driver_group, libc::SIGTERM);
-            }
-            let _ = tokio::time::timeout(Duration::from_secs(1), self.driver.wait()).await;
+            lifecycle::stop_driver(&mut self.driver, self.driver_group).await?;
             self.driver_group = 0;
         }
-        let _ = self.watchdog.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.watchdog.wait()).await;
+        self.watchdog
+            .start_kill()
+            .context("Cannot stop browser watchdog")?;
+        tokio::time::timeout(Duration::from_secs(1), self.watchdog.wait())
+            .await
+            .context("Timed out reaping browser watchdog")?
+            .context("Cannot reap browser watchdog")?;
+        Ok(())
     }
 }
 

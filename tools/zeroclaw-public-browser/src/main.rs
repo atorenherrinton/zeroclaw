@@ -1,4 +1,5 @@
 mod browser;
+mod lifecycle;
 mod policy;
 mod proxy;
 
@@ -40,7 +41,7 @@ async fn call(browser: &mut Option<Browser>, name: &str, args: Value) -> Result<
             bail!("close accepts an empty object");
         }
         if let Some(mut b) = browser.take() {
-            b.close().await;
+            b.close().await?;
         }
         return Ok(json!({"content":[{"type":"text","text":"Isolated Chrome session closed"}]}));
     }
@@ -164,19 +165,11 @@ async fn main() -> Result<()> {
             .nth(2)
             .ok_or_else(|| anyhow::Error::msg("Missing driver group"))?
             .parse()?;
-        if group <= 1 {
-            bail!("Invalid driver group");
-        }
-        let parent = unsafe { libc::getppid() };
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if unsafe { libc::getppid() } != parent {
-                unsafe {
-                    libc::kill(-group, libc::SIGTERM);
-                }
-                return Ok(());
-            }
-        }
+        let parent: i32 = std::env::args()
+            .nth(3)
+            .ok_or_else(|| anyhow::Error::msg("Missing browser owner process"))?
+            .parse()?;
+        return lifecycle::watch_driver(group, parent).await;
     }
     let mut browser = None;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -186,7 +179,7 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
     if let Some(b) = browser.as_mut() {
-        b.close().await;
+        b.close().await?;
     }
     result
 }
