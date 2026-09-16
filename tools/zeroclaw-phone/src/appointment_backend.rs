@@ -109,6 +109,7 @@ impl InboundScheduler {
     }
 
     fn admitted(&self) -> SafeResult<String> {
+        crate::appointment_stop::check_current(&self.root)?;
         let policy: common::PhoneConfig =
             toml::from_str(&common::private_read(&self.root.join("phone.toml"))?)
                 .map_err(|_| "phone_config_invalid")?;
@@ -142,7 +143,13 @@ impl InboundScheduler {
             };
         }
         drop(db);
-        let result = self.perform(&request, &from).await;
+        // Keep journal finalization outside this owned cancellation scope.
+        // Dropping local requests cannot retract an accepted provider write.
+        let result = tokio::select! {
+            biased;
+            error = crate::appointment_stop::interrupted(&self.root) => Err(error),
+            result = self.perform(&request, &from) => result,
+        };
         if result.is_err() {
             // A failed pre-write check is known not to have changed Calendar.
             // Once writing was recorded, keep outcome uncertainty for review;
@@ -501,6 +508,8 @@ mod workflow_tests {
         mismatched_number: bool,
         pending_write: bool,
         uncertain_write: bool,
+        pending_lookup_process: Option<PathBuf>,
+        before_write_action: Option<Box<dyn Fn() + Send + Sync>>,
         lookups: AtomicUsize,
         finds: AtomicUsize,
         writes: AtomicUsize,
@@ -511,6 +520,8 @@ mod workflow_tests {
                 mismatched_number: false,
                 pending_write: false,
                 uncertain_write: false,
+                pending_lookup_process: None,
+                before_write_action: None,
                 lookups: AtomicUsize::new(0),
                 finds: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
@@ -521,6 +532,9 @@ mod workflow_tests {
         fn lookup<'a>(&'a self, _request: &'a Request) -> Work<'a, LookupResponse> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                if let Some(path) = &self.pending_lookup_process {
+                    stop_tests::pending_lookup_command(path).await?;
+                }
                 Ok(LookupResponse {
                     schema_version: 1,
                     source: "apple_mapkit".into(),
@@ -576,9 +590,12 @@ mod workflow_tests {
             _original: &'a Event,
             before_write: &'a (dyn Fn() -> SafeResult<()> + Send + Sync),
         ) -> Work<'a, HoldReceipt> {
-            self.writes.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                if let Some(action) = &self.before_write_action {
+                    action();
+                }
                 before_write()?;
+                self.writes.fetch_add(1, Ordering::SeqCst);
                 if self.pending_write {
                     std::future::pending::<()>().await;
                 }
@@ -608,8 +625,9 @@ mod workflow_tests {
     impl Fixture {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let native = directory.path().join("native");
+            let native = directory.path().canonicalize().unwrap().join("native");
             common::private_dir(&native).unwrap();
+            common::atomic_private_write(&native.join("config.toml"), b"").unwrap();
             common::private_dir(&native.join("extensions")).unwrap();
             let root = native.join("extensions/phone");
             common::private_dir(&root).unwrap();
@@ -798,5 +816,10 @@ mod workflow_tests {
             "message_only"
         );
         assert_eq!(fake.lookups.load(Ordering::SeqCst), 0);
+    }
+
+    mod stop_tests {
+        use super::*;
+        include!("appointment_stop_tests.rs");
     }
 }

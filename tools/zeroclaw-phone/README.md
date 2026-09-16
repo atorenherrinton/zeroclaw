@@ -225,6 +225,17 @@ an availability or booking claim. A per-call private receipt is written before
 the provider operation. An interrupted or uncertain write is retained for
 reconciliation and never automatically retried under a new key.
 
+Tentative scheduling reads the native `[security.estop]` policy and canonical
+stop file at admission, every 100 ms while work is pending, and immediately
+before the writer starts. When enabled, kill-all, network-kill, any domain block,
+or a freeze of `tentatively_reschedule_appointment` or
+`google_write__calendar_mutate` prevents this workflow. Unsafe or invalid policy
+and stop files fail closed; an explicitly disabled policy retains the existing
+behavior. Stop handling drops owned pending work and retains uncertain write
+receipts. It cannot retract a request already accepted by Google. This guard
+covers tentative scheduling; ordinary voicemail and owner receipt inspection
+keep their existing behavior.
+
 The owner-only `appointment_status` MCP tool accepts `{}` for the latest 20
 receipts, `{"call_sid":"CA…"}` for one exact call, or
 `{"call_sid":"CA…","reconcile":true}` for read-only reconciliation of an

@@ -2,6 +2,7 @@ pub mod appointment_backend;
 pub mod appointment_calendar;
 pub mod appointment_commands;
 pub mod appointment_owner;
+mod appointment_stop;
 pub mod appointments;
 pub mod audio;
 pub mod cascade;
