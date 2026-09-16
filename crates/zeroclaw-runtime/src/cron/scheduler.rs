@@ -1608,13 +1608,25 @@ async fn run_job_command_with_runtime_and_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own the command's descendants as well as its direct shell. Dropping the
+    // execution future must not leave a delayed side effect running in a
+    // background child.
+    #[cfg(unix)]
+    command.process_group(0);
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return (false, format!("spawn error: {error}")),
     };
+    #[cfg(unix)]
+    let group_guard = crate::tools::shell::ChildGroupGuard::new(child.id());
 
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
+            // Keep ownership until output is collected too: an inherited pipe
+            // can outlive the direct shell, and a timeout must still kill the
+            // descendants holding that pipe open.
+            #[cfg(unix)]
+            group_guard.disarm();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = match output_format {
@@ -2670,6 +2682,119 @@ mod tests {
             run_job_command_with_timeout(&config, &security, &job, Duration::from_millis(50)).await;
         assert!(!success);
         assert!(output.contains("job timed out after"));
+    }
+
+    #[cfg(unix)]
+    async fn assert_cron_descendant_cleanup(cancel: bool, owner_exits: bool) {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        };
+        std::fs::write(
+            config.data_dir.join("descendant.sh"),
+            "printf '%s\\n' \"$$\" > descendant.pid\nprintf ready > ready\nsleep 0.6\nprintf escaped > escaped\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.data_dir.join("owner.sh"),
+            if owner_exits {
+                "sh descendant.sh &\nexit 0\n"
+            } else {
+                "sh descendant.sh &\nwait\n"
+            },
+        )
+        .unwrap();
+
+        // This process deliberately remains outside the job's process group.
+        // It must finish normally after the cancelled descendant's marker time.
+        let unrelated = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 0.9; printf untouched > unrelated"])
+            .current_dir(&config.data_dir)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let job = test_job("sh owner.sh");
+        let mut run = Box::pin(run_job_command_with_timeout(
+            &config,
+            &security,
+            &job,
+            if cancel {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(300)
+            },
+        ));
+        let ready = config.data_dir.join("ready");
+        tokio::select! {
+            result = &mut run => panic!("job ended before its descendant was ready: {result:?}"),
+            result = time::timeout(Duration::from_secs(3), async {
+                while !ready.exists() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("descendant ready marker"),
+        }
+        let descendant: i32 = std::fs::read_to_string(config.data_dir.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(descendant > 1);
+
+        if cancel {
+            // Drop the actual production execution future, as turn cancellation
+            // does. Aborting only a test observer would not prove child cleanup.
+            drop(run);
+        } else {
+            let (success, output) = run.await;
+            assert!(!success);
+            assert!(output.contains("job timed out after"), "{output}");
+        }
+
+        let unrelated_output = time::timeout(Duration::from_secs(3), unrelated.wait_with_output())
+            .await
+            .expect("unrelated process finishes")
+            .unwrap();
+        assert!(unrelated_output.status.success());
+        assert!(config.data_dir.join("unrelated").exists());
+        assert!(
+            !config.data_dir.join("escaped").exists(),
+            "the owned descendant performed its delayed side effect"
+        );
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal zero only probes the PID recorded by our
+                // fixture; it does not signal this or any unrelated process.
+                if unsafe { libc::kill(descendant, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned descendant must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_job_command_drop_kills_owned_descendants_only() {
+        assert_cron_descendant_cleanup(true, false).await;
+        assert_cron_descendant_cleanup(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_job_command_timeout_kills_owned_descendants_only() {
+        assert_cron_descendant_cleanup(false, false).await;
+        assert_cron_descendant_cleanup(false, true).await;
     }
 
     #[tokio::test]

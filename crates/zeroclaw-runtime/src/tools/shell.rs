@@ -18,20 +18,20 @@ const POST_EXIT_DRAIN: Duration = Duration::from_millis(250);
 /// Drop guard that SIGKILLs the child's process group on cancel/timeout paths.
 /// Disarmed after `child.wait()` returns so it never signals a recycled PID.
 #[cfg(unix)]
-struct ChildGroupGuard {
+pub(crate) struct ChildGroupGuard {
     pgid: std::sync::atomic::AtomicI32,
 }
 
 #[cfg(unix)]
 impl ChildGroupGuard {
-    fn new(child_pid: Option<u32>) -> Self {
+    pub(crate) fn new(child_pid: Option<u32>) -> Self {
         let pgid = child_pid.and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
         Self {
             pgid: std::sync::atomic::AtomicI32::new(pgid),
         }
     }
 
-    fn disarm(&self) {
+    pub(crate) fn disarm(&self) {
         self.pgid.store(0, std::sync::atomic::Ordering::Release);
     }
 }
