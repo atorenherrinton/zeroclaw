@@ -864,17 +864,12 @@ async fn route_check(root: &Path) -> SafeResult<()> {
             .map_err(|_| "tunnel_unavailable")?,
     )
     .await?;
-    let matches = tunnels
-        .get("tunnels")
-        .and_then(serde_json::Value::as_array)
-        .ok_or("tunnel_response_invalid")?
-        .iter()
-        .filter(|t| {
-            t["public_url"] == cfg.public_base
-                && t["config"]["addr"] == format!("http://127.0.0.1:{}", cfg.port)
-        })
-        .count();
-    check(matches == 1, "tunnel_route_mismatch")?;
+    let route_kind = zeroclaw_phone_extension::route_check::select(
+        &tunnels,
+        &cfg.config_dir,
+        &cfg.public_base,
+        cfg.port,
+    )?;
     let health = bounded_json(
         client
             .get(format!("{}/voice/health", cfg.public_base))
@@ -899,7 +894,13 @@ async fn route_check(root: &Path) -> SafeResult<()> {
         "unsigned_request_not_rejected",
     )?;
     println!(
-        "{{\"independentTunnelReady\":true,\"publicPhoneHealthy\":true,\"unsignedRequestsRejected\":true}}"
+        "{}",
+        serde_json::json!({
+            "independentTunnelReady": true,
+            "publicPhoneHealthy": true,
+            "unsignedRequestsRejected": true,
+            "routeKind": route_kind,
+        })
     );
     Ok(())
 }

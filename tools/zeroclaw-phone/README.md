@@ -47,6 +47,18 @@ The service reads an owner-private `phone.toml`, the existing ZeroClaw encrypted
 configuration, and `screening.md` from its extension root. Credentials and live
 configuration are intentionally not part of this repository.
 
+`route-check ROOT` recognizes either a direct tunnel to the configured phone port
+or the existing Google push bridge described by the private sibling
+`google-push/config.json`. Bridge mode requires canonical `Root`, `PublicURL`,
+`Listen`, and `Upstream` keys, matching public URL, a literal loopback listener,
+and the exact phone upstream. Duplicate topology keys, case-folded aliases,
+non-ASCII key names, unsafe files and arbitrary proxy targets fail the check.
+Direct mode does not require a bridge config. Both modes still check public
+`/voice/health` and reject an unsigned webhook with HTTP 403. The additive
+`routeKind` result is `direct` or `google_push_bridge`; this diagnoses configured
+topology and endpoint behavior, not the signature or identity of a listening
+process. It does not change routes or webhook authentication.
+
 ## Voice engines
 
 Two engines can bridge call audio. Both produce the same transcript and outcome,

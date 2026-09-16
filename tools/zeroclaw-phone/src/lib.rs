@@ -13,4 +13,5 @@ pub mod outbound;
 pub mod protocol;
 pub mod realtime;
 pub mod recording;
+pub mod route_check;
 pub mod summary;

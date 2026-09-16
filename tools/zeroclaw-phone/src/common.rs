@@ -23,6 +23,11 @@ pub fn private_dir(path: &Path) -> SafeResult<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))
             .map_err(|_| "directory_permissions_failed")?;
     }
+    existing_private_dir(path)
+}
+
+/// Validate an existing private directory without creating or repairing it.
+pub fn existing_private_dir(path: &Path) -> SafeResult<()> {
     let m = fs::symlink_metadata(path).map_err(|_| "directory_metadata_failed")?;
     // geteuid only reads this process's effective identity.
     check(
