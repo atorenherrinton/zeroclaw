@@ -1,6 +1,6 @@
 //! Public Apple Maps listing lookup. The SDK response is the source of listing
 //! fields; the caller decides whether a listed phone matches its call-bound From.
-//! Native MapKit runs only in this executable's disposable --maps-lookup mode.
+//! Native MapKit runs only in this executable's disposable lookup modes.
 
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -40,6 +40,54 @@ type LookupResult<T> = Result<T, &'static str>;
 
 fn valid_query(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+// Query inputs are borrowed only for this invocation. The inbound scheduler is
+// the authority for caller ID; this adapter neither chooses nor normalizes it.
+#[derive(Clone, Copy)]
+enum Query<'a> {
+    PublicBusiness { name: &'a str, locality: &'a str },
+    Phone(&'a str),
+}
+
+impl Query<'_> {
+    fn validate(self) -> LookupResult<()> {
+        match self {
+            Self::PublicBusiness { name, locality }
+                if valid_query(name) && valid_query(locality) =>
+            {
+                Ok(())
+            }
+            Self::Phone(phone) if crate::common::e164(phone) => Ok(()),
+            _ => Err("maps_query_invalid"),
+        }
+    }
+
+    fn command(self, executable: &std::path::Path, parent: u32) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(executable);
+        match self {
+            Self::PublicBusiness { name, locality } => {
+                command.arg("--maps-lookup").arg(name).arg(locality);
+            }
+            Self::Phone(phone) => {
+                command.arg("--maps-lookup-phone").arg(phone);
+            }
+        }
+        command.arg(parent.to_string());
+        command
+    }
+}
+
+fn parse_cli(args: &[String]) -> LookupResult<(Query<'_>, libc::pid_t)> {
+    let (query, parent) = match args {
+        [_, mode, name, locality, parent] if mode == "--maps-lookup" => {
+            (Query::PublicBusiness { name, locality }, parent)
+        }
+        [_, mode, phone, parent] if mode == "--maps-lookup-phone" => (Query::Phone(phone), parent),
+        _ => return Err("maps_query_invalid"),
+    };
+    query.validate()?;
+    Ok((query, parent.parse().map_err(|_| "maps_parent_invalid")?))
 }
 
 fn bounded_field(value: &str, max: usize) -> bool {
@@ -198,19 +246,28 @@ async fn collect(
 /// Search only the explicit public business and city/address supplied by the
 /// broker. This API never reads current location, Contacts, calendar or config.
 pub async fn lookup(public_business: &str, public_address: &str) -> LookupResult<LookupResponse> {
-    if !valid_query(public_business) || !valid_query(public_address) {
-        return Err("maps_query_invalid");
-    }
+    lookup_query(Query::PublicBusiness {
+        name: public_business,
+        locality: public_address,
+    })
+    .await
+}
+
+/// Search the signed inbound call's strict E.164 number alone. No model text,
+/// location, Contacts, calendar or config is read or appended to the query.
+/// MapKit does not promise complete reverse-phone coverage: no result or a
+/// mismatched returned listing phone cannot verify the caller's business.
+pub async fn lookup_phone(caller_id: &str) -> LookupResult<LookupResponse> {
+    lookup_query(Query::Phone(caller_id)).await
+}
+
+async fn lookup_query(query: Query<'_>) -> LookupResult<LookupResponse> {
+    query.validate()?;
     if !cfg!(target_os = "macos") {
         return Err("maps_platform_unavailable");
     }
     let executable = std::env::current_exe().map_err(|_| "maps_executable_missing")?;
-    let mut command = tokio::process::Command::new(executable);
-    command
-        .arg("--maps-lookup")
-        .arg(public_business)
-        .arg(public_address)
-        .arg(std::process::id().to_string());
+    let mut command = query.command(&executable, std::process::id());
     collect(&mut command, PROCESS_LIMIT).await
 }
 
@@ -221,6 +278,13 @@ unsafe extern "C" {
         name_len: usize,
         locality: *const u8,
         locality_len: usize,
+        timeout_ms: u32,
+        output: *mut *mut u8,
+        output_len: *mut usize,
+    ) -> i32;
+    fn maps_lookup_phone_json(
+        phone: *const u8,
+        phone_len: usize,
         timeout_ms: u32,
         output: *mut *mut u8,
         output_len: *mut usize,
@@ -268,18 +332,11 @@ fn start_watchdog(parent: libc::pid_t) -> LookupResult<()> {
     Ok(())
 }
 
-/// Return an exit code. The binary calls this synchronously for --maps-lookup,
+/// Return an exit code. The binary calls this synchronously for either lookup mode,
 /// before building Tokio or loading private phone state, and then exits.
 pub fn run_cli() -> i32 {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5
-        || args[1] != "--maps-lookup"
-        || !valid_query(&args[2])
-        || !valid_query(&args[3])
-    {
-        return 64;
-    }
-    let Ok(parent) = args[4].parse::<libc::pid_t>() else {
+    let Ok((query, parent)) = parse_cli(&args) else {
         return 64;
     };
     if start_watchdog(parent).is_err() {
@@ -290,15 +347,24 @@ pub fn run_cli() -> i32 {
         let mut output = std::ptr::null_mut();
         let mut len = 0;
         let code = unsafe {
-            maps_lookup_json(
-                args[2].as_ptr(),
-                args[2].len(),
-                args[3].as_ptr(),
-                args[3].len(),
-                NATIVE_TIMEOUT_MS,
-                &mut output,
-                &mut len,
-            )
+            match query {
+                Query::PublicBusiness { name, locality } => maps_lookup_json(
+                    name.as_ptr(),
+                    name.len(),
+                    locality.as_ptr(),
+                    locality.len(),
+                    NATIVE_TIMEOUT_MS,
+                    &mut output,
+                    &mut len,
+                ),
+                Query::Phone(phone) => maps_lookup_phone_json(
+                    phone.as_ptr(),
+                    phone.len(),
+                    NATIVE_TIMEOUT_MS,
+                    &mut output,
+                    &mut len,
+                ),
+            }
         };
         if output.is_null() {
             return 70;
@@ -318,6 +384,7 @@ pub fn run_cli() -> i32 {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = query;
         69
     }
 }
@@ -355,6 +422,114 @@ mod tests {
             lookup("Synthetic\nShop", "Example").await.unwrap_err(),
             "maps_query_invalid"
         );
+    }
+    #[tokio::test]
+    async fn maps_phone_query_rejects_non_e164_before_spawn() {
+        for phone in [
+            "",
+            "+",
+            "+1",
+            "+02025550100",
+            "12025550100",
+            "tel:+12025550100",
+            "+1 202 555 0100",
+            " +12025550100",
+            "+12025550100 ",
+            "+12025550100\n",
+            "+12025550100\0",
+            "+12025550100, Example",
+            "+12025550100;ext=1",
+            "+１２025550100",
+            "+1234567890123456",
+        ] {
+            assert_eq!(lookup_phone(phone).await.unwrap_err(), "maps_query_invalid");
+        }
+    }
+    #[test]
+    fn maps_phone_mode_sends_only_number_and_parent_and_keeps_public_mode() {
+        let args = ["phone", "--maps-lookup-phone", "+12025550100", "42"].map(str::to_owned);
+        let (query, parent) = parse_cli(&args).unwrap();
+        assert!(matches!(query, Query::Phone("+12025550100")));
+        assert_eq!(parent, 42);
+        let command = query.command(std::path::Path::new("/synthetic/phone"), 42);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["--maps-lookup-phone", "+12025550100", "42"]
+        );
+        let args = ["phone", "--maps-lookup", "Synthetic Shop", "Example", "42"].map(str::to_owned);
+        let (query, parent) = parse_cli(&args).unwrap();
+        assert!(matches!(
+            query,
+            Query::PublicBusiness {
+                name: "Synthetic Shop",
+                locality: "Example"
+            }
+        ));
+        assert_eq!(parent, 42);
+        let command = query.command(std::path::Path::new("/synthetic/phone"), 42);
+        assert_eq!(
+            command.as_std().get_args().collect::<Vec<_>>(),
+            ["--maps-lookup", "Synthetic Shop", "Example", "42"]
+        );
+        for args in [
+            vec!["phone", "--maps-lookup-phone", "+12025550100"],
+            vec![
+                "phone",
+                "--maps-lookup-phone",
+                "+12025550100",
+                "Example",
+                "42",
+            ],
+            vec!["phone", "--maps-lookup-phone", "+12025550100", "parent"],
+            vec!["phone", "--maps-lookup-phone", "Synthetic Shop", "42"],
+            vec!["phone", "--maps-lookup", "+12025550100", "42"],
+        ] {
+            assert!(parse_cli(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()).is_err());
+        }
+    }
+    #[test]
+    fn maps_phone_response_preserves_absence_and_incomplete_result_evidence() {
+        let value = serde_json::json!({"schema_version":1,"source":"apple_mapkit","status":"no_results","truncated":false,"items":[]});
+        let response = decode_response(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(response.status, "no_results");
+        assert!(response.items.is_empty());
+        let mut value = fixture();
+        value["items"][0]["phone"] = serde_json::Value::Null;
+        value["truncated"] = true.into();
+        let response = decode_response(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(response.items[0].phone.is_none());
+        assert!(response.truncated);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn maps_native_phone_rejects_text_before_mapkit() {
+        for phone in [
+            "",
+            "+1",
+            "+02025550100",
+            "+12025550100, Example",
+            "+12025550100\0",
+        ] {
+            let mut output = std::ptr::null_mut();
+            let mut len = 0;
+            let code = unsafe {
+                maps_lookup_phone_json(
+                    phone.as_ptr(),
+                    phone.len(),
+                    NATIVE_TIMEOUT_MS,
+                    &mut output,
+                    &mut len,
+                )
+            };
+            assert_eq!(code, 64);
+            assert!(!output.is_null() && len <= MAX_OUTPUT);
+            let response: LookupResponse =
+                serde_json::from_slice(unsafe { std::slice::from_raw_parts(output, len) }).unwrap();
+            unsafe { maps_lookup_free(output) };
+            assert_eq!(response.status, "invalid_input");
+            assert_eq!(response.error_code.as_deref(), Some("input_phone"));
+            assert!(response.items.is_empty());
+        }
     }
     #[tokio::test]
     async fn maps_parent_caps_response_and_kills_reaps_uncooperative_process() {

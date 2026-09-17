@@ -146,7 +146,7 @@ fn load(root: &Path, sid: Option<&str>, include_receipt: bool) -> SafeResult<Vec
 }
 
 fn request(row: &Row) -> SafeResult<Request> {
-    Request::parse(
+    Request::parse_stored(
         serde_json::from_str(&row.request).map_err(|_| "appointment_status_data_invalid")?,
     )
 }
@@ -250,7 +250,7 @@ fn metadata(row: &Row) -> SafeResult<Value> {
     };
     let unresolved = matches!(row.state.as_str(), "writing" | "uncertain");
     Ok(
-        json!({"call_sid":row.sid,"state":row.state,"original_start":request.original_start,"proposed_start":request.proposed_start,"proposed_end":proposed_end,
+        json!({"call_sid":row.sid,"state":row.state,"original_start":row.original.as_ref().map(|_| original(row).map(|event| event.start)).transpose()?.or(request.original_start),"proposed_start":request.proposed_start,"proposed_end":proposed_end,
         "public_maps_link":public_map(row)?,"original_preserved":true,"owner_review_required":true,"calendar_outcome_unknown":unresolved,
         "call_phase":phase(&row.phase),"call_outcome":outcome(row.outcome.as_deref()),"recording_suppressed":row.consent==Some(0)||row.outcome.as_deref()==Some("recording_declined"),
         "reconciliation_allowed":row.phase=="ended"&&unresolved&&row.original.is_some()&&row.key.as_deref()==Some(appointment_calendar::hold_key(&row.sid).as_str()),

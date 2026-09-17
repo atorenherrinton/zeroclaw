@@ -550,12 +550,25 @@ fn same_event(left: &Event, right: &Event) -> bool {
 
 async fn find_using<R: Runner>(
     config_dir: &Path,
-    original_start: &str,
+    original_start: Option<&str>,
     business_name: &str,
     business_address: &str,
     runner: &R,
 ) -> SafeResult<Event> {
-    let start = instant(original_start)?;
+    let start = original_start.map(instant).transpose()?;
+    // The clock is scoped to this lookup, so every page uses the same bounded
+    // window. An explicit caller time retains the existing exact-start lookup.
+    let now = Utc::now();
+    let (anchor, before, after) = match start {
+        Some(start) => (start, TimeDelta::seconds(1), TimeDelta::seconds(1)),
+        None => (now, TimeDelta::days(1), TimeDelta::days(90)),
+    };
+    let from = anchor
+        .checked_sub_signed(before)
+        .ok_or("calendar_time_invalid")?;
+    let to = anchor
+        .checked_add_signed(after)
+        .ok_or("calendar_time_invalid")?;
     let name = normalized(business_name);
     let address = normalized(business_address);
     check(
@@ -564,36 +577,46 @@ async fn find_using<R: Runner>(
     )?;
     let session = Session::new(config_dir, runner)?;
     let (primary, _) = session.calendars().await?;
-    let from = start
-        .checked_sub_signed(TimeDelta::seconds(1))
-        .ok_or("calendar_time_invalid")?
-        .to_rfc3339();
-    let to = start
-        .checked_add_signed(TimeDelta::seconds(1))
-        .ok_or("calendar_time_invalid")?
-        .to_rfc3339();
+    let from_arg = from.to_rfc3339();
+    let to_arg = to.to_rfc3339();
     let mut paging = Paging::default();
     let mut candidate = None;
     loop {
-        let mut args = vec!["calendar".into(), "events".into(), primary.clone(), "--max=250".into(), format!("--from={from}"), format!("--to={to}"), "--fields=nextPageToken,items(id,etag,status,eventType,summary,location,start,end,recurrence,recurringEventId,originalStartTime)".into()];
+        let mut args = vec!["calendar".into(), "events".into(), primary.clone(), "--max=250".into(), format!("--from={from_arg}"), format!("--to={to_arg}"), "--fields=nextPageToken,items(id,etag,status,eventType,summary,location,start,end,recurrence,recurringEventId,originalStartTime)".into()];
         if let Some(token) = &paging.next {
             args.push(format!("--page={token}"));
         }
         let page = session.read("calendar.events", args).await?;
         let (items, more) = paging.accept(&page, "events")?;
         for item in items {
-            if item["start"]["dateTime"]
-                .as_str()
-                .and_then(|v| instant(v).ok())
-                != Some(start)
-            {
-                continue;
-            }
             if !item["summary"].as_str().is_some_and(|v| phrase(v, &name))
                 || !item["location"]
                     .as_str()
                     .is_some_and(|v| phrase(v, &address))
             {
+                continue;
+            }
+            if start.is_none() {
+                // A matching record with unknown timing cannot establish a
+                // unique inferred appointment. All-day records are explicitly
+                // unsupported rather than treated as missing timed events.
+                check(
+                    item["start"].get("date").is_none() && item["end"].get("date").is_none(),
+                    "calendar_event_all_day",
+                )?;
+            }
+            let Some(item_start) = item["start"]["dateTime"]
+                .as_str()
+                .and_then(|v| instant(v).ok())
+            else {
+                check(start.is_some(), "calendar_original_timing_incomplete")?;
+                continue;
+            };
+            let matches_start = match start {
+                Some(start) => item_start == start,
+                None => item_start >= from && item_start < to,
+            };
+            if !matches_start {
                 continue;
             }
             let found = event(&primary, item)?;
@@ -615,7 +638,7 @@ async fn find_using<R: Runner>(
 
 pub async fn find_original(
     config_dir: &Path,
-    original_start: &str,
+    original_start: Option<&str>,
     business_name: &str,
     business_address: &str,
 ) -> SafeResult<Event> {
@@ -866,6 +889,12 @@ mod tests {
     fn source() -> Value {
         json!({"id":"original123","etag":"\"version-1\"","status":"confirmed","summary":"Synthetic Dental appointment","location":"100 Test Road, Example City","start":{"dateTime":"2030-01-01T10:00:00Z"},"end":{"dateTime":"2030-01-01T10:45:00Z"}})
     }
+    fn source_at(start: DateTime<Utc>) -> Value {
+        let mut value = source();
+        value["start"]["dateTime"] = json!(start.to_rfc3339());
+        value["end"]["dateTime"] = json!((start + TimeDelta::minutes(45)).to_rfc3339());
+        value
+    }
     fn list() -> Value {
         json!({"calendars":[{"id":CAL,"primary":true,"accessRole":"owner"},{"id":OTHER,"selected":true,"accessRole":"reader"}]})
     }
@@ -994,7 +1023,7 @@ mod tests {
         let script = Script::new(vec![list(), json!({"events":[source()]}), source()]);
         let found = find_using(
             &root,
-            "2030-01-01T02:00:00-08:00",
+            Some("2030-01-01T02:00:00-08:00"),
             "Synthetic Dental",
             "100 Test Road, Example City",
             &script,
@@ -1006,7 +1035,7 @@ mod tests {
         assert!(
             find_using(
                 &root,
-                &found.start,
+                Some(&found.start),
                 "Synthetic Dental",
                 "100 Test Road, Example City",
                 &script
@@ -1020,7 +1049,7 @@ mod tests {
         assert!(
             find_using(
                 &root,
-                &found.start,
+                Some(&found.start),
                 "Synthetic Dental",
                 "100 Test Road, Example City",
                 &script
@@ -1032,6 +1061,242 @@ mod tests {
             "Synthetic Dentistry",
             &normalized("Synthetic Dental")
         ));
+    }
+
+    #[tokio::test]
+    async fn inferred_unique_match_exhausts_pages_and_preserves_branch_and_fresh_get_checks() {
+        let (_temp, root) = setup();
+        let before = Utc::now();
+        let original = source_at(before + TimeDelta::days(10));
+        let mut other_branch = source_at(before + TimeDelta::days(11));
+        other_branch["id"] = json!("another-branch");
+        other_branch["location"] = json!("200 Other Road, Example City");
+        let script = Script::new(vec![
+            list(),
+            json!({"events":[original.clone()],"nextPageToken":"second-page"}),
+            json!({"events":[other_branch]}),
+            original.clone(),
+        ]);
+        let found = find_using(
+            &root,
+            None,
+            "Synthetic Dental",
+            "100 Test Road, Example City",
+            &script,
+        )
+        .await
+        .unwrap();
+        let after = Utc::now();
+        assert_eq!(found.id, "original123");
+        assert_eq!(found.start, original["start"]["dateTime"].as_str().unwrap());
+        let calls = script.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4);
+        let argument = |prefix: &str| {
+            calls[1]
+                .0
+                .iter()
+                .find_map(|v| v.strip_prefix(prefix))
+                .unwrap()
+        };
+        let from = instant(argument("--from=")).unwrap();
+        let to = instant(argument("--to=")).unwrap();
+        assert!(from >= before - TimeDelta::days(1));
+        assert!(from <= after - TimeDelta::days(1));
+        assert_eq!(to - from, TimeDelta::days(91));
+        assert!(calls[2].0.iter().any(|v| v == "--page=second-page"));
+        assert!(
+            calls[2]
+                .0
+                .iter()
+                .any(|v| v == &format!("--from={}", argument("--from=")))
+        );
+        assert!(calls[3].0.iter().any(|v| v == "calendar.events.get"));
+        assert!(calls.iter().all(|(_, input)| input.is_none()));
+        drop(calls);
+
+        let mut changed = original.clone();
+        changed["etag"] = json!("\"changed-after-list\"");
+        let script = Script::new(vec![list(), json!({"events":[original]}), changed]);
+        assert_eq!(
+            find_using(
+                &root,
+                None,
+                "Synthetic Dental",
+                "100 Test Road, Example City",
+                &script
+            )
+            .await
+            .err(),
+            Some("calendar_original_changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn inferred_multiple_matching_appointments_fail_closed_across_pages() {
+        let (_temp, root) = setup();
+        let now = Utc::now();
+        let original = source_at(now + TimeDelta::days(10));
+        let mut second = source_at(now + TimeDelta::days(11));
+        second["id"] = json!("another-matching-appointment");
+        let script = Script::new(vec![
+            list(),
+            json!({"events":[original],"nextPageToken":"second-page"}),
+            json!({"events":[second]}),
+        ]);
+        assert_eq!(
+            find_using(
+                &root,
+                None,
+                "Synthetic Dental",
+                "100 Test Road, Example City",
+                &script
+            )
+            .await
+            .err(),
+            Some("calendar_original_ambiguous")
+        );
+        let calls = script.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(
+            |(args, input)| input.is_none() && !args.iter().any(|v| v == "calendar.events.get")
+        ));
+    }
+
+    #[tokio::test]
+    async fn inferred_matching_record_with_unknown_timing_cannot_be_ignored_as_unique() {
+        let (_temp, root) = setup();
+        let original = source_at(Utc::now() + TimeDelta::days(10));
+        for (timing, expected_error) in [
+            (json!({}), "calendar_original_timing_incomplete"),
+            (
+                json!({"dateTime":"not-a-time"}),
+                "calendar_original_timing_incomplete",
+            ),
+            (
+                json!({"dateTime":123}),
+                "calendar_original_timing_incomplete",
+            ),
+            (json!({"date":"2030-01-01"}), "calendar_event_all_day"),
+        ] {
+            let mut incomplete = original.clone();
+            incomplete["id"] = json!("matching-with-unknown-time");
+            incomplete["start"] = timing;
+            let script = Script::new(vec![
+                list(),
+                json!({"events":[original.clone()],"nextPageToken":"second-page"}),
+                json!({"events":[incomplete.clone()]}),
+            ]);
+            assert_eq!(
+                find_using(
+                    &root,
+                    None,
+                    "Synthetic Dental",
+                    "100 Test Road, Example City",
+                    &script,
+                )
+                .await
+                .err(),
+                Some(expected_error)
+            );
+            let calls = script.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 3);
+            assert!(
+                calls.iter().all(|(args, input)| input.is_none()
+                    && !args.iter().any(|v| v == "calendar.events.get"))
+            );
+            drop(calls);
+
+            // An explicit time retains the prior exact-start behavior: an
+            // unparseable other start cannot match the supplied instant.
+            let script = Script::new(vec![
+                list(),
+                json!({"events":[original.clone(), incomplete]}),
+                original.clone(),
+            ]);
+            let found = find_using(
+                &root,
+                original["start"]["dateTime"].as_str(),
+                "Synthetic Dental",
+                "100 Test Road, Example City",
+                &script,
+            )
+            .await
+            .unwrap();
+            assert_eq!(found.id, "original123");
+        }
+    }
+
+    #[tokio::test]
+    async fn inferred_lookup_rejects_out_of_window_results_even_when_provider_returns_them() {
+        let (_temp, root) = setup();
+        let now = Utc::now();
+        let script = Script::new(vec![
+            list(),
+            json!({"events":[source_at(now - TimeDelta::days(2)), source_at(now + TimeDelta::days(91))]}),
+        ]);
+        assert_eq!(
+            find_using(
+                &root,
+                None,
+                "Synthetic Dental",
+                "100 Test Road, Example City",
+                &script
+            )
+            .await
+            .err(),
+            Some("calendar_original_not_found")
+        );
+        assert_eq!(script.calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn supplied_start_stays_exact_instead_of_selecting_another_matching_time() {
+        let (_temp, root) = setup();
+        let start = instant("2030-01-01T10:00:00Z").unwrap();
+        let other_time = source_at(start + TimeDelta::minutes(15));
+        let script = Script::new(vec![
+            list(),
+            json!({"events":[other_time.clone(), source()]}),
+            source(),
+        ]);
+        let found = find_using(
+            &root,
+            Some("2030-01-01T02:00:00-08:00"),
+            "Synthetic Dental",
+            "100 Test Road, Example City",
+            &script,
+        )
+        .await
+        .unwrap();
+        assert_eq!(instant(&found.start).unwrap(), start);
+        let calls = script.calls.lock().unwrap().clone();
+        assert!(
+            calls[1]
+                .0
+                .iter()
+                .any(|v| v == "--from=2030-01-01T09:59:59+00:00")
+        );
+        assert!(
+            calls[1]
+                .0
+                .iter()
+                .any(|v| v == "--to=2030-01-01T10:00:01+00:00")
+        );
+        drop(calls);
+        let script = Script::new(vec![list(), json!({"events":[other_time]})]);
+        assert_eq!(
+            find_using(
+                &root,
+                Some("2030-01-01T10:00:00Z"),
+                "Synthetic Dental",
+                "100 Test Road, Example City",
+                &script
+            )
+            .await
+            .err(),
+            Some("calendar_original_not_found")
+        );
+        assert_eq!(script.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1053,7 +1318,7 @@ mod tests {
         .await
         .unwrap();
         assert!(result.state == HoldState::Verified);
-        let calls = script.calls.lock().unwrap();
+        let calls = script.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 5);
         assert!(calls[0].0.iter().any(|v| v == "calendar.events.get"));
         assert!(calls[2].0.iter().any(|v| v == &format!("--cal={OTHER}")));
@@ -1217,7 +1482,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.state == HoldState::Verified);
-        let calls = script.calls.lock().unwrap();
+        let calls = script.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 2);
         let request = calls[0].1.as_ref().unwrap();
         assert_eq!(request["params"]["name"], "calendar_reconcile");
@@ -1263,7 +1528,7 @@ mod tests {
                 .unwrap(),
             CAL
         );
-        let calls = script.calls.lock().unwrap();
+        let calls = script.calls.lock().unwrap().clone();
         assert_eq!(calls.len(), 4);
         assert!(calls[1].0.iter().any(|v| v == "--page=second-page"));
         assert_eq!(

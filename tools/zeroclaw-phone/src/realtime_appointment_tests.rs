@@ -45,8 +45,7 @@ impl AppointmentScheduler for LocalScheduler {
 }
 
 fn proposal() -> Value {
-    json!({"business_name":"Synthetic Clinic","business_address":"123 Example St, Example City",
-        "original_start":"2026-10-01T09:00:00-07:00","proposed_start":"2026-10-02T10:00:00-07:00","caller_confirmed":true})
+    json!({"proposed_start":"2026-10-02T10:00:00-07:00","caller_confirmed":true})
 }
 fn start() -> Value {
     let stream = format!("MZ{}", "3".repeat(32));
@@ -182,12 +181,24 @@ impl Harness {
         let mut model = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let mut update = receive(&mut model).await;
         assert_eq!(update["type"], "session.update");
-        assert!(
-            update["session"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool["name"] == appointments::TOOL_NAME)
+        let appointment_tool = update["session"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == appointments::TOOL_NAME)
+            .unwrap();
+        assert_eq!(
+            appointment_tool["parameters"]["required"],
+            json!(["proposed_start", "caller_confirmed"])
+        );
+        let fields = appointment_tool["parameters"]["properties"]
+            .as_object()
+            .unwrap();
+        assert_eq!(fields.len(), 3);
+        assert!(fields.contains_key("original_start"));
+        assert_eq!(
+            appointment_tool["parameters"]["additionalProperties"],
+            false
         );
         update["type"] = json!("session.updated");
         update["session"]["model"] = json!(MODEL);

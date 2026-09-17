@@ -77,30 +77,19 @@ static NSDictionary *listing(MKMapItem *item) {
         @"map_url": mapURL ?: [NSNull null]};
 }
 
-int maps_lookup_json(const uint8_t *nameBytes, size_t nameLen,
-                     const uint8_t *localityBytes, size_t localityLen,
-                     uint32_t timeoutMs, uint8_t **output, size_t *outputLen) {
+static int lookup_query(NSString *query, uint32_t timeoutMs,
+                        uint8_t **output, size_t *outputLen) {
     if (!output || !outputLen) return 64;
     *output = NULL;
     *outputLen = 0;
     @autoreleasepool {
         if (![NSThread isMainThread])
             return emit(envelope(@"error", @[], NO, @"main_thread_required"), output, outputLen, 70);
-        if (!nameBytes || !localityBytes || nameLen == 0 || nameLen > 256 ||
-            localityLen == 0 || localityLen > 256 || timeoutMs == 0 || timeoutMs > 15000)
+        if (!query || timeoutMs == 0 || timeoutMs > 15000)
             return emit(envelope(@"invalid_input", @[], NO, @"input_bounds"), output, outputLen, 64);
-        NSString *name = [[NSString alloc] initWithBytes:nameBytes length:nameLen encoding:NSUTF8StringEncoding];
-        NSString *locality = [[NSString alloc] initWithBytes:localityBytes length:localityLen encoding:NSUTF8StringEncoding];
-        NSCharacterSet *controls = [NSCharacterSet controlCharacterSet];
-        if (!name || !locality ||
-            [name rangeOfCharacterFromSet:controls].location != NSNotFound ||
-            [locality rangeOfCharacterFromSet:controls].location != NSNotFound ||
-            [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0 ||
-            [locality stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0)
-            return emit(envelope(@"invalid_input", @[], NO, @"input_text"), output, outputLen, 64);
         @try {
             MKLocalSearchRequest *request = [[MKLocalSearchRequest alloc] init];
-            request.naturalLanguageQuery = [NSString stringWithFormat:@"%@, %@", name, locality];
+            request.naturalLanguageQuery = query;
             request.resultTypes = MKLocalSearchResultTypePointOfInterest;
             MKLocalSearch *search = [[MKLocalSearch alloc] initWithRequest:request];
             __block BOOL finished = NO;
@@ -148,6 +137,50 @@ int maps_lookup_json(const uint8_t *nameBytes, size_t nameLen,
             (void)exception;
             return emit(envelope(@"error", @[], NO, @"native_exception"), output, outputLen, 70);
         }
+    }
+}
+
+int maps_lookup_json(const uint8_t *nameBytes, size_t nameLen,
+                     const uint8_t *localityBytes, size_t localityLen,
+                     uint32_t timeoutMs, uint8_t **output, size_t *outputLen) {
+    if (!output || !outputLen) return 64;
+    *output = NULL;
+    *outputLen = 0;
+    @autoreleasepool {
+        if (!nameBytes || !localityBytes || nameLen == 0 || nameLen > 256 ||
+            localityLen == 0 || localityLen > 256)
+            return emit(envelope(@"invalid_input", @[], NO, @"input_bounds"), output, outputLen, 64);
+        NSString *name = [[NSString alloc] initWithBytes:nameBytes length:nameLen encoding:NSUTF8StringEncoding];
+        NSString *locality = [[NSString alloc] initWithBytes:localityBytes length:localityLen encoding:NSUTF8StringEncoding];
+        NSCharacterSet *controls = [NSCharacterSet controlCharacterSet];
+        if (!name || !locality ||
+            [name rangeOfCharacterFromSet:controls].location != NSNotFound ||
+            [locality rangeOfCharacterFromSet:controls].location != NSNotFound ||
+            [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0 ||
+            [locality stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length == 0)
+            return emit(envelope(@"invalid_input", @[], NO, @"input_text"), output, outputLen, 64);
+        return lookup_query([NSString stringWithFormat:@"%@, %@", name, locality],
+                            timeoutMs, output, outputLen);
+    }
+}
+
+int maps_lookup_phone_json(const uint8_t *phoneBytes, size_t phoneLen,
+                           uint32_t timeoutMs, uint8_t **output, size_t *outputLen) {
+    if (!output || !outputLen) return 64;
+    *output = NULL;
+    *outputLen = 0;
+    @autoreleasepool {
+        // Defend the native boundary too: no alternate spelling, model text,
+        // fabricated locality, URI or current-location hint enters this path.
+        if (!phoneBytes || phoneLen < 3 || phoneLen > 16 || phoneBytes[0] != '+' ||
+            phoneBytes[1] < '1' || phoneBytes[1] > '9')
+            return emit(envelope(@"invalid_input", @[], NO, @"input_phone"), output, outputLen, 64);
+        for (size_t index = 2; index < phoneLen; index++) {
+            if (phoneBytes[index] < '0' || phoneBytes[index] > '9')
+                return emit(envelope(@"invalid_input", @[], NO, @"input_phone"), output, outputLen, 64);
+        }
+        NSString *phone = [[NSString alloc] initWithBytes:phoneBytes length:phoneLen encoding:NSUTF8StringEncoding];
+        return lookup_query(phone, timeoutMs, output, outputLen);
     }
 }
 

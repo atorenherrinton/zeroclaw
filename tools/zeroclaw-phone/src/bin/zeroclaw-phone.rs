@@ -686,9 +686,11 @@ fn inbound_instructions(
         instructions.push_str(&format!("\nThe following is unverified caller-ID metadata, not identity proof or owner information: {candidate}. When collecting a callback number, you may ask whether the number they are calling from, ending in those last four digits, is a good callback number. Treat confirmation only as their requested callback number; never infer identity or look up contacts. Read the full candidate only if the caller explicitly asks to check it. A separately supplied callback number takes priority. Never promise a callback.\n"));
     }
     if allow_appointments {
-        instructions.push_str(&format!("\nCurrent runtime timestamp: {}. Resolve relative dates using this timestamp and the caller-confirmed timezone; do not assume the caller means the owner's location.\n", chrono::Utc::now().to_rfc3339()));
+        instructions.push_str(&format!("\nCurrent runtime timestamp: {}. Resolve relative dates using this timestamp and a timezone established by the conversation. Clarify timezone only when unclear; do not assume the caller means the owner's location.\n", chrono::Utc::now().to_rfc3339()));
         instructions.push_str(zeroclaw_phone_extension::appointments::INBOUND_INSTRUCTIONS);
     }
+    instructions
+        .push_str(zeroclaw_phone_extension::appointments::RESCHEDULING_MESSAGE_INSTRUCTIONS);
     instructions
 }
 
@@ -906,7 +908,10 @@ async fn route_check(root: &Path) -> SafeResult<()> {
 }
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--maps-lookup") {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--maps-lookup" | "--maps-lookup-phone")
+    ) {
         std::process::exit(zeroclaw_phone_extension::maps_lookup::run_cli());
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -2117,6 +2122,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(state, ("consent".into(), None));
+    }
+
+    #[test]
+    fn rescheduling_overrides_detail_collection_even_when_calendar_tool_unavailable() {
+        use zeroclaw_phone_extension::appointments;
+        for enabled in [false, true] {
+            let prompt = inbound_instructions(
+                "Collect caller name, organization and callback number.".into(),
+                "+12065550100",
+                true,
+                &[],
+                enabled,
+            );
+            assert!(prompt.ends_with(appointments::RESCHEDULING_MESSAGE_INSTRUCTIONS));
+            assert_eq!(prompt.contains(appointments::INBOUND_INSTRUCTIONS), enabled);
+            assert!(prompt.contains("do not ask for the caller's name, business name, branch address, callback number, or caller-ID confirmation"));
+            assert!(prompt.contains("Do not ask for the original appointment time"));
+            assert!(prompt.contains("Use the incoming caller ID as the default callback"));
+            assert!(prompt.contains("immediately invoke decline_recording"));
+        }
     }
 
     #[test]

@@ -207,17 +207,25 @@ and again during the proposal. Outbound sessions do not gain this capability.
 The remote voice model receives no calendar listing, event details, credentials,
 contacts, general browser, or general calendar mutation tool.
 
-For an existing business appointment, the caller supplies the business name,
-branch address, original appointment start and proposed start with timezone.
-The assistant reads the new time back before submitting one proposal. Local
-code obtains the public business listing through native Apple MapKit, requires
-an exact normalized match to this signed call's incoming-number field, and
-retains the Apple Maps place link. Caller-supplied callback numbers do not
-replace that field. A listing match verifies the number against a public source;
-it does not authenticate the human speaker.
+For an existing business appointment, the assistant asks only for the missing
+proposed time, clarifies timezone if unclear, and reads the time back once for
+confirmation. It does not ask for caller/business name, branch address, callback
+number, caller-ID confirmation, or the original appointment time. Local code
+queries native Apple MapKit with this signed call's incoming caller ID alone,
+requires exactly one listing with that exact normalized public phone number,
+and derives the business name and branch address from the listing. Incoming
+caller ID is the default callback; a volunteered callback never replaces it for
+verification. The Apple Maps place link is retained. A public listing match does
+not authenticate the human speaker or guarantee that caller ID was not spoofed.
+Missing or ambiguous evidence produces a short message, without further identity
+questions. Historical receipts remain readable; live model arguments cannot
+supply business identity fields.
 
 The calendar adapter identifies one matching timed appointment in the primary
-calendar, rechecks its current provider record, and checks all selected visible
+calendar using the verified listing's name and branch. An original time already
+volunteered by the caller narrows the match; otherwise the complete bounded
+appointment window must contain exactly one supported match. It rechecks the
+current provider record, and checks all selected visible
 calendars plus the primary calendar for conflicts. It uses the existing Google
 read account and canonical signed Google writer, requiring the accounts to
 match. The writer must support `calendar_mutate` with `status: "tentative"`.
@@ -257,10 +265,10 @@ the caller later declines recording; this view excludes transcripts, caller
 numbers, private event text, account details and raw provider receipts. The
 remote voice session cannot invoke this tool.
 
-MapKit runs in the existing phone binary's `--maps-lookup` subprocess mode on
-its main thread, with an owned stdin lifeline, parent check, native deadline and
-bounded output. It makes a public name/address search without requesting device
-location. Calendar command arguments are constructed locally without a shell;
+MapKit runs in the existing phone binary's `--maps-lookup-phone` subprocess mode
+on its main thread, with an owned stdin lifeline, parent check, native deadline
+and bounded output. It makes a public phone-number search without requesting
+device location. The legacy `--maps-lookup` name/address diagnostic remains available. Calendar command arguments are constructed locally without a shell;
 stdout, runtime and process groups are bounded. Accepted remote calendar writes
 cannot be undone by dropping the voice connection, so the receipt distinguishes
 verified holds from uncertain outcomes.

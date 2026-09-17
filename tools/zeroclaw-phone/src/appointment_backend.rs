@@ -24,7 +24,7 @@ use std::{
 type Work<'a, T> = Pin<Box<dyn Future<Output = SafeResult<T>> + Send + 'a>>;
 
 trait Services: Send + Sync {
-    fn lookup<'a>(&'a self, request: &'a Request) -> Work<'a, LookupResponse>;
+    fn lookup<'a>(&'a self, from: &'a str) -> Work<'a, LookupResponse>;
     fn find<'a>(
         &'a self,
         config: &'a Path,
@@ -44,11 +44,8 @@ trait Services: Send + Sync {
 struct NativeServices;
 
 impl Services for NativeServices {
-    fn lookup<'a>(&'a self, request: &'a Request) -> Work<'a, LookupResponse> {
-        Box::pin(maps_lookup::lookup(
-            &request.business_name,
-            &request.business_address,
-        ))
+    fn lookup<'a>(&'a self, from: &'a str) -> Work<'a, LookupResponse> {
+        Box::pin(maps_lookup::lookup_phone(from))
     }
     fn find<'a>(
         &'a self,
@@ -58,7 +55,7 @@ impl Services for NativeServices {
     ) -> Work<'a, Event> {
         Box::pin(appointment_calendar::find_original(
             config,
-            &request.original_start,
+            request.original_start.as_deref(),
             &proof.name,
             &proof.address,
         ))
@@ -162,8 +159,8 @@ impl InboundScheduler {
     }
 
     async fn perform(&self, request: &Request, from: &str) -> SafeResult<Value> {
-        let listings = self.services.lookup(request).await?;
-        let proof = verify_listing(listings, request, from)?;
+        let listings = self.services.lookup(from).await?;
+        let proof = verify_listing(listings, from)?;
         check(self.admitted()? == from, "appointment_call_changed")?;
         let config = common::native_dir(&self.root)?;
         let original = self.services.find(&config, request, &proof).await?;
@@ -175,11 +172,24 @@ impl InboundScheduler {
             end > start && end - start <= ChronoDuration::hours(8),
             "appointment_duration_invalid",
         )?;
+        if let Some(supplied) = &request.original_start {
+            check(
+                start
+                    == DateTime::parse_from_rfc3339(supplied)
+                        .map_err(|_| "appointment_original_invalid")?,
+                "appointment_original_changed",
+            )?;
+        }
+        let now = Utc::now();
+        let proposed = DateTime::parse_from_rfc3339(&request.proposed_start)
+            .map_err(|_| "appointment_time_invalid")?;
         check(
-            start
-                == DateTime::parse_from_rfc3339(&request.original_start)
-                    .map_err(|_| "appointment_original_invalid")?,
-            "appointment_original_changed",
+            start >= now - ChronoDuration::days(1)
+                && start <= now + ChronoDuration::days(90)
+                && proposed > now
+                && proposed <= now + ChronoDuration::days(90)
+                && proposed != start,
+            "appointment_outside_window",
         )?;
         check(self.admitted()? == from, "appointment_call_changed")?;
         check(
@@ -271,22 +281,26 @@ fn database(root: &Path) -> SafeResult<Connection> {
 
 fn unavailable(uncertain: bool) -> Value {
     json!({"status":if uncertain {"outcome_uncertain"} else {"message_only"},
-        "spoken_guidance":"I could not confirm the calendar arrangement. I will pass along your proposed date and callback number for review. Do not claim a booking, verification or availability; do not retry scheduling during this call.",
+        "spoken_guidance":"I could not confirm the calendar arrangement. I will pass along your proposed time for review. Use incoming caller ID as the default callback without asking for a name, business address, number, or caller-ID confirmation. Do not claim a booking, verification or availability; do not retry scheduling during this call.",
         "owner_review_required":true})
 }
 
 fn validate_window(request: &Request, now: DateTime<Utc>) -> SafeResult<()> {
     Request::parse(serde_json::to_value(request).map_err(|_| "appointment_arguments_invalid")?)?;
-    let original = DateTime::parse_from_rfc3339(&request.original_start)
-        .map_err(|_| "appointment_time_invalid")?;
     let proposed = DateTime::parse_from_rfc3339(&request.proposed_start)
         .map_err(|_| "appointment_time_invalid")?;
+    if let Some(supplied) = &request.original_start {
+        let original =
+            DateTime::parse_from_rfc3339(supplied).map_err(|_| "appointment_time_invalid")?;
+        check(
+            original >= now - ChronoDuration::days(1)
+                && original <= now + ChronoDuration::days(90)
+                && proposed != original,
+            "appointment_outside_window",
+        )?;
+    }
     check(
-        original >= now - ChronoDuration::days(1)
-            && original <= now + ChronoDuration::days(90)
-            && proposed > now
-            && proposed <= now + ChronoDuration::days(90)
-            && proposed != original,
+        proposed > now && proposed <= now + ChronoDuration::days(90),
         "appointment_outside_window",
     )
 }
@@ -307,54 +321,6 @@ fn normalized_name(value: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect()
-}
-
-fn address_words(value: &str) -> Vec<String> {
-    value
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .map(|word| {
-            match word {
-                "street" => "st",
-                "avenue" => "ave",
-                "boulevard" => "blvd",
-                "road" => "rd",
-                "lane" => "ln",
-                "drive" => "dr",
-                "court" => "ct",
-                "parkway" => "pkwy",
-                "suite" => "ste",
-                "north" => "n",
-                "south" => "s",
-                "east" => "e",
-                "west" => "w",
-                _ => word,
-            }
-            .to_owned()
-        })
-        .collect()
-}
-
-fn same_branch(requested: &str, listed: &str, city: Option<&str>) -> bool {
-    let requested = address_words(requested);
-    let listed = address_words(listed);
-    // A precise caller-supplied branch address must bind to the same street
-    // number. Merely sharing a chain name, city or switchboard is insufficient.
-    let number = |words: &[String]| {
-        words
-            .iter()
-            .find(|word| word.as_bytes().first().is_some_and(u8::is_ascii_digit))
-            .cloned()
-    };
-    if requested.len() < 3 || number(&requested).is_none() || number(&requested) != number(&listed)
-    {
-        return false;
-    }
-    let mut candidates = listed.into_iter().chain(address_words(city.unwrap_or("")));
-    requested
-        .iter()
-        .all(|word| candidates.by_ref().any(|candidate| &candidate == word))
 }
 
 fn phone_number(value: &str, country: Option<&str>) -> Option<String> {
@@ -384,11 +350,7 @@ fn phone_number(value: &str, country: Option<&str>) -> Option<String> {
     }
 }
 
-fn verify_listing(
-    response: LookupResponse,
-    request: &Request,
-    from: &str,
-) -> SafeResult<Verification> {
+fn verify_listing(response: LookupResponse, from: &str) -> SafeResult<Verification> {
     check(
         response.schema_version == 1
             && response.source == "apple_mapkit"
@@ -397,26 +359,14 @@ fn verify_listing(
             && response.error_code.is_none(),
         "appointment_maps_unavailable",
     )?;
-    let name = normalized_name(&request.business_name);
-    check(name.len() >= 5, "appointment_business_ambiguous")?;
     let mut matches = response.items.into_iter().filter(|item| {
-        let listed = normalized_name(&item.name);
-        listed.len() >= 5
-            && (listed.contains(&name) || name.contains(&listed))
-            && item
-                .phone
-                .as_deref()
-                .and_then(|phone| phone_number(phone, item.country_code.as_deref()))
-                .as_deref()
-                == Some(from)
+        item.phone
+            .as_deref()
+            .and_then(|phone| phone_number(phone, item.country_code.as_deref()))
+            .as_deref()
+            == Some(from)
     });
     let item = matches.next().ok_or("appointment_number_not_matched")?;
-    check(
-        item.address.as_deref().is_some_and(|address| {
-            same_branch(&request.business_address, address, item.city.as_deref())
-        }),
-        "appointment_branch_not_matched",
-    )?;
     check(matches.next().is_none(), "appointment_listing_ambiguous")?;
     let proof = Verification {
         name: item.name,
@@ -427,7 +377,9 @@ fn verify_listing(
         verified_ms: Utc::now().timestamp_millis(),
     };
     check(
-        !proof.address.is_empty() && !proof.place_id.is_empty(),
+        normalized_name(&proof.name).len() >= 3
+            && !proof.address.is_empty()
+            && !proof.place_id.is_empty(),
         "appointment_listing_incomplete",
     )?;
     Ok(proof)
@@ -440,19 +392,27 @@ pub fn summary_note(root: &Path, sid: &str) -> SafeResult<Option<String>> {
     if exists == 0 {
         return Ok(None);
     }
-    let row: Option<(String, String, Option<String>)> = db
+    let row: Option<(String, String, Option<String>, Option<String>)> = db
         .query_row(
-            "SELECT state,request,verification FROM appointment_proposals WHERE call_sid=?1",
+            "SELECT state,request,verification,original FROM appointment_proposals WHERE call_sid=?1",
             [sid],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()
         .map_err(|_| "appointment_state_read_failed")?;
-    let Some((state, request, verification)) = row else {
+    let Some((state, request, verification, original)) = row else {
         return Ok(None);
     };
-    let request: Request =
-        serde_json::from_str(&request).map_err(|_| "appointment_receipt_invalid")?;
+    let request = Request::parse_stored(
+        serde_json::from_str(&request).map_err(|_| "appointment_receipt_invalid")?,
+    )?;
+    let original = original
+        .map(|text| serde_json::from_str::<Event>(&text))
+        .transpose()
+        .map_err(|_| "appointment_receipt_invalid")?
+        .map(|event| event.start)
+        .or(request.original_start)
+        .unwrap_or_else(|| "Not identified; no original time requested".into());
     let listing = verification
         .map(|value| serde_json::from_str::<Verification>(&value))
         .transpose()
@@ -475,8 +435,8 @@ pub fn summary_note(root: &Path, sid: &str) -> SafeResult<Option<String>> {
         })
         .unwrap_or_default();
     Ok(Some(format!(
-        "Scheduling receipt\nOriginal time supplied: {}\nProposed time: {}\n{}{}\nNo callback has been placed.",
-        request.original_start, request.proposed_start, outcome, listing
+        "Scheduling receipt\nOriginal appointment time: {}\nProposed time: {}\n{}{}\nNo callback has been placed.",
+        original, request.proposed_start, outcome, listing
     )))
 }
 
@@ -506,6 +466,8 @@ mod workflow_tests {
 
     struct FakeServices {
         mismatched_number: bool,
+        shared_number: bool,
+        original_override: Option<String>,
         pending_write: bool,
         uncertain_write: bool,
         pending_lookup_process: Option<PathBuf>,
@@ -518,6 +480,8 @@ mod workflow_tests {
         fn new() -> Self {
             Self {
                 mismatched_number: false,
+                shared_number: false,
+                original_override: None,
                 pending_write: false,
                 uncertain_write: false,
                 pending_lookup_process: None,
@@ -529,13 +493,14 @@ mod workflow_tests {
         }
     }
     impl Services for FakeServices {
-        fn lookup<'a>(&'a self, _request: &'a Request) -> Work<'a, LookupResponse> {
+        fn lookup<'a>(&'a self, from: &'a str) -> Work<'a, LookupResponse> {
+            assert_eq!(from, "+12065550100");
             self.lookups.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 if let Some(path) = &self.pending_lookup_process {
                     stop_tests::pending_lookup_command(path).await?;
                 }
-                Ok(LookupResponse {
+                let mut response = LookupResponse {
                     schema_version: 1,
                     source: "apple_mapkit".into(),
                     status: "ok".into(),
@@ -559,7 +524,21 @@ mod workflow_tests {
                             "https://maps.apple.com/place?place-id=I0123456789ABCDEF".into(),
                         ),
                     }],
-                })
+                };
+                if self.shared_number {
+                    response.items.push(maps_lookup::MapListing {
+                        name: "Example Clinic".into(),
+                        address: Some("999 Other St, Example City".into()),
+                        city: Some("Example City".into()),
+                        country_code: Some("US".into()),
+                        phone: Some("+12065550100".into()),
+                        place_id: Some("I0123456789ABCDE0".into()),
+                        map_url: Some(
+                            "https://maps.apple.com/place?place-id=I0123456789ABCDE0".into(),
+                        ),
+                    });
+                }
+                Ok(response)
             })
         }
         fn find<'a>(
@@ -570,12 +549,19 @@ mod workflow_tests {
         ) -> Work<'a, Event> {
             self.finds.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
-                let start = DateTime::parse_from_rfc3339(&request.original_start).unwrap();
+                let inferred = self
+                    .original_override
+                    .clone()
+                    .unwrap_or_else(|| (Utc::now() + ChronoDuration::days(1)).to_rfc3339());
+                let start = DateTime::parse_from_rfc3339(
+                    request.original_start.as_deref().unwrap_or(&inferred),
+                )
+                .unwrap();
                 Ok(Event {
                     calendar_id: "synthetic@example.invalid".into(),
                     id: "synthetic-original".into(),
                     etag: "synthetic-etag".into(),
-                    start: request.original_start.clone(),
+                    start: start.to_rfc3339(),
                     end: (start + ChronoDuration::hours(1)).to_rfc3339(),
                     summary: "Private appointment detail: not for caller".into(),
                     location: "123 Example St, Example City".into(),
@@ -674,10 +660,7 @@ mod workflow_tests {
         }
         fn request(&self) -> Request {
             Request {
-                business_name: "Example Clinic".into(),
-                business_address: "123 Example St, Example City".into(),
-                original_start: (Utc::now() + ChronoDuration::days(1))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                original_start: None,
                 proposed_start: (Utc::now() + ChronoDuration::days(2))
                     .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                 caller_confirmed: true,
@@ -698,10 +681,13 @@ mod workflow_tests {
     #[tokio::test]
     async fn shared_business_number_does_not_authorize_a_different_branch() {
         let fixture = Fixture::new();
-        let fake = Arc::new(FakeServices::new());
-        let mut request = fixture.request();
-        request.business_address = "999 Other St, Example City".into();
-        let result = fixture.scheduler(fake.clone()).schedule(request).await;
+        let mut fake = FakeServices::new();
+        fake.shared_number = true;
+        let fake = Arc::new(fake);
+        let result = fixture
+            .scheduler(fake.clone())
+            .schedule(fixture.request())
+            .await;
         assert_eq!(result["status"], "message_only");
         assert_eq!(fake.finds.load(Ordering::SeqCst), 0);
         assert_eq!(fake.writes.load(Ordering::SeqCst), 0);
@@ -725,7 +711,7 @@ mod workflow_tests {
     }
 
     #[tokio::test]
-    async fn one_verified_hold_is_durable_idempotent_and_returns_no_private_event_details() {
+    async fn caller_id_only_hold_is_durable_idempotent_and_returns_no_private_event_details() {
         let fixture = Fixture::new();
         let fake = Arc::new(FakeServices::new());
         let scheduler = fixture.scheduler(fake.clone());
@@ -750,6 +736,27 @@ mod workflow_tests {
         assert!(note.contains("original appointment remains unchanged"));
         assert!(note.contains("call the business back"));
         assert!(note.contains("maps.apple.com/place"));
+        assert!(!note.contains("Not identified"));
+    }
+
+    #[tokio::test]
+    async fn inferred_original_must_be_in_window_and_different_from_proposed_time() {
+        for same_as_proposed in [false, true] {
+            let fixture = Fixture::new();
+            let request = fixture.request();
+            let mut fake = FakeServices::new();
+            fake.original_override = Some(if same_as_proposed {
+                request.proposed_start.clone()
+            } else {
+                (Utc::now() + ChronoDuration::days(100)).to_rfc3339()
+            });
+            let fake = Arc::new(fake);
+            let result = fixture.scheduler(fake.clone()).schedule(request).await;
+            assert_eq!(result["status"], "message_only");
+            assert_eq!(fake.finds.load(Ordering::SeqCst), 1);
+            assert_eq!(fake.writes.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.state(), "unavailable");
+        }
     }
 
     #[tokio::test]
