@@ -1004,6 +1004,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
+        Arc::new(zeroclaw_tools::reading_coach::ReadingCoachTool),
         Arc::new(zeroclaw_tools::wrappers::ReadPreviewTool::new(
             WeatherTool::new(),
         )),
@@ -3840,6 +3841,7 @@ permissions = ["http_client"]
         .tools;
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(names.contains(&"reading_coach"));
         assert!(names.contains(&"schedule"));
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));

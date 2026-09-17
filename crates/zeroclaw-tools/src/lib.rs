@@ -78,6 +78,7 @@ pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
 pub mod reaction;
+pub mod reading_coach;
 pub mod report_template_tool;
 pub mod report_templates;
 pub mod screenshot;
