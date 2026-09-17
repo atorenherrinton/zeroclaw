@@ -1,0 +1,2 @@
+# Unified patch context preserves leading spaces, blank lines and Go tabs.
+*.patch whitespace=-blank-at-eol,-space-before-tab

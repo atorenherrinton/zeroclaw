@@ -1,0 +1,13 @@
+{
+  "gogcli_commit": "324f656a4949c3adbf8e1f18066d3965757ed9db",
+  "gogcli_repository": "https://github.com/openclaw/gogcli.git",
+  "keyring_module": "github.com/99designs/keyring",
+  "keyring_version": "v1.2.2",
+  "keyring_sum": "h1:pZd3neh/EmUzWONb35LxQfvuY7kiSXAq3HQd97+XBn0=",
+  "patch_sha256": {
+    "0001-shared-client.patch": "9914da62aa87eb84c3a8529403dd5ef6852e2d49b6d8e8b9062b54d42f04f28a",
+    "0002-calendar-companion.patch": "9b4c5252f12b77eda8c8c308ecc66b786b1d6d5c87b7bcb221a89533b72a3368",
+    "0003-keyring-errors.patch": "f9a523445e26d87c5704ee65955c795120198cc789a47c1603c4793a4f5e5bf3"
+  },
+  "go_version": "go1.27.1"
+}
