@@ -104,8 +104,9 @@ Run `cargo test -p zeroclaw-tools reading_coach --lib`,
 `cargo clippy -p zeroclaw-tools --all-targets -- -D warnings`, and the repository
 format/check gates. Tests exercise the public tool boundary, real profile
 allowlisting, calendar arithmetic, and reminder suppression without contacting
-anyone. Existing repository CI is the merge gate; no client-side hook is required
-or used as a substitute.
+anyone. Run the maintained repository checks before merging and report actual
+results, including whether hosted CI ran. No client-side hook is required or
+used as a substitute.
 
 Disable the agent and remove any owner-created schedules to stop future use.
 The capability itself creates no schedule or delivery state to undo. For a
