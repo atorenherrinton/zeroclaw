@@ -79,6 +79,7 @@ tool_attribution!(BrowserTool, ToolKind::Plugin);
 tool_attribution!(BrowserDelegateTool, ToolKind::Plugin);
 tool_attribution!(BrowserOpenTool, ToolKind::Plugin);
 tool_attribution!(CalculatorTool, ToolKind::Plugin);
+tool_attribution!(crate::reading_coach::ReadingCoachTool, ToolKind::Plugin);
 tool_attribution!(CanvasTool, ToolKind::Plugin);
 tool_attribution!(ChannelRoomTool, ToolKind::Plugin);
 tool_attribution!(ClaudeCodeTool, ToolKind::Plugin);
