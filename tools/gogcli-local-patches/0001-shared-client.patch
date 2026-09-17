@@ -1,0 +1,501 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 5e3a30ec..061f6ba5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,5 +1,11 @@
+ # Changelog
+ 
++## 0.38.1-calendar-single-attempt - local maintenance patch
++
++- Calendar: serialize an explicitly supplied `--guests-can-modify=false` as JSON false on create rather than relying on the API default.
++
++- Calendar: disable HTTP retries for event inserts, including inserts that request attendee notifications. An error may follow a committed event; surface it rather than creating another event or repeating invitations. Normal base-transport authentication remains unchanged.
++
+ ## 0.38.1 - 2026-08-25
+ 
+ - Gmail: send exact prebuilt RFC822 messages with verified sender/account guards, normalized thread IDs, and content-safe offline dry runs. (#1032, #1029) — thanks @higginz777.
+diff --git a/go.mod b/go.mod
+index 382e2b57..df87a25f 100644
+--- a/go.mod
++++ b/go.mod
+@@ -71,3 +71,6 @@ require (
+ 	google.golang.org/grpc v1.83.0 // indirect
+ 	google.golang.org/protobuf v1.36.12 // indirect
+ )
++
++// Preserve native Keychain access errors instead of treating them as missing tokens.
++replace github.com/99designs/keyring => ./third_party/keyring
+diff --git a/internal/cmd/calendar_event_plan.go b/internal/cmd/calendar_event_plan.go
+index 81dc4c45..34ebd4a3 100644
+--- a/internal/cmd/calendar_event_plan.go
++++ b/internal/cmd/calendar_event_plan.go
+@@ -395,6 +395,8 @@ func buildCalendarCreatePlan(store *config.ConfigStore, input calendarCreateInpu
+ 	}
+ 	if input.GuestsCanModify != nil {
+ 		event.GuestsCanModify = *input.GuestsCanModify
++		// Preserve an explicitly requested false on the API wire as well.
++		event.ForceSendFields = append(event.ForceSendFields, "GuestsCanModify")
+ 	}
+ 	if input.GuestsCanSeeOthers != nil {
+ 		event.GuestsCanSeeOtherGuests = input.GuestsCanSeeOthers
+diff --git a/internal/cmd/calendar_insert_single_attempt_test.go b/internal/cmd/calendar_insert_single_attempt_test.go
+new file mode 100644
+index 00000000..28e15bc6
+--- /dev/null
++++ b/internal/cmd/calendar_insert_single_attempt_test.go
+@@ -0,0 +1,90 @@
++package cmd
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"google.golang.org/api/calendar/v3"
++	"google.golang.org/api/option"
++
++	"github.com/openclaw/gogcli/internal/googleapi"
++)
++
++// Exercise the actual command and Google API client through the production
++// retry transport. The only server is a local mock, with no Google credentials.
++func TestCalendarCreateCmd_InsertSingleAttempt(t *testing.T) {
++	for _, status := range []int{http.StatusServiceUnavailable, http.StatusTooManyRequests, http.StatusForbidden} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			var inserts, refreshes atomic.Int32
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				path := strings.TrimPrefix(r.URL.Path, "/calendar/v3")
++				if r.Method != http.MethodPost || path != "/calendars/cal@example.com/events" {
++					t.Errorf("unexpected request: %s %s", r.Method, path)
++					http.NotFound(w, r)
++					return
++				}
++				inserts.Add(1)
++				if r.URL.Query().Get("sendUpdates") != "all" {
++					t.Error("missing sendUpdates=all")
++				}
++				var event map[string]json.RawMessage
++				if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
++					t.Errorf("decode event: %v", err)
++				}
++				var attendees []*calendar.EventAttendee
++				if err := json.Unmarshal(event["attendees"], &attendees); err != nil {
++					t.Errorf("decode attendees: %v", err)
++				}
++				if len(attendees) != 1 || attendees[0].Email != "invitee@example.com" {
++					t.Errorf("unexpected attendees: %+v", attendees)
++				}
++				for _, field := range []string{"guestsCanInviteOthers", "guestsCanModify"} {
++					if string(event[field]) != "false" {
++						t.Errorf("%s must explicitly be false, got %s", field, event[field])
++					}
++				}
++				w.Header().Set("Content-Type", "application/json")
++				w.Header().Set("Retry-After", "0")
++				w.WriteHeader(status)
++				_, _ = fmt.Fprintf(w, `{"error":{"code":%d,"message":"insufficient authentication scopes"}}`, status)
++			}))
++			defer srv.Close()
++
++			retry := googleapi.NewRetryTransport(srv.Client().Transport)
++			retry.BaseDelay = 0
++			retry.RefreshAuth = func(context.Context) error {
++				refreshes.Add(1)
++				return nil
++			}
++			svc, err := calendar.NewService(context.Background(),
++				option.WithoutAuthentication(),
++				option.WithHTTPClient(&http.Client{Transport: retry}),
++				option.WithEndpoint(srv.URL+"/"),
++			)
++			if err != nil {
++				t.Fatal(err)
++			}
++			ctx := withCalendarTestService(newCmdRuntimeJSONOutputContext(t, io.Discard, io.Discard), svc)
++			cmd := &CalendarCreateCmd{}
++			err = runKong(t, cmd, []string{
++				"cal@example.com", "--summary", "Synthetic invitation",
++				"--from", "2030-01-01T10:00:00Z", "--to", "2030-01-01T11:00:00Z",
++				"--attendees", "invitee@example.com", "--send-updates", "all",
++				"--guests-can-invite=false", "--guests-can-modify=false",
++			}, ctx, &RootFlags{Account: "owner@example.com"})
++			if err == nil {
++				t.Fatal("insert error must propagate")
++			}
++			if inserts.Load() != 1 || refreshes.Load() != 0 {
++				t.Fatalf("insert was retried: inserts=%d refreshes=%d", inserts.Load(), refreshes.Load())
++			}
++		})
++	}
++}
+diff --git a/internal/cmd/calendar_mutation_helpers.go b/internal/cmd/calendar_mutation_helpers.go
+index f238a32e..7e26afc6 100644
+--- a/internal/cmd/calendar_mutation_helpers.go
++++ b/internal/cmd/calendar_mutation_helpers.go
+@@ -5,6 +5,7 @@ import (
+ 
+ 	"google.golang.org/api/calendar/v3"
+ 
++	"github.com/openclaw/gogcli/internal/googleapi"
+ 	"github.com/openclaw/gogcli/internal/outfmt"
+ 	"github.com/openclaw/gogcli/internal/ui"
+ )
+@@ -38,7 +39,10 @@ func newCalendarMutationContext(ctx context.Context, flags *RootFlags, calendarI
+ }
+ 
+ func (m *calendarMutationContext) insertEvent(ctx context.Context, event *calendar.Event, opts calendarInsertOptions) (*calendar.Event, error) {
+-	call := m.svc.Events.Insert(m.calendarID, event).Context(ctx)
++	// An insert may have committed (and sent attendee invitations) even when
++	// the response is an error. Never replay it through the retry transport.
++	// The base transport still owns normal authentication/token renewal.
++	call := m.svc.Events.Insert(m.calendarID, event).Context(googleapi.WithoutRetries(ctx))
+ 	if opts.sendUpdates != "" {
+ 		call = call.SendUpdates(opts.sendUpdates)
+ 	}
+diff --git a/internal/cmd/root.go b/internal/cmd/root.go
+index 203b3967..fee2b585 100644
+--- a/internal/cmd/root.go
++++ b/internal/cmd/root.go
+@@ -200,6 +200,13 @@ func executeWithRuntime(args []string, runtime *app.Runtime) (err error) {
+ 	if err = applyExplicitOutputModePrecedence(kctx, &cli.RootFlags); err != nil {
+ 		return reportEarlyError(runtimeIO.Err, err)
+ 	}
++	// Keychain dialogs outlive failed/timed-out background requests. Respect
++	// noninteractive execution in the native Security framework as well.
++	if cli.NoInput || !stdinIsTerminal(app.WithRuntime(context.Background(), runtime)) || kctx.Command() == "mcp" {
++		if err = secrets.SuppressKeychainPrompts(); err != nil {
++			return reportEarlyError(runtimeIO.Err, err)
++		}
++	}
+ 	if err = enforceEnabledCommands(kctx, cli.EnableCommands, cli.EnableCommandsExact); err != nil {
+ 		return reportEarlyError(runtimeIO.Err, err)
+ 	}
+diff --git a/internal/errfmt/errfmt.go b/internal/errfmt/errfmt.go
+index 32b6cfdd..7eebc1d9 100644
+--- a/internal/errfmt/errfmt.go
++++ b/internal/errfmt/errfmt.go
+@@ -30,6 +30,14 @@ func Format(err error) string {
+ 		return formatParseError(parseErr)
+ 	}
+ 
++	// Native Keychain errors do not mean OAuth credentials were deleted. Check
++	// the error chain before offering reconnection or credential replacement.
++	if isKeychainAccessDenied(err) {
++		return "macOS Keychain access is blocked (approval required or Keychain locked). " +
++			"This does not mean the Google refresh token is missing. " +
++			"Run the same signed client interactively in Terminal and approve its native Keychain prompt; do not reconnect Google solely for this error."
++	}
++
+ 	var authErr *gogapi.AuthRequiredError
+ 	if errors.As(err, &authErr) {
+ 		if isServiceAccountOnlyAuthService(authErr.Service) {
+diff --git a/internal/errfmt/keychain_darwin.go b/internal/errfmt/keychain_darwin.go
+new file mode 100644
+index 00000000..5a89c1cb
+--- /dev/null
++++ b/internal/errfmt/keychain_darwin.go
+@@ -0,0 +1,17 @@
++//go:build darwin && cgo
++
++package errfmt
++
++import (
++	"errors"
++	keychain "github.com/99designs/go-keychain"
++)
++
++func isKeychainAccessDenied(err error) bool {
++	var status keychain.Error
++	if !errors.As(err, &status) {
++		return false
++	}
++	// errSecInteractionNotAllowed, errSecAuthFailed, errSecUserCanceled.
++	return status == keychain.Error(-25308) || status == keychain.Error(-25293) || status == keychain.Error(-128)
++}
+diff --git a/internal/errfmt/keychain_darwin_test.go b/internal/errfmt/keychain_darwin_test.go
+new file mode 100644
+index 00000000..4f72e3f6
+--- /dev/null
++++ b/internal/errfmt/keychain_darwin_test.go
+@@ -0,0 +1,23 @@
++//go:build darwin && cgo
++
++package errfmt
++
++import (
++	"fmt"
++	keychain "github.com/99designs/go-keychain"
++	"github.com/99designs/keyring"
++	"strings"
++	"testing"
++)
++
++func TestKeychainDenialDoesNotRecommendReauthorization(t *testing.T) {
++	for _, status := range []keychain.Error{-25308, -25293, -128} {
++		message := Format(fmt.Errorf("read Google credential: %w", status))
++		if !strings.Contains(message, "Keychain access is blocked") || strings.Contains(message, "Run: gog auth add") {
++			t.Fatalf("misleading message: %s", message)
++		}
++	}
++	if message := Format(keyring.ErrKeyNotFound); !strings.Contains(message, "Secret not found") {
++		t.Fatalf("genuine missing record changed: %s", message)
++	}
++}
+diff --git a/internal/errfmt/keychain_other.go b/internal/errfmt/keychain_other.go
+new file mode 100644
+index 00000000..c49c3c94
+--- /dev/null
++++ b/internal/errfmt/keychain_other.go
+@@ -0,0 +1,5 @@
++//go:build !darwin || !cgo
++
++package errfmt
++
++func isKeychainAccessDenied(error) bool { return false }
+diff --git a/internal/googleapi/client_auth.go b/internal/googleapi/client_auth.go
+index fa3bf41d..d30e3f15 100644
+--- a/internal/googleapi/client_auth.go
++++ b/internal/googleapi/client_auth.go
+@@ -67,6 +67,10 @@ type resettableOAuthTokenSource struct {
+ 	refreshToken string
+ }
+ 
++type accessTokenCachePolicy interface {
++	PersistAccessTokenCache() bool
++}
++
+ type tokenAliasDeleter interface {
+ 	DeleteTokenAlias(client string, email string) error
+ }
+@@ -253,6 +257,10 @@ func (p *persistingTokenSource) persistTokenLocked(t *oauth2.Token) (*oauth2.Tok
+ 	refreshToken := strings.TrimSpace(t.RefreshToken)
+ 
+ 	updated := p.tok
++	persistAccessCache := true
++	if policy, ok := p.store.(accessTokenCachePolicy); ok {
++		persistAccessCache = policy.PersistAccessTokenCache()
++	}
+ 	changed := false
+ 	emailChangedFromIdentity := false
+ 
+@@ -263,12 +271,12 @@ func (p *persistingTokenSource) persistTokenLocked(t *oauth2.Token) (*oauth2.Tok
+ 
+ 	if accessToken := strings.TrimSpace(t.AccessToken); accessToken != "" && accessToken != strings.TrimSpace(p.tok.AccessToken) {
+ 		updated.AccessToken = accessToken
+-		changed = true
++		changed = changed || persistAccessCache
+ 	}
+ 
+ 	if !t.Expiry.IsZero() && !t.Expiry.Equal(p.tok.AccessTokenExpiresAt) {
+ 		updated.AccessTokenExpiresAt = t.Expiry
+-		changed = true
++		changed = changed || persistAccessCache
+ 	}
+ 
+ 	if grantedScopes := tokenGrantedScopes(t); len(grantedScopes) > 0 {
+@@ -303,6 +311,8 @@ func (p *persistingTokenSource) persistTokenLocked(t *oauth2.Token) (*oauth2.Tok
+ 	}
+ 
+ 	if !changed {
++		// Keep the current process cache fresh without rewriting shared credentials.
++		p.tok = updated
+ 		return t, nil
+ 	}
+ 
+diff --git a/internal/googleapi/client_keychain_cache_test.go b/internal/googleapi/client_keychain_cache_test.go
+new file mode 100644
+index 00000000..a61e0591
+--- /dev/null
++++ b/internal/googleapi/client_keychain_cache_test.go
+@@ -0,0 +1,71 @@
++package googleapi
++
++import (
++	"testing"
++	"time"
++
++	"github.com/openclaw/gogcli/internal/config"
++	"github.com/openclaw/gogcli/internal/secrets"
++	"golang.org/x/oauth2"
++)
++
++type memoryCacheStore struct{ stubStore }
++
++func (*memoryCacheStore) PersistAccessTokenCache() bool { return false }
++
++func TestKeychainAccessTokenRefreshDoesNotRewriteCredential(t *testing.T) {
++	stored := secrets.Token{Client: config.DefaultClientName, Email: "test@example.com", RefreshToken: "refresh"}
++	store := &memoryCacheStore{stubStore: stubStore{tok: stored}}
++	n := 0
++	base := tokenSourceFunc(func() (*oauth2.Token, error) {
++		n++
++		return &oauth2.Token{AccessToken: "new-access", RefreshToken: "refresh", Expiry: time.Unix(int64(n*3600), 0)}, nil
++	})
++	source := newPersistingTokenSource(base, store, config.DefaultClientName, stored.Email, stored, "", nil)
++	for range 3 {
++		token, err := source.Token()
++		if err != nil || token.AccessToken != "new-access" {
++			t.Fatalf("refresh failed: %v", err)
++		}
++	}
++	if store.setCalls != 0 {
++		t.Fatalf("access-token refresh rewrote credential %d times", store.setCalls)
++	}
++	if source.(*persistingTokenSource).tok.AccessToken != "new-access" {
++		t.Fatal("in-memory token did not advance")
++	}
++}
++
++func TestKeychainCachePolicyPreservesDurableChanges(t *testing.T) {
++	for _, kind := range []string{"refresh rotation", "scope change"} {
++		t.Run(kind, func(t *testing.T) {
++			stored := secrets.Token{Client: config.DefaultClientName, Email: "test@example.com", RefreshToken: "refresh", Scopes: []string{"old"}}
++			store := &memoryCacheStore{stubStore: stubStore{tok: stored}}
++			token := &oauth2.Token{AccessToken: "new-access", RefreshToken: "refresh"}
++			if kind == "refresh rotation" {
++				token.RefreshToken = "rotated"
++			} else {
++				token = token.WithExtra(map[string]any{"scope": "old new"})
++			}
++			source := newPersistingTokenSource(oauth2.StaticTokenSource(token), store, config.DefaultClientName, stored.Email, stored, "", nil)
++			if _, err := source.Token(); err != nil {
++				t.Fatal(err)
++			}
++			if store.setCalls != 1 {
++				t.Fatalf("durable change saved %d times", store.setCalls)
++			}
++			if kind == "refresh rotation" && store.lastSet.RefreshToken != "rotated" {
++				t.Fatal("rotated refresh token lost")
++			}
++			if kind == "scope change" && len(store.lastSet.Scopes) != 2 {
++				t.Fatal("new granted scope lost")
++			}
++			if _, err := source.Token(); err != nil {
++				t.Fatal(err)
++			}
++			if store.setCalls != 1 {
++				t.Fatal("unchanged durable metadata saved again")
++			}
++		})
++	}
++}
+diff --git a/internal/secrets/backend.go b/internal/secrets/backend.go
+index 3a402724..d86dd1eb 100644
+--- a/internal/secrets/backend.go
++++ b/internal/secrets/backend.go
+@@ -377,10 +377,10 @@ func Open(options OpenOptions) (Repository, error) {
+ 		return nil, err
+ 	}
+ 
+-	lock, _, err := keyringLockForRingInDir(ring, options.Layout.KeyringDir(), options.LockTimeout)
++	lock, fileBacked, err := keyringLockForRingInDir(ring, options.Layout.KeyringDir(), options.LockTimeout)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	return &KeyringStore{ring: ring, lock: lock}, nil
++	return &KeyringStore{ring: ring, lock: lock, memoryOnlyAccessTokens: options.GOOS == goosDarwin && !fileBacked}, nil
+ }
+diff --git a/internal/secrets/keychain_cache_test.go b/internal/secrets/keychain_cache_test.go
+new file mode 100644
+index 00000000..cc18e18f
+--- /dev/null
++++ b/internal/secrets/keychain_cache_test.go
+@@ -0,0 +1,30 @@
++package secrets
++
++import (
++	"github.com/99designs/keyring"
++	"github.com/openclaw/gogcli/internal/config"
++	"testing"
++)
++
++func TestOpenAccessTokenCachePolicy(t *testing.T) {
++	for _, tc := range []struct {
++		name, goos, backend string
++		want                bool
++	}{
++		{"macOS keychain", "darwin", "keychain", false},
++		{"macOS auto", "darwin", "auto", false},
++		{"macOS file", "darwin", "file", true},
++		{"Linux file", "linux", "file", true},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			layout := config.Layout{ConfigDir: t.TempDir(), DataDir: t.TempDir()}
++			repository, err := Open(OpenOptions{Layout: layout, Config: config.NewConfigStore(layout), GOOS: tc.goos, Backend: tc.backend, KeychainTrustApplication: "false", openKeyringFn: func(keyring.Config) (keyring.Keyring, error) { return keyring.NewArrayKeyring(nil), nil }})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := repository.(*KeyringStore).PersistAccessTokenCache(); got != tc.want {
++				t.Fatalf("cache policy = %v; want %v", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/internal/secrets/keychain_interaction_darwin.go b/internal/secrets/keychain_interaction_darwin.go
+new file mode 100644
+index 00000000..d04aa096
+--- /dev/null
++++ b/internal/secrets/keychain_interaction_darwin.go
+@@ -0,0 +1,20 @@
++//go:build darwin && cgo
++
++package secrets
++
++/*
++#cgo LDFLAGS: -framework Security
++#include <Security/Security.h>
++*/
++import "C"
++
++import "fmt"
++
++// SuppressKeychainPrompts makes unattended requests fail closed instead of
++// leaving native password dialogs behind after their caller times out.
++func SuppressKeychainPrompts() error {
++	if status := C.SecKeychainSetUserInteractionAllowed(C.Boolean(0)); status != 0 {
++		return fmt.Errorf("disable background Keychain dialogs: OSStatus %d", int(status))
++	}
++	return nil
++}
+diff --git a/internal/secrets/keychain_interaction_other.go b/internal/secrets/keychain_interaction_other.go
+new file mode 100644
+index 00000000..18c58d0a
+--- /dev/null
++++ b/internal/secrets/keychain_interaction_other.go
+@@ -0,0 +1,6 @@
++//go:build !darwin || !cgo
++
++package secrets
++
++// SuppressKeychainPrompts is a no-op without the macOS native Keychain backend.
++func SuppressKeychainPrompts() error { return nil }
+diff --git a/internal/secrets/store.go b/internal/secrets/store.go
+index b5ba5609..cb426619 100644
+--- a/internal/secrets/store.go
++++ b/internal/secrets/store.go
+@@ -33,8 +33,16 @@ type Repository interface {
+ }
+ 
+ type KeyringStore struct {
+-	ring keyring.Keyring
+-	lock *keyringLock
++	ring                   keyring.Keyring
++	lock                   *keyringLock
++	memoryOnlyAccessTokens bool
++}
++
++// PersistAccessTokenCache reports whether short-lived OAuth tokens may be written
++// to this store. Updating legacy macOS Keychain data resets its partition ACL,
++// removing the other approved executables from the shared credential.
++func (s *KeyringStore) PersistAccessTokenCache() bool {
++	return !s.memoryOnlyAccessTokens
+ }
+ 
+ var errTokenVerifyFailed = errors.New("token verification failed: keyring wrote 0 bytes")

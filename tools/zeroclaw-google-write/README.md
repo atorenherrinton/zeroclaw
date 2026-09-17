@@ -303,6 +303,13 @@ with offline tests and loaded connector configuration, never a test event.
 
 ## Required client safety
 
+The canonical source and build recipe for both clients is
+[`tools/gogcli-local-patches`](../gogcli-local-patches/README.md). Use the full
+kit to preserve the Calendar guards together with the macOS Keychain fixes.
+Routine access-token refreshes stay in memory; background clients suppress
+native prompts and distinguish denied Keychain access from missing credentials.
+Deliberate interactive owner approval remains available for final signed builds.
+
 The fixed executable is `/opt/homebrew/bin/gog`, with a cleared environment,
 owner HOME, exact command allowlists, `--gmail-no-send` and `--no-input`.
 The connector and runtime do not retry uncertain writes. Stock gogcli v0.38.1
