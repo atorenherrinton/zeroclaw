@@ -52,6 +52,61 @@ pub fn configuration() -> Result<(String, Vec<PathBuf>)> {
 
 const GOG_KEYCHAIN_SERVICE: &str = "gogcli";
 const DEFAULT_CLIENT_SECRET_KEY: &str = "client/default/client-secret";
+const COMPOSE_SCOPE: &str = "https://www.googleapis.com/auth/gmail.compose";
+const READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
+const MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+const MAX_OAUTH_RESPONSE: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OAuthScopes {
+    ComposeReadonly,
+    Modify,
+}
+
+impl OAuthScopes {
+    fn request(self) -> &'static str {
+        match self {
+            Self::ComposeReadonly => {
+                "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"
+            }
+            Self::Modify => MODIFY_SCOPE,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct StoredToken {
+    refresh_token: Zeroizing<String>,
+    scopes: Vec<String>,
+}
+
+fn refresh_credentials(bytes: &[u8]) -> Result<(Zeroizing<String>, OAuthScopes)> {
+    let token: StoredToken = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::Error::msg("invalid stored OAuth record or scope evidence"))?;
+    ensure!(
+        !token.refresh_token.trim().is_empty()
+            && !token.refresh_token.chars().any(char::is_control),
+        "refresh credential unavailable or malformed"
+    );
+    // The canonical stored grant owns these literal scopes. A scope with fewer
+    // capabilities is not necessarily a member of that grant.
+    ensure!(
+        token.scopes.iter().all(|scope| !scope.is_empty()
+            && scope
+                .bytes()
+                .all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')),
+        "stored OAuth scope evidence is malformed"
+    );
+    let contains = |scope: &str| token.scopes.iter().any(|value| value == scope);
+    let scopes = if contains(COMPOSE_SCOPE) && contains(READONLY_SCOPE) {
+        OAuthScopes::ComposeReadonly
+    } else if contains(MODIFY_SCOPE) {
+        OAuthScopes::Modify
+    } else {
+        bail!("stored OAuth grant lacks supported Gmail scopes")
+    };
+    Ok((token.refresh_token, scopes))
+}
 
 #[derive(Deserialize)]
 struct ClientCredentials {
@@ -171,14 +226,7 @@ async fn access_token_with_interaction(
     interactive: bool,
 ) -> Result<Zeroizing<String>> {
     let bytes = stored_token(account, interactive)?;
-    let token: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::Error::msg("invalid stored OAuth record"))?;
-    let refresh = Zeroizing::new(
-        token["refresh_token"]
-            .as_str()
-            .context("refresh credential unavailable")?
-            .to_owned(),
-    );
+    let (refresh, scopes) = refresh_credentials(&bytes)?;
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
     let path = home.join("Library/Application Support/gogcli/credentials.json");
     let creds = Zeroizing::new(
@@ -190,7 +238,7 @@ async fn access_token_with_interaction(
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("grant_type", "refresh_token"),
-            ("scope", "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"),
+            ("scope", scopes.request()),
             ("refresh_token", refresh.as_str()),
             ("client_id", creds.client_id.as_str()),
             ("client_secret", creds.client_secret.as_str()),
@@ -198,10 +246,7 @@ async fn access_token_with_interaction(
         .send()
         .await
         .map_err(|_| anyhow::Error::msg("OAuth transport failed"))?;
-    ensure!(
-        response.status().is_success(),
-        "OAuth renewal denied; owner reauthorization may be required"
-    );
+    let success = response.status().is_success();
     let mut response = response;
     let mut bytes = Zeroizing::new(Vec::new());
     while let Some(chunk) = response
@@ -210,37 +255,68 @@ async fn access_token_with_interaction(
         .map_err(|_| anyhow::Error::msg("OAuth response interrupted"))?
     {
         ensure!(
-            bytes.len() + chunk.len() <= 64 * 1024,
+            bytes.len() + chunk.len() <= MAX_OAUTH_RESPONSE,
             "OAuth response exceeds limit"
         );
         bytes.extend_from_slice(&chunk);
     }
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| anyhow::Error::msg("invalid OAuth response"))?;
-    validate_scopes(
-        value["scope"]
-            .as_str()
-            .context("OAuth scope evidence missing; owner reauthorization required")?,
-    )?;
-    match value["access_token"].as_str() {
-        Some(s) if !s.is_empty() => Ok(Zeroizing::new(s.to_owned())),
-        _ => bail!("OAuth access credential missing"),
-    }
+    oauth_token_response(&bytes, success, scopes)
 }
 
-/// Gmail offers no draft-only OAuth scope. Compose includes send permission,
-/// which the transport independently denies. Never accept full mailbox grants.
-pub fn validate_scopes(scopes: &str) -> Result<()> {
-    let expected = [
-        "https://www.googleapis.com/auth/gmail.compose",
-        "https://www.googleapis.com/auth/gmail.readonly",
-    ];
+fn oauth_token_response(
+    bytes: &[u8],
+    success: bool,
+    scopes: OAuthScopes,
+) -> Result<Zeroizing<String>> {
+    ensure!(
+        bytes.len() <= MAX_OAUTH_RESPONSE,
+        "OAuth response exceeds limit"
+    );
+    if !success {
+        #[derive(Deserialize)]
+        struct Failure {
+            error: String,
+        }
+        let failure = serde_json::from_slice::<Failure>(bytes).ok();
+        let category = match failure.as_ref().map(|failure| failure.error.as_str()) {
+            Some("invalid_scope") => "invalid_scope",
+            Some("invalid_grant") => "invalid_grant",
+            Some("invalid_client") => "invalid_client",
+            _ => "unknown",
+        };
+        // Never expose the provider's description, body, or unrecognized code.
+        bail!("OAuth renewal denied ({category})")
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        scope: String,
+        access_token: Zeroizing<String>,
+    }
+    let response: Response = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::Error::msg("invalid OAuth response or scope evidence"))?;
+    validate_scopes(&response.scope, scopes)?;
+    ensure!(
+        !response.access_token.trim().is_empty()
+            && !response.access_token.chars().any(char::is_control),
+        "OAuth access credential missing or malformed"
+    );
+    Ok(response.access_token)
+}
+
+/// Gmail offers no draft-only OAuth scope. Both supported grants permit send,
+/// and modify also permits mailbox mutations; the HTTP allowlist denies them.
+/// Accept only the exact subset selected before renewal, never a broader reply.
+pub(crate) fn validate_scopes(scopes: &str, selected: OAuthScopes) -> Result<()> {
+    let expected = selected
+        .request()
+        .split_whitespace()
+        .collect::<std::collections::HashSet<_>>();
     let actual = scopes
         .split_whitespace()
         .collect::<std::collections::HashSet<_>>();
     ensure!(
-        actual.len() == 2 && expected.iter().all(|s| actual.contains(s)),
-        "OAuth scopes must be exactly gmail.compose and gmail.readonly; owner reauthorization required"
+        actual == expected,
+        "OAuth scope evidence does not match the requested Gmail subset"
     );
     Ok(())
 }
@@ -249,6 +325,193 @@ pub fn validate_scopes(scopes: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    fn stored_record(scopes: Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "refresh_token": "synthetic-refresh-credential",
+            "scopes": scopes,
+        }))
+        .expect("synthetic record serialization")
+    }
+
+    #[test]
+    fn stored_grant_selects_only_supported_literal_subset_and_prefers_pair() -> Result<()> {
+        for scopes in [
+            serde_json::json!([COMPOSE_SCOPE, READONLY_SCOPE]),
+            serde_json::json!([MODIFY_SCOPE, READONLY_SCOPE, "openid", COMPOSE_SCOPE]),
+        ] {
+            let (refresh, selected) = refresh_credentials(&stored_record(scopes))?;
+            assert_eq!(refresh.as_str(), "synthetic-refresh-credential");
+            assert_eq!(selected, OAuthScopes::ComposeReadonly);
+            assert_eq!(
+                selected.request(),
+                format!("{COMPOSE_SCOPE} {READONLY_SCOPE}")
+            );
+        }
+        for scopes in [
+            serde_json::json!([MODIFY_SCOPE]),
+            serde_json::json!([
+                "email",
+                "https://www.googleapis.com/auth/calendar",
+                MODIFY_SCOPE,
+                "https://www.googleapis.com/auth/gmail.settings.basic",
+                "https://www.googleapis.com/auth/gmail.settings.sharing",
+                "https://www.googleapis.com/auth/pubsub",
+                "https://www.googleapis.com/auth/userinfo.email",
+                "openid"
+            ]),
+            serde_json::json!([COMPOSE_SCOPE, MODIFY_SCOPE]),
+            serde_json::json!([READONLY_SCOPE, MODIFY_SCOPE]),
+        ] {
+            let (_, selected) = refresh_credentials(&stored_record(scopes))?;
+            assert_eq!(selected, OAuthScopes::Modify);
+            assert_eq!(selected.request(), MODIFY_SCOPE);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_or_malformed_stored_scopes_never_select_a_fallback() {
+        for scopes in [
+            Value::Null,
+            serde_json::json!(MODIFY_SCOPE),
+            serde_json::json!({"scope": MODIFY_SCOPE}),
+            serde_json::json!([]),
+            serde_json::json!([COMPOSE_SCOPE]),
+            serde_json::json!([READONLY_SCOPE]),
+            serde_json::json!(["https://mail.google.com/"]),
+            serde_json::json!([MODIFY_SCOPE, null]),
+            serde_json::json!([MODIFY_SCOPE, 42]),
+            serde_json::json!([MODIFY_SCOPE, ""]),
+            serde_json::json!([MODIFY_SCOPE, "scope with spaces"]),
+            serde_json::json!([MODIFY_SCOPE, "synthetic-sensitive-payload\n"]),
+            serde_json::json!([MODIFY_SCOPE, "synthetic-sensitive-payload\\"]),
+            serde_json::json!([MODIFY_SCOPE, "synthetic-sensitive-payload\""]),
+        ] {
+            let error = refresh_credentials(&stored_record(scopes))
+                .expect_err("unusable scope evidence must fail before renewal");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+        for record in [
+            br#"{"refresh_token":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"refresh_token":"synthetic-sensitive-payload","scopes":[],"scopes":[]}"#
+                .as_slice(),
+            br#"{"refresh_token":"synthetic-sensitive-payload","scopes":["#.as_slice(),
+        ] {
+            let error = refresh_credentials(record).expect_err("malformed record must fail");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+    }
+
+    #[test]
+    fn refresh_response_must_match_the_selected_subset_without_fallback() -> Result<()> {
+        for selected in [OAuthScopes::ComposeReadonly, OAuthScopes::Modify] {
+            let success = serde_json::to_vec(&serde_json::json!({
+                "access_token": "synthetic-access-credential",
+                "scope": selected.request(),
+            }))?;
+            assert_eq!(
+                oauth_token_response(&success, true, selected)?.as_str(),
+                "synthetic-access-credential"
+            );
+            let other = match selected {
+                OAuthScopes::ComposeReadonly => OAuthScopes::Modify,
+                OAuthScopes::Modify => OAuthScopes::ComposeReadonly,
+            };
+            for scope in [
+                other.request().to_owned(),
+                format!("{} openid", selected.request()),
+                format!("{} https://mail.google.com/", selected.request()),
+                format!(
+                    "{} https://www.googleapis.com/auth/calendar",
+                    selected.request()
+                ),
+                String::new(),
+            ] {
+                let bytes = serde_json::to_vec(&serde_json::json!({
+                    "access_token": "synthetic-sensitive-payload",
+                    "scope": scope,
+                }))?;
+                let error = oauth_token_response(&bytes, true, selected)
+                    .expect_err("response may not substitute or expand the chosen set");
+                assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+            }
+            // Even valid-looking scope/access fields cannot turn a denial into
+            // success, and do not authorize a second request with another scope.
+            assert!(oauth_token_response(&success, false, selected).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_response_rejects_missing_or_malformed_scope_evidence() -> Result<()> {
+        for scopes in [Value::Null, serde_json::json!([]), serde_json::json!(42)] {
+            let response = serde_json::to_vec(&serde_json::json!({
+                "access_token": "synthetic-sensitive-payload",
+                "scope": scopes,
+            }))?;
+            let error = oauth_token_response(&response, true, OAuthScopes::Modify)
+                .expect_err("invalid scope evidence must not release a credential");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+        for bytes in [
+            br#"{"access_token":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"access_token":"synthetic-sensitive-payload","scope":"x","scope":"y"}"#.as_slice(),
+            br#"{"access_token":"synthetic-sensitive-payload""#.as_slice(),
+        ] {
+            let error = oauth_token_response(bytes, true, OAuthScopes::Modify)
+                .expect_err("missing or ambiguous evidence must fail");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_denials_report_only_allowlisted_error_categories() -> Result<()> {
+        for (code, category) in [
+            ("invalid_scope", "invalid_scope"),
+            ("invalid_grant", "invalid_grant"),
+            ("invalid_client", "invalid_client"),
+            ("synthetic-sensitive-payload", "unknown"),
+            ("invalid_scope\nsynthetic-sensitive-payload", "unknown"),
+        ] {
+            let response = serde_json::to_vec(&serde_json::json!({
+                "error": code,
+                "error_description": "synthetic-sensitive-payload",
+                "access_token": "synthetic-sensitive-payload",
+            }))?;
+            let error = oauth_token_response(&response, false, OAuthScopes::Modify)
+                .expect_err("denied renewal must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("OAuth renewal denied ({category})")
+            );
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+        for bytes in [
+            b"synthetic-sensitive-payload".as_slice(),
+            br#"{"error":42,"error_description":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"error":"invalid_scope","error":"invalid_client"}"#.as_slice(),
+        ] {
+            let error = oauth_token_response(bytes, false, OAuthScopes::Modify)
+                .expect_err("unknown denial must fail");
+            assert_eq!(error.to_string(), "OAuth renewal denied (unknown)");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn both_success_and_failure_oauth_responses_are_bounded() {
+        let response = vec![b'x'; MAX_OAUTH_RESPONSE + 1];
+        for success in [false, true] {
+            assert_eq!(
+                oauth_token_response(&response, success, OAuthScopes::Modify)
+                    .expect_err("oversized response must fail")
+                    .to_string(),
+                "OAuth response exceeds limit"
+            );
+        }
+    }
 
     #[test]
     fn metadata_only_reads_exact_default_secret_key_and_trims_raw_bytes() -> Result<()> {

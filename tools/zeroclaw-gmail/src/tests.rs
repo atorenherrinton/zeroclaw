@@ -1120,8 +1120,14 @@ fn transport_allows_only_draft_routes_and_denies_send_mailbox_or_arbitrary_urls(
 fn oauth_scope_validation_rejects_missing_and_broader_mailbox_grants() -> Result<()> {
     let compose = "https://www.googleapis.com/auth/gmail.compose";
     let readonly = "https://www.googleapis.com/auth/gmail.readonly";
-    auth::validate_scopes(&format!("{compose} {readonly}"))?;
-    auth::validate_scopes(&format!("{readonly}\n{compose}"))?;
+    auth::validate_scopes(
+        &format!("{compose} {readonly}"),
+        auth::OAuthScopes::ComposeReadonly,
+    )?;
+    auth::validate_scopes(
+        &format!("{readonly}\n{compose}"),
+        auth::OAuthScopes::ComposeReadonly,
+    )?;
     for scope in [
         String::new(),
         compose.to_owned(),
@@ -1132,7 +1138,7 @@ fn oauth_scope_validation_rejects_missing_and_broader_mailbox_grants() -> Result
         format!("{compose} {readonly} openid"),
     ] {
         assert!(
-            auth::validate_scopes(&scope).is_err(),
+            auth::validate_scopes(&scope, auth::OAuthScopes::ComposeReadonly).is_err(),
             "accepted broader/missing grant {scope}"
         );
     }

@@ -88,11 +88,30 @@ The OAuth `credentials.json` file supplies client metadata; the default client
 secret comes from the same Keychain service at `client/default/client-secret`.
 Legacy nonempty inline `client_secret` values remain supported. Malformed
 metadata and unavailable or invalid secrets fail closed. Both Keychain reads
-restore noninteractive mode before returning. The helper requests and verifies
-exactly `gmail.compose` and `gmail.readonly`, and checks
-the returned Gmail profile against the pinned account. Broader or missing scope
-evidence fails closed. Compose itself permits sending at Google's OAuth layer;
-the helper's separate HTTP allowlist refuses it.
+restore noninteractive mode before returning.
+
+The token record's existing `scopes` array is the source of truth for renewal.
+The helper requests exactly `gmail.compose` plus `gmail.readonly` when both are
+already granted; otherwise it requests exactly `gmail.modify` only when that
+literal scope is already granted. Missing, malformed or unsupported stored scope
+evidence fails before renewal. Google requires refresh requests to use a
+[subset of the original granted scopes](https://developers.google.com/identity/openid-connect/reference);
+a permission's narrower capabilities do not make its scope string part of an
+existing grant.
+
+The returned scope set must exactly match the selected subset before the helper
+uses the access token or checks the Gmail profile against the pinned account.
+Broader, substituted or missing scope evidence fails closed; a denial never
+triggers a retry with other scopes. Renewal failures expose only fixed
+`invalid_scope`, `invalid_grant`, `invalid_client` or `unknown` categories, never
+the provider's response body or description.
+
+Neither supported subset is draft-only at [Google's OAuth layer](https://developers.google.com/workspace/gmail/api/auth/scopes).
+Both authorize [draft updates](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.drafts/update).
+Compose permits sending; modify also permits mailbox mutations. Accepting an already granted
+modify scope therefore relies on the helper's independent HTTP allowlist to
+refuse sending and all non-draft writes. It never requests the full-mail scope
+or the existing grant's unrelated Calendar, settings, Pub/Sub or identity scopes.
 
 Refresh access tokens stay in memory. This helper does not change credentials,
 Keychain ACLs, scopes, backend storage or the existing Google executables. A new
