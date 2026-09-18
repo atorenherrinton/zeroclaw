@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::PathBuf;
 use zeroize::Zeroizing;
@@ -49,28 +50,99 @@ pub fn configuration() -> Result<(String, Vec<PathBuf>)> {
     Ok((account.to_owned(), roots))
 }
 
-#[cfg(target_os = "macos")]
-fn stored_token(account: &str, interactive: bool) -> Result<Zeroizing<Vec<u8>>> {
-    // Never trigger or approve a native permission dialog from a background tool.
-    // A missing grant must be resolved by the owner, not by changing ACLs.
-    let status = unsafe {
-        security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(u8::from(
-            interactive,
-        ))
-    };
-    ensure!(status == 0, "cannot set Keychain interaction policy");
-    let result = security_framework::passwords::get_generic_password(
-        "gogcli",
-        &format!("token:default:{account}"),
+const GOG_KEYCHAIN_SERVICE: &str = "gogcli";
+const DEFAULT_CLIENT_SECRET_KEY: &str = "client/default/client-secret";
+
+#[derive(Deserialize)]
+struct ClientCredentials {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Zeroizing<String>,
+}
+
+fn client_credentials(
+    metadata: &[u8],
+    interactive: bool,
+    read_secret: impl FnOnce(&str, &str, bool) -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<ClientCredentials> {
+    // Match gog's metadata-first lookup. Malformed metadata must never trigger
+    // a fallback read, and its parse error must not include credential content.
+    let mut credentials: ClientCredentials = serde_json::from_slice(metadata)
+        .map_err(|_| anyhow::Error::msg("invalid OAuth client configuration"))?;
+    ensure!(
+        !credentials.client_id.trim().is_empty()
+            && !credentials.client_id.chars().any(char::is_control),
+        "OAuth client ID missing or invalid"
     );
-    let reset =
-        unsafe { security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(0) };
-    ensure!(reset == 0, "cannot restore noninteractive Keychain policy");
-    result.map(Zeroizing::new).map_err(|e| anyhow::Error::msg(format!("Gmail Keychain access unavailable (OSStatus {}); owner native approval/setup may be required", e.code())))
+    if !credentials.client_secret.trim().is_empty() {
+        ensure!(
+            !credentials.client_secret.chars().any(char::is_control),
+            "OAuth client secret is malformed"
+        );
+        return Ok(credentials);
+    }
+    let bytes = read_secret(GOG_KEYCHAIN_SERVICE, DEFAULT_CLIENT_SECRET_KEY, interactive)
+        .map_err(|_| anyhow::Error::msg("OAuth client secret Keychain access unavailable; owner native approval/setup may be required"))?;
+    let secret = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::Error::msg("OAuth client secret is not valid UTF-8"))?;
+    credentials.client_secret = normalized_client_secret(secret)?;
+    Ok(credentials)
+}
+
+fn normalized_client_secret(secret: &str) -> Result<Zeroizing<String>> {
+    let secret = secret.trim();
+    ensure!(
+        !secret.is_empty() && !secret.chars().any(char::is_control),
+        "OAuth client secret is empty or malformed"
+    );
+    Ok(Zeroizing::new(secret.to_owned()))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn with_keychain_interaction(
+    interactive: bool,
+    mut set_interaction: impl FnMut(bool) -> Result<()>,
+    read: impl FnOnce() -> Result<Zeroizing<Vec<u8>>>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    set_interaction(interactive)?;
+    let result = read();
+    // Reset before returning either the secret or an access error. Wrapping the
+    // bytes inside read also erases them if restoring this policy fails.
+    set_interaction(false)?;
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_record(service: &str, key: &str, interactive: bool) -> Result<Zeroizing<Vec<u8>>> {
+    with_keychain_interaction(
+        interactive,
+        |allowed| {
+            let status = unsafe {
+                security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed(u8::from(
+                    allowed,
+                ))
+            };
+            ensure!(status == 0, "cannot set Keychain interaction policy");
+            Ok(())
+        },
+        || {
+            security_framework::passwords::get_generic_password(service, key)
+                .map(Zeroizing::new)
+                .map_err(|e| anyhow::Error::msg(format!("Gmail Keychain access unavailable (OSStatus {}); owner native approval/setup may be required", e.code())))
+        },
+    )
 }
 #[cfg(not(target_os = "macos"))]
-fn stored_token(_: &str, _: bool) -> Result<Zeroizing<Vec<u8>>> {
+fn keychain_record(_: &str, _: &str, _: bool) -> Result<Zeroizing<Vec<u8>>> {
     bail!("Gmail credential adapter is configured for macOS Keychain only")
+}
+
+fn stored_token(account: &str, interactive: bool) -> Result<Zeroizing<Vec<u8>>> {
+    keychain_record(
+        GOG_KEYCHAIN_SERVICE,
+        &format!("token:default:{account}"),
+        interactive,
+    )
 }
 
 /// No shell, credential output, Keychain writes, OAuth scope expansion, or stored
@@ -113,26 +185,15 @@ async fn access_token_with_interaction(
         std::fs::read(path)
             .map_err(|_| anyhow::Error::msg("OAuth client configuration unavailable"))?,
     );
-    let creds: Value = serde_json::from_slice(&creds)
-        .map_err(|_| anyhow::Error::msg("invalid OAuth client configuration"))?;
+    let creds = client_credentials(&creds, interactive, keychain_record)?;
     let response = client
         .post("https://oauth2.googleapis.com/token")
         .form(&[
             ("grant_type", "refresh_token"),
             ("scope", "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"),
             ("refresh_token", refresh.as_str()),
-            (
-                "client_id",
-                creds["client_id"]
-                    .as_str()
-                    .context("OAuth client ID missing")?,
-            ),
-            (
-                "client_secret",
-                creds["client_secret"]
-                    .as_str()
-                    .context("OAuth client secret missing")?,
-            ),
+            ("client_id", creds.client_id.as_str()),
+            ("client_secret", creds.client_secret.as_str()),
         ])
         .send()
         .await
@@ -182,4 +243,176 @@ pub fn validate_scopes(scopes: &str) -> Result<()> {
         "OAuth scopes must be exactly gmail.compose and gmail.readonly; owner reauthorization required"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn metadata_only_reads_exact_default_secret_key_and_trims_raw_bytes() -> Result<()> {
+        for interactive in [false, true] {
+            for metadata in [
+                br#"{"client_id":"synthetic-client"}"#.as_slice(),
+                br#"{"client_id":"synthetic-client","client_secret":"   "}"#.as_slice(),
+            ] {
+                let calls = Cell::new(0);
+                let credentials =
+                    client_credentials(metadata, interactive, |service, key, allowed| {
+                        calls.set(calls.get() + 1);
+                        assert_eq!(service, "gogcli");
+                        assert_eq!(key, "client/default/client-secret");
+                        assert_eq!(allowed, interactive);
+                        Ok(Zeroizing::new(b" \tsynthetic-client-secret\r\n".to_vec()))
+                    })?;
+                assert_eq!(calls.get(), 1);
+                assert_eq!(credentials.client_id, "synthetic-client");
+                assert_eq!(
+                    credentials.client_secret.as_str(),
+                    "synthetic-client-secret"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_inline_secret_does_not_read_keychain() -> Result<()> {
+        let credentials = client_credentials(
+            br#"{"client_id":"synthetic-client","client_secret":"legacy-secret"}"#,
+            false,
+            |_, _, _| panic!("nonempty inline secret must bypass Keychain fallback"),
+        )?;
+        assert_eq!(credentials.client_secret.as_str(), "legacy-secret");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_metadata_never_falls_back_or_exposes_its_payload() {
+        for metadata in [
+            br#"{"client_id":"synthetic-sensitive-payload""#.as_slice(),
+            br#"{"client_secret":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"client_id":null,"client_secret":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"client_id":42,"client_secret":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"client_id":"   ","client_secret":"synthetic-sensitive-payload"}"#.as_slice(),
+            br#"{"client_id":"synthetic-client","client_secret":null}"#.as_slice(),
+            br#"{"client_id":"synthetic-client","client_secret":42}"#.as_slice(),
+            br#"{"client_id":"synthetic-client","client_secret":"synthetic-sensitive-payload","client_secret":"second"}"#.as_slice(),
+            br#"{"client_id":"synthetic-client","client_secret":"synthetic-sensitive-payload\u0000"}"#.as_slice(),
+        ] {
+            let error = client_credentials(metadata, false, |_, _, _| {
+                panic!("malformed metadata must not fall back to Keychain")
+            }).err().expect("malformed metadata must be rejected");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+    }
+
+    #[test]
+    fn invalid_keychain_secret_bytes_fail_closed_without_payload_errors() {
+        for bytes in [
+            b"".as_slice(),
+            b" \r\n\t",
+            b"synthetic-sensitive-payload\xff",
+            b"synthetic-sensitive-payload\0",
+            b"synthetic-sensitive-payload\nsecond",
+        ] {
+            let error =
+                client_credentials(br#"{"client_id":"synthetic-client"}"#, false, |_, _, _| {
+                    Ok(Zeroizing::new(bytes.to_vec()))
+                })
+                .err()
+                .expect("invalid secret must be rejected");
+            assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        }
+    }
+
+    #[test]
+    fn secret_access_error_propagates_without_retry_or_payload() {
+        let calls = Cell::new(0);
+        let error = client_credentials(br#"{"client_id":"synthetic-client"}"#, false, |_, _, _| {
+            calls.set(calls.get() + 1);
+            Err(anyhow::Error::msg(
+                "access denied: synthetic-sensitive-payload",
+            ))
+        })
+        .err()
+        .expect("access denial must remain an error");
+        assert_eq!(calls.get(), 1);
+        assert!(error.to_string().contains("Keychain access unavailable"));
+        assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+    }
+
+    #[test]
+    fn every_keychain_read_restores_noninteractive_policy_even_on_error() -> Result<()> {
+        for interactive in [false, true] {
+            for denied in [false, true] {
+                let events = RefCell::new(Vec::new());
+                let result = with_keychain_interaction(
+                    interactive,
+                    |allowed| {
+                        events.borrow_mut().push(format!("interaction:{allowed}"));
+                        Ok(())
+                    },
+                    || {
+                        events.borrow_mut().push("read".into());
+                        if denied {
+                            Err(anyhow::Error::msg("synthetic access denied"))
+                        } else {
+                            Ok(Zeroizing::new(b"synthetic-secret".to_vec()))
+                        }
+                    },
+                );
+                assert_eq!(
+                    *events.borrow(),
+                    vec![
+                        format!("interaction:{interactive}"),
+                        "read".into(),
+                        "interaction:false".into()
+                    ]
+                );
+                if denied {
+                    let error = match result {
+                        Err(error) => error,
+                        Ok(_) => panic!("access denial must remain an error"),
+                    };
+                    assert_eq!(error.to_string(), "synthetic access denied");
+                } else {
+                    assert_eq!(result?.as_slice(), b"synthetic-secret");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn keychain_policy_failures_do_not_return_secret_bytes() {
+        let calls = Cell::new(0);
+        let result = with_keychain_interaction(
+            true,
+            |_| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    Err(anyhow::Error::msg("cannot restore interaction policy"))
+                } else {
+                    Ok(())
+                }
+            },
+            || Ok(Zeroizing::new(b"synthetic-sensitive-payload".to_vec())),
+        );
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("reset failure must reject the secret"),
+        };
+        assert_eq!(calls.get(), 2);
+        assert!(!format!("{error:?}").contains("synthetic-sensitive-payload"));
+        assert!(
+            with_keychain_interaction(
+                true,
+                |_| Err(anyhow::Error::msg("cannot configure interaction policy")),
+                || panic!("failed policy setup must not read Keychain"),
+            )
+            .is_err()
+        );
+    }
 }

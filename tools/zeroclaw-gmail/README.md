@@ -83,8 +83,13 @@ not proof of completion after a timeout.
 
 The canonical account remains `GOG_ACCOUNT` on the existing `google_write` MCP
 server in `config.toml`; it is never supplied by a tool argument. The helper reads
-the existing `gogcli` macOS Keychain record and OAuth client configuration. It
-requests and verifies exactly `gmail.compose` and `gmail.readonly`, and checks
+the existing `gogcli` macOS Keychain token record at `token:default:{account}`.
+The OAuth `credentials.json` file supplies client metadata; the default client
+secret comes from the same Keychain service at `client/default/client-secret`.
+Legacy nonempty inline `client_secret` values remain supported. Malformed
+metadata and unavailable or invalid secrets fail closed. Both Keychain reads
+restore noninteractive mode before returning. The helper requests and verifies
+exactly `gmail.compose` and `gmail.readonly`, and checks
 the returned Gmail profile against the pinned account. Broader or missing scope
 evidence fails closed. Compose itself permits sending at Google's OAuth layer;
 the helper's separate HTTP allowlist refuses it.
