@@ -17823,7 +17823,8 @@ api_key = "anthropic-key"
         }
         async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            let output = "completed synthetic action\n".to_owned() + &"\\\"😀".repeat(40000);
+            let output =
+                "completed synthetic action\n".to_owned() + "\\\"😀".repeat(40000).as_str();
             Ok(ToolResult {
                 success: true,
                 output: if self.1 {
