@@ -110,6 +110,10 @@ fn initialize_lists_exact_draft_only_tools() -> Result<()> {
             "gmail_discard_draft",
             "gmail_operation_status",
             "gmail_reconcile_draft",
+            "gmail_prepare_native_schedule",
+            "gmail_begin_native_schedule_handoff",
+            "gmail_cancel_native_schedule_handoff",
+            "gmail_reconcile_native_schedule",
         ])
     );
     for tool in definitions {
@@ -263,7 +267,12 @@ fn interactive_doctor_requires_owner_terminal_before_configuration_or_credential
 
 #[test]
 fn mutations_require_owner_request_before_configuration_or_credentials() -> Result<()> {
-    for name in ["gmail_apply_draft", "gmail_discard_draft"] {
+    for name in [
+        "gmail_apply_draft",
+        "gmail_discard_draft",
+        "gmail_begin_native_schedule_handoff",
+        "gmail_cancel_native_schedule_handoff",
+    ] {
         for args in [
             json!({}),
             json!({"owner_requested":false}),

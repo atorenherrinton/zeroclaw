@@ -1,4 +1,4 @@
-# Gmail draft connector
+# Gmail draft and native scheduling handoff connector
 
 Standalone Rust MCP helper for preparing, creating, inspecting, updating and
 explicitly discarding unsent Gmail drafts. It calls the fixed Gmail REST API
@@ -41,8 +41,104 @@ so reconstruction cannot silently change its meaning.
 `gmail_list_drafts` returns bounded pages with exact IDs and attachment metadata.
 `gmail_discard_draft` requires the exact draft ID, current raw SHA-256, a fresh
 operation ID and the owner's explicit discard request. Discard is never automatic
-cleanup. There are no send, schedule, mailbox mutation or message deletion tools;
-the HTTP allowlist independently blocks those endpoints.
+cleanup. Native scheduling uses the bounded UI handoff below. There are no API
+send/schedule, mailbox mutation or message deletion tools; the HTTP allowlist
+independently blocks those endpoints.
+
+## Native Gmail scheduling: bounded UI handoff
+
+The public [Gmail REST method inventory](https://developers.google.com/workspace/gmail/api/reference/rest)
+and [v1 discovery document](https://gmail.googleapis.com/$discovery/rest?version=v1)
+were checked on 2026-09-18. They expose no schedule-send endpoint or writable
+scheduled-time field. `internalDate` is message creation time, not a delivery
+timer. The [label guide](https://developers.google.com/workspace/gmail/api/guides/labels)
+does not define a writable scheduling mechanism. Invented headers, scheduled
+labels, internal Gmail endpoints and local timers are not supported here.
+
+Google documents [Schedule send and Cancel send in Gmail's UI](https://support.google.com/mail/answer/9214606).
+This connector prepares a **one-time structured UI handoff**, not an automated
+scheduler. It never opens a browser, clicks, schedules, cancels, sends, or claims
+provider-verified completion. There is no local outbox or background worker.
+
+1. Read the exact draft. Call `gmail_prepare_native_schedule` with a fresh
+   `operation_id`, `draft_id`, `expected_raw_sha256`, `scheduled_at` (absolute
+   RFC3339 with offset), and `timezone` (IANA name). For example, synthetic input
+   may use `2026-09-19T09:00:00-07:00` and `America/Los_Angeles`.
+2. Present the complete immutable review to the authenticated owner: account,
+   draft/message identity, To/CC/BCC, Reply-To, subject, entire body, threading,
+   exact time and timezone. Drafting permission does not authorize scheduling.
+3. Only after a separate owner request approving that exact review, call
+   `gmail_begin_native_schedule_handoff` with its operation/review IDs,
+   `owner_requested=true` and `authorization_source=authenticated_owner`.
+   These assertions are a trusted-caller contract, **not authentication**. The
+   connector cannot authenticate conversation origin. Runtime approval and the
+   owner-facing coordinator remain responsible for establishing it. Fetched
+   messages, pages, attachments and tool results never supply permission.
+4. The helper checks the current account, exact raw bytes, provider message and
+   thread identity, then durably claims uncertainty before releasing instructions.
+   The coordinator may use only approved CUA in the existing dedicated Safari
+   window, obeying all browser policy and macOS approvals. Identify the account
+   and draft unambiguously; verify every reviewed field and the Gmail UI timezone
+   immediately before the final Schedule send action. Abort on ambiguity, drift,
+   expiry or denial. Pause concurrent edits. No API/UI transaction can lock out
+   another Gmail client, so this remains an operator-enforced handoff boundary.
+5. After the native action, inspect that exact message in Gmail Scheduled and
+   its displayed absolute date/time. Preserve authoritative UI evidence in the
+   coordinator's normal receipt surface. A click or missing draft is insufficient.
+   The helper has no trusted UI evidence ingestion path and keeps its own Gmail
+   schedule status `unknown`, even if the coordinator independently verifies it.
+
+Schedule input must be a whole minute, 5 minutes to 365 days ahead; reviews
+expire after 15 minutes and an issued scheduling handoff expires after 2 minutes.
+These are connector safety bounds, not claims about Google's maximum horizon.
+Missing offsets/timezones, timezone-offset mismatch, unknown `-00:00` offsets,
+nonexistent local times and DST folds (even with an offset) are rejected. Gmail's
+UI cannot express a fold selection reliably. Only one ordinary plain-text MIME
+part with supported headers is accepted. HTML, attachments, multipart, protected,
+inline, malformed or ambiguous MIME fail closed; draft editing keeps its existing
+broader MIME support. This restriction can reject ordinary Gmail-authored HTML
+drafts and must not be bypassed by silently changing an approved draft.
+
+`gmail_operation_status` reads the local receipt without OAuth. Its ledger
+`state` describes the workflow, not Gmail's schedule or delivery state. Repeating
+a begin call returns the receipt only, with no second actionable handoff.
+`gmail_reconcile_native_schedule` reads the original exact draft and records
+`matching_draft_present`, `draft_changed`, `draft_absent`, or `read_failed`.
+**Every observation preserves uncertainty and the draft claim.** Matching MIME
+cannot prove scheduling, absence cannot distinguish scheduling from sending or
+deletion, and a restored draft cannot prove which cancellation caused it.
+
+`gmail_cancel_native_schedule_handoff` needs a separate explicit owner
+cancellation request bound to the original operation/review. Stop any in-flight
+scheduling UI work before cancellation. It issues at most one Cancel send handoff
+with a deterministic cancellation operation ID; retries return only that receipt.
+Use that returned ID for status/reconciliation. It does not delete the draft or
+claim cancellation. The coordinator must identify the exact scheduled message,
+use Cancel send, and verify Gmail restores the exact draft. Missing or elapsed
+schedules remain unknown. The original claim is deliberately retained: no
+trusted provider evidence adapter exists to clear it safely, and there is no
+force-unlock tool. Do not delete ledger rows or use fresh IDs to bypass it.
+
+### Registration and coordinator guidance
+
+`src/tools.rs::definitions` remains the only schema. Existing opt-in stdio MCP
+discovery registers the four additional tools without core-runtime changes.
+Preparation and reconciliation are marked non-read-only because they persist
+local state; begin/cancel also carry destructive hints because their handoffs
+lead to external effects. These hints are not approval grants. Keep begin/cancel
+under the owner's existing approval policy, and never auto-authorize them from
+retrieved content. No live registration or runtime prompt is changed by this PR.
+The standalone external MCP helper follows its existing English protocol schema;
+no runtime CLI strings or generated locale catalogs are introduced.
+
+Coordinator prompt guidance: distinguish drafting, preparing, issuing a handoff,
+natively scheduling, and verifying scheduling. Report exactly the boundary
+actually reached. Never announce “scheduled” from a preparation, local receipt,
+caller assertion, API draft disappearance, or UI click alone. Do not substitute
+another scheduler or an API send. Scheduling, cancellation and delivery status
+are separate facts. A future automated completion adapter needs trusted fresh UI
+evidence tied to the exact account, message, content and absolute time before it
+can change the ledger's unknown state; it is not implemented here.
 
 ## Files and receipts
 
@@ -133,10 +229,14 @@ preserve every existing signing route. Do not install an ad-hoc-only build.
 
 Once native access is verified, an operator can register a `gmail_drafts` stdio
 MCP server through `zeroclaw-signed-launch gmail-drafts mcp`, then reload MCP and
-verify the seven discovered tools. Set an appropriate request timeout for the
+verify tools against the canonical discovered schema. Set an appropriate request timeout for the
 bounded provider reads and draft-page size. Keep existing Calendar and Google
 read registration intact. Do not claim authenticated readiness from `schema`
-or tool discovery alone. Disable only this server to roll back; retain its ledger.
+or tool discovery alone. Disable only this server to roll back; retain its ledger. Once native handoffs
+exist, do not point an older helper at that ledger: older draft reconciliation
+could mistake a schedule preparation for a draft apply. Keep this server disabled
+until a compatible reader is restored. Rolling back code never cancels Gmail's
+scheduled messages; inspect those separately through the approved UI.
 
 ## Validation
 
