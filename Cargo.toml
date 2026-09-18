@@ -70,6 +70,16 @@ name = "zeroclaw-acp-bridge"
 path = "src/bin/zeroclaw-acp-bridge.rs"
 required-features = ["acp-bridge"]
 
+[[bin]]
+name = "configure_telegram_transcription"
+path = "src/bin/configure_telegram_transcription.rs"
+required-features = ["agent-runtime"]
+
+[[bin]]
+name = "verify_native_modmail_browser"
+path = "src/bin/verify_native_modmail_browser.rs"
+required-features = ["agent-runtime"]
+
 [lib]
 name = "zeroclaw"
 path = "src/lib.rs"
