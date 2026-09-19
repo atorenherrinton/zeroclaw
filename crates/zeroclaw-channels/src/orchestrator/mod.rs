@@ -4106,14 +4106,13 @@ async fn run_draft_updater(
                     continue;
                 }
                 let event = tool_progress_rx.as_mut().and_then(|rx| *rx.borrow_and_update());
-                if let Some(event) = event {
-                    if let Err(error) = channel.update_draft_tool_progress(&reply_target, &draft_id, event).await {
+                if let Some(event) = event
+                    && let Err(error) = channel.update_draft_tool_progress(&reply_target, &draft_id, event).await {
                         ::zeroclaw_log::record!(DEBUG,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                 .with_attrs(::serde_json::json!({"error": error.to_string()})),
                             "Executor draft tool progress update failed"
                         );
-                    }
                 }
                 continue;
             },
