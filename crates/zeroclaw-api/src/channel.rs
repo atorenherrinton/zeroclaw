@@ -436,6 +436,22 @@ pub enum ToolActivity {
     Memory,
     VersionControl,
     Other,
+    BrowserOpen,
+    BrowserRead,
+    BrowserInteract,
+    BrowserWait,
+    BrowserVerify,
+    FileRead,
+    FileWrite,
+    Search,
+    CalendarRead,
+    CalendarWrite,
+    DraftMessage,
+    SendMessage,
+    CheckDelivery,
+    Contacts,
+    Delegation,
+    ToolDiscovery,
 }
 
 /// Stage of a privacy-safe tool progress update.

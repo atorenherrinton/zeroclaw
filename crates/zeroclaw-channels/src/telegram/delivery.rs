@@ -117,16 +117,7 @@ impl TelegramChannel {
             .into());
         }
         let chunks = split_message_for_telegram(text);
-        let route = zeroclaw_api::conversation::current().filter(|r| {
-            r.reply_to.parse::<i64>().is_ok_and(|id| id > 0)
-                && r.channel == format!("telegram.{}", self.alias)
-                && r.recipient.split(':').next() == Some(chat_id)
-                && r.recipient
-                    .split_once(':')
-                    .map(|(_, t)| t)
-                    .or(r.thread.as_deref())
-                    == thread_id
-        });
+        let route = self.current_reply_route(chat_id, thread_id);
         // Structured tuple prevents delimiter collisions. Response content hash
         // identifies this exact immutable response, not a newly generated answer.
         let response_key = format!(
@@ -183,9 +174,7 @@ impl TelegramChannel {
                 if let Some(tid) = thread_id {
                     body["message_thread_id"] = tid.into();
                 }
-                if index == 0
-                    && let Some(id) = route.as_ref().and_then(|r| r.reply_to.parse::<i64>().ok())
-                {
+                if let Some(id) = route.as_ref().and_then(|r| r.reply_to.parse::<i64>().ok()) {
                     body["reply_parameters"] =
                         serde_json::json!({"message_id":id,"allow_sending_without_reply":true});
                 }
