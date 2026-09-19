@@ -16,21 +16,7 @@ pub fn root() -> Result<PathBuf> {
 /// Resolve the pinned identity and sharing policy from canonical configuration at
 /// use time, never from model arguments or email content.
 pub fn configuration() -> Result<(String, Vec<PathBuf>)> {
-    let value: toml::Value = toml::from_str(
-        &std::fs::read_to_string(root()?.join("config.toml"))
-            .map_err(|_| anyhow::Error::msg("configuration unavailable"))?,
-    )
-    .map_err(|_| anyhow::Error::msg("invalid runtime configuration"))?;
-    let value = serde_json::to_value(value)?;
-    let servers = value["mcp"]["servers"]
-        .as_array()
-        .context("MCP servers missing")?;
-    let account = servers
-        .iter()
-        .find(|s| s["name"] == "google_write")
-        .and_then(|s| s["env"]["GOG_ACCOUNT"].as_str())
-        .context("Google writer account must be pinned")?;
-    crate::model::mailbox(account)?;
+    let account = pinned_account()?;
     // Sharing roots are the existing operator-owned personal-ops policy.
     let policy = root()?.join("extensions/personal-ops/sharing.json");
     let policy: Value = serde_json::from_slice(
@@ -47,7 +33,27 @@ pub fn configuration() -> Result<(String, Vec<PathBuf>)> {
                 .context("invalid sharing root")
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok((account.to_owned(), roots))
+    Ok((account, roots))
+}
+
+/// Resolve the existing sole Google account without loading Gmail sharing policy.
+pub fn pinned_account() -> Result<String> {
+    let value: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root()?.join("config.toml"))
+            .map_err(|_| anyhow::Error::msg("configuration unavailable"))?,
+    )
+    .map_err(|_| anyhow::Error::msg("invalid runtime configuration"))?;
+    let value = serde_json::to_value(value)?;
+    let servers = value["mcp"]["servers"]
+        .as_array()
+        .context("MCP servers missing")?;
+    let account = servers
+        .iter()
+        .find(|s| s["name"] == "google_write")
+        .and_then(|s| s["env"]["GOG_ACCOUNT"].as_str())
+        .context("Google writer account must be pinned")?;
+    crate::model::mailbox(account)?;
+    Ok(account.to_owned())
 }
 
 const GOG_KEYCHAIN_SERVICE: &str = "gogcli";
@@ -61,6 +67,7 @@ const MAX_OAUTH_RESPONSE: usize = 64 * 1024;
 pub(crate) enum OAuthScopes {
     ComposeReadonly,
     Modify,
+    DriveFile,
 }
 
 impl OAuthScopes {
@@ -70,6 +77,7 @@ impl OAuthScopes {
                 "https://www.googleapis.com/auth/gmail.compose https://www.googleapis.com/auth/gmail.readonly"
             }
             Self::Modify => MODIFY_SCOPE,
+            Self::DriveFile => "https://www.googleapis.com/auth/drive.file",
         }
     }
 }
@@ -227,6 +235,70 @@ async fn access_token_with_interaction(
 ) -> Result<Zeroizing<String>> {
     let bytes = stored_token(account, interactive)?;
     let (refresh, scopes) = refresh_credentials(&bytes)?;
+    renew(client, refresh, scopes, interactive).await
+}
+
+/// Workspace never falls back to full Drive or unrelated account scopes.
+pub async fn workspace_access_token(
+    client: &reqwest::Client,
+    account: &str,
+    interactive: bool,
+) -> Result<Zeroizing<String>> {
+    if interactive {
+        use std::io::IsTerminal;
+        ensure!(
+            std::io::stdin().is_terminal(),
+            "interactive doctor requires an owner-operated terminal"
+        );
+    }
+    let bytes = stored_token(account, interactive)?;
+    let refresh = workspace_refresh_credentials(&bytes)?;
+    renew(client, refresh, OAuthScopes::DriveFile, interactive).await
+}
+
+fn workspace_refresh_credentials(bytes: &[u8]) -> Result<Zeroizing<String>> {
+    let token: StoredToken = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow::Error::msg("invalid stored OAuth scope evidence"))?;
+    ensure!(
+        token
+            .scopes
+            .iter()
+            .any(|s| s == OAuthScopes::DriveFile.request()),
+        "owner incremental consent for drive.file required; no broad-scope fallback"
+    );
+    ensure!(
+        !token.refresh_token.trim().is_empty()
+            && !token.refresh_token.chars().any(char::is_control),
+        "refresh credential unavailable or malformed"
+    );
+    ensure!(
+        token.scopes.iter().all(|scope| !scope.is_empty()
+            && scope
+                .bytes()
+                .all(|b| (0x21..=0x7e).contains(&b) && b != b'"' && b != b'\\')),
+        "malformed stored scope evidence"
+    );
+    Ok(token.refresh_token)
+}
+
+/// Read the established client without changing any canonical credential record.
+/// Used by the isolated Workspace authorization flow; callers must not log values.
+pub fn workspace_client(interactive: bool) -> Result<(String, Zeroizing<String>)> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
+    let bytes = Zeroizing::new(
+        std::fs::read(home.join("Library/Application Support/gogcli/credentials.json"))
+            .map_err(|_| anyhow::Error::msg("OAuth client configuration unavailable"))?,
+    );
+    let creds = client_credentials(&bytes, interactive, keychain_record)?;
+    Ok((creds.client_id, creds.client_secret))
+}
+
+async fn renew(
+    client: &reqwest::Client,
+    refresh: Zeroizing<String>,
+    scopes: OAuthScopes,
+    interactive: bool,
+) -> Result<Zeroizing<String>> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
     let path = home.join("Library/Application Support/gogcli/credentials.json");
     let creds = Zeroizing::new(
@@ -316,7 +388,7 @@ pub(crate) fn validate_scopes(scopes: &str, selected: OAuthScopes) -> Result<()>
         .collect::<std::collections::HashSet<_>>();
     ensure!(
         actual == expected,
-        "OAuth scope evidence does not match the requested Gmail subset"
+        "OAuth scope evidence does not match the requested connector subset"
     );
     Ok(())
 }
@@ -332,6 +404,41 @@ mod tests {
             "scopes": scopes,
         }))
         .expect("synthetic record serialization")
+    }
+
+    #[test]
+    fn workspace_never_substitutes_broad_drive_grants() -> Result<()> {
+        assert_eq!(
+            workspace_refresh_credentials(&stored_record(serde_json::json!([MODIFY_SCOPE])))
+                .unwrap_err()
+                .to_string(),
+            "owner incremental consent for drive.file required; no broad-scope fallback"
+        );
+        let scope = OAuthScopes::DriveFile.request();
+        assert!(workspace_refresh_credentials(&stored_record(serde_json::json!([scope]))).is_ok());
+        for scopes in [
+            serde_json::json!([]),
+            serde_json::json!(["https://www.googleapis.com/auth/drive"]),
+            serde_json::json!([
+                "https://www.googleapis.com/auth/documents",
+                "https://www.googleapis.com/auth/spreadsheets"
+            ]),
+            serde_json::json!([scope, "malformed scope"]),
+            Value::Null,
+        ] {
+            assert!(workspace_refresh_credentials(&stored_record(scopes)).is_err());
+        }
+        assert!(
+            validate_scopes(
+                "https://www.googleapis.com/auth/drive",
+                OAuthScopes::DriveFile
+            )
+            .is_err()
+        );
+        assert!(
+            validate_scopes(&format!("{scope} {MODIFY_SCOPE}"), OAuthScopes::DriveFile).is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -405,7 +512,11 @@ mod tests {
 
     #[test]
     fn refresh_response_must_match_the_selected_subset_without_fallback() -> Result<()> {
-        for selected in [OAuthScopes::ComposeReadonly, OAuthScopes::Modify] {
+        for selected in [
+            OAuthScopes::ComposeReadonly,
+            OAuthScopes::Modify,
+            OAuthScopes::DriveFile,
+        ] {
             let success = serde_json::to_vec(&serde_json::json!({
                 "access_token": "synthetic-access-credential",
                 "scope": selected.request(),
@@ -417,6 +528,7 @@ mod tests {
             let other = match selected {
                 OAuthScopes::ComposeReadonly => OAuthScopes::Modify,
                 OAuthScopes::Modify => OAuthScopes::ComposeReadonly,
+                OAuthScopes::DriveFile => OAuthScopes::Modify,
             };
             for scope in [
                 other.request().to_owned(),
