@@ -30,9 +30,49 @@ There is no `allowed_users` field under `[channels.telegram.<alias>]`.
 Authorization lives in [Peer Groups](./peer-groups.md); that page is the
 canonical reference for peer-group fields, matching, and multi-agent behavior.
 
+## Private task threads
+
+Enable **Threaded Mode** for your bot in the BotFather mini app to use Telegram
+topics in the private bot chat. Allow users to create threads if you want to
+start them from Telegram. Each topic keeps its own agent conversation history;
+replies inside it continue that task. Different topics can run concurrently
+within the configured channel worker limit. These are independent conversation
+sessions using the configured agent's tools and permissions, not new persistent
+agent configuration entries.
+
+For follow-ups to wait behind the current response instead of cancelling it:
+
+```toml
+[channels.telegram.home]
+interrupt_on_new_message = false
+stream_mode = "partial"
+```
+
+After changing runtime configuration, reload or restart the daemon while idle.
+A follow-up in a busy topic receives a queue acknowledgement. `/stop` applies
+to that topic's sender scope, leaving other topics running.
+
+Responses and progress drafts reply to the originating message in the topic.
+Tool progress describes actual execution using closed action labels, such as
+reading files, checking a calendar, or inspecting a browser page. It does not
+display raw commands, tool arguments, or hidden model reasoning.
+
+Concurrent topics within the same private chat, sender, bot alias and effective
+agent share bounded task-request excerpts at each model call. The source is the
+live turn registration directory, and finished or cancelled turns leave it
+automatically. Delegated agents inherit the same live source, retaining the
+registration until their work exits even if the parent turn has returned.
+The snapshot is transient prompt context: it does not add user
+instructions or peer transcripts to the topic's stored history. Agents are told
+to defer actions that overlap a peer's task. This is advisory coordination;
+it does not lock files, browser sessions or external records, and a model cannot
+receive an update in the middle of an already-running tool call. Group chats
+and other owners are excluded from this sharing.
+
 ## Repair and coding progress notices
 
-When a Telegram request starts native coding work, ZeroClaw sends a separate
+When draft streaming is disabled or no draft could be created, and a Telegram
+request starts native coding work, ZeroClaw sends a separate
 text notice to its original chat and topic. This covers built-in coding CLI
 tools, delegation to the explicit `coding` agent alias, and native file writes
 or edits to recognized source files. It sends one start notice per turn,
@@ -40,8 +80,9 @@ followed by an update every two minutes while that request remains open.
 The update describes the request as still running; it does not claim that
 files are still being edited or that a repair succeeded.
 
-These notices also work with draft streaming disabled and with ordinary tool
-call messages hidden. They contain no tool arguments, source paths, prompts,
+When a progress draft exists, the draft carries the live execution updates
+instead of these repetitive standalone notices. The fallback notices work with
+ordinary tool call messages hidden. They contain no tool arguments, source paths, prompts,
 commands, or tool output. They stay text-only for voice conversations. Read-only
 tools, ordinary document writes, arbitrary shell commands, other delegate
 aliases, and extension tools do not trigger them.

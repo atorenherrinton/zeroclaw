@@ -6,6 +6,7 @@ pub mod acp_embedded;
 pub mod acp_server;
 pub mod media_pipeline;
 mod repair_notifications;
+mod thread_coordination;
 mod turn_journal;
 use zeroclaw_api::turn::{TaskStatus, TurnJournal};
 #[cfg(feature = "channel-mqtt")]
@@ -172,6 +173,69 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
+}
+
+/// The observer event is canonical; this watch slot only buffers the latest
+/// pending transport status, without arguments, output, or error text.
+struct ToolProgressObserver {
+    inner: Arc<dyn Observer>,
+    progress: Option<tokio::sync::watch::Sender<Option<ToolProgressEvent>>>,
+}
+
+impl Observer for ToolProgressObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        if let Some(progress) = self.progress.as_ref()
+            && let Some(event) = executor_tool_progress(event)
+        {
+            progress.send_replace(Some(event));
+        }
+        self.inner.record_event(event);
+    }
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.inner.record_metric(metric);
+    }
+    fn flush(&self) {
+        self.inner.flush();
+    }
+    fn name(&self) -> &str {
+        "channel-tool-progress"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn executor_tool_progress(event: &ObserverEvent) -> Option<ToolProgressEvent> {
+    let (tool, arguments, phase) = match event {
+        ObserverEvent::ToolCallStart {
+            tool, arguments, ..
+        } => (tool, arguments, ToolProgressPhase::Running),
+        ObserverEvent::ToolCall {
+            tool,
+            arguments,
+            success,
+            ..
+        } => (
+            tool,
+            arguments,
+            if *success {
+                ToolProgressPhase::Succeeded
+            } else {
+                ToolProgressPhase::Failed
+            },
+        ),
+        _ => return None,
+    };
+    // Scrubbed/bounded observer arguments can be incomplete JSON. Fall back to
+    // a coarse name-based label instead of guessing the action.
+    let arguments = arguments
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Some(ToolProgressEvent {
+        activity: classify_tool_activity(tool, &arguments),
+        phase,
+    })
 }
 
 const NOTIFY_DETAIL_MAX_CHARS: usize = 4096;
@@ -3931,36 +3995,73 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// Tool names can originate in extensions, so they never cross the channel
 /// boundary verbatim. Unknown names intentionally collapse to `Other`.
-fn classify_tool_activity(tool: &str) -> ToolActivity {
+fn classify_tool_activity(tool: &str, arguments: &serde_json::Value) -> ToolActivity {
     let normalized = tool.to_ascii_lowercase();
     let leaf = normalized.rsplit("__").next().unwrap_or(&normalized);
 
-    if leaf == "codex_cli" {
-        ToolActivity::Codex
-    } else if normalized.starts_with("safari_browser__")
-        || matches!(
-            leaf,
-            "browser" | "browser_open" | "browser_delegate" | "screenshot"
-        )
+    if normalized.starts_with("safari_browser__")
+        || normalized.starts_with("public_browser__")
+        || leaf == "browser"
     {
-        ToolActivity::Browser
-    } else if matches!(
-        leaf,
-        "web_search" | "web_fetch" | "http_request" | "content_search" | "weather"
-    ) {
-        ToolActivity::Web
-    } else if leaf.starts_with("file_")
-        || matches!(leaf, "glob_search" | "project_intel" | "image_info")
-    {
-        ToolActivity::Files
-    } else if matches!(leaf, "shell" | "exec" | "exec_command") {
-        ToolActivity::CommandLine
-    } else if leaf.starts_with("memory_") {
-        ToolActivity::Memory
-    } else if leaf.starts_with("git_") || leaf.starts_with("github") {
-        ToolActivity::VersionControl
-    } else {
-        ToolActivity::Other
+        // Only match known action values. Neither the supplied value nor any
+        // URLs, selectors, field text, or other arguments reach the UI.
+        return match arguments.get("action").and_then(serde_json::Value::as_str) {
+            Some("open") => ToolActivity::BrowserOpen,
+            Some(
+                "read" | "snapshot" | "get_text" | "get_title" | "get_url" | "screenshot" | "find"
+                | "is_visible",
+            ) => ToolActivity::BrowserRead,
+            Some(
+                "click" | "fill" | "type" | "press" | "select" | "check" | "uncheck" | "set_date"
+                | "autofill" | "hover" | "scroll",
+            ) => ToolActivity::BrowserInteract,
+            Some("wait") => ToolActivity::BrowserWait,
+            Some("verify") => ToolActivity::BrowserVerify,
+            _ => ToolActivity::Browser,
+        };
+    }
+
+    match leaf {
+        "codex_cli" => ToolActivity::Codex,
+        "browser_open" => ToolActivity::BrowserOpen,
+        "screenshot" => ToolActivity::BrowserRead,
+        "browser_delegate" | "delegate" | "delegate_task" | "subagent_spawn" => {
+            ToolActivity::Delegation
+        }
+        "web_search" | "content_search" | "glob_search" => ToolActivity::Search,
+        "web_fetch" | "http_request" | "weather" => ToolActivity::Web,
+        "file_read" | "file_list" | "image_info" | "project_intel" => ToolActivity::FileRead,
+        "file_write" | "file_edit" | "apply_patch" => ToolActivity::FileWrite,
+        "shell" | "exec" | "exec_command" => ToolActivity::CommandLine,
+        "calendar_list" | "calendar_get" | "calendar_search" | "calendar_validate"
+        | "calendar_reconcile" => ToolActivity::CalendarRead,
+        "calendar_create_event" | "calendar_update_event" | "calendar_mutate" => {
+            ToolActivity::CalendarWrite
+        }
+        "gmail_create_draft"
+        | "imessage_draft"
+        | "text_prepare"
+        | "outbox_prepare"
+        | "group_text_prepare"
+        | "imessage_group_text_prepare"
+        | "voicemail_prepare"
+        | "voicemail_group_prepare"
+        | "files_prepare" => ToolActivity::DraftMessage,
+        "outbox_send"
+        | "delivery_execute"
+        | "imessage_approve"
+        | "imessage_group_text_schedule" => ToolActivity::SendMessage,
+        "delivery_status" | "outbox_status" | "imessage_list" => ToolActivity::CheckDelivery,
+        "contacts_get"
+        | "contacts_search"
+        | "contact_destination_resolve"
+        | "imessage_group_search"
+        | "imessage_group_get" => ToolActivity::Contacts,
+        "tool_search" => ToolActivity::ToolDiscovery,
+        _ if leaf.starts_with("file_") => ToolActivity::Files,
+        _ if leaf.starts_with("memory_") => ToolActivity::Memory,
+        _ if leaf.starts_with("git_") || leaf.starts_with("github") => ToolActivity::VersionControl,
+        _ => ToolActivity::Other,
     }
 }
 
@@ -3986,10 +4087,40 @@ async fn run_draft_updater(
     draft_id: String,
     known_tool_names: HashSet<String>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
+    mut tool_progress_rx: Option<tokio::sync::watch::Receiver<Option<ToolProgressEvent>>>,
 ) -> String {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
     let mut accumulated = String::new();
-    while let Some(event) = rx.recv().await {
+    let executor_progress_enabled = tool_progress_rx.is_some();
+    loop {
+        let event = tokio::select! {
+            biased;
+            changed = async {
+                match tool_progress_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    tool_progress_rx = None;
+                    continue;
+                }
+                let event = tool_progress_rx.as_mut().and_then(|rx| *rx.borrow_and_update());
+                if let Some(event) = event
+                    && let Err(error) = channel.update_draft_tool_progress(&reply_target, &draft_id, event).await {
+                        ::zeroclaw_log::record!(DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Executor draft tool progress update failed"
+                        );
+                }
+                continue;
+            },
+            event = rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             // A lifecycle event is a typed signal, not assistant text, so it
             // carries nothing to sanitize and passes straight through.
@@ -4033,14 +4164,26 @@ async fn run_draft_updater(
             // result, or error crosses that channel boundary. Matrix has its
             // own disclosure policy in `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                // Preparation announces calls before execution. Typed channels
+                // use executor events so "Now" names work actually started.
+                if executor_progress_enabled {
+                    continue;
+                }
                 if channel.supports_typed_tool_progress() {
                     let typed = match &event {
-                        StreamDelta::ToolStart { tool, .. } => ToolProgressEvent {
-                            activity: classify_tool_activity(tool),
+                        StreamDelta::ToolStart {
+                            tool, arguments, ..
+                        } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool, arguments),
                             phase: ToolProgressPhase::Running,
                         },
-                        StreamDelta::ToolComplete { tool, success, .. } => ToolProgressEvent {
-                            activity: classify_tool_activity(tool),
+                        StreamDelta::ToolComplete {
+                            tool,
+                            arguments,
+                            success,
+                            ..
+                        } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool, arguments),
                             phase: if *success {
                                 ToolProgressPhase::Succeeded
                             } else {
@@ -5409,13 +5552,16 @@ async fn process_channel_message(
             let journal = ctx.session_store.as_ref()
                 .filter(|store| store.supports_delivery_journal())
                 .map(|store| Arc::new(zeroclaw_infra::session_delivery::SessionDeliveryJournal(Arc::clone(store))) as Arc<dyn zeroclaw_api::delivery::DeliveryJournal>);
+            let peer_activity = thread_coordination::Registration::enter(&ctx.agent_alias, &msg)
+                .map(|source| source as Arc<dyn zeroclaw_api::peer_activity::PeerActivitySource>);
+            zeroclaw_api::peer_activity::SOURCE.scope(peer_activity,
             zeroclaw_api::delivery::SUMMARY.scope(std::sync::Mutex::new(None),
                 zeroclaw_api::delivery::JOURNAL.scope(journal,
                 zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route),
                     crate::mcp_elicitation::scope_channel_elicitation(
                         elicitation_channel, elicitation_route, elicitation_cancellation,
                         process_channel_message_body(ctx, msg, cancellation_token, composite_for_body),
-                    )))).await;
+                    ))))).await;
         }
     )
     .await;
@@ -7037,10 +7183,10 @@ async fn process_channel_message_body(
         None
     };
 
-    // Keep operational repair notices separate from editable drafts and the
-    // optional per-tool transcript. The relay preserves the original events.
+    // An active draft already explains the current work. Standalone repair
+    // reminders remain a fallback when drafts are disabled or failed to send.
     let (delta_rx, repair_notification_task) = match (delta_rx, target_channel.as_ref()) {
-        (Some(rx), Some(channel)) if msg.channel == "telegram" => {
+        (Some(rx), Some(channel)) if msg.channel == "telegram" && draft_message_id.is_none() => {
             let (draft_rx, task) = repair_notifications::start(
                 rx,
                 Arc::clone(channel),
@@ -7051,6 +7197,20 @@ async fn process_channel_message_body(
             (draft_rx, Some(task))
         }
         (rx, _) => (rx, None),
+    };
+
+    // Keep the latest executor status while transport is busy. Legacy/Matrix
+    // consumers retain their existing draft event contracts.
+    let (tool_progress_tx, tool_progress_rx) = if use_draft_streaming
+        && !matrix_single_message_streaming
+        && target_channel
+            .as_ref()
+            .is_some_and(|channel| channel.supports_typed_tool_progress())
+    {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
     };
 
     // Spawn the appropriate handler for the delta channel.
@@ -7092,7 +7252,15 @@ async fn process_channel_message_body(
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await
+                    run_draft_updater(
+                        channel,
+                        reply_target,
+                        draft_id,
+                        known_tool_names,
+                        rx,
+                        tool_progress_rx,
+                    )
+                    .await
                 }))
             }
         } else {
@@ -7186,6 +7354,10 @@ async fn process_channel_message_body(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
+    let execution_observer = ToolProgressObserver {
+        inner: notify_observer.clone(),
+        progress: tool_progress_tx,
+    };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -7276,7 +7448,7 @@ async fn process_channel_message_body(
                     },
                     ResolvedIo {
                         tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
+                        observer: &execution_observer,
                         silent: true,
                         approval: Some(&*ctx.approval_manager),
                         multimodal_config: &ctx.multimodal,
@@ -7550,6 +7722,7 @@ async fn process_channel_message_body(
         msg.thread_ts = followup_thread_id(&msg);
     }
     // Drop the notify sender so the forwarder task finishes
+    drop(execution_observer);
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(mut handle) = notify_task
@@ -8510,6 +8683,25 @@ async fn dispatch_worker(
     // Cancellation of a queued successor must still wait for its predecessor;
     // otherwise a third turn could overtake the still-executing first one.
     if let Some(previous) = previous {
+        if msg.channel == "telegram"
+            && msg.thread_ts.is_some()
+            && !ctx
+                .interrupt_on_new_message
+                .enabled_for_channel(&msg.channel)
+            && !previous.completion.done.load(Ordering::Acquire)
+            && let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
+        {
+            let notice = SendMessage::reply_to(
+                &msg,
+                zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-topic-followup-queued",
+                ),
+            )
+            .suppress_voice();
+            // This is an acknowledgement of queuing, never a final-delivery
+            // checkpoint. An uncertain send is not retried.
+            let _ = tokio::time::timeout(Duration::from_secs(3), channel.send(&notice)).await;
+        }
         previous.completion.wait().await;
     }
     let run = async {
@@ -14225,6 +14417,7 @@ fn concurrent_persist_lock_serialization() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("threading_dispatch_tests.rs");
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
     // pin the built-in filter's own behavior.
@@ -19357,7 +19550,7 @@ api_key = "anthropic-key"
                 );
                 assert_eq!(
                     sent.iter().filter(|text| text.ends_with(&notice)).count(),
-                    usize::from(expected_notice),
+                    usize::from(expected_notice && !draft_enabled),
                     "draft={draft_enabled}, tool={tool}, provenance={provenance:?}: {sent:?}"
                 );
                 let final_messages = if draft_enabled {
@@ -36154,6 +36347,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36214,6 +36408,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36226,16 +36421,211 @@ Done."#;
 
     #[test]
     fn tool_activity_classification_is_closed_and_useful() {
-        assert_eq!(classify_tool_activity("codex_cli"), ToolActivity::Codex);
         assert_eq!(
-            classify_tool_activity("safari_browser__browse"),
+            classify_tool_activity("codex_cli", &serde_json::Value::Null),
+            ToolActivity::Codex
+        );
+        assert_eq!(
+            classify_tool_activity("safari_browser__browse", &serde_json::Value::Null),
             ToolActivity::Browser
         );
-        assert_eq!(classify_tool_activity("file_read"), ToolActivity::Files);
-        assert_eq!(classify_tool_activity("shell"), ToolActivity::CommandLine);
         assert_eq!(
-            classify_tool_activity("extension__private-token-123"),
+            classify_tool_activity("file_read", &serde_json::Value::Null),
+            ToolActivity::FileRead
+        );
+        assert_eq!(
+            classify_tool_activity("shell", &serde_json::Value::Null),
+            ToolActivity::CommandLine
+        );
+        assert_eq!(
+            classify_tool_activity("extension__private-token-123", &serde_json::Value::Null),
             ToolActivity::Other
+        );
+    }
+
+    #[test]
+    fn tool_activity_distinguishes_actions_without_rendering_arguments() {
+        let cases = [
+            ("safari_browser__browse", "read", ToolActivity::BrowserRead),
+            ("safari_browser__browse", "open", ToolActivity::BrowserOpen),
+            (
+                "safari_browser__browse",
+                "verify",
+                ToolActivity::BrowserVerify,
+            ),
+            ("safari_browser__browse", "wait", ToolActivity::BrowserWait),
+            (
+                "public_browser__interact",
+                "fill",
+                ToolActivity::BrowserInteract,
+            ),
+            ("file_write", "", ToolActivity::FileWrite),
+            ("web_search", "", ToolActivity::Search),
+            (
+                "google_write__calendar_mutate",
+                "",
+                ToolActivity::CalendarWrite,
+            ),
+            (
+                "personal_ops__outbox_prepare",
+                "",
+                ToolActivity::DraftMessage,
+            ),
+            ("personal_ops__outbox_send", "", ToolActivity::SendMessage),
+            (
+                "personal_ops__delivery_status",
+                "",
+                ToolActivity::CheckDelivery,
+            ),
+            ("tool_search", "", ToolActivity::ToolDiscovery),
+        ];
+        for (tool, action, activity) in cases {
+            let arguments = serde_json::json!({
+                "action": action,
+                "query": "private-query",
+                "url": "https://example.invalid/?token=private-token",
+                "path": "/private/customer-data",
+                "text": "private-field-value",
+            });
+            assert_eq!(classify_tool_activity(tool, &arguments), activity);
+        }
+        assert_eq!(
+            classify_tool_activity(
+                "safari_browser__browse",
+                &serde_json::json!({
+                    "action": "secret-value-not-a-known-action"
+                })
+            ),
+            ToolActivity::Browser,
+            "unknown action text must remain an opaque, generic browser activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_uses_actual_execution_and_preserves_latest_status() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let channel_impl =
+            Arc::new(DraftRecordingChannel::new(false, false).with_typed_tool_progress());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // A different prepared call must not claim to be the running action.
+        tx.send(StreamDelta::ToolStart {
+            tool: "file_write".to_string(),
+            arguments: Arc::new(serde_json::json!({"path": "private-path"})),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(None);
+        let observer = ToolProgressObserver {
+            inner: Arc::new(NoopObserver),
+            progress: Some(progress_tx),
+        };
+        observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: "safari_browser__browse".into(),
+            tool_call_id: Some("fixture-call".into()),
+            arguments: Some(
+                serde_json::json!({"action": "read", "text": "private-text"}).to_string(),
+            ),
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        });
+        assert_eq!(
+            *progress_rx.borrow(),
+            Some(ToolProgressEvent {
+                activity: ToolActivity::BrowserRead,
+                phase: ToolProgressPhase::Running,
+            })
+        );
+        // A slow transport can miss intermediate statuses, but must receive
+        // the latest executor outcome rather than a full-queue stale start.
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: "safari_browser__browse".into(),
+            tool_call_id: Some("fixture-call".into()),
+            arguments: Some(
+                serde_json::json!({"action": "read", "text": "private-text"}).to_string(),
+            ),
+            duration: Duration::from_secs(2),
+            success: false,
+            result: Some("private-error".into()),
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        });
+        drop(observer);
+        run_draft_updater(
+            channel,
+            "chat-1".into(),
+            "draft-1".into(),
+            no_tools(),
+            rx,
+            Some(progress_rx),
+        )
+        .await;
+        assert!(channel_impl.progress_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.typed_tool_progress.lock().await.as_slice(),
+            [ToolProgressEvent {
+                activity: ToolActivity::BrowserRead,
+                phase: ToolProgressPhase::Failed
+            },]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_preserves_specific_action_and_outcome() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let channel_impl =
+            Arc::new(DraftRecordingChannel::new(false, false).with_typed_tool_progress());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let arguments = Arc::new(serde_json::json!({
+            "action": "fill", "text": "private-field-value", "selector": "#private-control"
+        }));
+        tx.send(StreamDelta::ToolStart {
+            tool: "safari_browser__interact".to_string(),
+            arguments: arguments.clone(),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamDelta::ToolComplete {
+            tool: "safari_browser__interact".to_string(),
+            arguments,
+            tool_provenance: None,
+            secs: 2,
+            success: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            rx,
+            None,
+        )
+        .await;
+        assert!(channel_impl.progress_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.typed_tool_progress.lock().await.as_slice(),
+            [
+                ToolProgressEvent {
+                    activity: ToolActivity::BrowserInteract,
+                    phase: ToolProgressPhase::Running
+                },
+                ToolProgressEvent {
+                    activity: ToolActivity::BrowserInteract,
+                    phase: ToolProgressPhase::Succeeded
+                },
+            ]
         );
     }
 
@@ -36278,6 +36668,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36350,6 +36741,7 @@ Done."#;
                 "draft-1".to_string(),
                 no_tools(),
                 rx,
+                None,
             )
             .await;
 
@@ -36417,6 +36809,7 @@ Done."#;
                 "draft-1".to_string(),
                 known.clone(),
                 rx,
+                None,
             )
             .await;
 
@@ -36458,6 +36851,7 @@ Done."#;
             "draft-1".to_string(),
             known,
             rx,
+            None,
         )
         .await;
 
