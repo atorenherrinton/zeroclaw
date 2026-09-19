@@ -75,7 +75,7 @@ mod threading_dispatch_tests {
                     history: messages.to_vec(),
                     release,
                 })
-                .map_err(|_| anyhow::anyhow!("request observer closed"))?;
+                .map_err(|_| anyhow::Error::msg("request observer closed"))?;
             wait.await?;
             lifetime.completed = true;
             Ok(format!("Completed: {label}"))
@@ -105,7 +105,7 @@ mod threading_dispatch_tests {
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.0
                 .send(message.clone())
-                .map_err(|_| anyhow::anyhow!("delivery observer closed"))
+                .map_err(|_| anyhow::Error::msg("delivery observer closed"))
         }
 
         async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
@@ -169,12 +169,9 @@ mod threading_dispatch_tests {
                 None,
             );
             let (tx, rx) = zeroclaw_api::inbound::channel(8);
-            let dispatcher = tokio::spawn(run_message_dispatch_loop_supervised(
-                rx,
-                AgentRouter::single(ctx.clone()),
-                2,
-                None,
-            ));
+            let dispatch =
+                run_message_dispatch_loop_supervised(rx, AgentRouter::single(ctx.clone()), 2, None);
+            let dispatcher = zeroclaw_spawn::spawn!(dispatch);
 
             let first = topic_message("101", "11", "alpha-first");
             let second = topic_message("102", "22", "beta-first");

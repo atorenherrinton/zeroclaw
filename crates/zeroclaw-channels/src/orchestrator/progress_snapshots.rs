@@ -218,14 +218,15 @@ mod tests {
         let channel = Arc::new(RecordingChannel::default());
         let (tx, rx) = mpsc::channel(16);
         let (tool_tx, tool_rx) = watch::channel(None);
-        let task = tokio::spawn(super::super::run_draft_updater(
+        let update = super::super::run_draft_updater(
             channel.clone(),
             "chat:topic".into(),
             "draft".into(),
             HashSet::new(),
             rx,
             Some(tool_rx),
-        ));
+        );
+        let task = zeroclaw_spawn::spawn!(update);
         tx.send(StreamDelta::Text(
             "I found the cause. Testing the repair.".into(),
         ))
@@ -282,14 +283,15 @@ mod tests {
         let channel = Arc::new(RecordingChannel::default());
         *channel.rate_limit_once.lock().unwrap() = Some(10);
         let (tx, rx) = mpsc::channel(16);
-        let task = tokio::spawn(super::super::run_draft_updater(
+        let update = super::super::run_draft_updater(
             channel.clone(),
             "chat:topic".into(),
             "draft".into(),
             HashSet::new(),
             rx,
             None,
-        ));
+        );
+        let task = zeroclaw_spawn::spawn!(update);
         tx.send(StreamDelta::Lifecycle(ProgressEvent::Received))
             .await
             .unwrap();
@@ -327,14 +329,15 @@ mod tests {
         let channel = Arc::new(RecordingChannel::default());
         let (tx, rx) = mpsc::channel(16);
         let (activity_tx, activity_rx) = watch::channel(None);
-        let task = tokio::spawn(super::super::run_draft_updater(
+        let update = super::super::run_draft_updater(
             channel.clone(),
             "chat:topic".into(),
             "draft".into(),
             HashSet::new(),
             rx,
             Some(activity_rx),
-        ));
+        );
+        let task = zeroclaw_spawn::spawn!(update);
         let running = DraftActivity::Tool(ToolProgressEvent {
             activity: ToolActivity::CommandLine,
             phase: ToolProgressPhase::Running,
@@ -369,14 +372,15 @@ mod tests {
             let channel = Arc::new(RecordingChannel::default());
             *channel.rate_limit_once.lock().unwrap() = Some(delay);
             let (tx, rx) = mpsc::channel(16);
-            let task = tokio::spawn(super::super::run_draft_updater(
+            let update = super::super::run_draft_updater(
                 channel.clone(),
                 "chat:topic".into(),
                 "draft".into(),
                 HashSet::new(),
                 rx,
                 None,
-            ));
+            );
+            let task = zeroclaw_spawn::spawn!(update);
             advance(1).await;
             assert_eq!(channel.frames.lock().unwrap().len(), 1);
             advance(150).await;
@@ -390,14 +394,15 @@ mod tests {
     async fn progress_snapshots_sanitize_split_protocol_before_transport() {
         let channel = Arc::new(RecordingChannel::default());
         let (tx, rx) = mpsc::channel(16);
-        let task = tokio::spawn(super::super::run_draft_updater(
+        let update = super::super::run_draft_updater(
             channel.clone(),
             "chat:topic".into(),
             "draft".into(),
             HashSet::new(),
             rx,
             None,
-        ));
+        );
+        let task = zeroclaw_spawn::spawn!(update);
         tx.send(StreamDelta::Text("Checking. <tool_res".into()))
             .await
             .unwrap();

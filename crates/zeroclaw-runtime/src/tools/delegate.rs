@@ -6402,24 +6402,23 @@ mod tests {
         let source = Arc::new(Peers(std::sync::Mutex::new("initial peer".into())));
         let weak = Arc::downgrade(&source);
         let (go, ready) = tokio::sync::oneshot::channel();
-        let child = SOURCE
-            .scope(Some(source.clone()), async {
-                let peer_activity = current();
-                zeroclaw_spawn::spawn!(scope_delegate_session_key(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    peer_activity,
-                    async {
-                        ready.await.unwrap();
-                        current().unwrap().context()
-                    },
-                ))
-            })
-            .await;
+        let child = SOURCE.sync_scope(Some(source.clone()), || {
+            let peer_activity = current();
+            let execution = scope_delegate_session_key(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                peer_activity,
+                async {
+                    ready.await.unwrap();
+                    current().unwrap().context()
+                },
+            );
+            zeroclaw_spawn::spawn!(execution)
+        });
         *source.0.lock().unwrap() = "new peer started".into();
         drop(source);
         assert!(
