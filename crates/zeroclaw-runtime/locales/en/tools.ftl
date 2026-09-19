@@ -214,3 +214,5 @@ coding-cli-result-truncated = [Coding command output incomplete; middle content 
 sessions-history-metadata-budget-exceeded = Session history metadata exceeds the output limit. Request fewer messages.
 
 tool-git-operations-push-reconcile = Git push exited without success. Inspect the exact execution receipt and reconcile the remote before any new attempt.
+tool-display-awake-allocation-error = Could not allocate a macOS display-awake assertion.
+tool-display-awake-native-error = macOS rejected the display-awake assertion ({ $status }); computer use was not started.
