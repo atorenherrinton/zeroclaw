@@ -146,15 +146,19 @@ pub fn schema() -> Vec<Value> {
         ),
         tool(
             "operations_activity",
-            "Read recent actions and receipts, drafts, invitations, scheduled jobs, partial failures, projects, packages, sources, connector health and irreversible actions.",
-            json!({}),
+            "Read a bounded activity overview with state, freshness, counts and explicit omissions. Use section/offset/limit for pages; source/pointer/revision for read-only snapshot details. Summaries omit exact reviews; use outbox_status before any send.",
+            crate::activity_mcp::parameters(),
             json!([]),
             true,
         ),
         tool(
             "personal_briefing",
             "Get one concise exception-focused operations briefing with today's calendar, important email, overdue reminders, project next actions, waiting-on items, package exceptions and automation failures. Preserve source freshness and outage warnings.",
-            json!({"refresh":{"type":"boolean","default":false}}),
+            {
+                let mut p = crate::activity_mcp::parameters();
+                p["refresh"] = json!({"type":"boolean","default":false});
+                p
+            },
             json!([]),
             true,
         ),
@@ -193,14 +197,15 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "shipment_update" => ops.shipment_update(args),
         "shipment_list" => ops.shipment_list(),
         "shipment_discover" => ops.shipment_discover().await,
-        "operations_activity" => ops.activity(),
+        "operations_activity" => ops.activity_mcp(args, false),
         "personal_briefing" => {
+            crate::activity_mcp::validate(args, true)?;
             if args["refresh"] == true {
                 ops.refresh_google().await?;
                 ops.refresh_github().await?;
                 ops.refresh_cron()?;
             }
-            ops.briefing()
+            ops.activity_mcp(args, true)
         }
         "event_ingest" => ops.event_ingest(args),
         _ => bail!("unknown operation"),

@@ -210,3 +210,81 @@ exit 1
     assert!(!calls.contains("--allow-write"));
     assert!(!calls.contains("calendar.events.patch"));
 }
+
+#[test]
+fn saved_compatibility_create_returns_actionable_receipt_over_mcp_and_recovers_readonly() {
+    use sha2::{Digest, Sha256};
+    use zeroclaw_personal_ops::Ops;
+    let install = Install::new();
+    let args = json!({"summary":"Synthetic appointment","start":"2030-01-01T10:00:00-08:00","end":"2030-01-01T11:00:00-08:00"});
+    let hash = |v: &Value| format!("{:x}", Sha256::digest(serde_json::to_vec(v).unwrap()));
+    let identity = json!({"summary":args["summary"],"start":1893520800i64,"end":1893524400i64});
+    let key = format!("legacy-create-{}", hash(&identity));
+    let journal_key = hash(&json!({"account":"synthetic-owner@example.com","key":key}));
+    let mut durable = args.clone();
+    for (k,v) in json!({"action":"create","calendar_id":"primary","idempotency_key":key,"owner_authorized":true,"timezone":"America/Los_Angeles","send_updates":"none"}).as_object().unwrap() {
+        durable[k] = v.clone();
+    }
+    let ops = Ops::open(&install.0.join(".zeroclaw")).unwrap();
+    ops.db.execute_batch("CREATE TABLE calendar_actions(key TEXT PRIMARY KEY,request_hash TEXT NOT NULL,request TEXT NOT NULL,event_id TEXT NOT NULL,intended TEXT NOT NULL,before_image TEXT NOT NULL,state TEXT NOT NULL,evidence TEXT NOT NULL,created_ms INTEGER NOT NULL);").unwrap();
+    ops.db
+        .execute(
+            "INSERT INTO calendar_actions VALUES(?1,?2,?3,'0cfixture',?4,'{}','uncertain','{}',0)",
+            rusqlite::params![
+                journal_key,
+                hash(&durable),
+                durable.to_string(),
+                json!({"id":"0cfixture","summary":"Synthetic appointment"}).to_string()
+            ],
+        )
+        .unwrap();
+    drop(ops);
+    executable(
+        &install.sibling(),
+        r##"#!/bin/sh
+set -eu
+dir=${0%/*}
+printf '%s\n' --CALL-- "$@" >> "$dir/calls"
+case " $* " in *" --readonly "*) ;; *) exit 99;; esac
+printf '%s\n' 'read token: keyring connection timed out after 30s; private@example.invalid' >&2
+exit 1
+"##,
+    );
+    let response = install.invoke_tool("calendar_create_event", args.clone());
+    assert_ne!(response["result"]["isError"], true, "{response}");
+    let receipt = &response["result"]["structuredContent"];
+    assert_eq!(receipt["state"], "uncertain");
+    assert_eq!(receipt["created"], false);
+    assert_eq!(receipt["idempotency_key"], key);
+    assert_eq!(receipt["event_id"], "0cfixture");
+    assert_eq!(
+        receipt["evidence"]["read_error"]["code"],
+        "google_keychain_access_required"
+    );
+    assert!(!response.to_string().contains("private@example.invalid"));
+    let recovered = install.invoke_tool("calendar_reconcile", json!({"create_identity":args}));
+    assert_eq!(
+        recovered["result"]["structuredContent"]["idempotency_key"],
+        key
+    );
+    executable(
+        &install.sibling(),
+        r##"#!/bin/sh
+set -eu
+dir=${0%/*}
+printf '%s\n' --CALL-- "$@" >> "$dir/calls"
+case " $* " in *" --readonly "*) ;; *) exit 99;; esac
+printf '%s\n' '{"id":"0cfixture","summary":"Synthetic appointment"}'
+"##,
+    );
+    let verified = install.invoke_tool(
+        "calendar_reconcile",
+        receipt["reconcile"]["arguments"].clone(),
+    );
+    assert_eq!(verified["result"]["structuredContent"]["state"], "verified");
+    let calls = fs::read_to_string(install.0.join("install with spaces/calls")).unwrap();
+    assert_eq!(calls.matches("--CALL--").count(), 3);
+    assert!(!calls.contains("calendar.events.insert"));
+    assert!(!calls.contains("calendar.events.delete"));
+    assert!(!calls.contains("calendar.events.patch"));
+}

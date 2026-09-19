@@ -1,0 +1,78 @@
+--- a/keychain.go
++++ b/keychain.go
+@@ -58,13 +58,7 @@
+ 
+ 	debugf("Querying keychain for service=%q, account=%q, keychain=%q", k.service, key, k.path)
+ 	results, err := gokeychain.QueryItem(query)
+-	if err == gokeychain.ErrorItemNotFound || len(results) == 0 {
+-		debugf("No results found")
+-		return Item{}, ErrKeyNotFound
+-	}
+-
+-	if err != nil {
+-		debugf("Error: %#v", err)
++	if err = keychainQueryError(err, len(results)); err != nil {
+ 		return Item{}, err
+ 	}
+ 
+@@ -91,11 +85,7 @@
+ 
+ 	debugf("Querying keychain for metadata of service=%q, account=%q, keychain=%q", k.service, key, k.path)
+ 	results, err := gokeychain.QueryItem(query)
+-	if err == gokeychain.ErrorItemNotFound || len(results) == 0 {
+-		debugf("No results found")
+-		return Metadata{}, ErrKeyNotFound
+-	} else if err != nil {
+-		debugf("Error: %#v", err)
++	if err = keychainQueryError(err, len(results)); err != nil {
+ 		return Metadata{}, err
+ 	}
+ 
+@@ -299,3 +289,18 @@
+ 	debugf("Creating keychain %s with provided password", k.path)
+ 	return gokeychain.NewKeychain(k.path, passphrase)
+ }
++
++// A failed native query returns no rows as well as an error. Preserve that
++// error before interpreting an empty successful query as a missing item.
++func keychainQueryError(err error, count int) error {
++	if err == gokeychain.ErrorItemNotFound {
++		return ErrKeyNotFound
++	}
++	if err != nil {
++		return err
++	}
++	if count == 0 {
++		return ErrKeyNotFound
++	}
++	return nil
++}
+--- /dev/null
++++ b/keychain_query_error_test.go
+@@ -0,0 +1,26 @@
++//go:build darwin && cgo
++
++package keyring
++
++import (
++	"errors"
++	gokeychain "github.com/99designs/go-keychain"
++	"testing"
++)
++
++func TestKeychainQueryError(t *testing.T) {
++	for _, status := range []gokeychain.Error{-25308, -25293, -128, -50} {
++		if got := keychainQueryError(status, 0); got != status || errors.Is(got, ErrKeyNotFound) {
++			t.Fatalf("native error %v became %v", status, got)
++		}
++	}
++	if got := keychainQueryError(gokeychain.ErrorItemNotFound, 0); got != ErrKeyNotFound {
++		t.Fatal(got)
++	}
++	if got := keychainQueryError(nil, 0); got != ErrKeyNotFound {
++		t.Fatal(got)
++	}
++	if got := keychainQueryError(nil, 1); got != nil {
++		t.Fatal(got)
++	}
++}
