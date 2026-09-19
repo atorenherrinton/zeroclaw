@@ -452,7 +452,7 @@ async fn classify(
         .iter()
         .find(|tool| tool.name() == TOOL)
         .map(|tool| tool.as_ref())
-        .or_else(|| activated.as_deref())?;
+        .or(activated.as_deref())?;
     let args = serde_json::json!({
         "state": {"request": safe_request_text(&msg.content)?},
         "questions": {"route": {"type": "choice", "instructions":
