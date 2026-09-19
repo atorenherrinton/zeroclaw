@@ -213,7 +213,7 @@ mod tests {
         let directory = Arc::new(Mutex::new(BTreeMap::new()));
         let worker_directory = directory.clone();
         let (ready, started) = tokio::sync::oneshot::channel();
-        let worker = tokio::spawn(async move {
+        let worker = zeroclaw_spawn::spawn!(async move {
             let registration =
                 Registration::enter_in(worker_directory, "main", &message("101", "1")).unwrap();
             ready.send(()).unwrap();

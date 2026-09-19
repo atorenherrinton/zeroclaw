@@ -75,7 +75,7 @@ mod threading_dispatch_tests {
                     history: messages.to_vec(),
                     release,
                 })
-                .map_err(|_| anyhow::anyhow!("request observer closed"))?;
+                .map_err(|_| anyhow::Error::msg("request observer closed"))?;
             wait.await?;
             lifetime.completed = true;
             Ok(format!("Completed: {label}"))
@@ -105,7 +105,7 @@ mod threading_dispatch_tests {
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.0
                 .send(message.clone())
-                .map_err(|_| anyhow::anyhow!("delivery observer closed"))
+                .map_err(|_| anyhow::Error::msg("delivery observer closed"))
         }
 
         async fn listen(&self, _tx: zeroclaw_api::inbound::Sender) -> anyhow::Result<()> {
@@ -169,9 +169,10 @@ mod threading_dispatch_tests {
                 None,
             );
             let (tx, rx) = zeroclaw_api::inbound::channel(8);
-            let dispatcher = tokio::spawn(run_message_dispatch_loop_supervised(
+            let dispatcher_ctx = ctx.clone();
+            let dispatcher = zeroclaw_spawn::spawn!(run_message_dispatch_loop_supervised(
                 rx,
-                AgentRouter::single(ctx.clone()),
+                AgentRouter::single(dispatcher_ctx),
                 2,
                 None,
             ));
