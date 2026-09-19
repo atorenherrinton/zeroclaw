@@ -25,6 +25,7 @@ pub mod composio;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
+mod display_awake;
 pub mod email_imap;
 pub mod email_read;
 pub mod email_search;
