@@ -61,23 +61,22 @@ async fn scope_delegate_session_key<F>(
     future: F,
 ) -> F::Output
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
 {
-    let scoped = zeroclaw_api::deadline::PARENT.scope(
-        deadline,
-        zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
-            route,
-            TOOL_LOOP_SESSION_KEY.scope(
-                session_key,
-                zeroclaw_api::peer_activity::SOURCE.scope(peer_activity, future),
-            ),
-        ),
-    );
-    if let Some(handler) = elicitation {
-        zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
-    } else {
-        scoped.await
-    }
+    zeroclaw_api::peer_activity::SOURCE
+        .scope(peer_activity, async move {
+            let scoped = zeroclaw_api::deadline::PARENT.scope(
+                deadline,
+                zeroclaw_api::conversation::ACTIVE_CONVERSATION
+                    .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future)),
+            );
+            if let Some(handler) = elicitation {
+                zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
+            } else {
+                scoped.await
+            }
+        })
+        .await
 }
 
 /// Serializable result of a background delegate task.
