@@ -28,7 +28,8 @@ impl HookRunner {
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// Whether an ingress consumer can proceed without bypassing a hook.
+    pub fn is_empty(&self) -> bool {
         self.handlers.is_empty()
     }
 

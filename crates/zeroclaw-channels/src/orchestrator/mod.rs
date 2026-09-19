@@ -4,6 +4,7 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod direct_routing;
 pub mod media_pipeline;
 mod repair_notifications;
 mod thread_coordination;
@@ -8662,6 +8663,10 @@ async fn retire_superseded_draft(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep optional pre-turn routing inside the existing supervised worker boundary"
+)]
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: ChannelMessage,
@@ -8670,6 +8675,7 @@ async fn dispatch_worker(
     semaphore: Arc<tokio::sync::Semaphore>,
     queue_permit: tokio::sync::OwnedSemaphorePermit,
     journal: Option<Arc<turn_journal::ChannelTurnJournal>>,
+    routing: Option<(AgentRouter, bool)>,
 ) {
     let _abort_checkpoint = turn_journal::WorkerCheckpointGuard(journal.clone());
     let _queue_permit = queue_permit;
@@ -8723,6 +8729,29 @@ async fn dispatch_worker(
                 }
             }
         };
+        let ctx = if let Some((router, allow_classification)) = routing {
+            let selected = direct_routing::resolve(
+                &router,
+                ctx,
+                &msg,
+                &state.cancellation,
+                allow_classification,
+            )
+            .await;
+            if let Some(journal) = &journal
+                && journal.assign(&selected.agent_alias).await.is_err()
+            {
+                turn_journal::checkpoint(TaskStatus::Failed, None, false).await;
+                return;
+            }
+            selected
+        } else {
+            ctx
+        };
+        if state.cancellation.is_cancelled() {
+            turn_journal::checkpoint(TaskStatus::Cancelled, None, false).await;
+            return;
+        }
         if !turn_journal::checkpoint(TaskStatus::Running, None, false).await {
             return;
         }
@@ -8774,6 +8803,8 @@ struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    /// Handle to canonical live configuration; never a cached routing policy.
+    live_config: Option<Arc<RwLock<Config>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -8785,6 +8816,7 @@ impl AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
+            live_config: None,
             sop_engine: None,
             sop_audit: None,
         }
@@ -8800,6 +8832,7 @@ impl AgentRouter {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
+            live_config: None,
             sop_engine,
             sop_audit,
         }
@@ -9567,6 +9600,7 @@ async fn run_message_dispatch_loop_supervised(
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let semaphore = Arc::clone(&semaphore);
+        let worker_router = router.clone();
         workers.spawn(async move {
             dispatch_worker(
                 worker_ctx,
@@ -9576,6 +9610,7 @@ async fn run_message_dispatch_loop_supervised(
                 semaphore,
                 queue_permit,
                 journal,
+                Some((worker_router, !recovering)),
             )
             .await;
         });
@@ -13847,6 +13882,14 @@ pub async fn start_channels(
                         .and_then(|cid| cid.split_once('.').map(|(b, _)| b.to_string()))
                         .and_then(|b| owner_by_channel_key.get(&b).cloned())
                 });
+            let owner_agent = owner_agent.map(|owner| {
+                direct_routing::persisted_owner(
+                    &config,
+                    &owner,
+                    m.agent_alias.as_deref(),
+                    m.channel_id.as_deref().unwrap_or(""),
+                )
+            });
             let target_ctx = match owner_agent.as_ref().and_then(|a| agent_ctxs.get(a)) {
                 Some(ctx) => ctx,
                 None => continue,
@@ -13904,7 +13947,8 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let mut router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    router.live_config = Some(Arc::clone(&config_arc));
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -15928,7 +15972,7 @@ temperature = 0.3
     /// Build a minimal `ChannelRuntimeContext` suitable only for identity
     /// checks (`Arc::ptr_eq`). Every dependency is a no-op default — these
     /// ctxs aren't usable for actually running the dispatch loop.
-    fn router_test_ctx() -> Arc<ChannelRuntimeContext> {
+    pub(super) fn router_test_ctx() -> Arc<ChannelRuntimeContext> {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
@@ -37545,6 +37589,7 @@ Done."#;
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
+            live_config: None,
             sop_engine: None,
             sop_audit: None,
         }
@@ -37648,6 +37693,7 @@ Done."#;
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
+            live_config: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
         };
@@ -38384,6 +38430,7 @@ Done."#;
             semaphore,
             queue,
             Some(journal),
+            None,
         ));
         tokio::task::yield_now().await;
         cancel.cancel();

@@ -4,6 +4,10 @@
 #[path = "tool_execution/estop_tests.rs"]
 mod estop_tests;
 
+#[cfg(test)]
+#[path = "tool_execution/routing_judgment_tests.rs"]
+mod routing_judgment_tests;
+
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -104,6 +108,51 @@ fn maybe_plan_event(
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+/// Run the fixed advisory classifier before a model turn without an approval
+/// prompt or a new execution-policy owner. The caller must resolve the tool from
+/// its current approved registry, enforce live risk/exclusion policy, and bound
+/// the outer routing deadline. Arguments and answers are deliberately not logged.
+pub async fn execute_routing_judgment(
+    tool: &dyn Tool,
+    args: serde_json::Value,
+    approval: &ApprovalManager,
+    cancellation: &CancellationToken,
+    config: &zeroclaw_config::schema::Config,
+) -> Result<crate::tools::ToolResult> {
+    const ROUTING_TOOL: &str = "typesafe__typesafe_system_one";
+    anyhow::ensure!(
+        tool.name() == ROUTING_TOOL,
+        "routing_judgment_tool_not_allowed"
+    );
+    // For this non-shell tool, NotRequired is the manager's ReadOnly result;
+    // only an actual Approved policy outcome admits a pre-turn network call.
+    anyhow::ensure!(
+        approval.approval_requirement(ROUTING_TOOL)
+            == crate::approval::ApprovalRequirement::Approved,
+        "routing_judgment_approval_required"
+    );
+
+    use crate::security::estop_runtime::{self, EstopRuntime};
+    use zeroclaw_log::Instrument;
+    let runtime = estop_runtime::current().unwrap_or_else(|| EstopRuntime::from_config(config));
+    let span = zeroclaw_log::info_span!(
+        target: "zeroclaw_log_internal_scope",
+        "zeroclaw_scope",
+        tool = ROUTING_TOOL,
+        tool_provenance = ?tool.tool_provenance(),
+    );
+    runtime
+        .run(
+            Some(ROUTING_TOOL),
+            estop_runtime::run_tool(
+                tool,
+                Some(cancellation),
+                tool.execute(args).instrument(span),
+            ),
+        )
+        .await
 }
 
 /// Resolve presentation provenance with the same static-then-activated lookup

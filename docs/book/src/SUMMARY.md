@@ -74,6 +74,7 @@
   - [Filesystem components](./agents/filesystem.md)
   - [Running agents](./agents/operating.md)
   - [Delegation & SubAgents](./agents/delegation.md)
+  - [Direct channel routing](./agents/direct-routing.md)
   - [Limited reading coach](./agents/reading-coach.md)
   - [Runtime internals](./agents/internals.md)
   - [History management](./agents/history-management.md)
