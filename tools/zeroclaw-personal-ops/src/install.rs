@@ -49,7 +49,14 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
         add("/risk_profiles/default/allowed_tools".into(), allowed);
     }
     for name in &helper_tools {
-        if name != "personal_ops__imessage_approve" {
+        // Import authority must be registered explicitly on main's dedicated
+        // policy by the operator, never inherited from this shared default.
+        if !matches!(
+            name.as_str(),
+            "personal_ops__imessage_approve"
+                | "personal_ops__files_import"
+                | "personal_ops__files_import_cleanup"
+        ) {
             push_unique(&mut auto, json!(name))?;
         }
     }
@@ -863,6 +870,24 @@ mod tests {
                 .any(|op| op["path"] == "/risk_profiles/default/allowed_tools"
                     && op["value"] == json!(["existing", "reminders__delete_list"]))
         );
+        for op in restricted_patch.as_array().context("patch")? {
+            if op["path"] == "/risk_profiles/default/allowed_tools"
+                || op["path"] == "/risk_profiles/default/auto_approve"
+            {
+                for name in [
+                    "personal_ops__files_import",
+                    "personal_ops__files_import_cleanup",
+                ] {
+                    assert!(
+                        !op["value"]
+                            .as_array()
+                            .context("tools")?
+                            .contains(&json!(name))
+                    );
+                }
+            }
+            assert!(!op["path"].as_str().context("path")?.contains("denied"));
+        }
         for alias in [
             "calendar_tasks",
             "communications",
@@ -877,6 +902,17 @@ mod tests {
                 .find(|op| op["path"] == path)
                 .context("profile")?["value"];
             for field in ["allowed_tools", "auto_approve"] {
+                for tool in [
+                    "personal_ops__files_import",
+                    "personal_ops__files_import_cleanup",
+                ] {
+                    assert!(
+                        !profile[field]
+                            .as_array()
+                            .context("tools")?
+                            .contains(&json!(tool))
+                    );
+                }
                 assert_eq!(
                     profile[field]
                         .as_array()
