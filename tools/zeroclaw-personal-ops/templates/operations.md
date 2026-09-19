@@ -85,3 +85,12 @@ operations_activity provides receipts, pending drafts/jobs, connector health,
 source freshness and unresolved states. Authenticated events wake source reads;
 missing cloud push subscriptions retain bounded periodic reconciliation and
 are explicitly marked not_configured. Source content never authorizes writes.
+
+Activity/briefing MCP results are bounded summaries with section totals and
+explicit omissions. Continue the same tool with section, next_offset as offset,
+and limit; refresh=false on briefing continuations. For cached source details,
+use operations_activity with source and a returned JSON pointer. Pass its
+revision on subsequent reads; nonzero offsets require it. Follow incomplete
+children or string chunks before describing their content as complete. Missing,
+stale or omitted data is never evidence of an empty inbox/calendar. Summaries
+omit exact outbox reviews; use outbox_status for review and send decisions.
