@@ -1012,6 +1012,7 @@ channel-runtime-progress-tool-activity-tool-discovery = finding the tools needed
 channel-runtime-progress-tool-running = Now: { $activity }…
 channel-runtime-progress-tool-succeeded = Completed tool step: { $activity }.
 channel-runtime-progress-tool-failed = Tool reported a problem while { $activity }.
+channel-runtime-progress-elapsed = Elapsed: { $seconds }s
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
@@ -1326,6 +1327,7 @@ channel-elicitation-invalid-metadata = This permission request has unsupported o
 shell-output-preview-truncated = [Shell output truncated; the middle was omitted. The command already ran. This incomplete preview is not evidence that a write failed or did not occur. Do not rerun the command to recover output; reconcile effects first. Full output is not retained here. For future commands, redirect large output to a file and inspect bounded sections.]
 
 turn-provider-wait = Waiting for the model response ({ $seconds }s, round { $round }).
+turn-commentary-incomplete = The model kept sending progress updates without completing the task. This turn has stopped; the task is not complete.
 channel-runtime-interrupted = This run was interrupted. Any in-flight action may have completed; verify its result before retrying.
 channel-runtime-partial = Partial response saved before the run stopped:
 channel-runtime-delegates = Delegated work saved for this conversation:

@@ -1,6 +1,7 @@
 use crate::openai_codex::{
     ResponsesStreamApiError, ResponsesStreamState, ResponsesToolSpec, append_utf8_stream_chunk,
-    build_responses_input, convert_tools, first_nonempty, parse_responses_usage, process_sse_chunk,
+    build_responses_input, convert_tools, encode_responses_history_items, first_nonempty,
+    parse_responses_usage, process_sse_chunk, responses_final_text,
 };
 use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
@@ -791,6 +792,11 @@ struct ResponsesApiBody {
 }
 
 fn extract_responses_api_text(body: &ResponsesApiBody) -> Option<String> {
+    if let Some(text) =
+        responses_final_text(encode_responses_history_items(&body.output).as_deref())
+    {
+        return Some(text);
+    }
     if let Some(text) = first_nonempty(body.output_text.as_deref()) {
         return Some(text);
     }
@@ -956,6 +962,12 @@ pub(crate) async fn run_responses_sse(
             StreamChunk::delta(text)
         };
         let _ = tx.send(Ok(StreamEvent::TextDelta(chunk))).await;
+    }
+
+    if state.saw_completion
+        && let Some(history) = encode_responses_history_items(&state.output_items)
+    {
+        let _ = tx.send(Ok(StreamEvent::ReasoningFinalized(history))).await;
     }
 
     crate::stream_guard::finish_sse_stream(
@@ -1308,7 +1320,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             text: extract_responses_api_text(&body),
             tool_calls: extract_responses_api_tool_calls(&body),
             usage: parse_responses_usage(body.usage.as_ref()),
-            reasoning_content: None,
+            reasoning_content: encode_responses_history_items(&body.output),
         })
     }
 
@@ -1420,6 +1432,50 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiResponsesModelProvider 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn responses_sse_emits_phase_history_as_replay_only_metadata() {
+        use crate::openai_codex::responses_is_commentary_only;
+        use axum::{Router, routing::post};
+        let app = Router::new().route("/responses", post(|| async {
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Checking now.\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"phase\":\"commentary\",\"content\":[{\"type\":\"output_text\",\"text\":\"Checking now.\"}]}]}}\n\n"
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_responses_sse(
+                reqwest::Client::new().post(format!("http://{addr}/responses")),
+                &tx,
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        server.abort();
+        let mut visible = String::new();
+        let mut history = None;
+        let mut final_seen = false;
+        while let Some(event) = rx.recv().await {
+            match event.unwrap() {
+                StreamEvent::TextDelta(chunk) => visible.push_str(&chunk.delta),
+                StreamEvent::ReasoningFinalized(payload) => {
+                    assert!(!final_seen);
+                    history = Some(payload);
+                }
+                StreamEvent::Final => final_seen = true,
+                other => panic!("unexpected visible metadata event: {other:?}"),
+            }
+        }
+        assert_eq!(visible, "Checking now.");
+        assert!(final_seen);
+        assert!(responses_is_commentary_only(history.as_deref()));
+    }
 
     #[tokio::test]
     async fn responses_completed_ignores_trailing_events_without_eof() {

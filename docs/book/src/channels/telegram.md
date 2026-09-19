@@ -57,6 +57,19 @@ Tool progress describes actual execution using closed action labels, such as
 reading files, checking a calendar, or inspecting a browser page. It does not
 display raw commands, tool arguments, or hidden model reasoning.
 
+In partial streaming mode, a draft keeps the latest assistant explanation
+alongside the current activity and elapsed time. Updates coalesce at the
+configured draft edit interval; an unchanged task refreshes every 30 seconds.
+This elapsed time indicates that the request is still open, not that a tool
+has completed or made new progress. Delegated tool activity can update this
+same view while the parent turn is open, without exposing the child's text,
+tool arguments, results, or private context. The draft shows the newest text
+when the accumulated explanation exceeds the message limit.
+
+Draft edits retry with bounded backoff and respect Telegram's retry-after
+response while the turn owns the draft. Finalization or cancellation ends
+these updates; a background delegate cannot keep editing a completed reply.
+
 Concurrent topics within the same private chat, sender, bot alias and effective
 agent share bounded task-request excerpts at each model call. The source is the
 live turn registration directory, and finished or cancelled turns leave it
@@ -80,8 +93,8 @@ followed by an update every two minutes while that request remains open.
 The update describes the request as still running; it does not claim that
 files are still being edited or that a repair succeeded.
 
-When a progress draft exists, the draft carries the live execution updates
-instead of these repetitive standalone notices. The fallback notices work with
+When a progress draft exists, the draft carries live execution updates and
+elapsed-time refreshes instead of standalone notices. The fallback notices work with
 ordinary tool call messages hidden. They contain no tool arguments, source paths, prompts,
 commands, or tool output. They stay text-only for voice conversations. Read-only
 tools, ordinary document writes, arbitrary shell commands, other delegate

@@ -70,6 +70,17 @@ From the user's perspective: text, then a visible indicator that the agent ran a
 
 ## Transport completion and timeouts
 
+OpenAI Responses assistant items retain their original `phase` in the opaque
+replay history. An explicit `commentary`-only response advances the current
+turn rather than completing the user task. The runtime permits at most three
+consecutive commentary-only continuations within the existing turn budget;
+tool execution resets this counter. Repeated commentary or iteration exhaustion
+returns an explicit incomplete-task error. Missing or unknown phases retain
+legacy final-response behavior. A response containing a `final_answer` uses
+that phase's text for its returned answer while preserving all original items
+for replay. The metadata itself is never streamed as user-visible reasoning.
+This follows [OpenAI's assistant phase guidance](https://developers.openai.com/api/docs/guides/reasoning#phase-parameter).
+
 Streaming transports do not rely on connection close as the success signal.
 OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on

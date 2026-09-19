@@ -1,5 +1,7 @@
 mod delivery;
 #[cfg(test)]
+mod progress_tests;
+#[cfg(test)]
 mod threading_tests;
 
 use anyhow::Context;
@@ -11,7 +13,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{
-    Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage, ToolProgressEvent,
+    Channel, ChannelMessage, DraftActivity, DraftSnapshot, DraftUpdateRateLimit, ListenerHealth,
+    ProgressEvent, SendMessage, ToolProgressEvent,
 };
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
@@ -75,6 +78,33 @@ const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
 /// Resolve a localized CLI string by Fluent key, using the process-global active locale.
 fn telegram_cli_string(key: &str) -> String {
     i18n::get_required_cli_string(key)
+}
+
+/// Render the turn owner's current snapshot; the adapter does not retain a
+/// second copy of narration or execution state. Reserve space for activity so
+/// long answers cannot hide the latest work behind Telegram's message limit.
+fn render_progress_snapshot(snapshot: DraftSnapshot<'_>) -> String {
+    let activity = match snapshot.activity {
+        DraftActivity::Lifecycle(event) => crate::util::localized_lifecycle_progress(event),
+        DraftActivity::Tool(event) => crate::util::localized_tool_progress(event),
+    };
+    let elapsed = i18n::get_required_cli_string_with_args(
+        "channel-runtime-progress-elapsed",
+        &[("seconds", &snapshot.elapsed_secs.to_string())],
+    );
+    let footer = format!("{activity}\n{elapsed}");
+    let footer = &footer[..footer.floor_char_boundary(TELEGRAM_MAX_MESSAGE_LENGTH)];
+    let narration = snapshot.text.trim();
+    let budget = TELEGRAM_MAX_MESSAGE_LENGTH.saturating_sub(footer.len() + 2);
+    if narration.is_empty() || budget < "…\n".len() {
+        return footer.to_string();
+    }
+    if narration.len() <= budget {
+        return format!("{narration}\n\n{footer}");
+    }
+
+    let start = narration.ceil_char_boundary(narration.len() - (budget - "…\n".len()));
+    format!("…\n{}\n\n{footer}", &narration[start..])
 }
 
 /// Sanitize a skill name into a valid Telegram command name.
@@ -4364,6 +4394,115 @@ impl Channel for TelegramChannel {
 
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
+    }
+
+    fn supports_progress_snapshots(&self) -> bool {
+        self.stream_mode == StreamMode::Partial
+    }
+
+    fn draft_update_interval_ms(&self) -> u64 {
+        self.draft_update_interval_ms
+    }
+
+    async fn update_draft_snapshot(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        snapshot: DraftSnapshot<'_>,
+    ) -> anyhow::Result<()> {
+        if !self.supports_progress_snapshots() {
+            return Ok(());
+        }
+        let (chat_id, _) = Self::parse_reply_target(recipient);
+        let message_id_parsed = message_id
+            .parse::<i64>()
+            .context("Invalid Telegram progress message ID")?;
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id_parsed,
+            "text": render_progress_snapshot(snapshot),
+        });
+
+        // The turn owner coalesces, bounds, and cancels this one request. Never
+        // sleep/retry here: an old snapshot must not edit a finalized answer.
+        let response = self
+            .client
+            .post(self.api_url("editMessageText"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|error| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                    "Telegram progress edit transport failed"
+                );
+                anyhow::Error::msg(format!(
+                    "Telegram progress edit transport failed: {}",
+                    zeroclaw_runtime::security::scrub(&error.without_url().to_string())
+                ))
+            })?;
+        let status = response.status();
+        let retry_header = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
+        // Malformed envelopes are failures too; retain an HTTP 429's backoff
+        // even if a proxy replaced the Bot API JSON with an error page.
+        let envelope = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        let error_code = envelope
+            .get("error_code")
+            .and_then(serde_json::Value::as_u64);
+        let ok = envelope.get("ok").and_then(serde_json::Value::as_bool);
+        let not_modified = matches!(
+            status,
+            reqwest::StatusCode::OK | reqwest::StatusCode::BAD_REQUEST
+        ) && ok == Some(false)
+            && error_code == Some(400)
+            && envelope
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|description| description.contains("message is not modified"));
+        if (status.is_success() && ok == Some(true)) || not_modified {
+            self.last_draft_edit
+                .lock()
+                .insert((chat_id, message_id.to_string()), std::time::Instant::now());
+            return Ok(());
+        }
+
+        // Vendor bodies can echo sensitive request content. Only numeric
+        // transport metadata crosses the error/log boundary.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_attrs(
+                serde_json::json!({
+                    "http_status": status.as_u16(),
+                    "error_code": error_code,
+                })
+            ),
+            "Telegram progress edit failed"
+        );
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || error_code == Some(429) {
+            let retry_after_secs = envelope
+                .get("parameters")
+                .and_then(|parameters| parameters.get("retry_after"))
+                .and_then(serde_json::Value::as_u64)
+                .or(retry_header)
+                .unwrap_or(30)
+                .max(1);
+            return Err(anyhow::Error::new(DraftUpdateRateLimit {
+                retry_after_secs,
+            }));
+        }
+        anyhow::bail!(
+            "Telegram progress edit failed (HTTP {}, API code {:?})",
+            status.as_u16(),
+            error_code
+        )
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {

@@ -5686,6 +5686,283 @@ mod tests {
         }
     }
 
+    fn phased_response(phase: &str, text: &str, with_tool: bool) -> ChatResponse {
+        let mut items = vec![serde_json::json!({
+            "type":"message", "role":"assistant", "phase":phase,
+            "content":[{"type":"output_text", "text":text}],
+        })];
+        let tool_calls = if with_tool {
+            items.push(serde_json::json!({"type":"function_call", "call_id":"phase_tool", "name":"count_tool", "arguments":"{}"}));
+            vec![ToolCall {
+                id: "phase_tool".into(),
+                name: "count_tool".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }]
+        } else {
+            vec![]
+        };
+        ChatResponse {
+            text: Some(text.into()),
+            tool_calls,
+            usage: None,
+            reasoning_content: Some(
+                serde_json::json!({
+                    "provider":"openai_codex", "kind":"responses_output_items", "items":items,
+                })
+                .to_string(),
+            ),
+        }
+    }
+
+    async fn run_phased_responses(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        invocations: Arc<AtomicUsize>,
+        on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<String> {
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            CountingTool::new("count_tool", invocations),
+        )]);
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "test",
+                    model: "test",
+                    temperature: None,
+                },
+                tools_registry: &tools,
+                observer: &NoopObserver,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 10,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: cancellation,
+            on_delta,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: "phase-test",
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continues_and_tool_executes_once_before_final() {
+        let provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                phased_response("commentary", "Checking now.", false),
+                phased_response("commentary", "Checking context.", false),
+                phased_response("commentary", "Checking details.", false),
+                phased_response("commentary", "Running the check.", true),
+                phased_response("commentary", "Verifying the result.", false),
+                phased_response("commentary", "Reviewing evidence.", false),
+                phased_response("commentary", "Finishing the answer.", false),
+                phased_response("final_answer", "Verified and complete.", false),
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::clone(&invocations),
+            Some(tx),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "Verified and complete.");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(provider.responses.lock().unwrap().is_empty());
+        let phases: Vec<_> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| {
+                let envelope: serde_json::Value = serde_json::from_str(&m.content).unwrap();
+                let replay: serde_json::Value =
+                    serde_json::from_str(envelope["reasoning_content"].as_str().unwrap()).unwrap();
+                replay["items"][0]["phase"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "final_answer"
+            ]
+        );
+        let mut visible = String::new();
+        while let Some(event) = rx.recv().await {
+            if let DraftEvent::Text(text) = event {
+                visible.push_str(&text);
+            }
+        }
+        assert_eq!(visible.matches("Checking now.").count(), 1);
+        assert_eq!(visible.matches("Verified and complete.").count(), 1);
+        assert!(!visible.contains("responses_output_items"));
+    }
+
+    struct CancelDuringCommentaryContinuation {
+        calls: AtomicUsize,
+        cancellation: CancellationToken,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CancelDuringCommentaryContinuation {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelDuringCommentaryContinuation"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CancelDuringCommentaryContinuation {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(phased_response("commentary", "Checking now.", false));
+            }
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("responses_output_items"))
+            );
+            self.cancellation.cancel();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continuation_remains_cancellable() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelDuringCommentaryContinuation {
+            calls: AtomicUsize::new(0),
+            cancellation: cancellation.clone(),
+        };
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_phased_responses(
+                &provider,
+                &mut history,
+                Arc::clone(&invocations),
+                None,
+                Some(cancellation),
+            ),
+        )
+        .await
+        .expect("commentary continuation must respect cancellation");
+        assert!(is_tool_loop_cancelled(&result.unwrap_err()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(history.iter().any(|m| m.content.contains("Checking now.")));
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continuation_is_bounded_and_legacy_text_is_final() {
+        let provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                phased_response(
+                    "commentary",
+                    "Still checking.",
+                    false
+                );
+                5
+            ]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let err = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("task is not complete"), "{err}");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            "An ordinary final answer.",
+            "must not run",
+        ]);
+        let mut history = vec![ChatMessage::user("Please answer.")];
+        let result = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "An ordinary final answer.");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+        assert_eq!(history.last().unwrap().content, result);
+    }
+
     #[tokio::test]
     async fn recovery_returns_control_to_zeroclaw_tool_loop() {
         let original_task = "ORIGINAL_TASK_SENTINEL: remain owned by ZeroClaw";

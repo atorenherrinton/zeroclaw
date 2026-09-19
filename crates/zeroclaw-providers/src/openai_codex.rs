@@ -306,21 +306,18 @@ fn is_replayable_responses_output_item(item: &Value) -> bool {
     )
 }
 
-fn encode_responses_history_items(output_items: &[Value], has_tool_calls: bool) -> Option<String> {
-    if !has_tool_calls {
-        return None;
-    }
-
+pub(crate) fn encode_responses_history_items(output_items: &[Value]) -> Option<String> {
     let replay_items = output_items
         .iter()
         .filter(|item| is_replayable_responses_output_item(item))
         .cloned()
         .collect::<Vec<_>>();
 
-    if !replay_items
-        .iter()
-        .any(|item| response_item_type(item) == Some("function_call"))
-    {
+    if !replay_items.iter().any(|item| {
+        response_item_type(item) == Some("function_call")
+            || (response_item_type(item) == Some("message")
+                && item.get("phase").and_then(Value::as_str).is_some())
+    }) {
         return None;
     }
 
@@ -349,6 +346,46 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
         .collect::<Vec<_>>();
 
     (!items.is_empty()).then_some(items)
+}
+
+/// Derive turn finality from the original Responses output, which is also the
+/// canonical replay payload. Unmarked/unknown phases retain legacy finality.
+pub fn responses_is_commentary_only(reasoning_content: Option<&str>) -> bool {
+    let Some(items) = reasoning_content.and_then(decode_responses_history_items) else {
+        return false;
+    };
+    let mut messages = items
+        .iter()
+        .filter(|item| response_item_type(item) == Some("message"))
+        .peekable();
+    messages.peek().is_some()
+        && messages.all(|item| item.get("phase").and_then(Value::as_str) == Some("commentary"))
+}
+
+/// Phase-bearing messages must survive history even when no tool was called.
+pub fn has_responses_history(reasoning_content: Option<&str>) -> bool {
+    reasoning_content
+        .and_then(decode_responses_history_items)
+        .is_some()
+}
+
+/// Select final text from a response that also streamed intermediate messages.
+/// The opaque history remains separate from user-visible text.
+pub fn responses_final_text(reasoning_content: Option<&str>) -> Option<String> {
+    let items = reasoning_content.and_then(decode_responses_history_items)?;
+    responses_phase_text(&items, "final_answer")
+}
+
+fn responses_phase_text(items: &[Value], phase: &str) -> Option<String> {
+    let texts = items
+        .iter()
+        .filter(|item| {
+            response_item_type(item) == Some("message")
+                && item.get("phase").and_then(Value::as_str) == Some(phase)
+        })
+        .map(|item| response_output_text_from_event_item(item).unwrap_or_default())
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then(|| texts.join("\n\n"))
 }
 
 /// Build a single Responses-API `function_call` input item from a parsed
@@ -547,6 +584,9 @@ pub(crate) fn nonempty_preserve(text: Option<&str>) -> Option<String> {
 }
 
 fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
+    if let Some(text) = responses_phase_text(&response.output, "final_answer") {
+        return Some(text);
+    }
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -609,8 +649,7 @@ fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToo
 
 fn responses_turn_from_response(response: &ResponsesResponse) -> ResponsesTurnResult {
     let tool_calls = extract_responses_tool_calls(response);
-    let reasoning_content =
-        encode_responses_history_items(&response.output, !tool_calls.is_empty());
+    let reasoning_content = encode_responses_history_items(&response.output);
 
     ResponsesTurnResult {
         text: extract_responses_text(response),
@@ -882,8 +921,9 @@ pub(crate) fn process_responses_stream_event(
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
             {
-                if !state.saw_text_delta && state.fallback_text.is_none() {
-                    state.fallback_text = extract_responses_text(&response);
+                if !state.saw_text_delta {
+                    state.fallback_text =
+                        extract_responses_text(&response).or_else(|| state.fallback_text.take());
                 }
                 replace_responses_output_items(state, &response.output);
                 for tool_call in extract_responses_tool_calls(&response) {
@@ -976,16 +1016,16 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
         process_sse_chunk(&buffer, &mut state)?;
     }
 
+    let reasoning_content = encode_responses_history_items(&state.output_items);
     Ok(ResponsesTurnResult {
-        text: if state.saw_text_delta {
-            nonempty_preserve(Some(&state.text_accumulator))
-        } else {
-            state.fallback_text
-        },
-        reasoning_content: encode_responses_history_items(
-            &state.output_items,
-            !state.collected_tool_calls.is_empty(),
-        ),
+        text: responses_final_text(reasoning_content.as_deref()).or_else(|| {
+            if state.saw_text_delta {
+                nonempty_preserve(Some(&state.text_accumulator))
+            } else {
+                state.fallback_text
+            }
+        }),
+        reasoning_content,
         tool_calls: state.collected_tool_calls,
         usage: state.usage,
     })
@@ -1860,6 +1900,85 @@ mod tests {
         );
     }
 
+    fn phase_message(phase: &str, text: &str) -> Value {
+        serde_json::json!({
+            "type": "message", "id": format!("msg_{phase}"), "role": "assistant",
+            "phase": phase, "status": "completed",
+            "content": [{"type": "output_text", "text": text, "annotations": []}]
+        })
+    }
+
+    #[test]
+    fn responses_phases_roundtrip_without_tools() {
+        for phase in ["commentary", "final_answer", "future_phase"] {
+            let item = phase_message(phase, "Visible text");
+            let response = responses_turn_from_response(&ResponsesResponse {
+                output: vec![item.clone()],
+                output_text: None,
+                usage: None,
+            });
+            assert_eq!(
+                responses_is_commentary_only(response.reasoning_content.as_deref()),
+                phase == "commentary"
+            );
+            let history = ChatMessage::assistant(
+                serde_json::json!({
+                    "content": response.text, "tool_calls": [],
+                    "reasoning_content": response.reasoning_content,
+                })
+                .to_string(),
+            );
+            let (_, input) = build_responses_input(&[history]);
+            assert_eq!(input, vec![item], "phase must survive exact replay");
+        }
+        assert!(!responses_is_commentary_only(None));
+        assert!(!responses_is_commentary_only(Some("ordinary reasoning")));
+    }
+
+    #[test]
+    fn responses_final_answer_wins_over_commentary_text() {
+        let response = responses_turn_from_response(&ResponsesResponse {
+            output: vec![
+                phase_message("commentary", "Checking now."),
+                phase_message("final_answer", "Checked and done."),
+            ],
+            output_text: Some("Checking now.Checked and done.".into()),
+            usage: None,
+        });
+        assert_eq!(response.text.as_deref(), Some("Checked and done."));
+        assert!(!responses_is_commentary_only(
+            response.reasoning_content.as_deref()
+        ));
+        assert_eq!(
+            responses_final_text(response.reasoning_content.as_deref()).as_deref(),
+            Some("Checked and done.")
+        );
+    }
+
+    #[test]
+    fn responses_sse_preserves_commentary_and_tool_history() {
+        let commentary = phase_message("commentary", "Checking now.");
+        let call = serde_json::json!({"type":"function_call", "id":"fc_1", "call_id":"call_1", "name":"echo", "arguments":"{}"});
+        let payload = format!(
+            "data: {}\n\ndata: {}\n\ndata: {}\n\n",
+            serde_json::json!({"type":"response.output_text.delta", "delta":"Checking now."}),
+            serde_json::json!({"type":"response.output_item.done", "item":call}),
+            serde_json::json!({"type":"response.completed", "response":{"output":[commentary, call]}})
+        );
+        let response = parse_sse_turn(&payload).unwrap();
+        assert_eq!(
+            response.tool_calls.len(),
+            1,
+            "terminal payload must not duplicate a streamed tool"
+        );
+        assert!(responses_is_commentary_only(
+            response.reasoning_content.as_deref()
+        ));
+        let items =
+            decode_responses_history_items(response.reasoning_content.as_deref().unwrap()).unwrap();
+        assert_eq!(items, vec![commentary, call]);
+    }
+
     #[test]
     fn extracts_output_text_first() {
         let response = ResponsesResponse {
@@ -2723,7 +2842,7 @@ data: [DONE]
             "status": "completed"
         });
         let reasoning_content =
-            encode_responses_history_items(&[reasoning_item, function_call_item], true)
+            encode_responses_history_items(&[reasoning_item, function_call_item])
                 .expect("history envelope should encode");
         let messages = vec![
             ChatMessage::assistant(

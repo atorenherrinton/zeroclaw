@@ -1,3 +1,5 @@
+#[path = "delegate_progress.rs"]
+pub mod progress;
 #[path = "delegate_settlement.rs"]
 pub(crate) mod settlement;
 
@@ -8,7 +10,6 @@ use crate::agent::loop_::{
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::ApprovalManager;
-use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -56,7 +57,7 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
 }
 
 #[allow(clippy::too_many_arguments)] // Explicit spawn-time ownership contexts.
-async fn scope_delegate_session_key<F>(
+fn scope_delegate_session_key<F>(
     session_key: Option<String>,
     route: Option<zeroclaw_api::conversation::ConversationRoute>,
     deadline: Option<tokio::time::Instant>,
@@ -65,29 +66,32 @@ async fn scope_delegate_session_key<F>(
     invocation: Option<crate::security::estop_runtime::InvocationCancellation>,
     peer_activity: Option<Arc<dyn zeroclaw_api::peer_activity::PeerActivitySource>>,
     future: F,
-) -> F::Output
+) -> impl std::future::Future<Output = F::Output> + Send
 where
     F: std::future::Future + Send,
 {
-    let scoped = zeroclaw_api::deadline::PARENT.scope(
-        deadline,
-        zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
-            route,
-            TOOL_LOOP_SESSION_KEY.scope(
-                session_key,
-                zeroclaw_api::peer_activity::SOURCE.scope(peer_activity, future),
+    // Capture before spawning: task locals are not inherited by Tokio tasks.
+    progress::inherit(async move {
+        let scoped = zeroclaw_api::deadline::PARENT.scope(
+            deadline,
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
+                route,
+                TOOL_LOOP_SESSION_KEY.scope(
+                    session_key,
+                    zeroclaw_api::peer_activity::SOURCE.scope(peer_activity, future),
+                ),
             ),
-        ),
-    );
-    let scoped = crate::security::estop_runtime::scope_invocation(
-        invocation,
-        crate::security::estop_runtime::scope(estop, scoped),
-    );
-    if let Some(handler) = elicitation {
-        zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
-    } else {
-        scoped.await
-    }
+        );
+        let scoped = crate::security::estop_runtime::scope_invocation(
+            invocation,
+            crate::security::estop_runtime::scope(estop, scoped),
+        );
+        if let Some(handler) = elicitation {
+            zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
+        } else {
+            scoped.await
+        }
+    })
 }
 
 /// Serializable result of a background delegate task.
@@ -1782,8 +1786,9 @@ impl DelegateTool {
             .map(|invocation| invocation.child());
         let __zc_delegate_alias = agent_name_owned.clone();
 
-        zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(
+        // Build the inherited future before spawn!: that macro evaluates its
+        // expression inside the child task, after the parent's task locals are gone.
+        let background_execution = scope_delegate_session_key(
                 parent_session_key,
                 parent_route,
                 parent_deadline,
@@ -1923,8 +1928,8 @@ impl DelegateTool {
             )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-            ))
-        );
+            ));
+        zeroclaw_spawn::spawn!(background_execution);
 
         Ok(ToolResult {
             success: true,
@@ -2091,7 +2096,7 @@ impl DelegateTool {
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
-            let handle = handles.spawn(
+            let handle = handles.spawn(progress::inherit(
                 async move {
                     let inner = DelegateTool {
                         agents,
@@ -2138,7 +2143,7 @@ impl DelegateTool {
                 .instrument(::zeroclaw_log::attribution_span!(
                     &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
                 )),
-            );
+            ));
             pending.insert(index, (agent_names[index].clone(), handle));
         }
 
@@ -3104,7 +3109,7 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = NoopObserver;
+        let progress_observer = progress::observer();
 
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
@@ -3133,7 +3138,7 @@ impl DelegateTool {
                             },
                             ResolvedIo {
                                 tools_registry: &sub_tools,
-                                observer: &noop_observer,
+                                observer: &progress_observer,
                                 silent: true,
                                 approval: approval_manager.as_ref(),
                                 multimodal_config: &self.multimodal_config,
@@ -3293,25 +3298,10 @@ impl Tool for ToolArcRef {
     }
 }
 
-struct NoopObserver;
-
-impl Observer for NoopObserver {
-    fn record_event(&self, _event: &ObserverEvent) {}
-
-    fn record_metric(&self, _metric: &ObserverMetric) {}
-
-    fn name(&self) -> &str {
-        "noop"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
@@ -3330,7 +3320,7 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, GatedProgressTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -3630,6 +3620,164 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[derive(Default)]
+    struct GatedProgressTool {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Tool for GatedProgressTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Wait for the test gate, then echo."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            EchoTool.parameters_schema()
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            assert!(zeroclaw_api::turn::trace_id().is_none());
+            self.entered.notify_one();
+            self.release.notified().await;
+            EchoTool.execute(args).await
+        }
+    }
+
+    struct DelegateProgressRecorder(tokio::sync::mpsc::UnboundedSender<ObserverEvent>);
+
+    impl Observer for DelegateProgressRecorder {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.0.send(event.clone()).unwrap();
+        }
+
+        fn record_metric(&self, _: &ObserverMetric) {
+            panic!("child metrics are not parent progress")
+        }
+
+        fn name(&self) -> &str {
+            "delegate-progress-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_progress_arrives_while_child_tool_pending_without_parent_journal_changes() {
+        struct ParentJournal;
+
+        #[async_trait]
+        impl zeroclaw_api::turn::TurnJournal for ParentJournal {
+            fn trace_id(&self) -> Option<&str> {
+                Some("parent-progress-turn")
+            }
+
+            async fn checkpoint(
+                &self,
+                _: zeroclaw_api::turn::TaskStatus,
+                _: Option<String>,
+                _: bool,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("child progress must not change parent journal")
+            }
+        }
+
+        let config = agentic_agent_config();
+        let gate = Arc::new(GatedProgressTool::default());
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".into()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![gate.clone()])));
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        zeroclaw_api::turn::JOURNAL
+            .scope(
+                Some(Arc::new(ParentJournal) as Arc<dyn zeroclaw_api::turn::TurnJournal>),
+                async {
+                    let run = progress::scope(Arc::new(DelegateProgressRecorder(send)), async {
+                        tool.execute_agentic(
+                            "agentic",
+                            &config,
+                            "test-provider",
+                            "test-model",
+                            &OneToolThenFinalModelProvider,
+                            "run",
+                            Some(0.2),
+                        )
+                        .await
+                    });
+                    tokio::pin!(run);
+                    tokio::select! {
+                        _ = gate.entered.notified() => {},
+                        result = &mut run => panic!("child finished before gate: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("child never reached tool"),
+                    }
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::LlmRequest {
+                            model_provider,
+                            model,
+                            messages_count: 0,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                        } if model_provider.is_empty() && model.is_empty()
+                    ));
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::ToolCallStart {
+                            tool,
+                            arguments: None,
+                            tool_call_id: None,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                        } if tool == "echo_tool"
+                    ));
+                    assert!(receive.try_recv().is_err(), "child tool is still running");
+                    assert_eq!(
+                        zeroclaw_api::turn::trace_id().as_deref(),
+                        Some("parent-progress-turn")
+                    );
+                    gate.release.notify_one();
+                    let result = run.await.unwrap();
+                    assert!(result.success, "{result:?}");
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::ToolCall {
+                            tool,
+                            success: true,
+                            arguments: None,
+                            result: None,
+                            tool_call_id: None,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                            ..
+                        } if tool == "echo_tool"
+                    ));
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::LlmRequest { .. }
+                    ));
+                    assert!(receive.try_recv().is_err());
+                    assert_eq!(
+                        zeroclaw_api::turn::trace_id().as_deref(),
+                        Some("parent-progress-turn")
+                    );
+                },
+            )
+            .await;
     }
 
     struct OneToolThenFinalModelProvider;

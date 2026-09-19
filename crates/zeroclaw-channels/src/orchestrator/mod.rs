@@ -6,6 +6,7 @@ pub mod acp_embedded;
 pub mod acp_server;
 mod direct_routing;
 pub mod media_pipeline;
+mod progress_snapshots;
 mod repair_notifications;
 mod thread_coordination;
 mod turn_journal;
@@ -83,8 +84,8 @@ use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
-    Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, ProgressEvent,
-    SendMessage, ToolActivity, ToolProgressEvent, ToolProgressPhase,
+    Channel, ChannelMessage, DraftActivity, DraftProgress, DraftProgressKind, ListenerHealth,
+    ProgressEvent, SendMessage, ToolActivity, ToolProgressEvent, ToolProgressPhase,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -180,13 +181,13 @@ struct ChannelNotifyObserver {
 /// pending transport status, without arguments, output, or error text.
 struct ToolProgressObserver {
     inner: Arc<dyn Observer>,
-    progress: Option<tokio::sync::watch::Sender<Option<ToolProgressEvent>>>,
+    progress: Option<tokio::sync::watch::Sender<Option<DraftActivity>>>,
 }
 
 impl Observer for ToolProgressObserver {
     fn record_event(&self, event: &ObserverEvent) {
         if let Some(progress) = self.progress.as_ref()
-            && let Some(event) = executor_tool_progress(event)
+            && let Some(event) = executor_draft_activity(event)
         {
             progress.send_replace(Some(event));
         }
@@ -203,6 +204,16 @@ impl Observer for ToolProgressObserver {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+fn executor_draft_activity(event: &ObserverEvent) -> Option<DraftActivity> {
+    // A single ordered observer stream owns both model and tool activity.
+    // Buffered lifecycle deltas must not overwrite a more recent tool event.
+    if matches!(event, ObserverEvent::LlmRequest { .. }) {
+        Some(DraftActivity::Lifecycle(ProgressEvent::WaitingOnModel))
+    } else {
+        executor_tool_progress(event).map(DraftActivity::Tool)
     }
 }
 
@@ -4088,9 +4099,20 @@ async fn run_draft_updater(
     draft_id: String,
     known_tool_names: HashSet<String>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
-    mut tool_progress_rx: Option<tokio::sync::watch::Receiver<Option<ToolProgressEvent>>>,
+    mut tool_progress_rx: Option<tokio::sync::watch::Receiver<Option<DraftActivity>>>,
 ) -> String {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
+    if channel.supports_progress_snapshots() {
+        return progress_snapshots::run(
+            channel,
+            reply_target,
+            draft_id,
+            known_tool_names,
+            rx,
+            tool_progress_rx,
+        )
+        .await;
+    }
     let mut accumulated = String::new();
     let executor_progress_enabled = tool_progress_rx.is_some();
     loop {
@@ -4107,8 +4129,12 @@ async fn run_draft_updater(
                     continue;
                 }
                 let event = tool_progress_rx.as_mut().and_then(|rx| *rx.borrow_and_update());
-                if let Some(event) = event
-                    && let Err(error) = channel.update_draft_tool_progress(&reply_target, &draft_id, event).await {
+                let result = match event {
+                    Some(DraftActivity::Tool(event)) => channel.update_draft_tool_progress(&reply_target, &draft_id, event).await,
+                    Some(DraftActivity::Lifecycle(event)) => channel.update_draft_lifecycle(&reply_target, &draft_id, event).await,
+                    None => Ok(()),
+                };
+                if let Err(error) = result {
                         ::zeroclaw_log::record!(DEBUG,
                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                 .with_attrs(::serde_json::json!({"error": error.to_string()})),
@@ -7355,6 +7381,12 @@ async fn process_channel_message_body(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
+    // Delegate activity is presentation-only. It must not mark parent tool
+    // execution, duplicate accounting, or transition the parent's turn journal.
+    let delegate_progress_observer: Arc<dyn Observer> = Arc::new(ToolProgressObserver {
+        inner: Arc::new(observability::NoopObserver),
+        progress: tool_progress_tx.clone(),
+    });
     let execution_observer = ToolProgressObserver {
         inner: notify_observer.clone(),
         progress: tool_progress_tx,
@@ -7426,7 +7458,7 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
+    let (llm_result, fallback_info) = tools::delegate::progress::scope(delegate_progress_observer, scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
                 .interruption_scope_id
@@ -7660,7 +7692,7 @@ async fn process_channel_message_body(
         };
         let fb = take_last_provider_fallback();
         (llm_result, fb)
-    })
+    }))
     .await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
@@ -36632,10 +36664,10 @@ Done."#;
         });
         assert_eq!(
             *progress_rx.borrow(),
-            Some(ToolProgressEvent {
+            Some(DraftActivity::Tool(ToolProgressEvent {
                 activity: ToolActivity::BrowserRead,
                 phase: ToolProgressPhase::Running,
-            })
+            }))
         );
         // A slow transport can miss intermediate statuses, but must receive
         // the latest executor outcome rather than a full-queue stale start.

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, DraftProgress, ProgressEvent,
-    RoomCreationOptions, SendMessage, ToolProgressEvent,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, DraftProgress, DraftSnapshot,
+    ProgressEvent, RoomCreationOptions, SendMessage, ToolProgressEvent,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -402,6 +402,26 @@ impl Channel for PacedChannel {
 
     fn supports_draft_updates(&self) -> bool {
         self.inner.supports_draft_updates()
+    }
+
+    fn supports_progress_snapshots(&self) -> bool {
+        self.inner.supports_progress_snapshots()
+    }
+
+    fn draft_update_interval_ms(&self) -> u64 {
+        self.inner.draft_update_interval_ms()
+    }
+
+    async fn update_draft_snapshot(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        snapshot: DraftSnapshot<'_>,
+    ) -> Result<()> {
+        // Live progress shares the draft's lifecycle, not the final-reply queue.
+        self.inner
+            .update_draft_snapshot(recipient, message_id, snapshot)
+            .await
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -1131,6 +1151,113 @@ mod tests {
             batch_progress.progress_updates.load(Ordering::SeqCst),
             0,
             "the pacing wrapper must retain an inner channel's coalesced progress batch",
+        );
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn progress_snapshots_reach_telegram_through_pacing_and_preserve_rate_limits() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::{DraftActivity, DraftUpdateRateLimit};
+        use zeroclaw_config::schema::StreamMode;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":42}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/editMessageText$"))
+            .respond_with(|request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["chat_id"], "123");
+                assert_eq!(body["message_id"], 42);
+                if body["text"].as_str().unwrap().starts_with("Try later") {
+                    ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                        "ok":false,"error_code":429,"parameters":{"retry_after":17}
+                    }))
+                } else {
+                    assert!(
+                        body["text"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("Checking details")
+                    );
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok":true,"result":{"message_id":42}}))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let inner = Arc::new(
+            crate::telegram::TelegramChannel::new(
+                "fixture-token".into(),
+                "progress-fixture",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_streaming(StreamMode::Partial, 1500)
+            .with_api_base(server.uri()),
+        );
+        let paced = PacedChannel::wrap(
+            inner,
+            &PacingFixture {
+                interval_secs: 3600,
+                depth: 4,
+            },
+        );
+        assert!(paced.supports_progress_snapshots());
+        assert_eq!(paced.draft_update_interval_ms(), 1500);
+        // Occupy the final-reply pacing window before both live edits.
+        paced
+            .send(&SendMessage::new("Initial response", "123:7"))
+            .await
+            .unwrap();
+        let activity = DraftActivity::Lifecycle(ProgressEvent::WaitingOnModel);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            paced.update_draft_snapshot(
+                "123:7",
+                "42",
+                DraftSnapshot {
+                    text: "Checking details",
+                    activity,
+                    elapsed_secs: 30,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            paced.update_draft_snapshot(
+                "123:7",
+                "42",
+                DraftSnapshot {
+                    text: "Try later",
+                    activity,
+                    elapsed_secs: 31,
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<DraftUpdateRateLimit>()
+                .unwrap()
+                .retry_after_secs,
+            17
         );
     }
 

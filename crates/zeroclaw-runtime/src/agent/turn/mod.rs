@@ -99,6 +99,7 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const MAX_COMMENTARY_CONTINUATIONS: usize = 3;
 
 /// Complete system-prompt variants for the two tool transports supported by a
 /// turn. The caller owns construction; the loop only selects the variant after
@@ -641,6 +642,10 @@ async fn run_tool_call_loop_inner(
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Explicit intermediate responses advance the same turn, with normal
+    // cancellation, cost and iteration limits. Repeated commentary alone must
+    // not keep a turn alive forever.
+    let mut consecutive_commentary_only: usize = 0;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -1050,7 +1055,12 @@ async fn run_tool_call_loop_inner(
         // the turn-level guard for direct/unwrapped providers: a transport
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
-        let chat_result = chat_result.and_then(|response| {
+        let chat_result = chat_result.and_then(|mut response| {
+            if let Some(final_text) = zeroclaw_providers::openai_codex::responses_final_text(
+                response.reasoning_content.as_deref(),
+            ) {
+                response.text = Some(final_text);
+            }
             if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -1070,6 +1080,7 @@ async fn run_tool_call_loop_inner(
             response_streamed_live,
             reported_input_tokens,
             response_usage,
+            commentary_only,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
@@ -1095,6 +1106,7 @@ async fn run_tool_call_loop_inner(
                     streamed_live_deltas,
                     interpreted.input_tokens,
                     interpreted.usage,
+                    interpreted.commentary_only,
                 )
             }
             Err(e) => {
@@ -1265,6 +1277,47 @@ async fn run_tool_call_loop_inner(
             }
         }
 
+        if tool_calls.is_empty() && commentary_only {
+            turn_state.push_dual(ChatMessage::assistant(assistant_history_content));
+            if !response_streamed_live && !protocol_suppressed {
+                outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text),
+                )
+                .await?;
+                if let Some(tx) = on_delta.as_ref() {
+                    outcome::until_cancelled(
+                        cancellation_token.as_ref(),
+                        events::stream_text_posthoc_chunks(
+                            tx,
+                            &display_text,
+                            cancellation_token.as_ref(),
+                        ),
+                    )
+                    .await??;
+                }
+            }
+            consecutive_commentary_only += 1;
+            anyhow::ensure!(
+                consecutive_commentary_only <= MAX_COMMENTARY_CONTINUATIONS,
+                "{}",
+                crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+            );
+            if let Some(reported) = reported_input_tokens {
+                enforce_reported_budget(
+                    turn_state.history,
+                    reported as usize,
+                    context_token_budget,
+                    event_tx.as_ref(),
+                    observer,
+                    cancellation_token.as_ref(),
+                )
+                .await;
+            }
+            continue;
+        }
+        consecutive_commentary_only = 0;
+
         if tool_calls.is_empty() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -1314,7 +1367,7 @@ async fn run_tool_call_loop_inner(
 
             // Accepted model output survives cancelled presentation; this is
             // not evidence that the consumer received the response.
-            let msg = ChatMessage::assistant(response_text.clone());
+            let msg = ChatMessage::assistant(assistant_history_content);
             turn_state.push_dual(msg);
             presentation?;
             if let Some(reported) = reported_input_tokens {
@@ -1717,6 +1770,12 @@ async fn run_tool_call_loop_inner(
             last_tool_output_hash = None;
         }
     }
+
+    anyhow::ensure!(
+        consecutive_commentary_only == 0,
+        "{}",
+        crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+    );
 
     finish_after_max_iterations(
         model_provider,
