@@ -954,6 +954,21 @@ impl McpServer {
         let control = current_mcp_lifecycle_control().or_else(|| self.lifecycle_control.clone());
         mcp_lifecycle::check(control.as_deref())?;
         let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        let needs_display = {
+            let inner = self.inner.lock().await;
+            rpc_method == "tools/call"
+                && params
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|tool| {
+                        crate::display_awake::mcp_needs_display(&inner.config, tool)
+                    })
+        };
+        let display_lease = needs_display
+            .then(|| {
+                crate::display_awake::acquire(deadline.saturating_duration_since(Instant::now()))
+            })
+            .transpose()?;
         let mut pre_write_retries = 0;
 
         loop {
@@ -1016,6 +1031,7 @@ impl McpServer {
                 }
                 Ok(Ok(response)) => {
                     cancellation_guard.disarm();
+                    drop(display_lease);
                     return Ok(response);
                 }
                 Ok(Err(error)) => {
@@ -2160,6 +2176,175 @@ mod tests {
     /// Transport that ignores the request and always returns one preset result.
     struct FakeTransport {
         result: serde_json::Value,
+    }
+
+    struct DisplayLeaseTransport {
+        state: Arc<std::sync::Mutex<crate::display_awake::testing::State>>,
+        behavior: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl SharedMcpTransportConn for DisplayLeaseTransport {
+        async fn send_and_recv(
+            &self,
+            request: &JsonRpcRequest,
+            _lifecycle: &McpRequestLifecycle,
+        ) -> Result<crate::mcp_protocol::JsonRpcResponse> {
+            assert!(self.state.lock().unwrap().active > 0);
+            match self.behavior {
+                "pending" => std::future::pending().await,
+                "panic" => panic!("injected transport panic"),
+                "error" => bail!("injected transport error"),
+                _ => Ok(crate::mcp_protocol::JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id.clone(),
+                    result: Some(json!({"content": []})),
+                    error: None,
+                }),
+            }
+        }
+        async fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn display_lease_covers_dispatch_and_releases_on_success_error_and_panic() {
+        use crate::display_awake::testing::{STATE, State};
+        use futures_util::FutureExt;
+        for (name, tool, behavior) in [
+            ("cua_repl", "js", "success"),
+            ("public_browser", "browse", "success"),
+            ("public_browser", "interact", "success"),
+            ("auth_browser", "browse", "success"),
+            ("auth_browser", "interact", "success"),
+            ("auth_browser", "login", "success"),
+            ("safari_browser", "browse", "success"),
+            ("safari_browser", "interact", "success"),
+            ("cua_repl", "js", "error"),
+            ("cua_repl", "js", "panic"),
+        ] {
+            let state = Arc::new(std::sync::Mutex::new(State::default()));
+            let transport = Arc::new(DisplayLeaseTransport {
+                state: state.clone(),
+                behavior,
+            });
+            let server = server_with_transport(name, transport, 7);
+            let result = STATE
+                .scope(
+                    state.clone(),
+                    std::panic::AssertUnwindSafe(server.call_tool(tool, json!({"code":"fixture"})))
+                        .catch_unwind(),
+                )
+                .await;
+            match behavior {
+                "success" => assert!(result.unwrap().is_ok()),
+                "error" => assert!(result.unwrap().is_err()),
+                _ => assert!(result.is_err()),
+            }
+            let state = state.lock().unwrap();
+            assert_eq!(state.active, 0);
+            assert_eq!(state.budgets.len(), 1);
+            assert!(state.budgets[0] <= Duration::from_secs(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn display_lease_timeout_cancellation_concurrency_and_parent_deadline() {
+        use crate::display_awake::testing::{STATE, State};
+        let state = Arc::new(std::sync::Mutex::new(State::default()));
+        let server = server_with_transport(
+            "cua_repl",
+            Arc::new(DisplayLeaseTransport {
+                state: state.clone(),
+                behavior: "pending",
+            }),
+            1,
+        );
+        STATE
+            .scope(state.clone(), async {
+                // Poll both futures into the real dispatcher without spawning jobs.
+                let mut first = Box::pin(server.call_tool("js", json!({})));
+                let mut second = Box::pin(server.call_tool("js", json!({})));
+                assert!(futures_util::poll!(&mut first).is_pending());
+                assert!(futures_util::poll!(&mut second).is_pending());
+                assert_eq!(state.lock().unwrap().active, 2);
+                drop(first);
+                assert_eq!(state.lock().unwrap().active, 1);
+                assert!(second.await.unwrap_err().to_string().contains("timed out"));
+                assert_eq!(state.lock().unwrap().active, 0);
+
+                let deadline = Instant::now() + Duration::from_millis(20);
+                let result = zeroclaw_api::deadline::PARENT
+                    .scope(Some(deadline), server.call_tool("js", json!({})))
+                    .await;
+                assert!(result.unwrap_err().is::<DeadlineExceeded>());
+                let state = state.lock().unwrap();
+                assert_eq!(state.active, 0);
+                assert!(state.budgets.last().unwrap() <= &Duration::from_millis(20));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn display_lease_failure_prevents_dispatch_and_expired_parent_does_not_acquire() {
+        use crate::display_awake::testing::{STATE, State};
+        let state = Arc::new(std::sync::Mutex::new(State {
+            fail: true,
+            ..State::default()
+        }));
+        let server = server_with_transport(
+            "cua_repl",
+            Arc::new(DisplayLeaseTransport {
+                state: state.clone(),
+                behavior: "panic",
+            }),
+            1,
+        );
+        STATE
+            .scope(state.clone(), async {
+                assert!(
+                    server
+                        .call_tool("js", json!({}))
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("injected display")
+                );
+                let result = zeroclaw_api::deadline::PARENT
+                    .scope(Some(Instant::now()), server.call_tool("js", json!({})))
+                    .await;
+                assert!(result.unwrap_err().is::<DeadlineExceeded>());
+                assert!(state.lock().unwrap().budgets.is_empty());
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn display_lease_excludes_generic_tools_metadata_and_reset() {
+        use crate::display_awake::testing::{STATE, State};
+        for (name, tool) in [
+            ("filesystem", "read"),
+            ("cua_repl", "js_reset"),
+            ("auth_browser", "accounts"),
+            ("auth_browser", "close"),
+            ("public_browser", "close"),
+            ("safari_browser", "close"),
+        ] {
+            let state = Arc::new(std::sync::Mutex::new(State::default()));
+            let server =
+                server_with_transport(name, Arc::new(FakeTransport { result: json!({}) }), 2);
+            STATE
+                .scope(state.clone(), async {
+                    server.call_tool(tool, json!({})).await.unwrap();
+                    server
+                        .dispatch_method("tools/list", json!({}))
+                        .await
+                        .unwrap();
+                })
+                .await;
+            assert!(state.lock().unwrap().budgets.is_empty());
+        }
     }
 
     #[async_trait::async_trait]

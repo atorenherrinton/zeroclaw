@@ -1039,6 +1039,12 @@ impl BrowserTool {
     ) -> anyhow::Result<ToolResult> {
         let endpoint = self.computer_use_endpoint_url()?;
 
+        // Only a loopback sidecar operates this Mac.
+        let local_display = matches!(
+            endpoint.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]")
+        );
+
         // Validate screenshot path but do NOT forward it to the sidecar.
         // The sidecar returns PNG bytes, and we perform the validated local write.
         let validated_path = if action == "screenshot" {
@@ -1113,6 +1119,11 @@ impl BrowserTool {
             }
         }
 
+        let display_lease = local_display
+            .then(|| {
+                crate::display_awake::acquire(Duration::from_millis(self.computer_use.timeout_ms))
+            })
+            .transpose()?;
         let response = request.send().await.with_context(|| {
             format!(
                 "Failed to call computer-use sidecar at {}",
@@ -1125,6 +1136,7 @@ impl BrowserTool {
             .text()
             .await
             .context("Failed to read computer-use sidecar response body")?;
+        drop(display_lease);
 
         // A path-bearing screenshot is the ONLY flow that transfers bytes from
         // the sidecar to the local filesystem. For that flow the tool must fail
@@ -3738,6 +3750,37 @@ mod tests {
     }
 
     // ============ ComputerUse dispatch tests ============
+
+    #[tokio::test]
+    async fn computer_use_display_lease_covers_http_and_releases_on_completion() {
+        use crate::display_awake::testing::{STATE, State};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let state = Arc::new(std::sync::Mutex::new(State::default()));
+        let observed = state.clone();
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                assert_eq!(observed.lock().unwrap().active, 1);
+                ResponseTemplate::new(200).set_body_json(json!({"success":true,"data":{}}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tool = browser_tool_with_computer_use(ComputerUseConfig {
+            endpoint: server.uri(),
+            ..test_computer_use_config()
+        });
+        STATE
+            .scope(state.clone(), async {
+                tool.execute_computer_use_action("click", &json!({"x":1,"y":1}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let state = state.lock().unwrap();
+        assert_eq!(state.active, 0);
+        assert_eq!(state.budgets, [Duration::from_secs(5)]);
+    }
 
     fn test_computer_use_config() -> ComputerUseConfig {
         ComputerUseConfig {

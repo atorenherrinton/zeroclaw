@@ -2,6 +2,70 @@
 
 This guide covers setting up browser automation capabilities in ZeroClaw, including both headless automation and GUI access via VNC.
 
+## Scoped display wake on macOS
+
+ZeroClaw requests a display wake and prevents idle display sleep during these
+local MCP operations (configured server name and original tool name):
+
+| Server | Tools with a display lease |
+|--------|----------------------------|
+| `cua_repl` | `js` |
+| `public_browser`, `safari_browser` | `browse`, `interact` |
+| `auth_browser` | `browse`, `interact`, `login` |
+
+Only stdio routes qualify. HTTP/SSE MCP, tool discovery, CUA reset, credential
+lookup, close, generic shell/API tools, and other server names do not acquire a
+lease. Server descriptions and annotations cannot opt into display wake. Renamed
+or additional computer connectors require an explicit code review of this list.
+CUA can mix computer actions and ordinary JavaScript in `js`; the whole invocation
+is the lease rather than attempting to classify arbitrary JavaScript. The existing
+public/auth browser helpers run headless; their listed operations are deliberately
+included in the configured browser-use lease policy.
+
+The built-in `computer_use` browser backend also acquires a lease for a loopback
+sidecar HTTP request, after action/path validation and through response body read.
+Remote sidecars, legacy `browser_open`, agent-browser CLI and WebDriver backends
+are outside this lease policy. Headed use of those backends needs separate wiring.
+
+The call future owns the lease, including MCP queue/recovery time within its
+existing tool deadline. The assertion budget comes from that deadline, shortened
+by the inherited parent deadline and an unconditional five-minute maximum.
+The maximum is not configurable or renewed; a longer-running operation can
+outlive its wake lease and should be split into bounded calls. Completion, errors, cancellation and panic
+unwinding drop it. Overlapping calls own independent assertions; ending one does
+not release another's lease. The OS releases process assertions on exit (including
+abort/crash), and a native timeout releases them even if the executor stalls.
+No background timer, helper process, new config setting, or always-awake service
+is introduced. Time between calls, model reasoning, and an idle open browser
+session are intentionally excluded. Scripts must await their computer actions;
+work detached inside an MCP server can outlive the client's lease.
+
+The native implementation uses public IOKit APIs:
+[`IOPMAssertionCreateWithDescription`](https://developer.apple.com/documentation/iokit/1557078-iopmassertioncreatewithdescripti)
+with `PreventUserIdleDisplaySleep` and `UserIsActive` for wake, following
+[Apple's caffeinate implementation](https://github.com/apple-oss-distributions/PowerManagement/blob/main/caffeinate/caffeinate.c).
+Both assertions have timeout-release properties from creation. An acquisition failure
+returns an error before tool dispatch. Other operating systems use a no-op.
+This does not unlock the Mac, grant Accessibility/Screen Recording permissions,
+override explicit sleep/lid closure, or change privacy settings. Releasing a
+lease allows normal idle policy to resume; it does not force the display off.
+Safari's existing helper-owned activity assertion remains independent and can
+retain its usual idle-timeout behavior after the daemon's lease ends.
+
+Automated tests use task-scoped fake assertions and mock transports, including
+completion, errors, panic, timeout, cancellation, concurrency and parent deadlines.
+The physical-display test is ignored by default. On an idle dedicated Mac only:
+
+```sh
+cargo test -p zeroclaw-tools --lib display_awake::native::native_display_ -- --ignored
+```
+
+Before installation, separately verify display wake, `pmset -g assertions`
+appearance/removal, locked-session behavior, process crash cleanup and OS timeout
+with the signed candidate. Do not run these checks during unrelated desktop work.
+Install only through the existing stable signing route after retaining a rollback
+binary; preserve daemon launch routing and helper/credential-core bytes.
+
 ## Overview
 
 ZeroClaw supports multiple browser access methods:
