@@ -880,6 +880,11 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
+        // Read concurrent task context at the provider boundary, after prompt
+        // reconciliation. Keep it out of history, owner-intent selection and
+        // tool authorization; the channel owner supplies a live bounded view.
+        zeroclaw_api::peer_activity::append_to_request(&mut provider_request_messages);
+
         let llm_started_at = announce_llm_request(
             &ctx,
             &provider_request_messages,

@@ -29,6 +29,22 @@ fn tool_activity_fluent_key(activity: ToolActivity) -> &'static str {
         ToolActivity::Memory => "channel-runtime-progress-tool-activity-memory",
         ToolActivity::VersionControl => "channel-runtime-progress-tool-activity-version-control",
         ToolActivity::Other => "channel-runtime-progress-tool-activity-other",
+        ToolActivity::BrowserOpen => "channel-runtime-progress-tool-activity-browser-open",
+        ToolActivity::BrowserRead => "channel-runtime-progress-tool-activity-browser-read",
+        ToolActivity::BrowserInteract => "channel-runtime-progress-tool-activity-browser-interact",
+        ToolActivity::BrowserWait => "channel-runtime-progress-tool-activity-browser-wait",
+        ToolActivity::BrowserVerify => "channel-runtime-progress-tool-activity-browser-verify",
+        ToolActivity::FileRead => "channel-runtime-progress-tool-activity-file-read",
+        ToolActivity::FileWrite => "channel-runtime-progress-tool-activity-file-write",
+        ToolActivity::Search => "channel-runtime-progress-tool-activity-search",
+        ToolActivity::CalendarRead => "channel-runtime-progress-tool-activity-calendar-read",
+        ToolActivity::CalendarWrite => "channel-runtime-progress-tool-activity-calendar-write",
+        ToolActivity::DraftMessage => "channel-runtime-progress-tool-activity-draft-message",
+        ToolActivity::SendMessage => "channel-runtime-progress-tool-activity-send-message",
+        ToolActivity::CheckDelivery => "channel-runtime-progress-tool-activity-check-delivery",
+        ToolActivity::Contacts => "channel-runtime-progress-tool-activity-contacts",
+        ToolActivity::Delegation => "channel-runtime-progress-tool-activity-delegation",
+        ToolActivity::ToolDiscovery => "channel-runtime-progress-tool-activity-tool-discovery",
     }
 }
 

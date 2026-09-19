@@ -14,6 +14,7 @@ pub mod memory_promotion;
 pub mod memory_traits;
 pub mod model_provider;
 pub mod observability_traits;
+pub mod peer_activity;
 pub mod peripherals_traits;
 pub mod plan;
 pub mod platform;
