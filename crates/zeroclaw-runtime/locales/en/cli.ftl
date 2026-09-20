@@ -1334,7 +1334,7 @@ channel-runtime-delegates = Delegated work saved for this conversation:
 
 turn-tool-error-too-large = Tool returned an oversized error. Execution status is uncertain; verify side effects before retrying. Full error omitted.
 
-turn-partial-checkpoint = Progress checkpoint: give a concise update of verified findings, remaining uncertainty, and pending delegate task IDs in your next response. Reuse delegated findings; do not repeat checks within a delegate's scope. Do not add tool calls solely to produce this update.
+turn-partial-checkpoint = [Progress checkpoint] Give a concise update of verified findings, remaining uncertainty, and pending delegate task IDs in your next response. Reuse delegated findings; do not repeat checks within a delegate's scope. Do not add tool calls solely to produce this update.
 
 channel-runtime-delegate-completed = Completed delegated work (task { $task_id }). Saved excerpt:
     { $output }

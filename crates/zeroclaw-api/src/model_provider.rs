@@ -55,6 +55,10 @@ pub struct ChatMessage {
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_PREFIX: &str = "[Tool exchange:";
 pub const PRUNED_TOOL_EXCHANGE_SUMMARY_SUFFIX: &str = "results collapsed]";
 pub const PRUNED_CONTEXT_SEPARATOR: &str = "[context continues]";
+/// Leading marker of the runtime's periodic progress-checkpoint prompt. That
+/// prompt is a synthetic `user` message inside a turn, so history trimmers must
+/// not mistake it for the start of a new conversation turn.
+pub const PROGRESS_CHECKPOINT_PREFIX: &str = "[Progress checkpoint]";
 
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
@@ -105,6 +109,14 @@ impl ChatMessage {
 
     pub fn is_pruned_context_separator(&self) -> bool {
         self.role == "user" && self.content.trim() == PRUNED_CONTEXT_SEPARATOR
+    }
+
+    pub fn is_progress_checkpoint(&self) -> bool {
+        self.role == "user"
+            && self
+                .content
+                .trim_start()
+                .starts_with(PROGRESS_CHECKPOINT_PREFIX)
     }
 
     pub fn should_skip_internal_pruning_marker(messages: &[Self], index: usize) -> bool {
