@@ -95,6 +95,8 @@ Run `tools` to inspect the JSON tool schemas, or `mcp CONFIG_DIR` for stdio MCP.
 | --- | --- |
 | text_prepare | Save an unsent text draft with exact recipients |
 | files_prepare | Prepare general file sharing from exact absolute paths |
+| files_import | Owner-requested single MP4 snapshot from Downloads, separately enabled |
+| files_import_cleanup | Remove only expired managed import snapshots and receipts |
 | voicemail_list | Read a bounded window of completed inbound screening calls |
 | voicemail_prepare | Prepare transcripts or consented archived audio from that source |
 | delivery_execute | Attempt up to four new items in an authorized prepared plan |
@@ -411,6 +413,14 @@ Existing installations must register these two tool names in the intended
 agent's existing allowed-tool policy after replacing the helper. Do not run the
 fresh installer over an existing installation or broadly replace risk profiles.
 No automatic permission grant or real-history read is an installation check.
+
+## Owner-selected Downloads import
+
+See [the import contract and coordinator upgrade procedure](SHARE_IMPORT.md).
+The capability defaults closed and does not change `files_prepare` sharing roots.
+The initial format scope is a bounded MP4 envelope recognizer. The contract
+documents inspect/confirm, idempotent replay, uncertain outcomes, operator policy,
+and the independent installation and live verification still required.
 
 ## Bounded MCP activity reads
 

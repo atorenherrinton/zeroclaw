@@ -28,6 +28,7 @@ pub mod messages;
 pub mod operations_api;
 pub mod outbox;
 pub mod service;
+mod share_import;
 pub mod shipments;
 
 pub fn text<'a>(v: &'a Value, key: &str, max: usize) -> Result<&'a str> {
@@ -170,6 +171,7 @@ impl Ops {
         journal::migrate(&db)?;
         continuity::migrate(&db)?;
         events::migrate(&db)?;
+        share_import::migrate(&db)?;
         Ok(Self {
             root: root.to_owned(),
             db,
@@ -221,7 +223,10 @@ impl Ops {
             meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 49_000_000,
             "file must be regular and at most 49 MB"
         );
-        let bytes = fs::read(path)?;
+        let bytes = match share_import::verified_bytes(self, path)? {
+            Some(bytes) => bytes,
+            None => fs::read(path)?,
+        };
         ensure!(bytes.len() <= 49_000_000, "file exceeds 49 MB");
         let hash = digest(&bytes);
         let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("bin");
@@ -793,6 +798,7 @@ pub fn schema() -> Value {
     if let Some(list) = tools.as_array_mut() {
         list.extend(operations_api::schema());
         list.extend(imessage_history::schema());
+        list.extend(share_import::schema());
     }
     tools
 }
@@ -810,6 +816,8 @@ pub async fn call(ops: &Ops, name: &str, args: &Value) -> Result<Value> {
         "imessage_history" => imessage_history::query(args, false).await,
         "text_prepare" => ops.prepare_text(args),
         "files_prepare" => ops.prepare_files(args),
+        "files_import" => share_import::import(ops, args),
+        "files_import_cleanup" => share_import::cleanup(ops, args),
         "delivery_execute" => ops.execute(args).await,
         "delivery_status" => ops.delivery_status(text(args, "plan_id", 64)?).await,
         "imessage_draft" => ops.message_draft(args),
