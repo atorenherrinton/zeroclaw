@@ -271,11 +271,14 @@ impl OpenRouterModelProvider {
             extra_body: None,
         }
     }
-    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
+    fn convert_tools(tools: Option<&[ToolSpec]>, model: &str) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
+        // OpenRouter forwards tool schemas verbatim, and Anthropic-hosted
+        // models reject a root-level oneOf/anyOf/allOf. Rewrite only those.
+        let routes_to_anthropic = model.starts_with("anthropic/");
         let valid: Vec<NativeToolSpec> = items
             .iter()
             .filter(|tool| is_valid_openai_tool_name(&tool.name))
@@ -284,7 +287,18 @@ impl OpenRouterModelProvider {
                 function: NativeToolFunctionSpec {
                     name: tool.name.clone(),
                     description: tool.description.clone(),
-                    parameters: Arc::clone(&tool.parameters),
+                    parameters: if routes_to_anthropic
+                        && zeroclaw_api::schema::SchemaCleanr::has_top_level_combinator(
+                            &tool.parameters,
+                        ) {
+                        Arc::new(
+                            zeroclaw_api::schema::SchemaCleanr::hoist_top_level_combinators(
+                                (*tool.parameters).clone(),
+                            ),
+                        )
+                    } else {
+                        Arc::clone(&tool.parameters)
+                    },
                 },
             })
             .collect();
@@ -760,7 +774,7 @@ impl ModelProvider for OpenRouterModelProvider {
             )
         })?;
 
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -859,7 +873,7 @@ impl ModelProvider for OpenRouterModelProvider {
             }
         };
 
-        let tools = Self::convert_tools(request.tools);
+        let tools = Self::convert_tools(request.tools, model);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -2058,6 +2072,31 @@ mod tests {
     }
 
     #[test]
+    fn convert_tools_hoists_root_combinators_only_for_anthropic_models() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "anyOf": [
+                { "properties": { "name": { "type": "string" } } },
+                { "properties": { "email": { "type": "string" } } }
+            ]
+        });
+        let tools = vec![ToolSpec::new("lookup", "Look something up", schema.clone())];
+
+        let anthropic =
+            OpenRouterModelProvider::convert_tools(Some(&tools), "anthropic/claude-sonnet-5")
+                .unwrap();
+        let parameters = &anthropic[0].function.parameters;
+        assert!(parameters.get("anyOf").is_none());
+        assert!(parameters["properties"].get("email").is_some());
+
+        let other = OpenRouterModelProvider::convert_tools(Some(&tools), "z-ai/glm-5.3").unwrap();
+        assert_eq!(*other[0].function.parameters, schema);
+    }
+
+    #[test]
     fn convert_tools_skips_invalid_names() {
         use zeroclaw_api::tool::ToolSpec;
 
@@ -2079,7 +2118,7 @@ mod tests {
             ),
         ];
 
-        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools), "z-ai/glm-5.3").unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].function.name, "valid_tool");
         assert_eq!(result[1].function.name, "another-valid");
@@ -2104,7 +2143,7 @@ mod tests {
             ),
         ];
 
-        let result = OpenRouterModelProvider::convert_tools(Some(&tools)).unwrap();
+        let result = OpenRouterModelProvider::convert_tools(Some(&tools), "z-ai/glm-5.3").unwrap();
         assert_eq!(
             result.len(),
             1,
@@ -2126,7 +2165,7 @@ mod tests {
             serde_json::json!({"type": "object"}),
         )];
 
-        assert!(OpenRouterModelProvider::convert_tools(Some(&tools)).is_none());
+        assert!(OpenRouterModelProvider::convert_tools(Some(&tools), "z-ai/glm-5.3").is_none());
     }
 
     #[test]

@@ -38,7 +38,7 @@ fn is_conversation_turn_boundary(msg: &ConversationMessage, is_breadcrumb: bool)
     matches!(
         msg,
         ConversationMessage::Chat(chat)
-            if chat.role == "user" && !is_breadcrumb
+            if chat.role == "user" && !is_breadcrumb && !chat.is_progress_checkpoint()
     )
 }
 
@@ -117,7 +117,9 @@ pub(crate) fn trim_conversation_to_recent_turns(
 }
 
 fn is_turn_boundary(msg: &ChatMessage) -> bool {
-    msg.role == "user" && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+    msg.role == "user"
+        && !msg.content.starts_with(TOOL_RESULTS_PREFIX)
+        && !msg.is_progress_checkpoint()
 }
 
 fn is_system(msg: &ChatMessage) -> bool {
@@ -293,6 +295,65 @@ mod tests {
     }
     fn tool(c: &str) -> ChatMessage {
         ChatMessage::tool(c)
+    }
+
+    /// Regression: the runtime injects the progress-checkpoint prompt as a user
+    /// message every few tool iterations. If trimming treats it as a turn
+    /// boundary, a context overflow drops the real request and leaves the model
+    /// with only the checkpoint prompt to answer.
+    #[test]
+    fn progress_checkpoint_is_not_a_turn_boundary() {
+        let checkpoint = crate::i18n::get_required_cli_string("turn-partial-checkpoint");
+        assert!(user(&checkpoint).is_progress_checkpoint());
+
+        let big = "x".repeat(4000);
+        let history = vec![
+            sys("system"),
+            user(&format!("old request {big}")),
+            asst(&format!("old reply {big}")),
+            user("fill in Konrad's passport form"),
+            asst("calling shell"),
+            user("[Tool results]\nok"),
+            user(&checkpoint),
+            asst("calling shell again"),
+            user("[Tool results]\nok"),
+            user(&checkpoint),
+        ];
+        assert_eq!(count_turns(&history), 2);
+
+        let result = trim_to_recent_turns(history, 1_200);
+        assert!(result.trimmed);
+        assert_eq!(result.dropped_turns, 1);
+        assert!(
+            result
+                .history
+                .iter()
+                .any(|m| m.content == "fill in Konrad's passport form"),
+            "the request the checkpoints belong to must survive trimming"
+        );
+        assert!(
+            !result
+                .history
+                .iter()
+                .any(|m| m.content.starts_with("old request"))
+        );
+
+        let conversation = vec![
+            conversation_system("system"),
+            conversation_user("old request"),
+            conversation_assistant("old reply"),
+            conversation_user("current request"),
+            conversation_assistant("working"),
+            conversation_user(&checkpoint),
+            conversation_assistant("still working"),
+            conversation_user(&checkpoint),
+        ];
+        let result = trim_conversation_to_recent_turns(conversation, 4, false);
+        assert!(result.trimmed);
+        assert!(result.history.iter().any(|m| matches!(
+            m,
+            ConversationMessage::Chat(chat) if chat.content == "current request"
+        )));
     }
 
     fn conversation_system(content: &str) -> ConversationMessage {

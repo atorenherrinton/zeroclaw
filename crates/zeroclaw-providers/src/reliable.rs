@@ -1214,6 +1214,7 @@ fn is_context_turn_boundary(message: &ChatMessage) -> bool {
     message.role == "user"
         && !crate::multimodal::is_prompt_tool_result_message(message)
         && !message.is_pruned_context_separator()
+        && !message.is_progress_checkpoint()
 }
 
 fn context_truncation_limit(messages: &[ChatMessage]) -> &'static str {
@@ -8280,6 +8281,29 @@ mod tests {
         assert_eq!(messages.len(), 4); // system + 3 remaining non-system
         // The last message should still be the most recent user message
         assert_eq!(messages.last().unwrap().content, "msg3");
+    }
+
+    #[test]
+    fn truncate_for_context_ignores_progress_checkpoint_boundaries() {
+        let checkpoint = "[Progress checkpoint] Give a concise update.";
+        let mut messages = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old reply"),
+            ChatMessage::user("current request"),
+            ChatMessage::assistant("working"),
+            ChatMessage::user(checkpoint),
+            ChatMessage::assistant("still working"),
+            ChatMessage::user(checkpoint),
+        ];
+
+        truncate_for_context(&mut messages);
+
+        assert!(
+            messages.iter().any(|m| m.content == "current request"),
+            "the request the checkpoints belong to must survive truncation"
+        );
+        assert!(!messages.iter().any(|m| m.content == "old request"));
     }
 
     #[test]

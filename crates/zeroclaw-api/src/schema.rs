@@ -158,6 +158,9 @@ impl SchemaCleanr {
     /// `anyOf`/`oneOf` simplification and sibling-`type` skipping, and
     /// null-stripping in `type` arrays).
     pub fn needs_cleaning(schema: &Value, strategy: CleaningStrategy) -> bool {
+        if strategy == CleaningStrategy::Anthropic && Self::has_top_level_combinator(schema) {
+            return true;
+        }
         match schema {
             Value::Object(obj) => {
                 let unsupported = strategy.unsupported_keywords();
@@ -190,7 +193,84 @@ impl SchemaCleanr {
             HashMap::new()
         };
 
-        Self::clean_with_defs(schema, &defs, strategy, &mut HashSet::new())
+        let cleaned = Self::clean_with_defs(schema, &defs, strategy, &mut HashSet::new());
+        if strategy == CleaningStrategy::Anthropic {
+            Self::hoist_top_level_combinators(cleaned)
+        } else {
+            cleaned
+        }
+    }
+
+    /// `true` when the root of `schema` carries `oneOf`, `anyOf` or `allOf`.
+    ///
+    /// Anthropic rejects such tool schemas outright
+    /// (`input_schema does not support oneOf, allOf, or anyOf at the top level`).
+    pub fn has_top_level_combinator(schema: &Value) -> bool {
+        schema.as_object().is_some_and(|obj| {
+            ["oneOf", "anyOf", "allOf"]
+                .iter()
+                .any(|key| obj.contains_key(*key))
+        })
+    }
+
+    /// Rewrite a root-level `oneOf`/`anyOf`/`allOf` into a plain object schema.
+    ///
+    /// Properties from every branch are merged into the root (the first
+    /// definition of a name wins). `required` keeps only what every valid
+    /// call must supply: the root's own list plus, for `allOf`, each branch's
+    /// list. Alternatives from `oneOf`/`anyOf` contribute no requirements, so
+    /// the model may still pick any branch; the tool validates the exact shape.
+    /// Schemas without a root combinator are returned unchanged.
+    pub fn hoist_top_level_combinators(schema: Value) -> Value {
+        if !Self::has_top_level_combinator(&schema) {
+            return schema;
+        }
+        let Value::Object(mut root) = schema else {
+            return schema;
+        };
+
+        let mut properties = match root.remove("properties") {
+            Some(Value::Object(props)) => props,
+            _ => Map::new(),
+        };
+        let mut required: Vec<Value> = match root.remove("required") {
+            Some(Value::Array(items)) => items,
+            _ => Vec::new(),
+        };
+
+        for key in ["allOf", "anyOf", "oneOf"] {
+            let Some(Value::Array(branches)) = root.remove(key) else {
+                continue;
+            };
+            for branch in branches {
+                let Value::Object(branch) = Self::hoist_top_level_combinators(branch) else {
+                    continue;
+                };
+                if let Some(Value::Object(branch_props)) = branch.get("properties") {
+                    for (name, value) in branch_props {
+                        properties
+                            .entry(name.clone())
+                            .or_insert_with(|| value.clone());
+                    }
+                }
+                if key == "allOf"
+                    && let Some(Value::Array(items)) = branch.get("required")
+                {
+                    for item in items {
+                        if !required.contains(item) {
+                            required.push(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        root.insert("type".into(), Value::String("object".into()));
+        root.insert("properties".into(), Value::Object(properties));
+        if !required.is_empty() {
+            root.insert("required".into(), Value::Array(required));
+        }
+        Value::Object(root)
     }
 
     /// Validate that a schema is suitable for LLM tool calling.
@@ -1561,5 +1641,66 @@ mod tests {
 
         assert_eq!(cleaned["not"]["type"], "integer");
         assert!(cleaned["not"].get("minimum").is_none());
+    }
+    #[test]
+    fn anthropic_clean_hoists_top_level_combinators_into_a_plain_object() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "id": { "type": "string" } },
+            "required": ["id"],
+            "oneOf": [
+                { "properties": { "name": { "type": "string" } }, "required": ["name"] },
+                { "properties": { "email": { "type": "string" } }, "required": ["email"] }
+            ]
+        });
+        assert!(SchemaCleanr::needs_cleaning(
+            &schema,
+            CleaningStrategy::Anthropic
+        ));
+
+        let cleaned = SchemaCleanr::clean_for_anthropic(schema);
+
+        for key in ["oneOf", "anyOf", "allOf"] {
+            assert!(
+                cleaned.get(key).is_none(),
+                "{key} must not remain at the top level"
+            );
+        }
+        assert_eq!(cleaned["type"], "object");
+        for name in ["id", "name", "email"] {
+            assert!(cleaned["properties"].get(name).is_some(), "missing {name}");
+        }
+        // Alternatives must not become mandatory; the root requirement stays.
+        assert_eq!(cleaned["required"], json!(["id"]));
+    }
+
+    #[test]
+    fn hoist_top_level_all_of_keeps_every_branch_requirement() {
+        let schema = json!({
+            "allOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                { "type": "object", "properties": { "b": { "type": "integer" } }, "required": ["b"] }
+            ]
+        });
+        assert!(SchemaCleanr::has_top_level_combinator(&schema));
+
+        let hoisted = SchemaCleanr::hoist_top_level_combinators(schema);
+
+        assert_eq!(hoisted["type"], "object");
+        assert_eq!(hoisted["required"], json!(["a", "b"]));
+        assert!(hoisted.get("allOf").is_none());
+    }
+
+    #[test]
+    fn hoist_leaves_plain_schemas_untouched() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "x": { "anyOf": [{ "type": "string" }, { "type": "integer" }] } }
+        });
+        assert!(!SchemaCleanr::has_top_level_combinator(&schema));
+        assert_eq!(
+            SchemaCleanr::hoist_top_level_combinators(schema.clone()),
+            schema
+        );
     }
 }
