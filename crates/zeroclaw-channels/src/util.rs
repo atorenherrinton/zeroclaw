@@ -29,6 +29,22 @@ fn tool_activity_fluent_key(activity: ToolActivity) -> &'static str {
         ToolActivity::Memory => "channel-runtime-progress-tool-activity-memory",
         ToolActivity::VersionControl => "channel-runtime-progress-tool-activity-version-control",
         ToolActivity::Other => "channel-runtime-progress-tool-activity-other",
+        ToolActivity::BrowserOpen => "channel-runtime-progress-tool-activity-browser-open",
+        ToolActivity::BrowserRead => "channel-runtime-progress-tool-activity-browser-read",
+        ToolActivity::BrowserInteract => "channel-runtime-progress-tool-activity-browser-interact",
+        ToolActivity::BrowserWait => "channel-runtime-progress-tool-activity-browser-wait",
+        ToolActivity::BrowserVerify => "channel-runtime-progress-tool-activity-browser-verify",
+        ToolActivity::FileRead => "channel-runtime-progress-tool-activity-file-read",
+        ToolActivity::FileWrite => "channel-runtime-progress-tool-activity-file-write",
+        ToolActivity::Search => "channel-runtime-progress-tool-activity-search",
+        ToolActivity::CalendarRead => "channel-runtime-progress-tool-activity-calendar-read",
+        ToolActivity::CalendarWrite => "channel-runtime-progress-tool-activity-calendar-write",
+        ToolActivity::DraftMessage => "channel-runtime-progress-tool-activity-draft-message",
+        ToolActivity::SendMessage => "channel-runtime-progress-tool-activity-send-message",
+        ToolActivity::CheckDelivery => "channel-runtime-progress-tool-activity-check-delivery",
+        ToolActivity::Contacts => "channel-runtime-progress-tool-activity-contacts",
+        ToolActivity::Delegation => "channel-runtime-progress-tool-activity-delegation",
+        ToolActivity::ToolDiscovery => "channel-runtime-progress-tool-activity-tool-discovery",
     }
 }
 
@@ -545,9 +561,43 @@ pub(crate) fn build_approve_deny_approval_prompt(
     test
 ))]
 pub(crate) struct PendingApproval {
+    /// Created when this entry is registered; protects replacement entries
+    /// under the same reply key from a previous waiter's drop cleanup.
+    #[cfg(any(feature = "channel-telegram", test))]
+    pub(crate) registration_id: uuid::Uuid,
     pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
     pub(crate) destination: String,
     pub(crate) tool_name: String,
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+// Guards never cross awaits: only entry insertion, claim, or removal happens
+// under this lock. Synchronous locking lets a cancelled waiter remove its entry
+// before Drop returns, without spawning work or depending on a running executor.
+pub(crate) type PendingApprovalMap =
+    parking_lot::Mutex<std::collections::HashMap<String, PendingApproval>>;
+
+#[cfg(any(feature = "channel-telegram", test))]
+pub(crate) fn remove_pending_approval_if_matches(
+    pending: &PendingApprovalMap,
+    token: &str,
+    registration_id: uuid::Uuid,
+) -> bool {
+    let mut pending = pending.lock();
+    if pending
+        .get(token)
+        .is_some_and(|entry| entry.registration_id == registration_id)
+    {
+        pending.remove(token);
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(any(
@@ -579,7 +629,7 @@ impl PendingApprovalResolution {
 
 #[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
 pub(crate) async fn resolve_pending_approval(
-    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    pending_approvals: &PendingApprovalMap,
     token: &str,
     response: zeroclaw_api::channel::ChannelApprovalResponse,
     responder_allowed: bool,
@@ -603,13 +653,13 @@ pub(crate) async fn resolve_pending_approval(
     test
 ))]
 pub(crate) async fn resolve_pending_approval_with_tool(
-    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    pending_approvals: &PendingApprovalMap,
     token: &str,
     response: zeroclaw_api::channel::ChannelApprovalResponse,
     responder_allowed: bool,
     destination: &str,
 ) -> (PendingApprovalResolution, Option<String>) {
-    let mut pending_approvals = pending_approvals.lock().await;
+    let mut pending_approvals = pending_approvals.lock();
     let Some(pending) = pending_approvals.get(token) else {
         return (PendingApprovalResolution::NotFound, None);
     };
@@ -1118,15 +1168,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn approval_cleanup_removes_only_matching_registration() {
+        let pending = PendingApprovalMap::default();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let registration_id = uuid::Uuid::new_v4();
+        pending.lock().insert(
+            "approval-id".into(),
+            PendingApproval {
+                registration_id,
+                sender,
+                destination: "fixture-room".into(),
+                tool_name: "fixture-tool".into(),
+            },
+        );
+        assert!(!remove_pending_approval_if_matches(
+            &pending,
+            "approval-id",
+            uuid::Uuid::new_v4()
+        ));
+        assert_eq!(pending.lock().len(), 1);
+        assert!(remove_pending_approval_if_matches(
+            &pending,
+            "approval-id",
+            registration_id
+        ));
+        assert!(pending.lock().is_empty());
+    }
+
     #[tokio::test]
     async fn approval_resolution_requires_authorized_responder_and_destination() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let pending = PendingApprovalMap::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        pending.lock().await.insert(
+        pending.lock().insert(
             "approval-id".to_string(),
             PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
@@ -1146,7 +1225,7 @@ mod tests {
             rejected_responder.suppresses_message(),
             "a rejected reply for a known approval must not reach normal dispatch"
         );
-        assert!(pending.lock().await.contains_key("approval-id"));
+        assert!(pending.lock().contains_key("approval-id"));
 
         let rejected_destination = resolve_pending_approval(
             &pending,
@@ -1161,7 +1240,7 @@ mod tests {
             rejected_destination.suppresses_message(),
             "a cross-destination reply for a known approval must not reach normal dispatch"
         );
-        assert!(pending.lock().await.contains_key("approval-id"));
+        assert!(pending.lock().contains_key("approval-id"));
 
         let resolved = resolve_pending_approval(
             &pending,
@@ -1174,7 +1253,7 @@ mod tests {
         assert_eq!(resolved, PendingApprovalResolution::Resolved);
         assert!(resolved.suppresses_message());
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.lock().is_empty());
 
         let not_found = resolve_pending_approval(
             &pending,
@@ -1195,12 +1274,13 @@ mod tests {
     async fn approval_resolution_reports_closed_receiver_as_failure() {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+        let pending = PendingApprovalMap::default();
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(rx);
-        pending.lock().await.insert(
+        pending.lock().insert(
             "approval-id".to_string(),
             PendingApproval {
+                registration_id: uuid::Uuid::new_v4(),
                 sender: tx,
                 destination: "room-a".to_string(),
                 tool_name: "tool".to_string(),
@@ -1220,6 +1300,6 @@ mod tests {
             resolution.suppresses_message(),
             "a consumed approval must not fall through after its receiver closes"
         );
-        assert!(pending.lock().await.is_empty());
+        assert!(pending.lock().is_empty());
     }
 }

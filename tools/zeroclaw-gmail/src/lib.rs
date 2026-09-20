@@ -5,6 +5,7 @@ pub mod auth;
 pub mod model;
 pub mod operations;
 pub mod protocol;
+pub mod schedule;
 pub mod store;
 #[cfg(test)]
 mod tests;

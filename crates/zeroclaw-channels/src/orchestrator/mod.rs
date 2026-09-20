@@ -4,8 +4,11 @@
 pub mod acp_embedded;
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod direct_routing;
 pub mod media_pipeline;
+mod progress_snapshots;
 mod repair_notifications;
+mod thread_coordination;
 mod turn_journal;
 use zeroclaw_api::turn::{TaskStatus, TurnJournal};
 #[cfg(feature = "channel-mqtt")]
@@ -81,8 +84,8 @@ use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
-    Channel, ChannelMessage, DraftProgress, DraftProgressKind, ListenerHealth, ProgressEvent,
-    SendMessage, ToolActivity, ToolProgressEvent, ToolProgressPhase,
+    Channel, ChannelMessage, DraftActivity, DraftProgress, DraftProgressKind, ListenerHealth,
+    ProgressEvent, SendMessage, ToolActivity, ToolProgressEvent, ToolProgressPhase,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -172,6 +175,79 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
+}
+
+/// The observer event is canonical; this watch slot only buffers the latest
+/// pending transport status, without arguments, output, or error text.
+struct ToolProgressObserver {
+    inner: Arc<dyn Observer>,
+    progress: Option<tokio::sync::watch::Sender<Option<DraftActivity>>>,
+}
+
+impl Observer for ToolProgressObserver {
+    fn record_event(&self, event: &ObserverEvent) {
+        if let Some(progress) = self.progress.as_ref()
+            && let Some(event) = executor_draft_activity(event)
+        {
+            progress.send_replace(Some(event));
+        }
+        self.inner.record_event(event);
+    }
+    fn record_metric(&self, metric: &ObserverMetric) {
+        self.inner.record_metric(metric);
+    }
+    fn flush(&self) {
+        self.inner.flush();
+    }
+    fn name(&self) -> &str {
+        "channel-tool-progress"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+fn executor_draft_activity(event: &ObserverEvent) -> Option<DraftActivity> {
+    // A single ordered observer stream owns both model and tool activity.
+    // Buffered lifecycle deltas must not overwrite a more recent tool event.
+    if matches!(event, ObserverEvent::LlmRequest { .. }) {
+        Some(DraftActivity::Lifecycle(ProgressEvent::WaitingOnModel))
+    } else {
+        executor_tool_progress(event).map(DraftActivity::Tool)
+    }
+}
+
+fn executor_tool_progress(event: &ObserverEvent) -> Option<ToolProgressEvent> {
+    let (tool, arguments, phase) = match event {
+        ObserverEvent::ToolCallStart {
+            tool, arguments, ..
+        } => (tool, arguments, ToolProgressPhase::Running),
+        ObserverEvent::ToolCall {
+            tool,
+            arguments,
+            success,
+            ..
+        } => (
+            tool,
+            arguments,
+            if *success {
+                ToolProgressPhase::Succeeded
+            } else {
+                ToolProgressPhase::Failed
+            },
+        ),
+        _ => return None,
+    };
+    // Scrubbed/bounded observer arguments can be incomplete JSON. Fall back to
+    // a coarse name-based label instead of guessing the action.
+    let arguments = arguments
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Some(ToolProgressEvent {
+        activity: classify_tool_activity(tool, &arguments),
+        phase,
+    })
 }
 
 const NOTIFY_DETAIL_MAX_CHARS: usize = 4096;
@@ -3856,6 +3932,26 @@ fn sanitize_streaming_draft_text(s: &str, known_tool_names: &HashSet<String>) ->
     truncate_at_unclosed_scratchpad_open(&cleaned)
 }
 
+/// Native assistant history contains provider replay data, including reasoning.
+/// Only its display content belongs in a failed turn's partial answer.
+fn visible_assistant_history_text(content: &str, known_tool_names: &HashSet<String>) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && value
+            .get("tool_calls")
+            .is_some_and(serde_json::Value::is_array)
+        && value.get("content").is_some()
+    {
+        return sanitize_streaming_draft_text(
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            known_tool_names,
+        );
+    }
+    sanitize_streaming_draft_text(content, known_tool_names)
+}
+
 /// Drop the tail from a JSON value that has started, already reads as tool
 /// protocol, and has not finished arriving.
 ///
@@ -3931,36 +4027,73 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
 ///
 /// Tool names can originate in extensions, so they never cross the channel
 /// boundary verbatim. Unknown names intentionally collapse to `Other`.
-fn classify_tool_activity(tool: &str) -> ToolActivity {
+fn classify_tool_activity(tool: &str, arguments: &serde_json::Value) -> ToolActivity {
     let normalized = tool.to_ascii_lowercase();
     let leaf = normalized.rsplit("__").next().unwrap_or(&normalized);
 
-    if leaf == "codex_cli" {
-        ToolActivity::Codex
-    } else if normalized.starts_with("safari_browser__")
-        || matches!(
-            leaf,
-            "browser" | "browser_open" | "browser_delegate" | "screenshot"
-        )
+    if normalized.starts_with("safari_browser__")
+        || normalized.starts_with("public_browser__")
+        || leaf == "browser"
     {
-        ToolActivity::Browser
-    } else if matches!(
-        leaf,
-        "web_search" | "web_fetch" | "http_request" | "content_search" | "weather"
-    ) {
-        ToolActivity::Web
-    } else if leaf.starts_with("file_")
-        || matches!(leaf, "glob_search" | "project_intel" | "image_info")
-    {
-        ToolActivity::Files
-    } else if matches!(leaf, "shell" | "exec" | "exec_command") {
-        ToolActivity::CommandLine
-    } else if leaf.starts_with("memory_") {
-        ToolActivity::Memory
-    } else if leaf.starts_with("git_") || leaf.starts_with("github") {
-        ToolActivity::VersionControl
-    } else {
-        ToolActivity::Other
+        // Only match known action values. Neither the supplied value nor any
+        // URLs, selectors, field text, or other arguments reach the UI.
+        return match arguments.get("action").and_then(serde_json::Value::as_str) {
+            Some("open") => ToolActivity::BrowserOpen,
+            Some(
+                "read" | "snapshot" | "get_text" | "get_title" | "get_url" | "screenshot" | "find"
+                | "is_visible",
+            ) => ToolActivity::BrowserRead,
+            Some(
+                "click" | "fill" | "type" | "press" | "select" | "check" | "uncheck" | "set_date"
+                | "autofill" | "hover" | "scroll",
+            ) => ToolActivity::BrowserInteract,
+            Some("wait") => ToolActivity::BrowserWait,
+            Some("verify") => ToolActivity::BrowserVerify,
+            _ => ToolActivity::Browser,
+        };
+    }
+
+    match leaf {
+        "codex_cli" => ToolActivity::Codex,
+        "browser_open" => ToolActivity::BrowserOpen,
+        "screenshot" => ToolActivity::BrowserRead,
+        "browser_delegate" | "delegate" | "delegate_task" | "subagent_spawn" => {
+            ToolActivity::Delegation
+        }
+        "web_search" | "content_search" | "glob_search" => ToolActivity::Search,
+        "web_fetch" | "http_request" | "weather" => ToolActivity::Web,
+        "file_read" | "file_list" | "image_info" | "project_intel" => ToolActivity::FileRead,
+        "file_write" | "file_edit" | "apply_patch" => ToolActivity::FileWrite,
+        "shell" | "exec" | "exec_command" => ToolActivity::CommandLine,
+        "calendar_list" | "calendar_get" | "calendar_search" | "calendar_validate"
+        | "calendar_reconcile" => ToolActivity::CalendarRead,
+        "calendar_create_event" | "calendar_update_event" | "calendar_mutate" => {
+            ToolActivity::CalendarWrite
+        }
+        "gmail_create_draft"
+        | "imessage_draft"
+        | "text_prepare"
+        | "outbox_prepare"
+        | "group_text_prepare"
+        | "imessage_group_text_prepare"
+        | "voicemail_prepare"
+        | "voicemail_group_prepare"
+        | "files_prepare" => ToolActivity::DraftMessage,
+        "outbox_send"
+        | "delivery_execute"
+        | "imessage_approve"
+        | "imessage_group_text_schedule" => ToolActivity::SendMessage,
+        "delivery_status" | "outbox_status" | "imessage_list" => ToolActivity::CheckDelivery,
+        "contacts_get"
+        | "contacts_search"
+        | "contact_destination_resolve"
+        | "imessage_group_search"
+        | "imessage_group_get" => ToolActivity::Contacts,
+        "tool_search" => ToolActivity::ToolDiscovery,
+        _ if leaf.starts_with("file_") => ToolActivity::Files,
+        _ if leaf.starts_with("memory_") => ToolActivity::Memory,
+        _ if leaf.starts_with("git_") || leaf.starts_with("github") => ToolActivity::VersionControl,
+        _ => ToolActivity::Other,
     }
 }
 
@@ -3986,10 +4119,55 @@ async fn run_draft_updater(
     draft_id: String,
     known_tool_names: HashSet<String>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
+    mut tool_progress_rx: Option<tokio::sync::watch::Receiver<Option<DraftActivity>>>,
 ) -> String {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
+    if channel.supports_progress_snapshots() {
+        return progress_snapshots::run(
+            channel,
+            reply_target,
+            draft_id,
+            known_tool_names,
+            rx,
+            tool_progress_rx,
+        )
+        .await;
+    }
     let mut accumulated = String::new();
-    while let Some(event) = rx.recv().await {
+    let executor_progress_enabled = tool_progress_rx.is_some();
+    loop {
+        let event = tokio::select! {
+            biased;
+            changed = async {
+                match tool_progress_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() {
+                    tool_progress_rx = None;
+                    continue;
+                }
+                let event = tool_progress_rx.as_mut().and_then(|rx| *rx.borrow_and_update());
+                let result = match event {
+                    Some(DraftActivity::Tool(event)) => channel.update_draft_tool_progress(&reply_target, &draft_id, event).await,
+                    Some(DraftActivity::Lifecycle(event)) => channel.update_draft_lifecycle(&reply_target, &draft_id, event).await,
+                    None => Ok(()),
+                };
+                if let Err(error) = result {
+                        ::zeroclaw_log::record!(DEBUG,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                            "Executor draft tool progress update failed"
+                        );
+                }
+                continue;
+            },
+            event = rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+        };
         match event {
             // A lifecycle event is a typed signal, not assistant text, so it
             // carries nothing to sanitize and passes straight through.
@@ -4033,14 +4211,26 @@ async fn run_draft_updater(
             // result, or error crosses that channel boundary. Matrix has its
             // own disclosure policy in `run_matrix_single_message_draft_updater`.
             event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                // Preparation announces calls before execution. Typed channels
+                // use executor events so "Now" names work actually started.
+                if executor_progress_enabled {
+                    continue;
+                }
                 if channel.supports_typed_tool_progress() {
                     let typed = match &event {
-                        StreamDelta::ToolStart { tool, .. } => ToolProgressEvent {
-                            activity: classify_tool_activity(tool),
+                        StreamDelta::ToolStart {
+                            tool, arguments, ..
+                        } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool, arguments),
                             phase: ToolProgressPhase::Running,
                         },
-                        StreamDelta::ToolComplete { tool, success, .. } => ToolProgressEvent {
-                            activity: classify_tool_activity(tool),
+                        StreamDelta::ToolComplete {
+                            tool,
+                            arguments,
+                            success,
+                            ..
+                        } => ToolProgressEvent {
+                            activity: classify_tool_activity(tool, arguments),
                             phase: if *success {
                                 ToolProgressPhase::Succeeded
                             } else {
@@ -5409,13 +5599,16 @@ async fn process_channel_message(
             let journal = ctx.session_store.as_ref()
                 .filter(|store| store.supports_delivery_journal())
                 .map(|store| Arc::new(zeroclaw_infra::session_delivery::SessionDeliveryJournal(Arc::clone(store))) as Arc<dyn zeroclaw_api::delivery::DeliveryJournal>);
+            let peer_activity = thread_coordination::Registration::enter(&ctx.agent_alias, &msg)
+                .map(|source| source as Arc<dyn zeroclaw_api::peer_activity::PeerActivitySource>);
+            zeroclaw_api::peer_activity::SOURCE.scope(peer_activity,
             zeroclaw_api::delivery::SUMMARY.scope(std::sync::Mutex::new(None),
                 zeroclaw_api::delivery::JOURNAL.scope(journal,
                 zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(Some(route),
                     crate::mcp_elicitation::scope_channel_elicitation(
                         elicitation_channel, elicitation_route, elicitation_cancellation,
                         process_channel_message_body(ctx, msg, cancellation_token, composite_for_body),
-                    )))).await;
+                    ))))).await;
         }
     )
     .await;
@@ -7037,10 +7230,10 @@ async fn process_channel_message_body(
         None
     };
 
-    // Keep operational repair notices separate from editable drafts and the
-    // optional per-tool transcript. The relay preserves the original events.
+    // An active draft already explains the current work. Standalone repair
+    // reminders remain a fallback when drafts are disabled or failed to send.
     let (delta_rx, repair_notification_task) = match (delta_rx, target_channel.as_ref()) {
-        (Some(rx), Some(channel)) if msg.channel == "telegram" => {
+        (Some(rx), Some(channel)) if msg.channel == "telegram" && draft_message_id.is_none() => {
             let (draft_rx, task) = repair_notifications::start(
                 rx,
                 Arc::clone(channel),
@@ -7051,6 +7244,20 @@ async fn process_channel_message_body(
             (draft_rx, Some(task))
         }
         (rx, _) => (rx, None),
+    };
+
+    // Keep the latest executor status while transport is busy. Legacy/Matrix
+    // consumers retain their existing draft event contracts.
+    let (tool_progress_tx, tool_progress_rx) = if use_draft_streaming
+        && !matrix_single_message_streaming
+        && target_channel
+            .as_ref()
+            .is_some_and(|channel| channel.supports_typed_tool_progress())
+    {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
     };
 
     // Spawn the appropriate handler for the delta channel.
@@ -7092,7 +7299,15 @@ async fn process_channel_message_body(
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await
+                    run_draft_updater(
+                        channel,
+                        reply_target,
+                        draft_id,
+                        known_tool_names,
+                        rx,
+                        tool_progress_rx,
+                    )
+                    .await
                 }))
             }
         } else {
@@ -7186,6 +7401,16 @@ async fn process_channel_message_body(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
+    // Delegate activity is presentation-only. It must not mark parent tool
+    // execution, duplicate accounting, or transition the parent's turn journal.
+    let delegate_progress_observer: Arc<dyn Observer> = Arc::new(ToolProgressObserver {
+        inner: Arc::new(observability::NoopObserver),
+        progress: tool_progress_tx.clone(),
+    });
+    let execution_observer = ToolProgressObserver {
+        inner: notify_observer.clone(),
+        progress: tool_progress_tx,
+    };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -7253,7 +7478,7 @@ async fn process_channel_message_body(
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
     );
-    let (llm_result, fallback_info) = scope_provider_fallback(async {
+    let (llm_result, fallback_info) = tools::delegate::progress::scope(delegate_progress_observer, scope_provider_fallback(async {
         let llm_result = loop {
             let thread_scope_id = msg
                 .interruption_scope_id
@@ -7276,7 +7501,7 @@ async fn process_channel_message_body(
                     },
                     ResolvedIo {
                         tools_registry: ctx.tools_registry.as_ref(),
-                        observer: notify_observer.as_ref() as &dyn Observer,
+                        observer: &execution_observer,
                         silent: true,
                         approval: Some(&*ctx.approval_manager),
                         multimodal_config: &ctx.multimodal,
@@ -7487,7 +7712,7 @@ async fn process_channel_message_body(
         };
         let fb = take_last_provider_fallback();
         (llm_result, fb)
-    })
+    }))
     .await;
 
     if matches!(llm_result, LlmExecutionResult::Completed(Ok(Ok(_))))
@@ -7550,6 +7775,7 @@ async fn process_channel_message_body(
         msg.thread_ts = followup_thread_id(&msg);
     }
     // Drop the notify sender so the forwarder task finishes
+    drop(execution_observer);
     drop(notify_observer);
     drop(notify_observer_flag);
     if let Some(mut handle) = notify_task
@@ -7619,7 +7845,7 @@ async fn process_channel_message_body(
             .skip(current_response_start)
             .filter(|m| m.role == "assistant")
             .map(|m| {
-                sanitize_streaming_draft_text(
+                visible_assistant_history_text(
                     &m.content,
                     &ctx.tools_registry
                         .iter()
@@ -8489,6 +8715,10 @@ async fn retire_superseded_draft(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep optional pre-turn routing inside the existing supervised worker boundary"
+)]
 async fn dispatch_worker(
     ctx: Arc<ChannelRuntimeContext>,
     msg: ChannelMessage,
@@ -8497,6 +8727,7 @@ async fn dispatch_worker(
     semaphore: Arc<tokio::sync::Semaphore>,
     queue_permit: tokio::sync::OwnedSemaphorePermit,
     journal: Option<Arc<turn_journal::ChannelTurnJournal>>,
+    routing: Option<(AgentRouter, bool)>,
 ) {
     let _abort_checkpoint = turn_journal::WorkerCheckpointGuard(journal.clone());
     let _queue_permit = queue_permit;
@@ -8510,6 +8741,25 @@ async fn dispatch_worker(
     // Cancellation of a queued successor must still wait for its predecessor;
     // otherwise a third turn could overtake the still-executing first one.
     if let Some(previous) = previous {
+        if msg.channel == "telegram"
+            && msg.thread_ts.is_some()
+            && !ctx
+                .interrupt_on_new_message
+                .enabled_for_channel(&msg.channel)
+            && !previous.completion.done.load(Ordering::Acquire)
+            && let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg)
+        {
+            let notice = SendMessage::reply_to(
+                &msg,
+                zeroclaw_runtime::i18n::get_required_cli_string(
+                    "channel-runtime-topic-followup-queued",
+                ),
+            )
+            .suppress_voice();
+            // This is an acknowledgement of queuing, never a final-delivery
+            // checkpoint. An uncertain send is not retried.
+            let _ = tokio::time::timeout(Duration::from_secs(3), channel.send(&notice)).await;
+        }
         previous.completion.wait().await;
     }
     let run = async {
@@ -8531,6 +8781,29 @@ async fn dispatch_worker(
                 }
             }
         };
+        let ctx = if let Some((router, allow_classification)) = routing {
+            let selected = direct_routing::resolve(
+                &router,
+                ctx,
+                &msg,
+                &state.cancellation,
+                allow_classification,
+            )
+            .await;
+            if let Some(journal) = &journal
+                && journal.assign(&selected.agent_alias).await.is_err()
+            {
+                turn_journal::checkpoint(TaskStatus::Failed, None, false).await;
+                return;
+            }
+            selected
+        } else {
+            ctx
+        };
+        if state.cancellation.is_cancelled() {
+            turn_journal::checkpoint(TaskStatus::Cancelled, None, false).await;
+            return;
+        }
         if !turn_journal::checkpoint(TaskStatus::Running, None, false).await {
             return;
         }
@@ -8582,6 +8855,8 @@ struct AgentRouter {
     by_agent: Arc<HashMap<String, Arc<ChannelRuntimeContext>>>,
     owner_by_channel_key: Arc<HashMap<String, String>>,
     single_ctx: Option<Arc<ChannelRuntimeContext>>,
+    /// Handle to canonical live configuration; never a cached routing policy.
+    live_config: Option<Arc<RwLock<Config>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
 }
@@ -8593,6 +8868,7 @@ impl AgentRouter {
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: Some(ctx),
+            live_config: None,
             sop_engine: None,
             sop_audit: None,
         }
@@ -8608,6 +8884,7 @@ impl AgentRouter {
             by_agent: Arc::new(by_agent),
             owner_by_channel_key: Arc::new(owner_by_channel_key),
             single_ctx: None,
+            live_config: None,
             sop_engine,
             sop_audit,
         }
@@ -9375,6 +9652,7 @@ async fn run_message_dispatch_loop_supervised(
         let worker_ctx = Arc::clone(&ctx);
         let in_flight = Arc::clone(&in_flight_by_sender);
         let semaphore = Arc::clone(&semaphore);
+        let worker_router = router.clone();
         workers.spawn(async move {
             dispatch_worker(
                 worker_ctx,
@@ -9384,6 +9662,7 @@ async fn run_message_dispatch_loop_supervised(
                 semaphore,
                 queue_permit,
                 journal,
+                Some((worker_router, !recovering)),
             )
             .await;
         });
@@ -13655,6 +13934,14 @@ pub async fn start_channels(
                         .and_then(|cid| cid.split_once('.').map(|(b, _)| b.to_string()))
                         .and_then(|b| owner_by_channel_key.get(&b).cloned())
                 });
+            let owner_agent = owner_agent.map(|owner| {
+                direct_routing::persisted_owner(
+                    &config,
+                    &owner,
+                    m.agent_alias.as_deref(),
+                    m.channel_id.as_deref().unwrap_or(""),
+                )
+            });
             let target_ctx = match owner_agent.as_ref().and_then(|a| agent_ctxs.get(a)) {
                 Some(ctx) => ctx,
                 None => continue,
@@ -13712,7 +13999,8 @@ pub async fn start_channels(
         }
     }
 
-    let router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    let mut router = AgentRouter::multi(agent_ctxs, owner_by_channel_key, sop_engine, sop_audit);
+    router.live_config = Some(Arc::clone(&config_arc));
 
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
@@ -14225,6 +14513,7 @@ fn concurrent_persist_lock_serialization() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    include!("threading_dispatch_tests.rs");
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
     // pin the built-in filter's own behavior.
@@ -15735,7 +16024,7 @@ temperature = 0.3
     /// Build a minimal `ChannelRuntimeContext` suitable only for identity
     /// checks (`Arc::ptr_eq`). Every dependency is a no-op default — these
     /// ctxs aren't usable for actually running the dispatch loop.
-    fn router_test_ctx() -> Arc<ChannelRuntimeContext> {
+    pub(super) fn router_test_ctx() -> Arc<ChannelRuntimeContext> {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(HashMap::new()),
             model_provider: Arc::new(DummyModelProvider),
@@ -17839,11 +18128,17 @@ api_key = "anthropic-key"
     }
     #[tokio::test]
     async fn oversized_write_stops_truthfully_while_marked_read_preview_continues_without_replay() {
-        for preview_read in [false, true] {
+        use zeroclaw_api::turn::TurnJournal;
+        use zeroclaw_runtime::control_plane::ControlPlaneHandle;
+        for (preview_read, confirmed) in [(false, true), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let plane = ControlPlaneHandle::start_with_boot_id(dir.path(), "fixture".into())
+                .await
+                .unwrap();
             let channel = Arc::new(ConfirmingTerminalChannel {
                 text: Default::default(),
                 attempts: AtomicUsize::new(0),
-                confirmed: true,
+                confirmed,
             });
             let invocations = Arc::new(AtomicUsize::new(0));
             let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
@@ -17861,12 +18156,59 @@ api_key = "anthropic-key"
                     preview_read,
                 ))],
             );
-            process_channel_message(
-                ctx,
-                message_sent_hook_test_message(),
-                CancellationToken::new(),
-            )
-            .await;
+            let msg = message_sent_hook_test_message();
+            let journal = turn_journal::ChannelTurnJournal::admit(&plane, &ctx.agent_alias, &msg)
+                .await
+                .unwrap()
+                .unwrap();
+            journal
+                .checkpoint(TaskStatus::Queued, None, false)
+                .await
+                .unwrap();
+            journal
+                .checkpoint(TaskStatus::Running, None, false)
+                .await
+                .unwrap();
+            let id = journal.trace_id().unwrap().to_owned();
+            zeroclaw_api::turn::JOURNAL
+                .scope(
+                    Some(journal),
+                    zeroclaw_api::delivery::SUMMARY.scope(
+                        Mutex::new(None),
+                        process_channel_message(ctx, msg, CancellationToken::new()),
+                    ),
+                )
+                .await;
+            let task = plane.store.get(&id).await.unwrap().unwrap();
+            assert_eq!(
+                task.status,
+                if confirmed {
+                    TaskStatus::Delivered
+                } else {
+                    TaskStatus::Uncertain
+                }
+            );
+            assert_eq!(task.delivered, confirmed);
+            let conn = rusqlite::Connection::open(dir.path().join("control_plane.db")).unwrap();
+            let events: String = conn
+                .query_row(
+                    "SELECT group_concat(state) FROM task_turn_events WHERE task_id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                events.contains("waiting_on_tool,running,response_ready,submitting"),
+                "{events}"
+            );
+            if !preview_read {
+                let error: String = conn
+                    .query_row("SELECT error FROM tasks WHERE id=?1", [&id], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert!(error.contains("reconcile external effects"), "{error}");
+            }
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
             assert_eq!(channel.attempts.load(Ordering::SeqCst), 1);
             let messages = channel.text.lock().await;
@@ -18101,6 +18443,139 @@ api_key = "anthropic-key"
                 .contains("Saved finding")
         );
         assert!(!final_body["text"].as_str().unwrap().contains("Working"));
+    }
+
+    struct CommentaryThenErrorProvider(AtomicUsize);
+
+    impl zeroclaw_api::attribution::Attributable for CommentaryThenErrorProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "commentary-error-fixture"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CommentaryThenErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.0.fetch_add(1, Ordering::SeqCst) != 0 {
+                anyhow::bail!("synthetic provider failure")
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("Checking the fixture.".into()),
+                reasoning_content: Some(serde_json::json!({
+                    "provider": "openai_codex",
+                    "kind": "responses_output_items",
+                    "items": [
+                        {"type": "reasoning", "id": "PRIVATE_REASONING", "encrypted_content": "PRIVATE_REPLAY"},
+                        {"type": "message", "role": "assistant", "phase": "commentary",
+                         "content": [{"type": "output_text", "text": "Checking the fixture."}]}
+                    ]
+                }).to_string()),
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_commentary_continuation_delivers_only_visible_partial_text() {
+        let channel = Arc::new(ConfirmingTerminalChannel {
+            text: Default::default(),
+            attempts: AtomicUsize::new(0),
+            confirmed: true,
+        });
+        let provider = Arc::new(CommentaryThenErrorProvider(AtomicUsize::new(0)));
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.precheck.enabled = false;
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let msg = ChannelMessage {
+            id: "commentary-error".into(),
+            sender: "fixture".into(),
+            reply_target: "room".into(),
+            channel: "test-channel".into(),
+            content: "Check the fixture.".into(),
+            ..Default::default()
+        };
+        process_channel_message(ctx, msg, CancellationToken::new()).await;
+        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+        let delivered = channel.text.lock().await;
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].contains("Checking the fixture."),
+            "{}",
+            delivered[0]
+        );
+        assert!(
+            delivered[0].contains("synthetic provider failure"),
+            "{}",
+            delivered[0]
+        );
+        for private in [
+            "PRIVATE_REASONING",
+            "PRIVATE_REPLAY",
+            "reasoning_content",
+            "responses_output_items",
+            "tool_calls",
+        ] {
+            assert!(!delivered[0].contains(private), "leaked {private}");
+        }
+    }
+
+    #[test]
+    fn partial_history_keeps_only_native_display_content() {
+        let names = HashSet::new();
+        for calls in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":"fixture","name":"tool","arguments":"PRIVATE_ARGUMENT"}]),
+        ] {
+            let native = serde_json::json!({
+                "content": "Visible finding.<think>PRIVATE_THOUGHT</think>",
+                "tool_calls": calls,
+                "reasoning_content": "PRIVATE_REASONING",
+            })
+            .to_string();
+            assert_eq!(
+                visible_assistant_history_text(&native, &names),
+                "Visible finding."
+            );
+        }
+        assert_eq!(
+            visible_assistant_history_text(
+                r#"{"content":null,"tool_calls":[],"reasoning_content":"PRIVATE"}"#,
+                &names
+            ),
+            ""
+        );
+        let ordinary = r#"{"content":"ordinary JSON answer","count":2}"#;
+        assert_eq!(visible_assistant_history_text(ordinary, &names), ordinary);
     }
 
     struct FormatErrorModelProvider;
@@ -19357,7 +19832,7 @@ api_key = "anthropic-key"
                 );
                 assert_eq!(
                     sent.iter().filter(|text| text.ends_with(&notice)).count(),
-                    usize::from(expected_notice),
+                    usize::from(expected_notice && !draft_enabled),
                     "draft={draft_enabled}, tool={tool}, provenance={provenance:?}: {sent:?}"
                 );
                 let final_messages = if draft_enabled {
@@ -36154,6 +36629,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36214,6 +36690,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36226,16 +36703,211 @@ Done."#;
 
     #[test]
     fn tool_activity_classification_is_closed_and_useful() {
-        assert_eq!(classify_tool_activity("codex_cli"), ToolActivity::Codex);
         assert_eq!(
-            classify_tool_activity("safari_browser__browse"),
+            classify_tool_activity("codex_cli", &serde_json::Value::Null),
+            ToolActivity::Codex
+        );
+        assert_eq!(
+            classify_tool_activity("safari_browser__browse", &serde_json::Value::Null),
             ToolActivity::Browser
         );
-        assert_eq!(classify_tool_activity("file_read"), ToolActivity::Files);
-        assert_eq!(classify_tool_activity("shell"), ToolActivity::CommandLine);
         assert_eq!(
-            classify_tool_activity("extension__private-token-123"),
+            classify_tool_activity("file_read", &serde_json::Value::Null),
+            ToolActivity::FileRead
+        );
+        assert_eq!(
+            classify_tool_activity("shell", &serde_json::Value::Null),
+            ToolActivity::CommandLine
+        );
+        assert_eq!(
+            classify_tool_activity("extension__private-token-123", &serde_json::Value::Null),
             ToolActivity::Other
+        );
+    }
+
+    #[test]
+    fn tool_activity_distinguishes_actions_without_rendering_arguments() {
+        let cases = [
+            ("safari_browser__browse", "read", ToolActivity::BrowserRead),
+            ("safari_browser__browse", "open", ToolActivity::BrowserOpen),
+            (
+                "safari_browser__browse",
+                "verify",
+                ToolActivity::BrowserVerify,
+            ),
+            ("safari_browser__browse", "wait", ToolActivity::BrowserWait),
+            (
+                "public_browser__interact",
+                "fill",
+                ToolActivity::BrowserInteract,
+            ),
+            ("file_write", "", ToolActivity::FileWrite),
+            ("web_search", "", ToolActivity::Search),
+            (
+                "google_write__calendar_mutate",
+                "",
+                ToolActivity::CalendarWrite,
+            ),
+            (
+                "personal_ops__outbox_prepare",
+                "",
+                ToolActivity::DraftMessage,
+            ),
+            ("personal_ops__outbox_send", "", ToolActivity::SendMessage),
+            (
+                "personal_ops__delivery_status",
+                "",
+                ToolActivity::CheckDelivery,
+            ),
+            ("tool_search", "", ToolActivity::ToolDiscovery),
+        ];
+        for (tool, action, activity) in cases {
+            let arguments = serde_json::json!({
+                "action": action,
+                "query": "private-query",
+                "url": "https://example.invalid/?token=private-token",
+                "path": "/private/customer-data",
+                "text": "private-field-value",
+            });
+            assert_eq!(classify_tool_activity(tool, &arguments), activity);
+        }
+        assert_eq!(
+            classify_tool_activity(
+                "safari_browser__browse",
+                &serde_json::json!({
+                    "action": "secret-value-not-a-known-action"
+                })
+            ),
+            ToolActivity::Browser,
+            "unknown action text must remain an opaque, generic browser activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_uses_actual_execution_and_preserves_latest_status() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let channel_impl =
+            Arc::new(DraftRecordingChannel::new(false, false).with_typed_tool_progress());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // A different prepared call must not claim to be the running action.
+        tx.send(StreamDelta::ToolStart {
+            tool: "file_write".to_string(),
+            arguments: Arc::new(serde_json::json!({"path": "private-path"})),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let (progress_tx, progress_rx) = tokio::sync::watch::channel(None);
+        let observer = ToolProgressObserver {
+            inner: Arc::new(NoopObserver),
+            progress: Some(progress_tx),
+        };
+        observer.record_event(&ObserverEvent::ToolCallStart {
+            tool: "safari_browser__browse".into(),
+            tool_call_id: Some("fixture-call".into()),
+            arguments: Some(
+                serde_json::json!({"action": "read", "text": "private-text"}).to_string(),
+            ),
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        });
+        assert_eq!(
+            *progress_rx.borrow(),
+            Some(DraftActivity::Tool(ToolProgressEvent {
+                activity: ToolActivity::BrowserRead,
+                phase: ToolProgressPhase::Running,
+            }))
+        );
+        // A slow transport can miss intermediate statuses, but must receive
+        // the latest executor outcome rather than a full-queue stale start.
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: "safari_browser__browse".into(),
+            tool_call_id: Some("fixture-call".into()),
+            arguments: Some(
+                serde_json::json!({"action": "read", "text": "private-text"}).to_string(),
+            ),
+            duration: Duration::from_secs(2),
+            success: false,
+            result: Some("private-error".into()),
+            channel: None,
+            agent_alias: None,
+            parent_agent_alias: None,
+            turn_id: None,
+        });
+        drop(observer);
+        run_draft_updater(
+            channel,
+            "chat-1".into(),
+            "draft-1".into(),
+            no_tools(),
+            rx,
+            Some(progress_rx),
+        )
+        .await;
+        assert!(channel_impl.progress_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.typed_tool_progress.lock().await.as_slice(),
+            [ToolProgressEvent {
+                activity: ToolActivity::BrowserRead,
+                phase: ToolProgressPhase::Failed
+            },]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_preserves_specific_action_and_outcome() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        let channel_impl =
+            Arc::new(DraftRecordingChannel::new(false, false).with_typed_tool_progress());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let arguments = Arc::new(serde_json::json!({
+            "action": "fill", "text": "private-field-value", "selector": "#private-control"
+        }));
+        tx.send(StreamDelta::ToolStart {
+            tool: "safari_browser__interact".to_string(),
+            arguments: arguments.clone(),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamDelta::ToolComplete {
+            tool: "safari_browser__interact".to_string(),
+            arguments,
+            tool_provenance: None,
+            secs: 2,
+            success: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            rx,
+            None,
+        )
+        .await;
+        assert!(channel_impl.progress_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl.typed_tool_progress.lock().await.as_slice(),
+            [
+                ToolProgressEvent {
+                    activity: ToolActivity::BrowserInteract,
+                    phase: ToolProgressPhase::Running
+                },
+                ToolProgressEvent {
+                    activity: ToolActivity::BrowserInteract,
+                    phase: ToolProgressPhase::Succeeded
+                },
+            ]
         );
     }
 
@@ -36278,6 +36950,7 @@ Done."#;
             "draft-1".to_string(),
             no_tools(),
             rx,
+            None,
         )
         .await;
 
@@ -36350,6 +37023,7 @@ Done."#;
                 "draft-1".to_string(),
                 no_tools(),
                 rx,
+                None,
             )
             .await;
 
@@ -36417,6 +37091,7 @@ Done."#;
                 "draft-1".to_string(),
                 known.clone(),
                 rx,
+                None,
             )
             .await;
 
@@ -36458,6 +37133,7 @@ Done."#;
             "draft-1".to_string(),
             known,
             rx,
+            None,
         )
         .await;
 
@@ -37098,6 +37774,7 @@ Done."#;
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
+            live_config: None,
             sop_engine: None,
             sop_audit: None,
         }
@@ -37201,6 +37878,7 @@ Done."#;
             by_agent: Arc::new(HashMap::new()),
             owner_by_channel_key: Arc::new(HashMap::new()),
             single_ctx: None,
+            live_config: None,
             sop_engine: Some(Arc::clone(&engine)),
             sop_audit: None,
         };
@@ -37937,6 +38615,7 @@ Done."#;
             semaphore,
             queue,
             Some(journal),
+            None,
         ));
         tokio::task::yield_now().await;
         cancel.cancel();

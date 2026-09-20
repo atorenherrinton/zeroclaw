@@ -17,7 +17,65 @@ use zeroclaw_api::channel::{
 
 /// Shared map keyed by `request_id`. Consumed by the receive loop to resolve
 /// the oneshot when an `approval_response` frame arrives.
-pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>;
+pub type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
+
+/// A pending responder plus its exact registration identity. The receive loop
+/// retains its existing remove-and-send interface.
+pub struct PendingApproval {
+    registration_id: Uuid,
+    sender: oneshot::Sender<ChannelApprovalResponse>,
+}
+
+impl PendingApproval {
+    pub fn send(self, response: ChannelApprovalResponse) -> Result<(), ChannelApprovalResponse> {
+        self.sender.send(response)
+    }
+}
+
+struct PendingApprovalRegistration {
+    request_id: String,
+    registration_id: Uuid,
+    receiver: oneshot::Receiver<ChannelApprovalResponse>,
+    pending: PendingApprovals,
+}
+
+impl PendingApprovalRegistration {
+    fn new(pending: &PendingApprovals) -> Self {
+        loop {
+            let request_id = Uuid::new_v4().to_string();
+            let mut entries = pending.lock();
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                entries.entry(request_id.clone())
+            {
+                let registration_id = Uuid::new_v4();
+                let (sender, receiver) = oneshot::channel();
+                slot.insert(PendingApproval {
+                    registration_id,
+                    sender,
+                });
+                return Self {
+                    request_id,
+                    registration_id,
+                    receiver,
+                    pending: Arc::clone(pending),
+                };
+            }
+        }
+    }
+}
+
+impl Drop for PendingApprovalRegistration {
+    fn drop(&mut self) {
+        self.receiver.close();
+        let mut pending = self.pending.lock();
+        if pending
+            .get(&self.request_id)
+            .is_some_and(|entry| entry.registration_id == self.registration_id)
+        {
+            pending.remove(&self.request_id);
+        }
+    }
+}
 
 /// Construct an empty pending-approvals registry for a fresh connection.
 pub fn new_pending_approvals() -> PendingApprovals {
@@ -109,9 +167,10 @@ impl Channel for WsApprovalChannel {
         _recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
-        let request_id = Uuid::new_v4().to_string();
-        let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(request_id.clone(), tx);
+        // The receiver and registration are owned before event delivery can
+        // block, so cancellation covers both send and operator-response waits.
+        let mut registration = PendingApprovalRegistration::new(&self.pending);
+        let request_id = registration.request_id.clone();
 
         let event = TurnEvent::ApprovalRequest {
             request_id: request_id.clone(),
@@ -124,18 +183,16 @@ impl Channel for WsApprovalChannel {
             // pending entry and let the agent's caller treat this the same
             // as any other channel that returns None: fall through to
             // auto-deny per ApprovalManager policy.
-            self.pending.lock().remove(&request_id);
             return Ok(None);
         }
 
-        match tokio::time::timeout(self.timeout, rx).await {
+        match tokio::time::timeout(self.timeout, &mut registration.receiver).await {
             Ok(Ok(decision)) => Ok(Some(AttributedApprovalResponse::operator(decision))),
             Ok(Err(_)) => {
                 // Sender dropped without responding (connection closed
                 // mid-prompt). Treat as deny rather than None so the agent
                 // does not silently fall back to "no channel handled this" —
                 // but mark it Unreachable, because nobody answered.
-                self.pending.lock().remove(&request_id);
                 Ok(Some(AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::Unreachable,
@@ -145,7 +202,6 @@ impl Channel for WsApprovalChannel {
                 // Timeout: pop and deny. Mirrors Telegram / Slack behaviour
                 // when the operator does not tap a button in time. This deny is
                 // the runtime's, not the operator's.
-                self.pending.lock().remove(&request_id);
                 Ok(Some(AttributedApprovalResponse::from_runtime(
                     ChannelApprovalResponse::Deny,
                     ApprovalSource::TimedOut,
@@ -159,6 +215,117 @@ impl Channel for WsApprovalChannel {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_send_removes_registration_before_drop_returns() {
+        let (tx, mut events) = mpsc::channel(1);
+        tx.send(TurnEvent::ApprovalRequest {
+            request_id: "occupied".into(),
+            tool_name: "fixture".into(),
+            arguments_summary: String::new(),
+            timeout_secs: 60,
+        })
+        .await
+        .unwrap();
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending.clone(), Duration::from_secs(60));
+        let request = approval_request();
+        let mut wait = Box::pin(channel.request_approval_attributed("fixture", &request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err()
+        );
+        assert_eq!(pending.lock().len(), 1);
+        drop(wait);
+        assert!(pending.lock().is_empty());
+        assert!(
+            matches!(events.recv().await, Some(TurnEvent::ApprovalRequest { request_id, .. }) if request_id == "occupied")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "cancelled send must not publish later"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_rejects_late_response_and_new_request_can_complete() {
+        let (tx, mut events) = mpsc::channel(2);
+        let pending = new_pending_approvals();
+        let channel = WsApprovalChannel::new(tx, pending.clone(), Duration::from_secs(60));
+        let request = approval_request();
+        let mut first = Box::pin(channel.request_approval_attributed("fixture", &request));
+        let first_id = tokio::select! {
+            biased;
+            _ = &mut first => panic!("approval ended without a response"),
+            event = events.recv() => match event.unwrap() {
+                TurnEvent::ApprovalRequest { request_id, .. } => request_id,
+                _ => panic!("approval event required"),
+            },
+        };
+        drop(first);
+        assert!(!pending.lock().contains_key(&first_id));
+        let mut next = Box::pin(channel.request_approval_attributed("fixture", &request));
+        let next_id = tokio::select! {
+            biased;
+            _ = &mut next => panic!("new approval ended without a response"),
+            event = events.recv() => match event.unwrap() {
+                TurnEvent::ApprovalRequest { request_id, .. } => request_id,
+                _ => panic!("approval event required"),
+            },
+        };
+        assert_ne!(first_id, next_id);
+        assert!(
+            pending.lock().remove(&first_id).is_none(),
+            "late response has no owner"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut next)
+                .await
+                .is_err()
+        );
+        pending
+            .lock()
+            .remove(&next_id)
+            .unwrap()
+            .send(ChannelApprovalResponse::Approve)
+            .unwrap();
+        assert_eq!(
+            next.await.unwrap().unwrap().response,
+            ChannelApprovalResponse::Approve
+        );
+        assert!(pending.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_registration_preserves_replacement_under_same_key() {
+        let pending = new_pending_approvals();
+        let registration = PendingApprovalRegistration::new(&pending);
+        let key = registration.request_id.clone();
+        let old = pending.lock().remove(&key).unwrap();
+        let (sender, receiver) = oneshot::channel();
+        let replacement_id = Uuid::new_v4();
+        pending.lock().insert(
+            key.clone(),
+            PendingApproval {
+                registration_id: replacement_id,
+                sender,
+            },
+        );
+        drop(registration);
+        assert!(old.send(ChannelApprovalResponse::AlwaysApprove).is_err());
+        assert_eq!(
+            pending.lock().get(&key).unwrap().registration_id,
+            replacement_id
+        );
+        pending
+            .lock()
+            .remove(&key)
+            .unwrap()
+            .send(ChannelApprovalResponse::Approve)
+            .unwrap();
+        assert_eq!(receiver.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
 
     #[test]
     fn ws_approval_channel_declines_free_form_ask() {

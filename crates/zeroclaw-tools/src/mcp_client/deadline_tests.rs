@@ -188,7 +188,8 @@ async fn parent_bounds_config_lock_and_prewrite_waits_without_reset_or_write() {
         true,
     );
     assert!(!server.recovery.is_poisoned());
-    server.recovery.finish(0);
+    let checked = server.recovery.checked_controls().unwrap();
+    server.recovery.finish(0, &checked);
     assert_deadline(
         limited(server.call_tool("effect", json!({})))
             .await

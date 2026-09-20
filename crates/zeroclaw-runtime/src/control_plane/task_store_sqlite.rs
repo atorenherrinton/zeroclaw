@@ -400,7 +400,10 @@ impl TaskRegistry for SqliteTaskStore {
         let (id, agent, boot_id) = (id.to_owned(), agent.to_owned(), boot_id.to_owned());
         tokio::task::spawn_blocking(move || {
             let conn = connection.lock();
-            let changed = conn.execute("UPDATE tasks SET agent=?2 WHERE id=?1 AND kind='channel_turn' AND status='received' AND owner_boot_id=?3", params![id, agent, boot_id])?;
+            // Pre-turn routing runs inside the queued worker so a slow
+            // classifier cannot stall channel ingress or /stop. Ownership is
+            // immutable once execution reaches Running.
+            let changed = conn.execute("UPDATE tasks SET agent=?2 WHERE id=?1 AND kind='channel_turn' AND status IN ('received','queued') AND owner_boot_id=?3", params![id, agent, boot_id])?;
             anyhow::ensure!(changed == 1, "channel turn is no longer available for routing");
             Ok(())
         }).await?
@@ -832,6 +835,47 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn channel_assignment_can_change_while_queued_but_never_after_execution() {
+        let store = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("route", "main", 0, "boot");
+        task.kind = TaskKind::ChannelTurn;
+        task.status = TaskStatus::Received;
+        store
+            .admit_channel_turn(task, "synthetic".into())
+            .await
+            .unwrap();
+        store
+            .assign_channel_turn("route", "main", "boot")
+            .await
+            .unwrap();
+        store
+            .checkpoint_channel_turn("route", TaskStatus::Queued, None, false)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .assign_channel_turn("route", "coding", "wrong-boot")
+                .await
+                .is_err()
+        );
+        store
+            .assign_channel_turn("route", "coding", "boot")
+            .await
+            .unwrap();
+        store
+            .checkpoint_channel_turn("route", TaskStatus::Running, None, false)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .assign_channel_turn("route", "main", "boot")
+                .await
+                .is_err()
+        );
+        assert_eq!(store.get("route").await.unwrap().unwrap().agent, "coding");
     }
 
     #[tokio::test]

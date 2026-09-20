@@ -457,12 +457,32 @@ impl AuthProfilesStore {
         );
         let tmp_path = self.path.with_file_name(tmp_name);
 
-        fs::write(&tmp_path, &json).await.with_context(|| {
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        // Auth updates replace the inode, so the old file's permissions do not
+        // carry over. Restrict the temporary file before any token bytes are
+        // written, including when a later write or rename fails.
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&tmp_path).await.with_context(|| {
+            format!(
+                "Failed to create temporary auth profile file at {}",
+                tmp_path.display()
+            )
+        })?;
+        file.write_all(&json).await.with_context(|| {
             format!(
                 "Failed to write temporary auth profile file at {}",
                 tmp_path.display()
             )
         })?;
+        file.flush().await.with_context(|| {
+            format!(
+                "Failed to flush temporary auth profile file at {}",
+                tmp_path.display()
+            )
+        })?;
+        drop(file);
 
         fs::rename(&tmp_path, &self.path).await.with_context(|| {
             format!(
@@ -775,6 +795,72 @@ mod tests {
 
         let contents = tokio::fs::read_to_string(path).await.unwrap();
         assert!(contents.contains("\"schema_version\": 1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_store_creation_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_token("anthropic", "default", "private-token".into());
+        store.upsert_profile(profile.clone(), true).await.unwrap();
+
+        let mode = fs::metadata(store.path())
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auth files must be private regardless of umask"
+        );
+        let data = store.load().await.unwrap();
+        assert_eq!(
+            data.profiles[&profile.id].token.as_deref(),
+            Some("private-token")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_store_update_replaces_world_readable_file_with_owner_only_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = TempDir::new().unwrap();
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        let profile = AuthProfile::new_token("anthropic", "default", "old-token".into());
+        store.upsert_profile(profile.clone(), true).await.unwrap();
+        fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        let previous_file = std::fs::File::open(store.path()).unwrap();
+        let previous_inode = previous_file.metadata().unwrap().ino();
+
+        store
+            .update_profile(&profile.id, |profile| {
+                profile.token = Some("refreshed-token".into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let metadata = fs::metadata(store.path()).await.unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            metadata.ino(),
+            previous_inode,
+            "updates must replace atomically"
+        );
+        let data = store.load().await.unwrap();
+        assert_eq!(
+            data.profiles[&profile.id].token.as_deref(),
+            Some("refreshed-token")
+        );
+        assert_eq!(data.active_profiles["anthropic"], profile.id);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]

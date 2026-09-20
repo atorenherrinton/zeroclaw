@@ -426,6 +426,7 @@ fn scrub_agent_refs(cfg: &mut Config, alias: &str) {
     }
     for agent in cfg.agents.values_mut() {
         agent.delegates.retain(|d| d.agent().trim() != alias); // trimmed (validate trims)
+        agent.direct_routing.candidates.remove(alias);
         agent.workspace.access.retain(|k, _| k.as_str() != alias); // raw
         agent
             .workspace
@@ -506,6 +507,7 @@ fn delete_channel(
 fn scrub_channel_refs(cfg: &mut Config, target: &str) {
     for agent in cfg.agents.values_mut() {
         agent.channels.retain(|ch| ch.trim() != target);
+        agent.direct_routing.channels.retain(|ch| ch != target);
     }
     cfg.escalation
         .alert_channels
@@ -710,6 +712,13 @@ fn rewrite_agent_refs(cfg: &mut Config, old: &str, new: &str) -> Vec<String> {
     }
     for (name, agent) in cfg.agents.iter_mut() {
         let mut touched = false;
+        if let Some(description) = agent.direct_routing.candidates.remove(old) {
+            agent
+                .direct_routing
+                .candidates
+                .insert(new.to_string(), description);
+            touched = true;
+        }
         for d in agent.delegates.iter_mut() {
             if d.agent().trim() == old {
                 d.agent = new.to_string(); // trimmed (validate trims delegates)
@@ -882,6 +891,12 @@ fn rewrite_channel_refs(cfg: &mut Config, channel_type: &str, old: &str, new: &s
         for ch in agent.channels.iter_mut() {
             if ch.trim() == old_target {
                 *ch = new_target.as_str().into();
+                touched = true;
+            }
+        }
+        for ch in &mut agent.direct_routing.channels {
+            if *ch == old_target {
+                *ch = new_target.clone();
                 touched = true;
             }
         }
@@ -1093,6 +1108,15 @@ fn collect_channel_refs(cfg: &Config, channel_type: &str, alias: &str, sites: &m
     // matching, mirror the dotted-vs-bare rule, and keep the raw text.
     // agents.<X>.channels[] — empty list is valid (delegate-only agents).
     for (name, agent) in sorted_agents(cfg) {
+        for (i, ch) in agent.direct_routing.channels.iter().enumerate() {
+            if *ch == target {
+                sites.push(RefSite::soft(
+                    format!("agents.{name}.direct_routing.channels[{i}]"),
+                    ScrubAction::DropFromVec { index: i },
+                    ch,
+                ));
+            }
+        }
         for (i, ch) in agent.channels.iter().enumerate() {
             if ch.trim() == target {
                 sites.push(RefSite::soft(
@@ -1203,6 +1227,15 @@ fn collect_agent_refs(cfg: &Config, alias: &str, sites: &mut Vec<RefSite>) {
         ));
     }
     for (name, agent) in sorted_agents(cfg) {
+        if agent.direct_routing.candidates.contains_key(alias) {
+            sites.push(RefSite::soft(
+                format!("agents.{name}.direct_routing.candidates.{alias}"),
+                ScrubAction::RemoveMapKey {
+                    key: alias.to_string(),
+                },
+                alias,
+            ));
+        }
         // delegates[].agent — validate() trims.
         for (i, d) in agent.delegates.iter().enumerate() {
             if d.agent().trim() == alias {
@@ -2372,6 +2405,61 @@ mod tests {
     }
 
     // ── rename_with_cascade─────────────────────────────────────────
+
+    #[test]
+    fn direct_routing_candidate_rename_and_delete_preserve_alias_contract() {
+        let mut cfg = empty_config();
+        cfg.agents
+            .insert("worker".into(), AliasedAgentConfig::default());
+        let mut owner = AliasedAgentConfig::default();
+        owner
+            .direct_routing
+            .candidates
+            .insert("worker".into(), "Code repair".into());
+        cfg.agents.insert("owner".into(), owner);
+        assert_eq!(
+            find_all_references(&cfg, &AliasKind::Agent, "worker").len(),
+            1
+        );
+        rename_with_cascade(&mut cfg, &AliasKind::Agent, "worker", "developer").unwrap();
+        assert_eq!(
+            cfg.agents["owner"].direct_routing.candidates["developer"],
+            "Code repair"
+        );
+        assert!(
+            !cfg.agents["owner"]
+                .direct_routing
+                .candidates
+                .contains_key("worker")
+        );
+        delete_with_cascade(
+            &mut cfg,
+            &AliasKind::Agent,
+            "developer",
+            CascadePolicy::RefuseOnHard,
+        )
+        .unwrap();
+        assert!(cfg.agents["owner"].direct_routing.candidates.is_empty());
+    }
+
+    #[test]
+    fn direct_routing_channel_rename_and_delete_preserve_allowlist() {
+        let mut cfg = empty_config();
+        cfg.create_map_key("channels.discord", "main").unwrap();
+        let mut owner = AliasedAgentConfig::default();
+        owner.channels.push("discord.main".into());
+        owner.direct_routing.channels.push("discord.main".into());
+        cfg.agents.insert("owner".into(), owner);
+        let kind = channel_kind();
+        assert_eq!(find_all_references(&cfg, &kind, "main").len(), 2);
+        rename_with_cascade(&mut cfg, &kind, "main", "primary").unwrap();
+        assert_eq!(
+            cfg.agents["owner"].direct_routing.channels,
+            vec!["discord.primary"]
+        );
+        delete_with_cascade(&mut cfg, &kind, "primary", CascadePolicy::RefuseOnHard).unwrap();
+        assert!(cfg.agents["owner"].direct_routing.channels.is_empty());
+    }
 
     #[test]
     fn rename_agent_rewrites_every_ref_kind() {

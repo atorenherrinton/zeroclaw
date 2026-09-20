@@ -2028,7 +2028,7 @@ mod client {
 // ─── inbound ───────────────────────────────────────────────────────────────
 mod inbound {
     use std::{
-        collections::{HashMap, HashSet},
+        collections::HashSet,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -2075,7 +2075,7 @@ mod inbound {
         pub transcription: Option<super::TranscriptionResolver>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: zeroclaw_api::inbound::Sender,
-        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+        pub pending_approvals: Arc<crate::util::PendingApprovalMap>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -4063,7 +4063,7 @@ pub struct MatrixChannel {
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<TranscriptionResolver>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+    pending_approvals: Arc<crate::util::PendingApprovalMap>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -4111,7 +4111,7 @@ impl MatrixChannel {
             workspace_dir: None,
             transcription: None,
             client: tokio::sync::OnceCell::new(),
-            pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+            pending_approvals: Arc::new(crate::util::PendingApprovalMap::default()),
             streaming_state: Arc::new(TokioRwLock::new(streaming_state)),
             threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
             alias_cache: Arc::new(TokioRwLock::new(HashMap::new())),
@@ -5035,9 +5035,11 @@ impl Channel for MatrixChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
+        self.pending_approvals.lock().insert(
             token.clone(),
             crate::util::PendingApproval {
+                #[cfg(any(feature = "channel-telegram", test))]
+                registration_id: uuid::Uuid::new_v4(),
                 sender: tx,
                 destination,
                 tool_name: request.tool_name.clone(),
@@ -5046,14 +5048,14 @@ impl Channel for MatrixChannel {
 
         let send_msg = SendMessage::new(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
-            self.pending_approvals.lock().await.remove(&token);
+            self.pending_approvals.lock().remove(&token);
             return Err(e);
         }
 
         let timeout = Duration::from_secs(self.config.approval_timeout_secs.max(1));
         let result = tokio::time::timeout(timeout, rx).await;
         if result.is_err() {
-            self.pending_approvals.lock().await.remove(&token);
+            self.pending_approvals.lock().remove(&token);
         }
         // Only the first arm is an operator decision; the other two are the
         // runtime denying because nobody replied, and must say so.
@@ -5509,7 +5511,7 @@ mod tests {
     // event parsing → media download/save → attach_media → transcript
     // insertion, with only the homeserver and STT provider mocked at HTTP.
     mod inbound_route {
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashSet;
         use std::sync::Arc;
         use std::sync::atomic::AtomicBool;
         use std::time::Duration;
@@ -5599,7 +5601,7 @@ mod tests {
                 )),
                 workspace_dir: Some(Arc::new(workspace.to_path_buf())),
                 tx,
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_approvals: Arc::new(crate::util::PendingApprovalMap::default()),
                 threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
                 bot_user_id: user_id!("@bot:localhost").to_owned(),
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
@@ -6085,7 +6087,7 @@ mod tests {
                 transcription: None,
                 workspace_dir: None,
                 tx: tx.into(),
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
+                pending_approvals: Arc::new(crate::util::PendingApprovalMap::default()),
                 threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
                 bot_user_id: user_id!("@bot:localhost").to_owned(),
                 bot_display_name: Arc::new(TokioRwLock::new(None)),
@@ -6096,10 +6098,12 @@ mod tests {
             let (wrong_tx, _wrong_rx) = oneshot::channel();
             let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
             {
-                let mut approvals = ctx.pending_approvals.lock().await;
+                let mut approvals = ctx.pending_approvals.lock();
                 approvals.insert(
                     "AUTH0001".into(),
                     crate::util::PendingApproval {
+                        #[cfg(any(feature = "channel-telegram", test))]
+                        registration_id: uuid::Uuid::new_v4(),
                         sender: approved_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -6108,6 +6112,8 @@ mod tests {
                 approvals.insert(
                     "WRONG001".into(),
                     crate::util::PendingApproval {
+                        #[cfg(any(feature = "channel-telegram", test))]
+                        registration_id: uuid::Uuid::new_v4(),
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
                         tool_name: "tool".to_string(),
@@ -6116,6 +6122,8 @@ mod tests {
                 approvals.insert(
                     "OTHER001".into(),
                     crate::util::PendingApproval {
+                        #[cfg(any(feature = "channel-telegram", test))]
+                        registration_id: uuid::Uuid::new_v4(),
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
                         tool_name: "tool".to_string(),
@@ -6168,7 +6176,7 @@ mod tests {
                     .is_err(),
                 "approval-shaped events must not reach agent dispatch"
             );
-            let approvals = ctx.pending_approvals.lock().await;
+            let approvals = ctx.pending_approvals.lock();
             assert!(approvals.contains_key("WRONG001"));
             assert!(approvals.contains_key("OTHER001"));
         }
@@ -6258,11 +6266,13 @@ mod tests {
 
         #[tokio::test]
         async fn pending_approval_requires_allowed_user_and_origin_room() {
-            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
+            let pending = crate::util::PendingApprovalMap::default();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
+            pending.lock().insert(
                 "APPROVAL".to_string(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),
@@ -6288,7 +6298,7 @@ mod tests {
                     .await,
                     crate::util::PendingApprovalResolution::Rejected,
                 );
-                assert!(pending.lock().await.contains_key("APPROVAL"));
+                assert!(pending.lock().contains_key("APPROVAL"));
             }
 
             assert_eq!(
@@ -6305,7 +6315,7 @@ mod tests {
                 .await,
                 crate::util::PendingApprovalResolution::Rejected,
             );
-            assert!(pending.lock().await.contains_key("APPROVAL"));
+            assert!(pending.lock().contains_key("APPROVAL"));
 
             assert_eq!(
                 crate::util::resolve_pending_approval(
@@ -6324,9 +6334,11 @@ mod tests {
             assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
 
             let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
+            pending.lock().insert(
                 "APPROVE2".to_string(),
                 crate::util::PendingApproval {
+                    #[cfg(any(feature = "channel-telegram", test))]
+                    registration_id: uuid::Uuid::new_v4(),
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
                     tool_name: "tool".to_string(),

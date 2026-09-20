@@ -1439,6 +1439,9 @@ pub enum SessionUpdateEvent {
     TurnComplete {
         session_id: String,
         outcome: TurnCompletionOutcome,
+        /// Allowlisted control-flow projection, never an error payload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_cause: Option<TurnStopCause>,
         /// Final assistant text (Completed) or partial accumulated text
         /// at cancel point (Cancelled).
         content: String,
@@ -1465,6 +1468,31 @@ pub enum TurnCompletionOutcome {
     Completed,
     Cancelled,
     Failed,
+}
+
+/// Stable public categories derived from owned runtime evidence or the
+/// existing external cancellation registration. Never infer a human actor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStopCause {
+    EmergencyStop,
+    Deadline,
+    ClientRpc,
+    AdminKill,
+    SessionRemoved,
+    SettlementIncomplete,
+}
+impl TurnStopCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EmergencyStop => "emergency_stop",
+            Self::Deadline => "deadline",
+            Self::ClientRpc => "client_rpc",
+            Self::AdminKill => "admin_kill",
+            Self::SessionRemoved => "session_removed",
+            Self::SettlementIncomplete => "settlement_incomplete",
+        }
+    }
 }
 
 pub use crate::quickstart::{

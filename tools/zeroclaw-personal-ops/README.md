@@ -421,3 +421,46 @@ The capability defaults closed and does not change `files_prepare` sharing roots
 The initial format scope is a bounded MP4 envelope recognizer. The contract
 documents inspect/confirm, idempotent replay, uncertain outcomes, operator policy,
 and the independent installation and live verification still required.
+
+## Bounded MCP activity reads
+
+`operations_activity {}` and `personal_briefing {}` return bounded summaries
+from the existing SQLite ledger, including section totals, source availability,
+verification times, stale/error warnings and explicit omissions. Briefing
+operation, project, shipment and connector totals count only the matching
+exceptions/active projects. Missing or omitted sources never mean an empty
+calendar or inbox. Snapshot collection counts describe cached data; upstream
+`truncated`/`nextPageToken` remain explicit and are not a claim of completeness.
+
+Continue a section with the same tool and `{"section":"receipts","offset":N,
+"limit":10}`, using its returned `next_offset`. Totals cover the ledger rather
+than the dashboard's recent-record window. These are current-state pages;
+concurrent inserts or updates can shift their order. Omitted receipt evidence
+remains available in the authenticated dashboard. Activity summaries exclude
+exact message reviews: `outbox_status` retains complete immutable review and
+receipt semantics before a send; an overview is never a replacement review.
+
+Inspect cached source data without refreshing or executing an action through
+`operations_activity {"source":"github","pointer":"","limit":10}`. Children
+include JSON pointers, an exact/preview flag, and a page cursor. Follow a child
+pointer for omitted data. Strings are returned in UTF-8-safe chunks with offsets
+counted in Unicode scalar values. Pass the returned `revision` for all subsequent
+reads of that snapshot; a nonzero offset requires it, and changed snapshots fail
+explicitly so pages cannot silently combine different source revisions.
+
+The helper measures the nested encoded MCP/native-history envelope, including
+receipt allowance, against a 12 KiB presentation ceiling. It defers whole rows
+or returns marked source previews, never cuts a JSON result into fragments.
+Runtime per-result and batch budgets still apply; unusually small configured
+limits or large tool batches can still reject results. Invalid reads remain MCP
+errors. HTTP activity, CLI activity, background alert behavior, stored snapshots,
+exact review/send tools and their authorization rules are unchanged. Refreshing
+a briefing retains its existing source-refresh behavior; continuation reads
+should use `refresh:false`.
+
+Validation: `cargo test --manifest-path tools/zeroclaw-personal-ops/Cargo.toml
+--locked` includes real MCP-process tests with synthetic large escaped/Unicode
+snapshots, all-record pagination, revision mismatch, failures, exception filters
+and unchanged exact reviews. No external send is performed. Roll back only the
+helper executable using its preserved signing identity and reconnect MCP clients;
+keep the ledger and all later delivery receipts intact.

@@ -345,7 +345,9 @@ fn model_probe_status_label(outcome: ModelProbeOutcome) -> &'static str {
 fn classify_model_probe_error(err_message: &str) -> ModelProbeOutcome {
     let lower = err_message.to_lowercase();
 
-    if lower.contains("does not support live model discovery") {
+    if lower.contains("does not support live model discovery")
+        || lower.contains("live model listing is not supported for this model_provider")
+    {
         return ModelProbeOutcome::Skipped;
     }
 
@@ -1913,6 +1915,49 @@ fn parse_rfc3339(raw: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn unsupported_model_catalog_is_skipped_without_hiding_provider_errors() {
+        for message in [
+            "model_provider does not support live model discovery",
+            "live model listing is not supported for this model_provider",
+            "catalog probe: live model listing is not supported for this model_provider",
+        ] {
+            assert_eq!(
+                classify_model_probe_error(message),
+                ModelProbeOutcome::Skipped
+            );
+        }
+        assert_eq!(
+            classify_model_probe_error("401 unauthorized"),
+            ModelProbeOutcome::AuthOrAccess
+        );
+        assert_eq!(
+            classify_model_probe_error("connection refused"),
+            ModelProbeOutcome::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_unavailable_is_a_warning_in_structured_diagnostics() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = config_with_install_root(&tmp);
+        config
+            .providers
+            .models
+            .ensure("openai", "subscription")
+            .expect("known provider type")
+            .requires_openai_auth = true;
+
+        // The Codex adapter inherits the unsupported catalog implementation;
+        // this reaches the real provider factory and diagnostic severity path
+        // without using credentials or making an external provider request.
+        let results = probe_models(&config).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].severity, Severity::Warn);
+        assert!(results[0].message.starts_with("openai.subscription:"));
+        assert!(results[0].message.contains("not supported"));
+    }
 
     #[test]
     fn collapse_model_probes_groups_identical_and_breaks_divergent() {

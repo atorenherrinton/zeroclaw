@@ -274,7 +274,8 @@ pub(crate) async fn attempt_codex_recovery(
     receipt_generator: Option<&ReceiptGenerator>,
     ctx: &TurnCtx<'_>,
     will_retry: bool,
-) -> CodexRecoveryResult {
+) -> anyhow::Result<CodexRecoveryResult> {
+    super::outcome::until_cancelled(ctx.cancellation_token, std::future::ready(())).await?;
     let failure = crate::i18n::get_required_cli_string(trigger.label_key());
     let trigger_text = crate::i18n::get_required_cli_string_with_args(
         "turn-codex-recovery-triggered",
@@ -288,7 +289,7 @@ pub(crate) async fn attempt_codex_recovery(
     if explicitly_excluded || find_tool(tools_registry, CODEX_TOOL).is_none() {
         let result = CodexRecoveryResult::new(trigger, RecoveryStatus::Unavailable);
         send_status_with_next_action(ctx, "turn-codex-recovery-unavailable", will_retry).await;
-        return result;
+        return Ok(result);
     }
 
     send_status(
@@ -315,13 +316,15 @@ pub(crate) async fn attempt_codex_recovery(
         )
     });
     if let (Some(tx), Some((arguments, tool_provenance))) = (ctx.on_delta, &stream_call) {
-        let _ = tx
-            .send(StreamDelta::ToolStart {
+        let _ = super::outcome::until_cancelled(
+            ctx.cancellation_token,
+            tx.send(StreamDelta::ToolStart {
                 tool: CODEX_TOOL.to_string(),
                 arguments: std::sync::Arc::clone(arguments),
                 tool_provenance: *tool_provenance,
-            })
-            .await;
+            }),
+        )
+        .await;
     }
     let started = std::time::Instant::now();
     let outcome = zeroclaw_tools::codex_cli::scope_zeroclaw_recovery(
@@ -341,8 +344,9 @@ pub(crate) async fn attempt_codex_recovery(
     .await;
 
     if let (Some(tx), Some((arguments, tool_provenance))) = (ctx.on_delta, stream_call) {
-        let _ = tx
-            .send(StreamDelta::ToolComplete {
+        let _ = super::outcome::until_cancelled(
+            ctx.cancellation_token,
+            tx.send(StreamDelta::ToolComplete {
                 tool: CODEX_TOOL.to_string(),
                 arguments,
                 tool_provenance,
@@ -352,12 +356,16 @@ pub(crate) async fn attempt_codex_recovery(
                 ),
                 success: outcome.as_ref().is_ok_and(|result| result.success),
                 error: None,
-            })
-            .await;
+            }),
+        )
+        .await;
     }
 
     let status = match outcome {
         Ok(outcome) if outcome.success => parse_status(&outcome.output),
+        Err(error) if crate::agent::tool_execution::is_terminal_tool_error(&error) => {
+            return Err(error);
+        }
         Ok(_) | Err(_) => RecoveryStatus::Failed,
     };
     let result = CodexRecoveryResult::new(trigger, status);
@@ -373,7 +381,7 @@ pub(crate) async fn attempt_codex_recovery(
     } else {
         send_status_with_next_action(ctx, progress_key, will_retry).await;
     }
-    result
+    Ok(result)
 }
 
 async fn send_status_with_next_action(ctx: &TurnCtx<'_>, status_key: &str, will_retry: bool) {
@@ -392,7 +400,11 @@ async fn send_status(ctx: &TurnCtx<'_>, mut message: String) {
         message.push('\n');
     }
     if let Some(tx) = ctx.on_delta {
-        let _ = tx.send(StreamDelta::Status(message)).await;
+        let _ = super::outcome::until_cancelled(
+            ctx.cancellation_token,
+            tx.send(StreamDelta::Status(message)),
+        )
+        .await;
     }
 }
 
@@ -720,7 +732,8 @@ mod tests {
             &ctx,
             true,
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(restricted.status, RecoveryStatus::Unavailable);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         while let Ok(event) = delta_rx.try_recv() {
@@ -736,7 +749,9 @@ mod tests {
         let original_task = "ORIGINAL_TASK_SENTINEL: contact a person";
         let mut zeroclaw_history = vec![ChatMessage::user(original_task)];
         let recovered =
-            attempt_codex_recovery(trigger, &registry, None, &[], None, None, &ctx, true).await;
+            attempt_codex_recovery(trigger, &registry, None, &[], None, None, &ctx, true)
+                .await
+                .unwrap();
         zeroclaw_history.push(recovered.history_message());
 
         assert_eq!(recovered.status, RecoveryStatus::Applied);

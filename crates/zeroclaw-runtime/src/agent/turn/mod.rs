@@ -3,6 +3,7 @@
 pub(crate) mod approval_gate;
 pub(crate) mod batch_failures;
 pub(crate) mod call_prep;
+mod completion_repair;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
@@ -13,6 +14,7 @@ pub(crate) mod history_window;
 pub(crate) mod knobs;
 pub(crate) mod max_iter;
 pub(crate) mod outcome;
+pub(crate) mod owned_cancellation;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
 pub(crate) mod progress;
@@ -21,6 +23,7 @@ pub(crate) mod provider_call;
 pub(crate) mod recovery;
 pub(crate) mod redact;
 pub(crate) mod results_collect;
+pub(crate) mod sop_settlement;
 pub(crate) mod steering;
 pub(crate) mod stream_consume;
 pub(crate) mod stream_guard;
@@ -97,6 +100,7 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+const MAX_COMMENTARY_CONTINUATIONS: usize = 3;
 
 /// Complete system-prompt variants for the two tool transports supported by a
 /// turn. The caller owns construction; the loop only selects the variant after
@@ -244,6 +248,7 @@ async fn enforce_reported_budget(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
+    cancellation: Option<&CancellationToken>,
 ) {
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
         return;
@@ -259,13 +264,15 @@ async fn enforce_reported_budget(
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
         *history = trimmed;
         if let Some(tx) = event_tx {
-            let _ = tx
-                .send(TurnEvent::HistoryTrimmed {
+            let _ = outcome::until_cancelled(
+                cancellation,
+                tx.send(TurnEvent::HistoryTrimmed {
                     dropped_messages: result.dropped_messages,
                     kept_turns: result.kept_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                })
-                .await;
+                }),
+            )
+            .await;
         }
         observer.record_event(
             &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
@@ -380,7 +387,70 @@ impl<'a> TurnState<'a> {
     }
 }
 
-pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
+pub fn run_tool_call_loop<'a>(
+    p: ToolLoop<'a>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+    // SOP steps recursively enter this boundary. Erase each owned turn future
+    // before nesting scopes, bounding both stack use and recursive Send proofs.
+    Box::pin(run_tool_call_loop_owned(p))
+}
+
+async fn run_tool_call_loop_owned(mut p: ToolLoop<'_>) -> Result<String> {
+    use crate::security::estop_runtime::{self, EstopRuntime};
+
+    // A daemon Agent supplies its live-config resolver. Nested turns inherit
+    // the same installation authority; one-shot entry points use their config.
+    let estop = estop_runtime::current().or_else(|| p.exec.config.map(EstopRuntime::from_config));
+    let owner =
+        owned_cancellation::CancellationOwner::new(estop.clone(), p.cancellation_token.clone());
+    owner.check(None)?;
+    // Never cancel the caller's parent token: a resumed operation is new work,
+    // and must not inherit cancellation of this stopped turn.
+    let cancellation = p
+        .cancellation_token
+        .as_ref()
+        .map_or_else(CancellationToken::new, CancellationToken::child_token);
+    p.cancellation_token = Some(cancellation.clone());
+    // The turn retains the queue outside the cancellable execution future so
+    // error/timeout exits cannot discard undriven canonical SOP claims.
+    let live_sop_queue = crate::sop::executor::new_live_action_queue();
+    let result = estop_runtime::scope_invocation(
+        Some(owner.invocation()),
+        estop_runtime::scope(
+            estop,
+            owned_cancellation::run_turn(
+                &owner,
+                &cancellation,
+                Box::pin(run_tool_call_loop_scoped(p, live_sop_queue.clone())),
+            ),
+        ),
+    )
+    .await;
+    let queued = crate::sop::executor::drain_live_actions(&live_sop_queue);
+    if queued.is_empty() {
+        return result;
+    }
+    let cause = match result {
+        Err(error) => error,
+        Ok(output) => owned_cancellation::completed_after_interruption(
+            output,
+            anyhow::Error::new(sop_settlement::SopPhaseIncomplete {
+                phase: "undriven queue",
+            }),
+        ),
+    };
+    Err(sop_settlement::interrupted(
+        cause,
+        None,
+        queued.into(),
+        Vec::new(),
+    ))
+}
+
+async fn run_tool_call_loop_scoped(
+    p: ToolLoop<'_>,
+    live_sop_queue: crate::sop::executor::LiveActionQueue,
+) -> Result<String> {
     // Narrow wiring only: the decomposed memory crate owns promotion policy.
     // Every nested call installs its own fail-closed scope, never inheriting a
     // parent's owner authority. Parallel tools use join_all in the same task.
@@ -404,16 +474,17 @@ pub async fn run_tool_call_loop(p: ToolLoop<'_>) -> Result<String> {
             p.exec.max_tool_result_chars
         };
     }
-    zeroclaw_api::deadline::run_inherited(
-        zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
+    zeroclaw_api::memory_promotion::OWNER_RECALL_CONTEXT
         // Keep the task-local wrapper from embedding the turn engine's large
         // state machine in another stack-resident future.
-        .scope(context, Box::pin(run_tool_call_loop_inner(p))),
-    )
+        .scope(context, Box::pin(run_tool_call_loop_inner(p, live_sop_queue)))
     .await
 }
 
-async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
+async fn run_tool_call_loop_inner(
+    mut p: ToolLoop<'_>,
+    live_sop_queue: crate::sop::executor::LiveActionQueue,
+) -> Result<String> {
     let model_switch_state = p
         .exec
         .model_switch_callback
@@ -519,21 +590,24 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         {
             let scopes: Vec<Option<&str>> =
                 turn_memory.sessions.iter().map(|s| s.as_deref()).collect();
-            let context = crate::agent::memory_inject::render_memory_context(
-                turn_memory.handle,
-                observer,
-                &turn_memory.query,
-                &scopes,
-                &turn_memory.cfg,
-                exclude_conversation,
-                TurnMeta {
-                    agent_alias,
-                    parent_agent_alias,
-                    turn_id,
-                    channel_name,
-                },
+            let context = outcome::until_cancelled(
+                cancellation_token.as_ref(),
+                crate::agent::memory_inject::render_memory_context(
+                    turn_memory.handle,
+                    observer,
+                    &turn_memory.query,
+                    &scopes,
+                    &turn_memory.cfg,
+                    exclude_conversation,
+                    TurnMeta {
+                        agent_alias,
+                        parent_agent_alias,
+                        turn_id,
+                        channel_name,
+                    },
+                ),
             )
-            .await;
+            .await?;
             if !context.is_empty() {
                 let existing = &turn_state.history[last_user_idx].content;
                 turn_state.history[last_user_idx].content = format!("{context}{existing}");
@@ -569,6 +643,14 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
     // Accumulated display text across all tool-loop calls.
     let mut accumulated_display_text = String::new();
     let mut malformed_tool_protocol_retries: usize = 0;
+    // Explicit intermediate responses advance the same turn, with normal
+    // cancellation, cost and iteration limits. Repeated commentary alone must
+    // not keep a turn alive forever.
+    let mut consecutive_commentary_only: usize = 0;
+    // This turn owns one corrective request for an unstarted promise-only
+    // response. Execution evidence remains in history, not another counter.
+    let mut initial_progress_repairs: usize = 0;
+    let mut completion_repair_pending = false;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -714,15 +796,17 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     );
                 }
                 if let Some(tx) = event_tx.as_ref() {
-                    let _ = tx
-                        .send(TurnEvent::HistoryTrimmed {
+                    let _ = outcome::until_cancelled(
+                        cancellation_token.as_ref(),
+                        tx.send(TurnEvent::HistoryTrimmed {
                             dropped_messages: result.dropped_messages,
                             kept_turns: result.kept_turns,
                             reason: crate::i18n::get_required_cli_string(
                                 "history-trim-reason-budget",
                             ),
-                        })
-                        .await;
+                        }),
+                    )
+                    .await;
                 }
                 observer.record_event(
                     &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
@@ -797,21 +881,26 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        let prepared_messages = prepare_messages_for_iteration(
-            turn_state.history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
+        let prepared_messages = outcome::until_cancelled(
+            cancellation_token.as_ref(),
+            prepare_messages_for_iteration(
+                turn_state.history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            ),
         )
-        .await?;
+        .await??;
         let mut provider_request_messages = prepared_messages.messages;
         let mut hook_selected_model = None;
 
         if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
             let mut candidate_model = active_model.to_string();
-            match hooks
-                .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
-                .await
+            match outcome::until_cancelled(
+                ctx.cancellation_token,
+                hooks.run_before_llm_call(&mut provider_request_messages, &mut candidate_model),
+            )
+            .await?
             {
                 crate::hooks::HookResult::Continue(()) => {
                     hook_selected_model = Some(candidate_model);
@@ -880,15 +969,29 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let llm_started_at = announce_llm_request(
-            &ctx,
-            &provider_request_messages,
-            active_model_provider,
-            active_model_provider_name,
-            provider_request_model,
-            iteration,
+        // Read concurrent task context at the provider boundary, after prompt
+        // reconciliation. Keep it out of history, owner-intent selection and
+        // tool authorization; the channel owner supplies a live bounded view.
+        zeroclaw_api::peer_activity::append_to_request(&mut provider_request_messages);
+
+        // Only this request receives the reminder. It cannot become a user
+        // instruction, alter tool selection, or pollute persisted history.
+        if std::mem::take(&mut completion_repair_pending) {
+            completion_repair::append_instruction(&mut provider_request_messages);
+        }
+
+        let llm_started_at = outcome::until_cancelled(
+            cancellation_token.as_ref(),
+            announce_llm_request(
+                &ctx,
+                &provider_request_messages,
+                active_model_provider,
+                active_model_provider_name,
+                provider_request_model,
+                iteration,
+            ),
         )
-        .await;
+        .await?;
 
         // Unified path via ModelProvider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
@@ -963,7 +1066,12 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         // the turn-level guard for direct/unwrapped providers: a transport
         // success with no final text and no tool calls cannot complete a turn.
         // This runs before response-success telemetry and history mutation.
-        let chat_result = chat_result.and_then(|response| {
+        let chat_result = chat_result.and_then(|mut response| {
+            if let Some(final_text) = zeroclaw_providers::openai_codex::responses_final_text(
+                response.reasoning_content.as_deref(),
+            ) {
+                response.text = Some(final_text);
+            }
             if response.is_semantically_empty_terminal() {
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -983,6 +1091,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             response_streamed_live,
             reported_input_tokens,
             response_usage,
+            commentary_only,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
@@ -1008,21 +1117,28 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_live_deltas,
                     interpreted.input_tokens,
                     interpreted.usage,
+                    interpreted.commentary_only,
                 )
             }
             Err(e) => {
                 crate::agent::cost::settle_provider_attempts(&attempts, None);
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
-                let recovered = try_recover_context_overflow(
-                    turn_state.history,
-                    &e,
-                    iteration,
-                    event_tx.as_ref(),
-                    on_delta.as_ref(),
-                    observer,
-                    context_token_budget,
+                let recovered = outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    try_recover_context_overflow(
+                        turn_state.history,
+                        &e,
+                        iteration,
+                        event_tx.as_ref(),
+                        on_delta.as_ref(),
+                        observer,
+                        context_token_budget,
+                    ),
                 )
-                .await;
+                .await
+                // Recovery is optional; stopping its wait cannot replace the
+                // provider's original error or already-visible stream partial.
+                .unwrap_or(false);
                 if recovered {
                     continue;
                 }
@@ -1116,7 +1232,11 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
             accumulated_display_text.push_str(&fallback);
             if let Some(ref tx) = on_delta {
-                let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
+                let _ = outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    tx.send(StreamDelta::Text(fallback.to_string())),
+                )
+                .await;
             }
             let msg = ChatMessage::assistant(fallback.to_string());
             turn_state.push_dual(msg);
@@ -1160,14 +1280,76 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
             if !tool_calls.is_empty() {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
+                let _ = outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    tx.send(StreamDelta::Status(format!(
                         "\u{1f4ac} Got {} tool call(s) ({llm_secs}s)\n",
                         tool_calls.len()
-                    )))
-                    .await;
+                    ))),
+                )
+                .await;
             }
         }
+
+        // Every preceding round must be a known no-tool continuation. A tool
+        // attempt or other recovery creates a gap even if compaction removes
+        // its history evidence; prose must never cause those effects to replay.
+        let initial_progress_only = iteration
+            == consecutive_commentary_only + initial_progress_repairs
+            && tool_calls.is_empty()
+            && !commentary_only
+            && !tool_specs.is_empty()
+            && completion_repair::is_initial_progress_only(&display_text, turn_state.history);
+        if tool_calls.is_empty() && (commentary_only || initial_progress_only) {
+            turn_state.push_dual(ChatMessage::assistant(assistant_history_content));
+            if !response_streamed_live && !protocol_suppressed {
+                outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text),
+                )
+                .await?;
+                if let Some(tx) = on_delta.as_ref() {
+                    outcome::until_cancelled(
+                        cancellation_token.as_ref(),
+                        events::stream_text_posthoc_chunks(
+                            tx,
+                            &display_text,
+                            cancellation_token.as_ref(),
+                        ),
+                    )
+                    .await??;
+                }
+            }
+            if initial_progress_only {
+                initial_progress_repairs += 1;
+                anyhow::ensure!(
+                    initial_progress_repairs <= 1,
+                    "{}",
+                    crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+                );
+                completion_repair_pending = true;
+            } else {
+                consecutive_commentary_only += 1;
+                anyhow::ensure!(
+                    consecutive_commentary_only <= MAX_COMMENTARY_CONTINUATIONS,
+                    "{}",
+                    crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+                );
+            }
+            if let Some(reported) = reported_input_tokens {
+                enforce_reported_budget(
+                    turn_state.history,
+                    reported as usize,
+                    context_token_budget,
+                    event_tx.as_ref(),
+                    observer,
+                    cancellation_token.as_ref(),
+                )
+                .await;
+            }
+            continue;
+        }
+        consecutive_commentary_only = 0;
 
         if tool_calls.is_empty() {
             ::zeroclaw_log::record!(
@@ -1189,21 +1371,38 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             // If text wasn't streamed live, send it now post-hoc. Gated on
             // event_tx independently of on_delta (never nested — §8.4).
             if !response_streamed_live && !protocol_suppressed {
-                events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text).await;
+                let _ = outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    events::emit_posthoc_turn_chunk(event_tx.as_ref(), &display_text),
+                )
+                .await;
             }
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.
-            if let Some(ref tx) = on_delta
+            let presentation = if let Some(ref tx) = on_delta
                 && !response_streamed_live
                 && !protocol_suppressed
             {
-                events::stream_text_posthoc_chunks(tx, &display_text, cancellation_token.as_ref())
-                    .await?;
-            }
+                outcome::until_cancelled(
+                    cancellation_token.as_ref(),
+                    events::stream_text_posthoc_chunks(
+                        tx,
+                        &display_text,
+                        cancellation_token.as_ref(),
+                    ),
+                )
+                .await
+                .and_then(|result| result)
+            } else {
+                Ok(())
+            };
 
-            let msg = ChatMessage::assistant(response_text.clone());
+            // Accepted model output survives cancelled presentation; this is
+            // not evidence that the consumer received the response.
+            let msg = ChatMessage::assistant(assistant_history_content);
             turn_state.push_dual(msg);
+            presentation?;
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
                     turn_state.history,
@@ -1211,14 +1410,22 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     context_token_budget,
                     event_tx.as_ref(),
                     observer,
+                    cancellation_token.as_ref(),
                 )
                 .await;
             }
             return Ok(accumulated_display_text);
         }
 
-        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::WaitingOnTool, None, false)
-            .await?;
+        outcome::until_cancelled(
+            cancellation_token.as_ref(),
+            zeroclaw_api::turn::checkpoint(
+                zeroclaw_api::turn::TaskStatus::WaitingOnTool,
+                None,
+                false,
+            ),
+        )
+        .await??;
 
         // Relay only the portion of narration the live stream did not already
         // deliver: re-sending the whole thing duplicates it.
@@ -1235,7 +1442,11 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     if !narration.ends_with('\n') {
                         narration.push('\n');
                     }
-                    let _ = tx.send(StreamDelta::Text(narration)).await;
+                    let _ = outcome::until_cancelled(
+                        cancellation_token.as_ref(),
+                        tx.send(StreamDelta::Text(narration)),
+                    )
+                    .await;
                 }
             }
             if !silent {
@@ -1265,7 +1476,6 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        let live_sop_queue = crate::sop::executor::new_live_action_queue();
         let executed_slots = zeroclaw_tools::output_budget::with_round_preview_budget(
             max_tool_result_chars,
             tool_calls.len(),
@@ -1338,7 +1548,9 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                     crate::i18n::get_required_cli_string("turn-tool-batch-not-started")
                 }
                 ToolExecutionSlot::Failed(error) => {
-                    let output = if is_tool_loop_cancelled(&error) {
+                    let output = if crate::security::estop_runtime::is_estop_interrupted(&error) {
+                        crate::i18n::get_required_cli_string("estop-runtime-interrupted")
+                    } else if is_tool_loop_cancelled(&error) {
                         crate::i18n::get_required_cli_string("turn-tool-batch-cancelled")
                     } else {
                         // Project typed evidence for history, but return the original
@@ -1396,7 +1608,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut terminal_error = terminal_failures.into_error();
 
-        record_executed_outcomes(
+        let collected = record_executed_outcomes(
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
@@ -1408,38 +1620,77 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             !stopped_mid_batch,
         )
         .await
-        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))?;
-        // Source admission already checks the actual batch size. Keep the
-        // canonical outcomes intact through final history admission: an equal
-        // per-call excerpt can discard evidence from a batch that fits, or
-        // replace the original source just before a wrapping rejection.
+        .map_err(|budget_error| budget_error.with_prior(terminal_error.take()))
+        .and_then(|()| {
+            // Source admission already checks the actual batch size. Keep the
+            // canonical outcomes intact through final history admission: an equal
+            // per-call excerpt can discard evidence from a batch that fits, or
+            // replace the original source just before a wrapping rejection.
 
+            collect_tool_results(
+                ordered_results,
+                &tool_calls,
+                turn_state.history,
+                &mut loop_detector,
+                &mut recovery_tracker,
+                &loop_ignore_tools,
+                max_tool_result_chars,
+                collected_receipts,
+                model,
+                iteration,
+                turn_id,
+            )
+            .map_err(|error| {
+                // Retain both typed errors: a size failure cannot erase a sibling's
+                // already-known delivery/deadline/cancellation evidence.
+                match error.downcast::<results_collect::ResultBudgetExceeded>() {
+                    Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
+                    Err(error) => error,
+                }
+            })
+        });
+
+        // Retain admitted results in history before any fallible checkpoint.
+        // Rejected results remain owned by the typed error in `collected`.
+        if let Ok(results) = &collected {
+            turn_state.append_tool_round(
+                assistant_history_content,
+                &native_tool_calls,
+                &results.individual_results,
+                &results.tool_results,
+                use_native_tools,
+            );
+        }
+        // A fully completed dispatch is no longer waiting on tools, even when
+        // its results cannot fit history. Record that fact before propagating
+        // admission errors so the channel can legally submit a terminal notice.
+        // Interrupted batches keep their lifecycle and original typed cause.
+        let cancelled_while_settling = cancellation_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        if !stopped_mid_batch
+            && !cancelled_while_settling
+            && let Err(checkpoint_error) = outcome::until_cancelled(
+                cancellation_token.as_ref(),
+                zeroclaw_api::turn::checkpoint(
+                    zeroclaw_api::turn::TaskStatus::Running,
+                    None,
+                    false,
+                ),
+            )
+            .await
+            .and_then(|result| result)
+        {
+            return Err(match collected {
+                Ok(_) => checkpoint_error,
+                Err(result_error) => result_error.context(checkpoint_error),
+            });
+        }
         let CollectedResults {
-            individual_results,
-            tool_results,
             detection_relevant_output,
             mut recovery_trigger,
-        } = collect_tool_results(
-            ordered_results,
-            &tool_calls,
-            turn_state.history,
-            &mut loop_detector,
-            &mut recovery_tracker,
-            &loop_ignore_tools,
-            max_tool_result_chars,
-            collected_receipts,
-            model,
-            iteration,
-            turn_id,
-        )
-        .map_err(|error| {
-            // Retain both typed errors: a size failure cannot erase a sibling's
-            // already-known delivery/deadline/cancellation evidence.
-            match error.downcast::<results_collect::ResultBudgetExceeded>() {
-                Ok(budget_error) => budget_error.with_prior(terminal_error.take()),
-                Err(error) => error,
-            }
-        })?;
+            ..
+        } = collected?;
 
         if !stopped_mid_batch && recovery_trigger.is_none() {
             recovery_trigger = check_identical_output_abort(
@@ -1454,24 +1705,16 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             );
         }
 
-        turn_state.append_tool_round(
-            assistant_history_content,
-            &native_tool_calls,
-            &individual_results,
-            &tool_results,
-            use_native_tools,
-        );
-
         if let Some(error) = terminal_error {
             return Err(error);
         }
-        if stopped_mid_batch {
+        if stopped_mid_batch
+            || cancellation_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
             return Err(ToolLoopCancelled.into());
         }
-        // Checkpoint failures also leave the completed round in history.
-        zeroclaw_api::turn::checkpoint(zeroclaw_api::turn::TaskStatus::Running, None, false)
-            .await?;
-
         let queued_sop_actions = crate::sop::executor::drain_live_actions(&live_sop_queue);
         if !queued_sop_actions.is_empty() {
             // Box the drive future: it inlines the full per-agent re-assembly
@@ -1529,6 +1772,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 context_token_budget,
                 event_tx.as_ref(),
                 observer,
+                cancellation_token.as_ref(),
             )
             .await;
         }
@@ -1547,7 +1791,7 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
                 &ctx,
                 iteration + 1 < max_iterations,
             )
-            .await;
+            .await?;
             turn_state.push_dual(recovery_result.history_message());
             recovery_attempted = true;
             // The bounded repair attempt is a semantic boundary. Retain the
@@ -1559,6 +1803,12 @@ async fn run_tool_call_loop_inner(mut p: ToolLoop<'_>) -> Result<String> {
             last_tool_output_hash = None;
         }
     }
+
+    anyhow::ensure!(
+        consecutive_commentary_only == 0 && !completion_repair_pending,
+        "{}",
+        crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+    );
 
     finish_after_max_iterations(
         model_provider,
@@ -1761,6 +2011,19 @@ pub(crate) async fn assemble_owned_execution(
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
 ) -> Result<OwnedAgentExecution> {
+    let assembly_owner = owned_cancellation::CancellationOwner::new(
+        crate::security::estop_runtime::current().or_else(|| {
+            Some(crate::security::estop_runtime::EstopRuntime::from_config(
+                config,
+            ))
+        }),
+        None,
+    );
+    assembly_owner.check(None)?;
+    #[cfg(test)]
+    if let Ok(probe) = sop_settlement::ASSEMBLY_PROBE.try_with(Arc::clone) {
+        return probe().await;
+    }
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     // The one canonical per-agent runtime-knob surface: identity plus every
     // runtime-profile override baked in. Fail closed on an unknown alias —
@@ -1783,6 +2046,7 @@ pub(crate) async fn assemble_owned_execution(
         .and_then(|(_, _, cfg)| cfg.api_key.clone());
     let memory =
         zeroclaw_memory::create_memory_for_agent(config, alias, resolved_key.as_deref()).await?;
+    assembly_owner.check(None)?;
 
     // Mirror a fresh agent turn: the headless SOP driver reaches this agent's
     // tools via `crate::agent::run`, which builds its runtime from
@@ -1832,6 +2096,7 @@ pub(crate) async fn assemble_owned_execution(
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
     // disconnected — a nested SOP sub-loop must not seize the serial hardware the
     // live daemon holds exclusively.
+    assembly_owner.check(None)?;
     let assembled =
         crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
             config,
@@ -1854,6 +2119,7 @@ pub(crate) async fn assemble_owned_execution(
             emit_assembly_logs: true,
         })
         .await;
+    assembly_owner.check(None)?;
     let mcp_prompt_section = assembled.combined_mcp_prompt_section();
     let crate::tools::scoped::ScopedAssembled {
         registry,
@@ -2013,6 +2279,11 @@ async fn drive_live_sop_actions(
     // distinct step agent per turn, never per step.
     exec_cache: &mut std::collections::HashMap<String, OwnedAgentExecution>,
 ) -> Result<()> {
+    let owner = owned_cancellation::CancellationOwner::new(
+        crate::security::estop_runtime::current()
+            .or_else(|| config.map(crate::security::estop_runtime::EstopRuntime::from_config)),
+        cancellation_token.clone(),
+    );
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
         let mut action = queued.action.clone();
@@ -2022,12 +2293,29 @@ async fn drive_live_sop_actions(
         // consume a later run's allowance.
         let mut deterministic_steps_driven = 0usize;
         loop {
+            let capability = match &action {
+                crate::sop::SopRunAction::DeterministicStep { step, .. } => {
+                    step.capability.as_deref()
+                }
+                _ => None,
+            };
+            if let Err(cause) = owner.check(capability) {
+                return Err(sop_settlement::interrupted(
+                    cause,
+                    Some(sop_settlement::with_action(&queued, action)),
+                    pending,
+                    Vec::new(),
+                ));
+            }
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
                     run_id,
                     step,
                     context,
                 } => {
+                    let child_cancellation = cancellation_token
+                        .as_ref()
+                        .map_or_else(CancellationToken::new, CancellationToken::child_token);
                     let started_at = crate::sop::engine::now_iso8601();
                     let user_message = ChatMessage::user(context.clone());
                     history.push(user_message.clone());
@@ -2056,12 +2344,18 @@ async fn drive_live_sop_actions(
                             step_alias.expect("needs_reassembly implies a step agent alias");
                         if let Some(reassembly) = sop_reassembly {
                             if !exec_cache.contains_key(alias) {
-                                match assemble_owned_execution(
-                                    reassembly.config,
-                                    alias,
-                                    Arc::clone(&queued.engine),
-                                    queued.audit.clone(),
-                                    approval,
+                                match sop_settlement::assemble(
+                                    &owner,
+                                    crate::security::estop_runtime::scope_invocation(
+                                        Some(owner.invocation()),
+                                        assemble_owned_execution(
+                                            reassembly.config,
+                                            alias,
+                                            Arc::clone(&queued.engine),
+                                            queued.audit.clone(),
+                                            approval,
+                                        ),
+                                    ),
                                 )
                                 .await
                                 {
@@ -2256,103 +2550,111 @@ async fn drive_live_sop_actions(
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
                             };
-                            let step_result = crate::sop::executor::scope_step_call_sink(
-                                step_call_sink.clone(),
-                                Box::pin(run_tool_call_loop(ToolLoop {
-                                    exec: ResolvedAgentExecution::resolve(
-                                        ResolvedModelAccess {
-                                            model_provider: eff_model_provider,
-                                            provider_name: eff_provider_name,
-                                            model: eff_model,
-                                            temperature: eff_temperature,
-                                        },
-                                        ResolvedIo {
-                                            tools_registry: eff_registry,
-                                            observer,
-                                            silent,
-                                            approval: eff_approval,
-                                            multimodal_config,
-                                            config,
-                                            hooks,
-                                            activated_tools: eff_activated,
-                                            // Deliberately NOT the outer round's
-                                            // `model_switch_callback`: every nested
-                                            // step loop — same-agent or cross-agent —
-                                            // gets `None` here, so `run_tool_call_loop`
-                                            // mints a fresh, isolated switch state
-                                            // scoped to just this child call (see its
-                                            // top-of-function fallback). Reusing the
-                                            // parent's shared state let a child's
-                                            // `model_switch` mutate the SAME `Arc` the
-                                            // parent round checks after every
-                                            // iteration, so a cross-agent step's own
-                                            // switch could silently become the
-                                            // parent's. A switch still reaches the
-                                            // caller correctly: it surfaces as this
-                                            // child loop's own `ModelSwitchRequested`
-                                            // error, not via continued access to
-                                            // shared mutable state after the call
-                                            // returns.
-                                            model_switch_callback: None,
-                                            receipt_generator,
-                                        },
-                                        ResolvedRuntimeKnobs {
-                                            max_tool_iterations: eff_max_tool_iterations,
-                                            excluded_tools: &sop_excluded_tools,
-                                            dedup_exempt_tools: eff_dedup_exempt_tools,
-                                            pacing: eff_pacing,
-                                            strict_tool_parsing: eff_strict_tool_parsing,
-                                            parallel_tools: eff_parallel_tools,
-                                            max_tool_result_chars: eff_max_tool_result_chars,
-                                            context_token_budget: eff_context_token_budget,
-                                            knobs,
-                                        },
+                            let step_result = sop_settlement::execute_step(
+                                &owner,
+                                &child_cancellation,
+                                crate::security::estop_runtime::scope_invocation(
+                                    Some(owner.invocation()),
+                                    crate::sop::executor::scope_step_call_sink(
+                                        step_call_sink.clone(),
+                                        Box::pin(run_tool_call_loop(ToolLoop {
+                                            exec: ResolvedAgentExecution::resolve(
+                                                ResolvedModelAccess {
+                                                    model_provider: eff_model_provider,
+                                                    provider_name: eff_provider_name,
+                                                    model: eff_model,
+                                                    temperature: eff_temperature,
+                                                },
+                                                ResolvedIo {
+                                                    tools_registry: eff_registry,
+                                                    observer,
+                                                    silent,
+                                                    approval: eff_approval,
+                                                    multimodal_config,
+                                                    config,
+                                                    hooks,
+                                                    activated_tools: eff_activated,
+                                                    // Deliberately NOT the outer round's
+                                                    // `model_switch_callback`: every nested
+                                                    // step loop — same-agent or cross-agent —
+                                                    // gets `None` here, so `run_tool_call_loop`
+                                                    // mints a fresh, isolated switch state
+                                                    // scoped to just this child call (see its
+                                                    // top-of-function fallback). Reusing the
+                                                    // parent's shared state let a child's
+                                                    // `model_switch` mutate the SAME `Arc` the
+                                                    // parent round checks after every
+                                                    // iteration, so a cross-agent step's own
+                                                    // switch could silently become the
+                                                    // parent's. A switch still reaches the
+                                                    // caller correctly: it surfaces as this
+                                                    // child loop's own `ModelSwitchRequested`
+                                                    // error, not via continued access to
+                                                    // shared mutable state after the call
+                                                    // returns.
+                                                    model_switch_callback: None,
+                                                    receipt_generator,
+                                                },
+                                                ResolvedRuntimeKnobs {
+                                                    max_tool_iterations: eff_max_tool_iterations,
+                                                    excluded_tools: &sop_excluded_tools,
+                                                    dedup_exempt_tools: eff_dedup_exempt_tools,
+                                                    pacing: eff_pacing,
+                                                    strict_tool_parsing: eff_strict_tool_parsing,
+                                                    parallel_tools: eff_parallel_tools,
+                                                    max_tool_result_chars:
+                                                        eff_max_tool_result_chars,
+                                                    context_token_budget: eff_context_token_budget,
+                                                    knobs,
+                                                },
+                                            ),
+                                            history: nested_history,
+                                            channel_name,
+                                            channel_reply_target,
+                                            cancellation_token: Some(child_cancellation.clone()),
+                                            on_delta: on_delta.clone(),
+                                            shared_budget: shared_budget.clone(),
+                                            channel,
+                                            collected_receipts,
+                                            event_tx: event_tx.clone(),
+                                            steering: None,
+                                            // Same-agent: pass a fresh empty buffer so
+                                            // the child loop's one-time clone-and-append
+                                            // does not sync the parent's accumulated
+                                            // messages into the child's nested_history.
+                                            // After the child returns, replay its buffer
+                                            // back to the parent's new_messages_out.
+                                            // Cross-agent: None (child transcript does
+                                            // not flow into the parent's persisted
+                                            // conversation; only the final output does).
+                                            new_messages_out: if owned.is_some() {
+                                                None
+                                            } else {
+                                                Some(&mut inner_new_msgs)
+                                            },
+                                            image_cache: image_cache.as_deref_mut(),
+                                            memory: None,
+                                            ingress: IngressContext::sub_turn(),
+                                            // Attribution follows the EFFECTIVE agent:
+                                            // the step agent's identity is stamped on
+                                            // observer/receipt/OTel records for the
+                                            // sub-loop, with the delegating agent kept
+                                            // alongside as the parent correlation.
+                                            agent_alias: if owned.is_some() {
+                                                step_alias
+                                            } else {
+                                                agent_alias
+                                            },
+                                            parent_agent_alias: if owned.is_some() {
+                                                agent_alias
+                                            } else {
+                                                parent_agent_alias
+                                            },
+                                            turn_id: &nested_turn_id,
+                                            sop_reassembly,
+                                        })),
                                     ),
-                                    history: nested_history,
-                                    channel_name,
-                                    channel_reply_target,
-                                    cancellation_token: cancellation_token.clone(),
-                                    on_delta: on_delta.clone(),
-                                    shared_budget: shared_budget.clone(),
-                                    channel,
-                                    collected_receipts,
-                                    event_tx: event_tx.clone(),
-                                    steering: None,
-                                    // Same-agent: pass a fresh empty buffer so
-                                    // the child loop's one-time clone-and-append
-                                    // does not sync the parent's accumulated
-                                    // messages into the child's nested_history.
-                                    // After the child returns, replay its buffer
-                                    // back to the parent's new_messages_out.
-                                    // Cross-agent: None (child transcript does
-                                    // not flow into the parent's persisted
-                                    // conversation; only the final output does).
-                                    new_messages_out: if owned.is_some() {
-                                        None
-                                    } else {
-                                        Some(&mut inner_new_msgs)
-                                    },
-                                    image_cache: image_cache.as_deref_mut(),
-                                    memory: None,
-                                    ingress: IngressContext::sub_turn(),
-                                    // Attribution follows the EFFECTIVE agent:
-                                    // the step agent's identity is stamped on
-                                    // observer/receipt/OTel records for the
-                                    // sub-loop, with the delegating agent kept
-                                    // alongside as the parent correlation.
-                                    agent_alias: if owned.is_some() {
-                                        step_alias
-                                    } else {
-                                        agent_alias
-                                    },
-                                    parent_agent_alias: if owned.is_some() {
-                                        agent_alias
-                                    } else {
-                                        parent_agent_alias
-                                    },
-                                    turn_id: &nested_turn_id,
-                                    sop_reassembly,
-                                })),
+                                ),
                             )
                             .await;
                             // Replay child loop's new messages to the parent's
@@ -2389,6 +2691,7 @@ async fn drive_live_sop_actions(
                     } else {
                         agent_alias.map(str::to_string)
                     };
+                    let mut original_error = None;
                     let step_result = match step_output {
                         Ok(output) => crate::sop::SopStepResult {
                             step_number: step.number,
@@ -2399,29 +2702,121 @@ async fn drive_live_sop_actions(
                             effective_agent,
                             tool_calls: step_calls,
                         },
-                        Err(e) => crate::sop::SopStepResult {
-                            step_number: step.number,
-                            status: crate::sop::SopStepStatus::Failed,
-                            output: e.to_string(),
-                            started_at,
-                            completed_at: Some(completed_at),
-                            effective_agent,
-                            tool_calls: step_calls,
-                        },
+                        Err(error) => {
+                            let completed = error
+                                .downcast_ref::<owned_cancellation::TurnCompletedAfterInterruption>(
+                                );
+                            let result = crate::sop::SopStepResult {
+                                step_number: step.number,
+                                status: if completed.is_some() {
+                                    crate::sop::SopStepStatus::Completed
+                                } else {
+                                    crate::sop::SopStepStatus::Failed
+                                },
+                                output: completed.map_or_else(
+                                    || error.to_string(),
+                                    |result| result.output.clone(),
+                                ),
+                                started_at,
+                                completed_at: Some(completed_at),
+                                effective_agent,
+                                tool_calls: step_calls,
+                            };
+                            original_error = Some(error);
+                            result
+                        }
                     };
+                    let stop = owner.check(None).err();
+                    let terminal = original_error
+                        .as_ref()
+                        .is_some_and(sop_settlement::terminal_step_error)
+                        || stop.is_some();
+                    let current_queued = sop_settlement::with_action(
+                        &queued,
+                        crate::sop::SopRunAction::ExecuteStep {
+                            run_id: run_id.clone(),
+                            step: step.clone(),
+                            context: context.clone(),
+                        },
+                    );
+                    if terminal {
+                        let cause = match (original_error, stop) {
+                            (Some(error), Some(cause)) => {
+                                owned_cancellation::with_stop_cause(error, cause)
+                            }
+                            (Some(error), None) | (None, Some(error)) => error,
+                            (None, None) => unreachable!("terminal step has a cause"),
+                        };
+                        let persistence_error = sop_settlement::cancel_then_advance(
+                            &queued,
+                            &run_id,
+                            step_result.clone(),
+                        )
+                        .err();
+                        // The engine owns cancellation/result persistence. Do not
+                        // begin an optional audit operation after interruption.
+                        let settled = sop_settlement::StepSettlement {
+                            queued: current_queued,
+                            result: step_result,
+                            persistence_error,
+                            audit: sop_settlement::AuditSettlement::NotStarted,
+                        };
+                        return Err(sop_settlement::interrupted(
+                            cause,
+                            None,
+                            pending,
+                            vec![settled],
+                        ));
+                    }
 
-                    let (next_action, finished_run) = crate::sop::executor::advance_sop_step(
+                    let (next_action, finished_run) = match crate::sop::executor::advance_sop_step(
                         &queued.engine,
                         &run_id,
                         step_result.clone(),
-                    )?;
-                    crate::sop::executor::audit_sop_step(
-                        queued.audit.as_deref(),
+                    ) {
+                        Ok(advanced) => advanced,
+                        Err(error) => {
+                            let settled = sop_settlement::StepSettlement {
+                                queued: current_queued,
+                                result: step_result,
+                                persistence_error: Some(error),
+                                audit: sop_settlement::AuditSettlement::NotStarted,
+                            };
+                            return Err(sop_settlement::interrupted(
+                                anyhow::Error::new(sop_settlement::SopPhaseIncomplete {
+                                    phase: "step persistence",
+                                }),
+                                None,
+                                pending,
+                                vec![settled],
+                            ));
+                        }
+                    };
+                    let audit = sop_settlement::audit(
+                        &queued,
                         &run_id,
                         &step_result,
                         finished_run.as_ref(),
                     )
                     .await;
+                    if let Some(cause) = owner
+                        .check(None)
+                        .err()
+                        .or_else(|| sop_settlement::audit_error(&audit))
+                    {
+                        let settled = sop_settlement::StepSettlement {
+                            queued: current_queued,
+                            result: step_result,
+                            persistence_error: None,
+                            audit,
+                        };
+                        return Err(sop_settlement::interrupted(
+                            cause,
+                            Some(sop_settlement::with_action(&queued, next_action)),
+                            pending,
+                            vec![settled],
+                        ));
+                    }
                     action = next_action;
                 }
                 crate::sop::SopRunAction::WaitApproval { run_id, step, .. } => {
@@ -2452,14 +2847,28 @@ async fn drive_live_sop_actions(
                         break;
                     }
                     deterministic_steps_driven += 1;
+                    let current_queued = sop_settlement::with_action(&queued, action.clone());
                     let next = {
                         let mut engine = match queued.engine.lock() {
                             Ok(engine) => engine,
                             Err(poisoned) => poisoned.into_inner(),
                         };
-                        engine.advance_headless_deterministic_step(&run_id, action)?
+                        engine.advance_headless_deterministic_step(&run_id, action)
                     };
-                    action = next;
+                    action = match next {
+                        Ok(next) => next,
+                        Err(error) => {
+                            // The synchronous capability has returned. Preserve
+                            // its original error and every remaining identity;
+                            // canonical cancellation can now settle this boundary.
+                            return Err(sop_settlement::interrupted(
+                                error,
+                                Some(current_queued),
+                                pending,
+                                Vec::new(),
+                            ));
+                        }
+                    };
                     // Let an operator request acquire the engine before the next
                     // deterministic capability is dispatched.
                     tokio::task::yield_now().await;
@@ -2664,7 +3073,7 @@ mod reported_budget_tests {
         let estimated = crate::agent::history::estimate_history_tokens(&history);
         let reported = estimated * 4;
         let budget = reported / 2;
-        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver).await;
+        enforce_reported_budget(&mut history, reported, budget, None, &NoopObserver, None).await;
         assert!(
             history.len() < before,
             "over-budget no-tool history must be trimmed before it is persisted"
@@ -2685,7 +3094,15 @@ mod reported_budget_tests {
         ];
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         let estimated = crate::agent::history::estimate_history_tokens(&history);
-        enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
+        enforce_reported_budget(
+            &mut history,
+            estimated,
+            estimated * 4,
+            None,
+            &NoopObserver,
+            None,
+        )
+        .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
     }
@@ -2698,7 +3115,7 @@ mod reported_budget_tests {
         // The rejected attempt's 80 input tokens remain billed separately; the
         // accepted response reports 80 input tokens, which is within this
         // model's 100-token context budget and must not trim history.
-        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver).await;
+        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver, None).await;
 
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(
@@ -2711,7 +3128,7 @@ mod reported_budget_tests {
     async fn enforce_noop_when_budget_disabled() {
         let mut history = big_history();
         let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
-        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
+        enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver, None).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
     }
@@ -2783,6 +3200,7 @@ mod shared_iteration_budget_tests {
 #[cfg(test)]
 mod sop_step_reassembly_tests {
     use super::*;
+    include!("sop_settlement_tests.rs");
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_providers::{ChatResponse, ToolCall};
 

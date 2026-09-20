@@ -38,6 +38,10 @@ This is the *connection* boundary (which servers an agent talks to at all). The 
 
 ## Transports
 
+On macOS, selected local computer/browser calls hold a bounded
+[display-awake lease](./browser.md#scoped-display-wake-on-macos). This does not
+change MCP grants, tool allowlists, approval, cancellation, or replay rules.
+
 A server is reached over one of three transports (the `transport` field):
 
 | Transport | When to use | Required fields |

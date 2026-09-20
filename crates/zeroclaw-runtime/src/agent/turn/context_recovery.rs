@@ -92,7 +92,6 @@ pub(crate) async fn try_recover_context_overflow(
             // Recognizing the overflow is not enough: a single oversized turn
             // cannot be trimmed, and announcing on recognition would claim
             // work that never happens.
-            send_progress(on_delta, ProgressEvent::CompactingContext).await;
             // Insert the same model-visible breadcrumb the turn-boundary path
             // uses, after the leading system messages, so the retried provider
             // call tells the model earlier turns were dropped (never silent to
@@ -118,6 +117,17 @@ pub(crate) async fn try_recover_context_overflow(
                 "Context recovery: dropped oldest whole turns, retrying"
             );
             let reason = crate::i18n::get_required_cli_string("history-trim-reason-budget");
+            observer.record_event(&ObserverEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                reason: reason.clone(),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            });
+            // Commit the trimmed history and its breadcrumb before presentation:
+            // cancellation of a blocked consumer must never leave history empty.
+            send_progress(on_delta, ProgressEvent::CompactingContext).await;
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
@@ -127,14 +137,6 @@ pub(crate) async fn try_recover_context_overflow(
                     })
                     .await;
             }
-            observer.record_event(&ObserverEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                reason,
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-            });
             return true;
         }
 
@@ -182,6 +184,57 @@ mod tests {
             h.push(ChatMessage::assistant(format!("reply {i} {big}").as_str()));
         }
         h
+    }
+
+    #[tokio::test]
+    async fn cancelled_context_recovery_keeps_history_with_blocked_progress_or_trim_event() {
+        for block_progress in [false, true] {
+            let mut history = overflowing_history();
+            let last = history.last().unwrap().clone();
+            let before_len = history.len();
+            let err = anyhow::Error::msg("maximum context length exceeded");
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+            let (delta_tx, _delta_rx) = tokio::sync::mpsc::channel(1);
+            event_tx
+                .send(zeroclaw_api::agent::TurnEvent::Chunk {
+                    delta: "full".into(),
+                })
+                .await
+                .unwrap();
+            delta_tx
+                .send(super::super::events::DraftEvent::Text("full".into()))
+                .await
+                .unwrap();
+            let token = tokio_util::sync::CancellationToken::new();
+            let (result, ()) = tokio::join!(
+                super::super::outcome::until_cancelled(
+                    Some(&token),
+                    try_recover_context_overflow(
+                        &mut history,
+                        &err,
+                        1,
+                        Some(&event_tx),
+                        block_progress.then_some(&delta_tx),
+                        &NoopObserver,
+                        32_000,
+                    )
+                ),
+                async {
+                    tokio::task::yield_now().await;
+                    token.cancel();
+                },
+            );
+            assert!(is_tool_loop_cancelled(&result.unwrap_err()));
+            assert!(history.len() < before_len);
+            assert_eq!(history.last().unwrap().content, last.content);
+            assert_eq!(history[0].role, "system");
+            assert!(
+                history
+                    .iter()
+                    .any(|message| message.content
+                        == crate::agent::history_trim::breadcrumb().content)
+            );
+        }
     }
 
     /// The `CompactingContext` lifecycle state is only reachable through this

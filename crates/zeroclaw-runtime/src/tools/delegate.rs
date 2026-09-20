@@ -1,3 +1,8 @@
+#[path = "delegate_progress.rs"]
+pub mod progress;
+#[path = "delegate_settlement.rs"]
+pub(crate) mod settlement;
+
 use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
@@ -5,7 +10,6 @@ use crate::agent::loop_::{
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::approval::ApprovalManager;
-use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
@@ -52,26 +56,42 @@ fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
-async fn scope_delegate_session_key<F>(
+#[allow(clippy::too_many_arguments)] // Explicit spawn-time ownership contexts.
+fn scope_delegate_session_key<F>(
     session_key: Option<String>,
     route: Option<zeroclaw_api::conversation::ConversationRoute>,
     deadline: Option<tokio::time::Instant>,
     elicitation: Option<Arc<dyn zeroclaw_tools::mcp_protocol::McpElicitationHandler>>,
+    estop: Option<crate::security::estop_runtime::EstopRuntime>,
+    invocation: Option<crate::security::estop_runtime::InvocationCancellation>,
+    peer_activity: Option<Arc<dyn zeroclaw_api::peer_activity::PeerActivitySource>>,
     future: F,
-) -> F::Output
+) -> impl std::future::Future<Output = F::Output> + Send
 where
-    F: std::future::Future,
+    F: std::future::Future + Send,
 {
-    let scoped = zeroclaw_api::deadline::PARENT.scope(
-        deadline,
-        zeroclaw_api::conversation::ACTIVE_CONVERSATION
-            .scope(route, TOOL_LOOP_SESSION_KEY.scope(session_key, future)),
-    );
-    if let Some(handler) = elicitation {
-        zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
-    } else {
-        scoped.await
-    }
+    // Capture before spawning: task locals are not inherited by Tokio tasks.
+    progress::inherit(async move {
+        let scoped = zeroclaw_api::deadline::PARENT.scope(
+            deadline,
+            zeroclaw_api::conversation::ACTIVE_CONVERSATION.scope(
+                route,
+                TOOL_LOOP_SESSION_KEY.scope(
+                    session_key,
+                    zeroclaw_api::peer_activity::SOURCE.scope(peer_activity, future),
+                ),
+            ),
+        );
+        let scoped = crate::security::estop_runtime::scope_invocation(
+            invocation,
+            crate::security::estop_runtime::scope(estop, scoped),
+        );
+        if let Some(handler) = elicitation {
+            zeroclaw_tools::mcp_protocol::with_mcp_elicitation_handler(handler, scoped).await
+        } else {
+            scoped.await
+        }
+    })
 }
 
 /// Serializable result of a background delegate task.
@@ -84,6 +104,10 @@ pub struct BackgroundDelegateResult {
     pub error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
+    /// Typed terminal projection and original returned evidence, stored in the
+    /// existing result record. Older records deserialize without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<serde_json::Value>,
 }
 
 /// Status of a background delegate task.
@@ -140,6 +164,7 @@ impl BackgroundResultState {
     }
 }
 
+#[derive(Clone)]
 pub struct DelegateTool {
     agents: Arc<HashMap<String, AliasedAgentConfig>>,
     security: Arc<SecurityPolicy>,
@@ -1030,10 +1055,22 @@ impl DelegateTool {
         result_path: &Path,
         result: &BackgroundDelegateResult,
     ) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
         let bytes = serde_json::to_vec_pretty(result)?;
-        let tmp_path = result_path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
-        tokio::fs::write(&tmp_path, &bytes).await?;
-        tokio::fs::rename(&tmp_path, result_path).await?;
+        let parent = result_path
+            .parent()
+            .ok_or_else(|| anyhow::Error::msg("delegate result requires a parent directory"))?;
+        // NamedTempFile creates a private inode (0600 on Unix). The TempPath
+        // owns cleanup if a write fails or this future drops before publication.
+        let temporary = tempfile::NamedTempFile::new_in(parent)?;
+        let (file, path) = temporary.into_parts();
+        let mut file = tokio::fs::File::from_std(file);
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        path.persist(result_path)?;
+        #[cfg(unix)]
+        tokio::fs::File::open(parent).await?.sync_all().await?;
         Ok(())
     }
 
@@ -1152,7 +1189,25 @@ impl Tool for DelegateTool {
         })
     }
 
+    fn supports_cooperative_settlement(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        crate::security::estop_runtime::scope(
+            self.estop_runtime(),
+            crate::security::estop_runtime::run_tool(
+                self,
+                Some(&self.cancellation_token),
+                Box::pin(self.execute_dispatch(args)),
+            ),
+        )
+        .await
+    }
+}
+
+impl DelegateTool {
+    async fn execute_dispatch(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action_value = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -1242,9 +1297,16 @@ impl Tool for DelegateTool {
         // --- Synchronous delegation (original path) ---
         self.execute_sync(agent_name, prompt, &args).await
     }
-}
 
-impl DelegateTool {
+    fn estop_runtime(&self) -> Option<crate::security::estop_runtime::EstopRuntime> {
+        use crate::security::estop_runtime::{self, EstopRuntime};
+        self.live_config
+            .as_ref()
+            .map(|config| EstopRuntime::from_live_config(Arc::clone(config)))
+            .or_else(estop_runtime::current)
+            .or_else(|| self.root_config.as_deref().map(EstopRuntime::from_config))
+    }
+
     /// Original synchronous delegation path (extracted for reuse).
     async fn execute_sync(
         &self,
@@ -1263,10 +1325,54 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // The child owns its cancellation token. Scope the original earliest
+        // deadline unchanged through setup/providers/tools; run_tool observes it
+        // and requests cooperative settlement instead of dropping the nested turn.
+        let mut child = self.clone();
+        child.cancellation_token = self.cancellation_token.child_token();
+        let local_budget = self.agents.get(agent_name).map(|config| {
+            if self.resolve_agentic(&config.runtime_profile) {
+                self.resolve_agentic_timeout_secs(&config.runtime_profile)
+                    .unwrap_or(self.delegate_config.agentic_timeout_secs)
+            } else {
+                self.resolve_delegation_timeout(&config.runtime_profile)
+                    .unwrap_or(self.delegate_config.timeout_secs)
+            }
+        });
+        let deadline = local_budget
+            .map(|seconds| zeroclaw_api::deadline::bounded_by_parent(Duration::from_secs(seconds)))
+            .or_else(zeroclaw_api::deadline::current);
+        zeroclaw_api::deadline::PARENT
+            .scope(
+                deadline,
+                crate::security::estop_runtime::scope(
+                    self.estop_runtime(),
+                    crate::security::estop_runtime::run_tool(
+                        &child,
+                        Some(&self.cancellation_token),
+                        Box::pin(settlement::settle_turn(
+                            agent_name,
+                            &child.cancellation_token,
+                            Box::pin(child.execute_sync_with_provider_attribution(
+                                agent_name, prompt, args, admission,
+                            )),
+                        )),
+                    ),
+                ),
+            )
+            .await
+    }
+
+    async fn execute_sync_with_provider_attribution(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
         let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
-            let result = zeroclaw_api::deadline::run_inherited_phase(
-                zeroclaw_api::deadline::Phase::Delegate,
+            let result = Box::pin(
                 self.execute_sync_with_admission_inner(agent_name, prompt, args, admission),
             )
             .await;
@@ -1417,18 +1523,17 @@ impl DelegateTool {
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agentic {
-            return self
-                .execute_agentic_with_admission(
-                    agent_name,
-                    agent_config,
-                    &provider_type,
-                    &model,
-                    &*model_provider,
-                    &full_prompt,
-                    temperature,
-                    admission,
-                )
-                .await;
+            return Box::pin(self.execute_agentic_with_admission(
+                agent_name,
+                agent_config,
+                &provider_type,
+                &model,
+                &*model_provider,
+                &full_prompt,
+                temperature,
+                admission,
+            ))
+            .await;
         }
 
         // Build enriched system prompt for non-agentic sub-agent.
@@ -1443,28 +1548,16 @@ impl DelegateTool {
         );
         let system_prompt_ref = enriched_system_prompt.as_deref();
 
-        // Wrap the model_provider call in a timeout to prevent indefinite blocking
-        let timeout_secs = self
-            .resolve_delegation_timeout(&agent_config.runtime_profile)
-            .unwrap_or(self.delegate_config.timeout_secs);
+        // The owned delegate scope applies the earliest deadline to setup and
+        // this provider wait. Preserve its terminal cause rather than rendering
+        // it as a retryable provider failure.
         let dispatcher = ProviderDispatch::from_ref(&*model_provider);
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            dispatcher.chat_with_system(system_prompt_ref, &full_prompt, &model, temperature),
-        )
-        .await;
-
+        let result = dispatcher
+            .chat_with_system(system_prompt_ref, &full_prompt, &model, temperature)
+            .await;
         let result = match result {
-            Ok(inner) => inner,
-            Err(_elapsed) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Agent '{agent_name}' timed out after {timeout_secs}s"
-                    )),
-                });
-            }
+            Err(error) if settlement::terminal(&error) => return Err(error),
+            result => result,
         };
 
         Ok(Self::render_non_agentic_result(
@@ -1620,6 +1713,7 @@ impl DelegateTool {
             error: None,
             started_at: started_at.clone(),
             finished_at: None,
+            evidence: None,
         };
         let result_path = results_dir.join(format!("{task_id}.json"));
         Self::write_result_atomic(&result_path, &initial_result).await?;
@@ -1682,128 +1776,160 @@ impl DelegateTool {
         let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
+        let parent_peer_activity = zeroclaw_api::peer_activity::current();
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
         let parent_deadline = zeroclaw_api::deadline::current();
         let parent_elicitation = zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler();
+        let parent_estop = self.estop_runtime();
+        let parent_invocation = crate::security::estop_runtime::current_invocation()
+            .map(|invocation| invocation.child());
         let __zc_delegate_alias = agent_name_owned.clone();
 
-        zeroclaw_spawn::spawn!(
-            scope_delegate_session_key(parent_session_key, parent_route, parent_deadline, parent_elicitation, async move {
-                let inner = DelegateTool {
-                    agents,
-                    security,
-                    global_credential,
-                    provider_runtime_options,
-                    depth,
-                    parent_tools,
-                    runtime,
-                    multimodal_config,
-                    delegate_config,
-                    workspace_dir: workspace_dir.clone(),
-                    cancellation_token: child_token.clone(),
-                    memory,
-                    providers_models,
-                    risk_profiles,
-                    runtime_profiles,
-                    skill_bundles,
-                    root_config,
-                    live_config,
-                    caller_alias,
-                };
+        // Build the inherited future before spawn!: that macro evaluates its
+        // expression inside the child task, after the parent's task locals are gone.
+        let background_execution = scope_delegate_session_key(
+                parent_session_key,
+                parent_route,
+                parent_deadline,
+                parent_elicitation,
+                parent_estop,
+                parent_invocation,
+                parent_peer_activity,
+                async move {
+                    let inner = DelegateTool {
+                        agents,
+                        security,
+                        global_credential,
+                        provider_runtime_options,
+                        depth,
+                        parent_tools,
+                        runtime,
+                        multimodal_config,
+                        delegate_config,
+                        workspace_dir: workspace_dir.clone(),
+                        cancellation_token: child_token.clone(),
+                        memory,
+                        providers_models,
+                        risk_profiles,
+                        runtime_profiles,
+                        skill_bundles,
+                        root_config,
+                        live_config,
+                        caller_alias,
+                    };
 
-                let args_inner = json!({
-                    "agent": agent_name_owned,
-                    "prompt": full_prompt,
-                });
+                    let args_inner = json!({
+                        "agent": agent_name_owned,
+                        "prompt": full_prompt,
+                    });
 
-                // Race the delegation against cancellation
-                let outcome = tokio::select! {
-                    () = child_token.cancelled() => {
-                        Err("Cancelled by parent session".to_string())
-                    }
-                    result = Box::pin(inner.execute_sync_with_admission(
+                    let _owner = settlement::BackgroundOwner(task_id_clone.clone());
+                    // The live task owns cancellation through nested settlement. Its
+                    // result file is finalized only after that owner returns evidence.
+                    let outcome = Box::pin(inner.execute_sync_with_admission(
                         &agent_name_owned,
                         &full_prompt,
                         &args_inner,
                         DelegateAdmission::Prevalidated,
-                    )) => {
-                        match result {
-                            Ok(tool_result) => {
-                                if tool_result.success {
-                                    Ok(tool_result.output.into_string())
+                    ))
+                    .await;
+                    let finished_at = chrono::Utc::now().to_rfc3339();
+                    let (status, output, error, evidence) = match outcome {
+                        Ok(result) => (
+                            if result.success {
+                                BackgroundTaskStatus::Completed
+                            } else {
+                                BackgroundTaskStatus::Failed
+                            },
+                            (!result.output.is_empty()).then(|| result.output.as_str().to_owned()),
+                            result.error.clone(),
+                            json!({"kind":"returned", "result":result}),
+                        ),
+                        Err(error) => {
+                            let kind = settlement::error_kind(&error);
+                            let status =
+                                if matches!(kind, "emergency_stop" | "deadline" | "cancelled") {
+                                    BackgroundTaskStatus::Cancelled
                                 } else {
-                                    Err(tool_result.error.unwrap_or_else(|| "Unknown error".into()))
-                                }
-                            }
-                            Err(e) => Err(e.to_string()),
+                                    BackgroundTaskStatus::Failed
+                                };
+                            (
+                                status,
+                                None,
+                                Some(crate::security::scrub(&error.to_string())),
+                                settlement::error_evidence(&error),
+                            )
                         }
-                    }
-                };
-
-                let finished_at = chrono::Utc::now().to_rfc3339();
-                let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
+                    };
+                    let final_result = BackgroundDelegateResult {
                         task_id: task_id_clone.clone(),
                         agent: agent_name_owned,
-                        status: BackgroundTaskStatus::Completed,
-                        output: Some(output),
-                        error: None,
+                        status,
+                        output,
+                        error,
                         started_at,
                         finished_at: Some(finished_at),
-                    },
-                    Err(err) => {
-                        let status = if err.contains("Cancelled") {
-                            BackgroundTaskStatus::Cancelled
-                        } else {
-                            BackgroundTaskStatus::Failed
+                        evidence: Some(evidence),
+                    };
+                    let result_path = results_dir.join(format!("{}.json", task_id_clone));
+                    if let Err(error) =
+                        DelegateTool::write_result_atomic(&result_path, &final_result).await
+                    {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            ),
+                            &format!(
+                                "delegate terminal result persistence incomplete: {}",
+                                crate::security::scrub(&error.to_string())
+                            )
+                        );
+                    }
+
+                    if let Some(cp) = crate::control_plane::control_plane() {
+                        let cp_status = match final_result.status {
+                            BackgroundTaskStatus::Completed => {
+                                crate::control_plane::TaskStatus::Completed
+                            }
+                            BackgroundTaskStatus::Failed => {
+                                crate::control_plane::TaskStatus::Failed
+                            }
+                            BackgroundTaskStatus::Cancelled => {
+                                crate::control_plane::TaskStatus::Cancelled
+                            }
+                            BackgroundTaskStatus::Running => {
+                                crate::control_plane::TaskStatus::Running
+                            }
                         };
-                        BackgroundDelegateResult {
-                            task_id: task_id_clone.clone(),
-                            agent: agent_name_owned,
-                            status,
-                            output: None,
-                            error: Some(err),
-                            started_at,
-                            finished_at: Some(finished_at),
+                        if let Err(error) = cp
+                            .store
+                            .update_status(
+                                &task_id_clone,
+                                cp_status,
+                                final_result.output.clone().or_else(|| Some(
+                                    serde_json::to_value(&final_result)
+                                        .expect("background record contains only JSON values and strings")
+                                        .to_string()
+                                )),
+                                final_result.error.clone(),
+                            )
+                            .await
+                        {
+                            ::zeroclaw_log::record!(WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail),
+                                &format!("delegate control-plane terminal persistence incomplete: {}",
+                                    crate::security::scrub(&error.to_string())));
                         }
                     }
-                };
-
-                let result_path = results_dir.join(format!("{}.json", task_id_clone));
-                let _ = DelegateTool::write_result_atomic(&result_path, &final_result).await;
-
-                if let Some(cp) = crate::control_plane::control_plane() {
-                    let cp_status = match final_result.status {
-                        BackgroundTaskStatus::Completed => {
-                            crate::control_plane::TaskStatus::Completed
-                        }
-                        BackgroundTaskStatus::Failed => crate::control_plane::TaskStatus::Failed,
-                        BackgroundTaskStatus::Cancelled => {
-                            crate::control_plane::TaskStatus::Cancelled
-                        }
-                        BackgroundTaskStatus::Running => crate::control_plane::TaskStatus::Running,
-                    };
-                    let _ = cp
-                        .store
-                        .update_status(
-                            &task_id_clone,
-                            cp_status,
-                            final_result.output.clone(),
-                            final_result.error.clone(),
-                        )
-                        .await;
                 }
-
-                // Drop the live cancel token now the task has settled.
-                Self::background_task_cancels()
-                    .lock()
-                    .remove(&task_id_clone);
-            })
+            )
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-            ))
-        );
+            ));
+        zeroclaw_spawn::spawn!(background_execution);
 
         Ok(ToolResult {
             success: true,
@@ -1904,14 +2030,36 @@ impl DelegateTool {
             .try_with(Clone::clone)
             .ok()
             .flatten();
+        let parent_peer_activity = zeroclaw_api::peer_activity::current();
         let parent_session_key = current_tool_loop_session_key();
         let parent_route = zeroclaw_api::conversation::current();
         let parent_deadline = zeroclaw_api::deadline::current();
         let parent_elicitation = zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler();
+        let parent_estop = self.estop_runtime();
+        let parent_invocation = crate::security::estop_runtime::current_invocation();
 
         // Spawn all agents concurrently
-        let mut handles = Vec::with_capacity(agent_names.len());
-        for agent_name in &agent_names {
+        let mut handles = tokio::task::JoinSet::new();
+        let mut pending = std::collections::BTreeMap::new();
+        let batch_token = self.cancellation_token.child_token();
+        let mut interruption = None;
+        let mut unstarted = Vec::new();
+        for (index, agent_name) in agent_names.iter().enumerate() {
+            if let Some(invocation) = &parent_invocation
+                && let Err(error) = invocation.check()
+            {
+                interruption = Some(error);
+                unstarted.extend(
+                    agent_names[index..]
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, agent)| settlement::DelegateUnstarted {
+                            index: index + offset,
+                            agent: agent.clone(),
+                        }),
+                );
+                break;
+            }
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
             let global_credential = self.global_credential.clone();
@@ -1925,7 +2073,7 @@ impl DelegateTool {
             let multimodal_config = self.multimodal_config.clone();
             let delegate_config = self.delegate_config.clone();
             let workspace_dir = self.workspace_dir.clone();
-            let cancellation_token = self.cancellation_token.child_token();
+            let cancellation_token = batch_token.child_token();
             let agent_name = agent_name.clone();
             let prompt = prompt.to_string();
             let args_clone = args.clone();
@@ -1939,13 +2087,16 @@ impl DelegateTool {
             // that will construct its own nested registries.
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
+            let peer_activity = parent_peer_activity.clone();
             let session_key = parent_session_key.clone();
             let route = parent_route.clone();
             let elicitation = parent_elicitation.clone();
+            let estop = parent_estop.clone();
+            let invocation = parent_invocation.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
-            handles.push(zeroclaw_spawn::spawn!(
+            let handle = handles.spawn(progress::inherit(
                 async move {
                     let inner = DelegateTool {
                         agents,
@@ -1974,6 +2125,9 @@ impl DelegateTool {
                         route,
                         parent_deadline,
                         elicitation,
+                        estop,
+                        invocation,
+                        peer_activity,
                         async move {
                             crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                                 .scope(receipt_scope, async move {
@@ -1984,58 +2138,176 @@ impl DelegateTool {
                         },
                     )
                     .await;
-                    (agent_name_for_return, result)
+                    (index, agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(
                     &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
-                ))
+                )),
             ));
+            pending.insert(index, (agent_names[index].clone(), handle));
         }
 
-        // Collect all results
-        let mut outputs = Vec::with_capacity(handles.len());
-        let mut all_success = true;
-
-        for handle in handles {
-            match handle.await {
-                Ok((agent_name, Ok(tool_result))) => {
-                    if !tool_result.success {
-                        all_success = false;
+        // Completion order determines collection; input indices determine the
+        // returned evidence order. JoinSet owns every task even if this future drops.
+        let mut completed = Vec::new();
+        let mut failures = Vec::new();
+        let mut first_terminal = None;
+        let mut unsettled = Vec::new();
+        let mut settlement_deadline = interruption.as_ref().map(|_| {
+            batch_token.cancel();
+            tokio::time::Instant::now() + settlement::FANOUT_SETTLEMENT
+        });
+        let mut timed_out = false;
+        loop {
+            let joined = if timed_out {
+                handles.try_join_next()
+            } else if let Some(deadline) = settlement_deadline {
+                tokio::select! {
+                    biased;
+                    result = handles.join_next() => result,
+                    () = tokio::time::sleep_until(deadline) => {
+                        timed_out = true;
+                        handles.abort_all();
+                        continue;
                     }
-                    outputs.push(format!(
-                        "--- {agent_name} (success={}) ---\n{}{}",
-                        tool_result.success,
-                        tool_result.output,
-                        tool_result
-                            .error
-                            .map(|e| format!("\nError: {e}"))
-                            .unwrap_or_default()
-                    ));
                 }
-                Ok((agent_name, Err(e))) => {
-                    all_success = false;
-                    outputs.push(format!("--- {agent_name} (success=false) ---\nError: {e}"));
+            } else {
+                tokio::select! {
+                    biased;
+                    cause = settlement::invocation_interrupted(parent_invocation.as_ref()) => {
+                        interruption = Some(cause);
+                        batch_token.cancel();
+                        settlement_deadline = Some(tokio::time::Instant::now() + settlement::FANOUT_SETTLEMENT);
+                        continue;
+                    }
+                    result = handles.join_next() => result,
                 }
-                Err(e) => {
-                    all_success = false;
-                    outputs.push(format!("--- [join error] ---\n{e}"));
+            };
+            let Some(joined) = joined else { break };
+            match joined {
+                Ok((index, agent, Ok(result))) => {
+                    pending.remove(&index);
+                    completed.push(settlement::DelegateChildResult {
+                        index,
+                        agent,
+                        result,
+                    });
+                }
+                Ok((index, agent, Err(error))) => {
+                    pending.remove(&index);
+                    if settlement::terminal(&error) {
+                        first_terminal.get_or_insert(index);
+                        if settlement_deadline.is_none() {
+                            batch_token.cancel();
+                            settlement_deadline =
+                                Some(tokio::time::Instant::now() + settlement::FANOUT_SETTLEMENT);
+                        }
+                    }
+                    failures.push(settlement::DelegateChildFailure {
+                        index,
+                        agent,
+                        error,
+                    });
+                }
+                Err(error) => {
+                    let index = pending.iter().find_map(|(index, (_, handle))| {
+                        (handle.id() == error.id()).then_some(*index)
+                    });
+                    if let Some((index, (agent, _))) =
+                        index.and_then(|index| pending.remove(&index).map(|entry| (index, entry)))
+                    {
+                        if error.is_cancelled() {
+                            unsettled.push(settlement::DelegateUnsettled {
+                                index,
+                                agent,
+                                reason: if timed_out {
+                                    "settlement_timeout"
+                                } else {
+                                    "aborted"
+                                },
+                            });
+                        } else {
+                            failures.push(settlement::DelegateChildFailure {
+                                index,
+                                agent,
+                                error: error.into(),
+                            });
+                        }
+                    }
                 }
             }
         }
-
+        for (index, (agent, handle)) in pending {
+            handle.abort();
+            unsettled.push(settlement::DelegateUnsettled {
+                index,
+                agent,
+                reason: "settlement_timeout",
+            });
+        }
+        completed.sort_by_key(|child| child.index);
+        failures.sort_by_key(|child| child.index);
+        unsettled.sort_by_key(|child| child.index);
+        if interruption.is_some()
+            || failures
+                .iter()
+                .any(|failure| settlement::terminal(&failure.error))
+            || !unsettled.is_empty()
+        {
+            return Err(settlement::DelegateTerminalError {
+                completed,
+                failures,
+                unsettled,
+                unstarted,
+                first_terminal,
+                cause: interruption,
+            }
+            .into());
+        }
+        let all_success = failures.is_empty() && completed.iter().all(|child| child.result.success);
+        let mut outputs: Vec<_> = completed
+            .iter()
+            .map(|child| {
+                (
+                    child.index,
+                    format!(
+                        "--- {} (success={}) ---\n{}{}",
+                        child.agent,
+                        child.result.success,
+                        child.result.output,
+                        child
+                            .result
+                            .error
+                            .as_ref()
+                            .map(|error| format!("\nError: {error}"))
+                            .unwrap_or_default()
+                    ),
+                )
+            })
+            .collect();
+        outputs.extend(failures.iter().map(|failure| {
+            (
+                failure.index,
+                format!(
+                    "--- {} (success=false) ---\nError: {}",
+                    failure.agent, failure.error
+                ),
+            )
+        }));
+        outputs.sort_by_key(|(index, _)| *index);
         Ok(ToolResult {
             success: all_success,
             output: format!(
                 "[Parallel delegation: {} agents]\n\n{}",
                 agent_names.len(),
-                outputs.join("\n\n")
+                outputs
+                    .into_iter()
+                    .map(|(_, output)| output)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
             )
             .into(),
-            error: if all_success {
-                None
-            } else {
-                Some("One or more parallel agents failed".into())
-            },
+            error: (!all_success).then(|| "One or more parallel agents failed".into()),
         })
     }
 
@@ -2395,7 +2667,7 @@ impl DelegateTool {
 
         // Read current status
         let content = tokio::fs::read_to_string(&result_path).await?;
-        let mut result: BackgroundDelegateResult = serde_json::from_str(&content)?;
+        let result: BackgroundDelegateResult = serde_json::from_str(&content)?;
 
         if result.status != BackgroundTaskStatus::Running {
             return Ok(ToolResult {
@@ -2408,42 +2680,31 @@ impl DelegateTool {
             });
         }
 
-        // Actually abort the running task by signalling its registered cancel token —
-        // this cascades into the task's `tokio::select!`, which settles it as Cancelled.
-        // Falls back to file-marking when the task already settled (token absent).
-        let aborted = Self::background_task_cancels()
-            .lock()
-            .remove(task_id)
-            .inspect(CancellationToken::cancel)
-            .is_some();
-
-        result.status = BackgroundTaskStatus::Cancelled;
-        result.error = Some("Cancelled by user request".into());
-        result.finished_at = Some(chrono::Utc::now().to_rfc3339());
-        Self::write_result_atomic(&result_path, &result).await?;
-
-        // Reconcile the durable supervision registry so the supervised view agrees.
-        if let Some(cp) = crate::control_plane::control_plane() {
-            let _ = cp
-                .store
-                .update_status(
-                    task_id,
-                    crate::control_plane::TaskStatus::Cancelled,
-                    None,
-                    Some("cancelled by user request".into()),
+        // The running owner alone may publish its terminal result. Keep the
+        // token registered until settlement and never overwrite completed evidence
+        // with an optimistic "cancelled" record from this concurrent request.
+        let token = Self::background_task_cancels().lock().get(task_id).cloned();
+        if let Some(token) = token {
+            token.cancel();
+            Ok(ToolResult {
+                success: true,
+                output: crate::i18n::get_required_cli_string_with_args(
+                    "delegate-cancellation-requested",
+                    &[("task_id", task_id)],
                 )
-                .await;
+                .into(),
+                error: None,
+            })
+        } else {
+            Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(crate::i18n::get_required_cli_string_with_args(
+                    "delegate-cancellation-owner-missing",
+                    &[("task_id", task_id)],
+                )),
+            })
         }
-
-        Ok(ToolResult {
-            success: true,
-            output: if aborted {
-                format!("Task '{task_id}' cancelled: the running task was aborted.").into()
-            } else {
-                format!("Task '{task_id}' marked cancelled (it had already settled).").into()
-            },
-            error: None,
-        })
     }
 
     /// Cancel all background tasks (cascade control).
@@ -2687,6 +2948,7 @@ impl DelegateTool {
                         sub_skills = Some(independent.skills);
                         independent.tools
                     }
+                    Err(e) if settlement::terminal(&e) => return Err(e),
                     Err(e) => {
                         return Ok(ToolResult {
                             success: false,
@@ -2847,11 +3109,8 @@ impl DelegateTool {
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
-        let noop_observer = NoopObserver;
+        let progress_observer = progress::observer();
 
-        let agentic_timeout_secs = self
-            .resolve_agentic_timeout_secs(&agent_config.runtime_profile)
-            .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let receipt_scope = crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
             .try_with(Clone::clone)
             .ok()
@@ -2862,8 +3121,7 @@ impl DelegateTool {
         let pacing = zeroclaw_config::schema::PacingConfig::default();
         let loop_knobs = LoopKnobs::default();
         use futures_util::FutureExt;
-        let execution = tokio::time::timeout(
-            Duration::from_secs(agentic_timeout_secs),
+        let execution =
             // The child has its own delegate task record. Its tool phases must
             // never transition the synchronous parent's channel-turn journal.
             zeroclaw_api::turn::JOURNAL
@@ -2880,7 +3138,7 @@ impl DelegateTool {
                             },
                             ResolvedIo {
                                 tools_registry: &sub_tools,
-                                observer: &noop_observer,
+                                observer: &progress_observer,
                                 silent: true,
                                 approval: approval_manager.as_ref(),
                                 multimodal_config: &self.multimodal_config,
@@ -2940,8 +3198,7 @@ impl DelegateTool {
                 )
                 .instrument(::zeroclaw_log::attribution_span!(
                     &crate::agent::AgentAttribution(agent_name)
-                )),
-        );
+                ));
         let result = match thinking_params {
             Some(params) => {
                 zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2952,12 +3209,12 @@ impl DelegateTool {
         };
 
         match result {
-            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+            Ok(response) if response.trim().is_empty() => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
                 error: Some(invalid_semantic_completion_error(agent_name)),
             }),
-            Ok(Ok(response)) => Ok(ToolResult {
+            Ok(response) => Ok(ToolResult {
                 success: true,
                 output: format!(
                     "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
@@ -2965,24 +3222,13 @@ impl DelegateTool {
                 .into(),
                 error: None,
             }),
-            Ok(Err(e))
-                if e.is::<zeroclaw_api::delivery::DeliveryFailure>()
-                    || e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
-                    || e.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>() =>
-            {
-                Err(e)
+            Err(error) if settlement::terminal(&error) => {
+                Err(settlement::DelegateAgenticError { history, error }.into())
             }
-            Ok(Err(e)) => Ok(ToolResult {
+            Err(error) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(delegate_failure_error(agent_name, &e)),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!(
-                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
-                )),
+                error: Some(delegate_failure_error(agent_name, &error)),
             }),
         }
     }
@@ -3043,30 +3289,19 @@ impl Tool for ToolArcRef {
         self.inner.invocation_triggers()
     }
 
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.inner.supports_cooperative_settlement()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
-    }
-}
-
-struct NoopObserver;
-
-impl Observer for NoopObserver {
-    fn record_event(&self, _event: &ObserverEvent) {}
-
-    fn record_metric(&self, _metric: &ObserverMetric) {}
-
-    fn name(&self) -> &str {
-        "noop"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
     use crate::platform::{NativeRuntime, RuntimeAdapter};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::tools::{MemoryRecallTool, MemoryStoreTool};
@@ -3085,7 +3320,7 @@ mod tests {
         ReliableProviderTerminalFailureKind, ToolCall,
     };
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
+    zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool, GatedProgressTool);
 
     #[tokio::test]
     async fn reconciled_loss_label_surfaces_registry_truth() {
@@ -3178,10 +3413,11 @@ mod tests {
         DelegateTool::background_task_cancels()
             .lock()
             .insert(key.into(), token.clone());
-        // cancel_task-style lookup: remove + signal the live token
+        // cancel_task signals the owner without claiming it has settled.
         let aborted = DelegateTool::background_task_cancels()
             .lock()
-            .remove(key)
+            .get(key)
+            .cloned()
             .inspect(CancellationToken::cancel)
             .is_some();
         assert!(aborted, "a registered task token is found and aborted");
@@ -3192,11 +3428,15 @@ mod tests {
         assert!(
             DelegateTool::background_task_cancels()
                 .lock()
-                .remove(key)
-                .is_none(),
-            "the token is gone after cancellation"
+                .contains_key(key)
         );
-        // An unknown id is a no-op (cancel_task falls back to file-marking).
+        drop(settlement::BackgroundOwner(key.into()));
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(key)
+        );
+        // An unknown id has no live owner and must not claim cancellation.
         assert!(
             DelegateTool::background_task_cancels()
                 .lock()
@@ -3331,6 +3571,7 @@ mod tests {
             error: error.map(str::to_string),
             started_at: "2026-06-29T12:00:00Z".to_string(),
             finished_at,
+            evidence: None,
         }
     }
 
@@ -3379,6 +3620,164 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[derive(Default)]
+    struct GatedProgressTool {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Tool for GatedProgressTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+
+        fn description(&self) -> &str {
+            "Wait for the test gate, then echo."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            EchoTool.parameters_schema()
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            assert!(zeroclaw_api::turn::trace_id().is_none());
+            self.entered.notify_one();
+            self.release.notified().await;
+            EchoTool.execute(args).await
+        }
+    }
+
+    struct DelegateProgressRecorder(tokio::sync::mpsc::UnboundedSender<ObserverEvent>);
+
+    impl Observer for DelegateProgressRecorder {
+        fn record_event(&self, event: &ObserverEvent) {
+            self.0.send(event.clone()).unwrap();
+        }
+
+        fn record_metric(&self, _: &ObserverMetric) {
+            panic!("child metrics are not parent progress")
+        }
+
+        fn name(&self) -> &str {
+            "delegate-progress-test"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_progress_arrives_while_child_tool_pending_without_parent_journal_changes() {
+        struct ParentJournal;
+
+        #[async_trait]
+        impl zeroclaw_api::turn::TurnJournal for ParentJournal {
+            fn trace_id(&self) -> Option<&str> {
+                Some("parent-progress-turn")
+            }
+
+            async fn checkpoint(
+                &self,
+                _: zeroclaw_api::turn::TaskStatus,
+                _: Option<String>,
+                _: bool,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("child progress must not change parent journal")
+            }
+        }
+
+        let config = agentic_agent_config();
+        let gate = Arc::new(GatedProgressTool::default());
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".into()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![gate.clone()])));
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel();
+        zeroclaw_api::turn::JOURNAL
+            .scope(
+                Some(Arc::new(ParentJournal) as Arc<dyn zeroclaw_api::turn::TurnJournal>),
+                async {
+                    let run = progress::scope(Arc::new(DelegateProgressRecorder(send)), async {
+                        tool.execute_agentic(
+                            "agentic",
+                            &config,
+                            "test-provider",
+                            "test-model",
+                            &OneToolThenFinalModelProvider,
+                            "run",
+                            Some(0.2),
+                        )
+                        .await
+                    });
+                    tokio::pin!(run);
+                    tokio::select! {
+                        _ = gate.entered.notified() => {},
+                        result = &mut run => panic!("child finished before gate: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("child never reached tool"),
+                    }
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::LlmRequest {
+                            model_provider,
+                            model,
+                            messages_count: 0,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                        } if model_provider.is_empty() && model.is_empty()
+                    ));
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::ToolCallStart {
+                            tool,
+                            arguments: None,
+                            tool_call_id: None,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                        } if tool == "echo_tool"
+                    ));
+                    assert!(receive.try_recv().is_err(), "child tool is still running");
+                    assert_eq!(
+                        zeroclaw_api::turn::trace_id().as_deref(),
+                        Some("parent-progress-turn")
+                    );
+                    gate.release.notify_one();
+                    let result = run.await.unwrap();
+                    assert!(result.success, "{result:?}");
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::ToolCall {
+                            tool,
+                            success: true,
+                            arguments: None,
+                            result: None,
+                            tool_call_id: None,
+                            channel: None,
+                            agent_alias: None,
+                            parent_agent_alias: None,
+                            turn_id: None,
+                            ..
+                        } if tool == "echo_tool"
+                    ));
+                    assert!(matches!(
+                        receive.try_recv().unwrap(),
+                        ObserverEvent::LlmRequest { .. }
+                    ));
+                    assert!(receive.try_recv().is_err());
+                    assert_eq!(
+                        zeroclaw_api::turn::trace_id().as_deref(),
+                        Some("parent-progress-turn")
+                    );
+                },
+            )
+            .await;
     }
 
     struct OneToolThenFinalModelProvider;
@@ -4183,6 +4582,245 @@ mod tests {
         });
 
         (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    fn non_agentic_estop_fixture(
+        fixture: &mut DelegateMemoryFixture,
+    ) -> (Arc<RwLock<Config>>, crate::security::estop::EstopManager) {
+        // The constructor snapshot deliberately stays disabled. Only the live
+        // resolver is allowed to supply the changed policy to this same tool.
+        Arc::make_mut(&mut fixture.tool.runtime_profiles)
+            .get_mut("agentic_test")
+            .unwrap()
+            .agentic = false;
+        let mut config = fixture.tool.root_config.as_deref().unwrap().clone();
+        config.security.estop.enabled = true;
+        config.security.estop.state_file = "estop-fixture.json".into();
+        config.security.estop.require_otp_to_resume = false;
+        let manager = crate::security::estop::EstopManager::load(
+            &config.security.estop,
+            &config.install_root_dir(),
+        )
+        .unwrap();
+        let live = Arc::new(RwLock::new(config));
+        fixture.tool.live_config = Some(Arc::clone(&live));
+        (live, manager)
+    }
+
+    async fn wait_for_estop_provider_request(requests: &std::sync::atomic::AtomicUsize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("local provider receives the delegated request");
+    }
+
+    #[tokio::test]
+    async fn estop_delegate_live_admission_blocks_non_agentic_provider_then_resumes() {
+        use crate::security::estop::{EstopLevel, ResumeSelector};
+        use crate::security::estop_runtime::is_estop_interrupted;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_request(&mut socket).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            write_json_response(
+                &mut socket,
+                json!({
+                    "choices": [{"message": {"content": "explicit resumed run"}}]
+                }),
+            )
+            .await;
+        });
+        let mut fixture = delegate_memory_fixture(Some(uri)).await;
+        let (_live, mut manager) = non_agentic_estop_fixture(&mut fixture);
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let args = json!({"agent": "target", "prompt": "local fixture"});
+        let error = fixture.tool.execute(args.clone()).await.unwrap_err();
+        assert!(is_estop_interrupted(&error));
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        manager.resume(ResumeSelector::KillAll, None, None).unwrap();
+        let result = fixture.tool.execute(args).await.unwrap();
+        assert!(result.success, "{result:?}");
+        assert!(result.output.contains("explicit resumed run"));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn estop_delegate_cancels_active_non_agentic_and_parallel_provider_without_replay() {
+        use crate::security::estop::EstopLevel;
+        use crate::security::estop_runtime::is_estop_interrupted;
+
+        for parallel in [false, true] {
+            let (server, requests) = start_slow_chat_server(Duration::from_secs(5)).await;
+            let mut fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+            let (_live, mut manager) = non_agentic_estop_fixture(&mut fixture);
+            let args = if parallel {
+                json!({"parallel": ["target"], "prompt": "local fixture"})
+            } else {
+                json!({"agent": "target", "prompt": "local fixture"})
+            };
+            let run = fixture.tool.execute(args);
+            let stop = async {
+                wait_for_estop_provider_request(&requests).await;
+                manager
+                    .engage(EstopLevel::ToolFreeze(vec![DelegateTool::NAME.into()]))
+                    .unwrap();
+            };
+            let (result, ()) =
+                tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(run, stop) })
+                    .await
+                    .expect("delegated provider future must stop promptly");
+            assert!(is_estop_interrupted(&result.unwrap_err()));
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+            server._task.abort();
+            let _ = server._task.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn estop_delegate_background_cancellation_keeps_terminal_record() {
+        use crate::security::estop::EstopLevel;
+
+        let (server, requests) = start_slow_chat_server(Duration::from_secs(5)).await;
+        let mut fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let (_live, mut manager) = non_agentic_estop_fixture(&mut fixture);
+        let started = fixture
+            .tool
+            .execute(json!({
+                "agent": "target", "prompt": "local fixture", "background": true
+            }))
+            .await
+            .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .unwrap();
+        wait_for_estop_provider_request(&requests).await;
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
+        assert!(terminal.output.is_none());
+        assert_eq!(
+            terminal.error.as_deref(),
+            Some(crate::i18n::get_required_cli_string("estop-runtime-interrupted").as_str())
+        );
+        assert!(
+            !DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(task_id)
+        );
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server._task.abort();
+        let _ = server._task.await;
+    }
+
+    #[tokio::test]
+    async fn estop_delegate_spawn_carries_parent_authority_without_live_handle() {
+        use crate::security::estop::EstopLevel;
+        use crate::security::estop_runtime::{self, EstopRuntime};
+
+        let (server, requests) = start_slow_chat_server(Duration::from_secs(5)).await;
+        let mut fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+        let (live, mut manager) = non_agentic_estop_fixture(&mut fixture);
+        fixture.tool.live_config = None;
+        let authority = EstopRuntime::from_live_config(live);
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let result = estop_runtime::scope(
+            Some(authority.clone()),
+            fixture.tool.execute(json!({
+                "parallel": ["target"], "prompt": "local fixture"
+            })),
+        )
+        .await;
+        assert!(estop_runtime::is_estop_interrupted(&result.unwrap_err()));
+        let denied = estop_runtime::scope(
+            Some(authority.clone()),
+            fixture
+                .tool
+                .execute(json!({"agent":"target","prompt":"local fixture","background":true})),
+        )
+        .await
+        .unwrap_err();
+        assert!(estop_runtime::is_estop_interrupted(&denied));
+        assert!(
+            !fixture.tool.results_dir().exists(),
+            "stopped admission cannot create a background claim"
+        );
+        manager
+            .resume(crate::security::estop::ResumeSelector::KillAll, None, None)
+            .unwrap();
+        let started = estop_runtime::scope(
+            Some(authority),
+            fixture.tool.execute(json!({
+                "agent": "target", "prompt": "local fixture", "background": true
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(started.success, "{started:?}");
+        let task_id = started
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .unwrap();
+        wait_for_estop_provider_request(&requests).await;
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let terminal = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(terminal.status, BackgroundTaskStatus::Cancelled);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        server._task.abort();
+        let _ = server._task.await;
+    }
+
+    #[tokio::test]
+    async fn estop_delegate_agentic_frozen_child_keeps_terminal_cause() {
+        use crate::security::estop::{EstopLevel, EstopManager};
+        use crate::security::estop_runtime::{self, EstopRuntime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut authority = Config {
+            config_path: dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        authority.security.estop.enabled = true;
+        authority.security.estop.state_file = "estop-fixture.json".into();
+        let mut manager = EstopManager::load(&authority.security.estop, dir.path()).unwrap();
+        manager
+            .engage(EstopLevel::ToolFreeze(vec!["echo_tool".into()]))
+            .unwrap();
+        let target = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(5))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".into()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+        let provider = OneToolThenFinalModelProvider;
+        let result = estop_runtime::scope(
+            Some(EstopRuntime::from_config(&authority)),
+            tool.execute_agentic(
+                "agentic",
+                &target,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                Some(0.2),
+            ),
+        )
+        .await;
+        let error = result.unwrap_err();
+        assert!(estop_runtime::is_estop_interrupted(&error));
+        assert!(crate::agent::loop_::is_tool_loop_cancelled(&error));
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -5468,12 +6106,21 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(result.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
+        let owned = result
+            .downcast_ref::<settlement::DelegateAgenticError>()
+            .expect("agentic error retains original history and cause");
+        assert!(!owned.history.is_empty());
+        assert!(
+            owned
+                .error
+                .is::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+        );
         assert!(
             model_provider.tool_message().is_none(),
             "no oversized result is sent back to the child provider"
         );
-        let evidence = result
+        let evidence = owned
+            .error
             .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
             .unwrap();
         assert!(evidence.results[0].as_ref().unwrap().2.success);
@@ -5728,6 +6375,9 @@ mod tests {
                         zeroclaw_api::conversation::current(),
                         zeroclaw_api::deadline::current(),
                         zeroclaw_tools::mcp_protocol::current_mcp_elicitation_handler(),
+                        None,
+                        None,
+                        None,
                         async { current_tool_loop_session_key() },
                     )
                     .await
@@ -5738,6 +6388,47 @@ mod tests {
             .await;
 
         assert_eq!(seen.as_deref(), Some("channel_session"));
+    }
+
+    #[tokio::test]
+    async fn delegate_spawn_retains_live_peer_context_until_child_finishes() {
+        use zeroclaw_api::peer_activity::{PeerActivitySource, SOURCE, current};
+        struct Peers(std::sync::Mutex<String>);
+        impl PeerActivitySource for Peers {
+            fn context(&self) -> Option<String> {
+                Some(self.0.lock().unwrap().clone())
+            }
+        }
+        let source = Arc::new(Peers(std::sync::Mutex::new("initial peer".into())));
+        let weak = Arc::downgrade(&source);
+        let (go, ready) = tokio::sync::oneshot::channel();
+        let child = SOURCE.sync_scope(Some(source.clone()), || {
+            let peer_activity = current();
+            let execution = scope_delegate_session_key(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                peer_activity,
+                async {
+                    ready.await.unwrap();
+                    current().unwrap().context()
+                },
+            );
+            zeroclaw_spawn::spawn!(execution)
+        });
+        *source.0.lock().unwrap() = "new peer started".into();
+        drop(source);
+        assert!(
+            weak.upgrade().is_some(),
+            "child keeps the registration alive"
+        );
+        go.send(()).unwrap();
+        assert_eq!(child.await.unwrap().as_deref(), Some("new peer started"));
+        assert!(weak.upgrade().is_none());
+        assert!(current().is_none());
     }
 
     #[tokio::test]
@@ -5772,12 +6463,21 @@ mod tests {
                 let route = zeroclaw_api::conversation::current();
                 let handler = current_mcp_elicitation_handler();
                 zeroclaw_spawn::spawn!(async move {
-                    scope_delegate_session_key(None, route, None, handler, async {
-                        (
-                            zeroclaw_api::conversation::current(),
-                            current_mcp_elicitation_handler(),
-                        )
-                    })
+                    scope_delegate_session_key(
+                        None,
+                        route,
+                        None,
+                        handler,
+                        None,
+                        None,
+                        None,
+                        async {
+                            (
+                                zeroclaw_api::conversation::current(),
+                                current_mcp_elicitation_handler(),
+                            )
+                        },
+                    )
                     .await
                 })
                 .await
@@ -10041,18 +10741,11 @@ command = "rm independent-delegate-marker"
             .delegation_timeout_secs = Some(1);
         let tool = fallback_delegate_tool(Arc::new(config), None);
 
-        let result = tool
+        let error = tool
             .execute(json!({"agent": "target", "prompt": "respond"}))
             .await
-            .expect("delegate call completes");
-
-        assert!(!result.success, "timeout must remain terminal: {result:?}");
-        assert!(
-            result.output.is_empty(),
-            "timeout must not carry output: {result:?}"
-        );
-        let error = result.error.expect("timeout error");
-        assert_eq!(error, "Agent 'target' timed out after 1s");
+            .expect_err("delegate deadline remains a typed terminal result");
+        assert_eq!(settlement::error_kind(&error), "deadline");
         assert_eq!(
             backup_requests.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -10529,6 +11222,7 @@ command = "rm independent-delegate-marker"
             "non-OAuth target without api_key must fall back to global credential"
         );
     }
+    include!("delegate_settlement_tests.rs");
 }
 
 #[cfg(test)]

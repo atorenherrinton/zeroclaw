@@ -3698,6 +3698,43 @@ impl<'de> Deserialize<'de> for DelegateTargetConfig {
     }
 }
 
+/// Opt-in typed judgment before the first turn of a channel conversation.
+/// The candidates define intent rubrics, not grants: channel dispatch intersects
+/// them with the owner's currently permitted independent delegate roster.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "direct_routing"]
+#[serde(default, deny_unknown_fields)]
+pub struct DirectRoutingConfig {
+    /// Route new plain-text channel conversations through the owner's admitted
+    /// `typesafe__typesafe_system_one` tool. Existing conversations keep their owner.
+    pub enabled: bool,
+    /// Agent alias to intent description. The channel owner is always the fallback.
+    pub candidates: HashMap<String, String>,
+    /// Exact channel keys owned by this agent on which direct routing is allowed.
+    /// Empty disables routing. This narrows existing channel ownership.
+    pub channels: Vec<String>,
+    /// Maximum routing delay before falling back to the channel owner.
+    pub timeout_ms: u64,
+    /// Minimum selected Choice probability, inclusive.
+    pub min_probability: f64,
+    /// Minimum Choice confidence, inclusive.
+    pub min_confidence: f64,
+}
+
+impl Default for DirectRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            candidates: HashMap::new(),
+            channels: Vec::new(),
+            timeout_ms: 1500,
+            min_probability: 0.8,
+            min_confidence: 0.6,
+        }
+    }
+}
+
 /// Configuration for an aliased agent. Each `[agents.<alias>]` TOML
 /// block deserializes into one of these. The `DelegateTool` looks up
 /// entries here to dispatch a subtask to a named sibling agent.
@@ -3822,6 +3859,13 @@ pub struct AliasedAgentConfig {
     #[nested]
     pub precheck: crate::scattered_types::ChannelPrecheckConfig,
 
+    /// Optional first-turn agent selection. Requires durable SQLite session
+    /// ownership and never expands another agent's permissions or delegate reach.
+    #[tab(Channels)]
+    #[serde(default)]
+    #[nested]
+    pub direct_routing: DirectRoutingConfig,
+
     /// Per-agent override for the context-compression summarizer provider, as
     /// a `providers.models.<type>.<alias>` reference. Empty (Default) = inherit
     /// the runtime profile's `context_compression.summary_provider`, else the
@@ -3914,6 +3958,7 @@ impl Default for AliasedAgentConfig {
             transcription_provider: crate::providers::TranscriptionProviderRef::default(),
             classifier_provider: crate::providers::ModelProviderRef::default(),
             precheck: crate::scattered_types::ChannelPrecheckConfig::default(),
+            direct_routing: DirectRoutingConfig::default(),
             summary_provider: crate::providers::ModelProviderRef::default(),
             delegate_same_risk_profile: true,
             delegates: Vec::new(),
@@ -21898,6 +21943,68 @@ impl Config {
                     "agents.{alias}.precheck.timeout_secs must be greater than 0"
                 );
             }
+            let routing = &agent.direct_routing;
+            let mut routing_channels = std::collections::HashSet::new();
+            for channel in &routing.channels {
+                if !agent.channels.iter().any(|owned| owned.as_str() == channel)
+                    || !routing_channels.insert(channel)
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.direct_routing.channels"),
+                        "agents.{alias}.direct_routing.channels must contain unique channel keys owned by this agent"
+                    );
+                }
+            }
+            if !(100..=5000).contains(&routing.timeout_ms) {
+                validation_bail!(
+                    InvalidNumericRange,
+                    format!("agents.{alias}.direct_routing.timeout_ms"),
+                    "agents.{alias}.direct_routing.timeout_ms must be between 100 and 5000"
+                );
+            }
+            for (field, value) in [
+                ("min_probability", routing.min_probability),
+                ("min_confidence", routing.min_confidence),
+            ] {
+                if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                    validation_bail!(
+                        InvalidNumericRange,
+                        format!("agents.{alias}.direct_routing.{field}"),
+                        "agents.{alias}.direct_routing.{field} must be finite and between 0 and 1"
+                    );
+                }
+            }
+            if routing.candidates.len() > 32 {
+                validation_bail!(
+                    InvalidFormat,
+                    format!("agents.{alias}.direct_routing.candidates"),
+                    "agents.{alias}.direct_routing.candidates allows at most 32 entries"
+                );
+            }
+            for (target, description) in &routing.candidates {
+                if target.trim().is_empty()
+                    || target.len() > 128
+                    || target.chars().any(char::is_control)
+                    || !self.agents.contains_key(target)
+                {
+                    validation_bail!(
+                        DanglingReference,
+                        format!("agents.{alias}.direct_routing.candidates"),
+                        "agents.{alias}.direct_routing.candidates must name configured agent aliases"
+                    );
+                }
+                if description.trim().is_empty()
+                    || description.len() > 2048
+                    || description.contains('\0')
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.direct_routing.candidates.{target}"),
+                        "agents.{alias}.direct_routing.candidates.{target} requires an intent description of 1 through 2048 bytes"
+                    );
+                }
+            }
         }
         // Heartbeat agent: when heartbeat is enabled, the agent field
         // must name a configured agent.
@@ -29008,6 +29115,56 @@ reasoning_effort = "turbo"
         assert!(!cfg.resolved.strict_tool_parsing);
         assert!(cfg.precheck.enabled);
         assert_eq!(cfg.precheck.timeout_secs, 5);
+        assert!(!cfg.direct_routing.enabled);
+        assert!(cfg.direct_routing.candidates.is_empty());
+    }
+
+    #[test]
+    async fn direct_routing_config_roundtrips_intent_rubrics() {
+        let raw = r#"
+[agents.default]
+model_provider = "custom.default"
+risk_profile = "default"
+runtime_profile = "default"
+[agents.default.direct_routing]
+enabled = true
+timeout_ms = 1200
+min_probability = 0.85
+min_confidence = 0.7
+[agents.default.direct_routing.candidates]
+default = "General assistance"
+"#;
+        let parsed = parse_test_config(raw);
+        let routing = &parsed.agents["default"].direct_routing;
+        assert!(routing.enabled);
+        assert_eq!(routing.timeout_ms, 1200);
+        assert_eq!(routing.candidates["default"], "General assistance");
+        let encoded = toml::to_string(routing).unwrap();
+        let restored: DirectRoutingConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.min_probability, 0.85);
+        assert_eq!(restored.min_confidence, 0.7);
+        assert!(toml::from_str::<DirectRoutingConfig>("enable = true").is_err());
+    }
+
+    #[test]
+    async fn direct_routing_config_rejects_unbounded_or_invalid_input() {
+        for invalid in [
+            "timeout_ms = 0",
+            "timeout_ms = 5001",
+            "min_probability = 1.01",
+            "min_probability = nan",
+            "min_confidence = -0.1",
+            "candidates = { missing = 'Coding' }",
+            "candidates = { default = '' }",
+            "channels = ['telegram.not-owned']",
+        ] {
+            let raw = format!(
+                "[agents.default]\nmodel_provider = 'custom.default'\nrisk_profile = 'default'\nruntime_profile = 'default'\n[agents.default.direct_routing]\n{invalid}\n"
+            );
+            let config = parse_test_config(&raw);
+            let error = config.validate().expect_err(invalid).to_string();
+            assert!(error.contains("direct_routing"), "{invalid}: {error}");
+        }
     }
 
     #[test]

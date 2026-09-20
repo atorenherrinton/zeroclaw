@@ -910,6 +910,7 @@ cli-update-not-writable = install directory {$dir} is not writable ({$error}); r
 
 # ── self-test (zeroclaw self-test) ──
 cli-selftest-all-passed = All {$total} checks passed.
+cli-selftest-websocket-auth-unavailable = Authenticated handshake not verified: pairing requires a client bearer token. Supply an existing token through ZEROCLAW_GATEWAY_TOKEN for this diagnostic process; keep gateway.paired_tokens hashed and pairing enabled. Endpoint: {$url}
 cli-selftest-some-failed = {$failed}/{$total} checks failed.
 cli-selftest-channel-config-uncompiled = {$compiled} compiled channel types, {$configured} compiled/configured; configured but not compiled: {$names}. Build from source with `./install.sh --source --preset full`, `--features channels-full`, or the specific `channel-*` feature.
 
@@ -978,22 +979,40 @@ turn-codex-recovery-will-stop = ZeroClaw will report the stop without delegating
 # tool-call protocol and the turn gives up retrying.
 channel-runtime-malformed-tool-output = I generated an internal tool-call format error and could not complete this request. Please try again.
 channel-runtime-progress-received = Got it — checking the request…
+channel-runtime-topic-followup-queued = Your follow-up is queued in this thread. I’ll handle it when the current response finishes; other task threads can keep running.
 channel-runtime-progress-planning = Reviewing what I know and choosing the next step…
 channel-runtime-progress-waiting-on-model = Waiting for the model response…
-channel-runtime-progress-running-tool = Using a tool to gather the next piece of information…
+channel-runtime-progress-running-tool = Running the next tool action…
 channel-runtime-progress-compacting-context = Organizing the working context so I can continue…
 channel-runtime-progress-finalizing-response = Putting the result into a clear answer…
-channel-runtime-progress-tool-activity-codex = Codex
-channel-runtime-progress-tool-activity-browser = the browser
-channel-runtime-progress-tool-activity-web = the web
-channel-runtime-progress-tool-activity-files = files and code
-channel-runtime-progress-tool-activity-command-line = the command line
-channel-runtime-progress-tool-activity-memory = saved context
-channel-runtime-progress-tool-activity-version-control = version control
-channel-runtime-progress-tool-activity-other = another tool
-channel-runtime-progress-tool-running = Working with { $activity } to gather the next piece of information…
-channel-runtime-progress-tool-succeeded = Finished with { $activity }; reviewing what it found…
-channel-runtime-progress-tool-failed = { $activity } hit a problem; checking the error and another safe route…
+channel-runtime-progress-tool-activity-codex = working on the delegated task in Codex
+channel-runtime-progress-tool-activity-browser = using the browser
+channel-runtime-progress-tool-activity-web = fetching web information
+channel-runtime-progress-tool-activity-files = working with local files
+channel-runtime-progress-tool-activity-command-line = running a command
+channel-runtime-progress-tool-activity-memory = accessing saved context
+channel-runtime-progress-tool-activity-version-control = working with version control
+channel-runtime-progress-tool-activity-other = running a tool
+channel-runtime-progress-tool-activity-browser-open = opening a browser page
+channel-runtime-progress-tool-activity-browser-read = inspecting the browser page
+channel-runtime-progress-tool-activity-browser-interact = interacting with the browser page
+channel-runtime-progress-tool-activity-browser-wait = waiting for browser content to appear
+channel-runtime-progress-tool-activity-browser-verify = verifying the browser page state
+channel-runtime-progress-tool-activity-file-read = reading local files
+channel-runtime-progress-tool-activity-file-write = editing local files
+channel-runtime-progress-tool-activity-search = searching for information
+channel-runtime-progress-tool-activity-calendar-read = checking calendar information
+channel-runtime-progress-tool-activity-calendar-write = applying a calendar change
+channel-runtime-progress-tool-activity-draft-message = preparing a message draft or attachment
+channel-runtime-progress-tool-activity-send-message = submitting or scheduling the approved message
+channel-runtime-progress-tool-activity-check-delivery = checking message delivery status
+channel-runtime-progress-tool-activity-contacts = looking up contacts or message recipients
+channel-runtime-progress-tool-activity-delegation = working with a delegated agent
+channel-runtime-progress-tool-activity-tool-discovery = finding the tools needed for this request
+channel-runtime-progress-tool-running = Now: { $activity }…
+channel-runtime-progress-tool-succeeded = Completed tool step: { $activity }.
+channel-runtime-progress-tool-failed = Tool reported a problem while { $activity }.
+channel-runtime-progress-elapsed = Elapsed: { $seconds }s
 channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
@@ -1308,6 +1327,7 @@ channel-elicitation-invalid-metadata = This permission request has unsupported o
 shell-output-preview-truncated = [Shell output truncated; the middle was omitted. The command already ran. This incomplete preview is not evidence that a write failed or did not occur. Do not rerun the command to recover output; reconcile effects first. Full output is not retained here. For future commands, redirect large output to a file and inspect bounded sections.]
 
 turn-provider-wait = Waiting for the model response ({ $seconds }s, round { $round }).
+turn-commentary-incomplete = The model kept sending progress updates without completing the task. This turn has stopped; the task is not complete.
 channel-runtime-interrupted = This run was interrupted. Any in-flight action may have completed; verify its result before retrying.
 channel-runtime-partial = Partial response saved before the run stopped:
 channel-runtime-delegates = Delegated work saved for this conversation:
@@ -1321,3 +1341,18 @@ channel-runtime-delegate-completed = Completed delegated work (task { $task_id }
 cli-cron-completion-check-failed = Scheduled task completion check failed: { $detail }
 
 cron-reconcile-rejected = Reconciliation rejected: exact current quarantined job/run/occurrence and non-conflicting operator evidence are required. No replay is authorized.
+estop-runtime-interrupted = Emergency stop interrupted this operation. Inspect the stop status and explicitly resume before starting new work. An external action already accepted by a service may still complete.
+
+estop-tool-settlement-incomplete = The tool stopped before its completed results could be fully collected. Check its recorded effects before retrying.
+
+# Owned delegate cancellation settlement
+delegate-settlement-incomplete = Delegated execution did not settle.
+delegate-cancellation-requested = Cancellation requested for task '{ $task_id }'; its owner is settling pending work.
+delegate-cancellation-owner-missing = Task '{ $task_id }' has no live owner; its execution outcome is unknown. The stored result was not changed.
+turn-settlement-incomplete = The turn stopped before all pending work could settle. Some results may be incomplete; reconcile recorded effects before retrying.
+sop-settlement-incomplete = The workflow stopped with unfinished cleanup or persistence. Its recorded results remain available; reconcile its pending work before restarting it.
+
+# RPC terminal control-flow projection; raw owned evidence stays internal.
+rpc-turn-emergency-stop = Turn stopped by emergency stop. Resume explicitly before starting a new turn.
+rpc-turn-deadline = Turn stopped because its deadline expired.
+rpc-turn-settlement-incomplete = Turn stopped with incomplete execution evidence. Review completed and uncertain work before retrying.

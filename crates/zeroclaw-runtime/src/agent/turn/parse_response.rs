@@ -119,6 +119,8 @@ pub(crate) struct InterpretedResponse {
     /// Full cumulative provider usage.  The caller records this as rejected
     /// when protocol classification rejects the response.
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    /// Derived from the provider's canonical replay payload, never prose.
+    pub(crate) commentary_only: bool,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
@@ -136,7 +138,12 @@ pub(crate) async fn interpret_chat_response(
 ) -> InterpretedResponse {
     let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
 
-    let response_text = strip_think_tags(resp.text_or_empty());
+    let commentary_only = zeroclaw_providers::openai_codex::responses_is_commentary_only(
+        resp.reasoning_content.as_deref(),
+    );
+    let final_text =
+        zeroclaw_providers::openai_codex::responses_final_text(resp.reasoning_content.as_deref());
+    let response_text = strip_think_tags(final_text.as_deref().unwrap_or(resp.text_or_empty()));
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
     // Handles stacked markers with arbitrary whitespace between them.
     let response_text = strip_trailing_terminal_markers(&response_text);
@@ -229,7 +236,12 @@ pub(crate) async fn interpret_chat_response(
     // Preserve native tool call IDs in assistant history so role=tool
     // follow-up messages can reference the exact call id.
     let reasoning_content = resp.reasoning_content.clone();
-    let assistant_history_content = if resp.tool_calls.is_empty() {
+    let assistant_history_content = if resp.tool_calls.is_empty()
+        && calls.is_empty()
+        && zeroclaw_providers::openai_codex::has_responses_history(reasoning_content.as_deref())
+    {
+        build_native_assistant_history(&response_text, &[], reasoning_content.as_deref())
+    } else if resp.tool_calls.is_empty() {
         if specs.use_native_tools {
             build_native_assistant_history_from_parsed_calls(
                 &response_text,
@@ -258,6 +270,7 @@ pub(crate) async fn interpret_chat_response(
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
         usage: resp.usage,
+        commentary_only,
     }
 }
 
@@ -298,14 +311,16 @@ pub(crate) async fn record_accepted_chat_response(
     if let Some(tx) = ctx.event_tx
         && let Some(usage) = usage
     {
-        let _ = tx
-            .send(TurnEvent::Usage {
+        let _ = super::outcome::until_cancelled(
+            ctx.cancellation_token,
+            tx.send(TurnEvent::Usage {
                 input_tokens: usage.input_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 output_tokens: usage.output_tokens,
                 cost_usd,
-            })
-            .await;
+            }),
+        )
+        .await;
     }
     ::zeroclaw_log::record!(
         INFO,

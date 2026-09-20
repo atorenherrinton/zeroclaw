@@ -85,6 +85,12 @@ pub struct HistoryPage {
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
+    /// Whether agent ownership metadata survives a backend restart. Routing
+    /// must not mistake the legacy no-op attribution methods for persistence.
+    fn supports_session_agent_attribution(&self) -> bool {
+        false
+    }
+
     fn supports_delivery_journal(&self) -> bool {
         false
     }

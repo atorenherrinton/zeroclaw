@@ -155,6 +155,13 @@ Display/Debug. The payload lifecycle contract describes this transient ownership
 Unstarted sequential calls are distinguished from calls that stopped
 without a normal result.
 
+When every dispatched call returns a normal outcome, the turn checkpoints back
+to `Running` before returning a source/history budget rejection. This lets a
+channel submit its terminal error notice through the existing legal lifecycle.
+Admitted results reach history first; rejected outcomes remain owned by the typed
+error, including when the checkpoint itself fails. Interrupted batches do not
+claim normal completion, and no admission failure replays tool work.
+
 The ordered result vector keeps one slot per original model call. Preparation
 fills slots for cancelled, denied, replaced, or deduplicated calls; execution
 fills the remaining slots. This preserves provider history ordering even when

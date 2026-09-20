@@ -228,7 +228,7 @@ pub struct Prepare {
     #[serde(default)]
     pub attachments: Vec<LocalAttachment>,
 }
-fn digest(value: &str) -> Result<()> {
+pub(crate) fn digest(value: &str) -> Result<()> {
     ensure!(
         value.len() == 64
             && value
@@ -586,6 +586,10 @@ pub async fn apply(
     let review_id = text(args, "review_id", 64)?;
     let (review, raw) = store.review(op, review_id)?;
     ensure!(
+        matches!(review["action"].as_str(), Some("create" | "update")),
+        "draft apply requires a draft preparation"
+    );
+    ensure!(
         review["account"] == account,
         "review belongs to a different pinned account"
     );
@@ -710,6 +714,13 @@ pub async fn reconcile(
         return Ok(status);
     }
     let intent = &status["intent"];
+    ensure!(
+        matches!(
+            intent["action"].as_str(),
+            Some("create" | "update" | "discard")
+        ),
+        "use native schedule reconciliation for native handoffs"
+    );
     let target = args["draft_id"]
         .as_str()
         .or(intent["draft_id"].as_str())

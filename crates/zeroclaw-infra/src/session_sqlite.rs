@@ -774,6 +774,10 @@ impl SqliteSessionBackend {
 const HISTORY_PAGE_ROW_SQL: &str = "SELECT id,substr(role,1,32),substr(CAST(content AS BLOB),1,?3),length(CAST(content AS BLOB)),substr(created_at,1,64) FROM sessions WHERE session_key=?1 AND id<?2 ORDER BY id DESC LIMIT 1";
 
 impl SessionBackend for SqliteSessionBackend {
+    fn supports_session_agent_attribution(&self) -> bool {
+        true
+    }
+
     fn supports_delivery_journal(&self) -> bool {
         true
     }

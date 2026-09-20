@@ -248,11 +248,38 @@ impl Tool for SkillShellTool {
             cmd.env(SESSION_ID_ENV_VAR, session_id);
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(self.timeout_secs), cmd.output()).await;
+        // Own the process subtree through cancellation and timeout. `output()`
+        // alone leaves a child running when its future is dropped.
+        #[cfg(unix)]
+        cmd.process_group(0);
+        cmd.kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+        #[cfg(unix)]
+        let group_guard = super::shell::ChildGroupGuard::new(child.id());
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            child.wait_with_output(),
+        )
+        .await;
 
         match result {
             Ok(Ok(output)) => {
+                // Inherited pipes can outlive the direct shell. Keep the guard
+                // armed until output collection completes, as cron does.
+                #[cfg(unix)]
+                group_guard.disarm();
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -381,6 +408,10 @@ fn narrow_schema(
 
 #[async_trait]
 impl Tool for SkillBuiltinTool {
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.target_tool.supports_cooperative_settlement()
+    }
+
     fn name(&self) -> &str {
         &self.tool_name
     }
@@ -422,7 +453,14 @@ impl Tool for SkillBuiltinTool {
             "skill-scoped elevated tool invoked"
         );
         let merged = merge_locked_args(&self.locked_args, args);
-        self.target_tool.execute(merged).await
+        // The outer skill alias is not the delegated capability's name. Reuse
+        // the current invocation's authority at this actual dispatch boundary.
+        crate::security::estop_runtime::run_tool(
+            self.target_tool.as_ref(),
+            None,
+            self.target_tool.execute(merged),
+        )
+        .await
     }
 }
 
@@ -640,6 +678,116 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
+    }
+
+    #[cfg(unix)]
+    async fn assert_skill_shell_descendant_cleanup(cancel: bool, owner_exits: bool) {
+        let workspace = tempfile::tempdir().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        });
+        let effect_delay = if cancel { "0.6" } else { "1.5" };
+        std::fs::write(workspace.path().join("descendant.sh"), format!(
+            "printf '%s\\n' \"$$\" > descendant.pid\nprintf ready > ready\nsleep {effect_delay}\nprintf escaped > escaped\n"
+        )).unwrap();
+        std::fs::write(
+            workspace.path().join("owner.sh"),
+            if owner_exits {
+                "sh descendant.sh &\nexit 0\n"
+            } else {
+                "sh descendant.sh &\nwait\n"
+            },
+        )
+        .unwrap();
+        let unrelated = tokio::process::Command::new("sh")
+            .args([
+                "-c",
+                if cancel {
+                    "sleep 0.9; printf untouched > unrelated"
+                } else {
+                    "sleep 1.8; printf untouched > unrelated"
+                },
+            ])
+            .current_dir(workspace.path())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut declaration = sample_skill_tool();
+        declaration.command = "sh owner.sh".into();
+        declaration.args.clear();
+        declaration.timeout_secs = Some(if cancel { 5 } else { 1 });
+        let tool = SkillShellTool::new("lifecycle_fixture", &declaration, security);
+        let mut run = Box::pin(tool.execute(serde_json::json!({})));
+        let ready = workspace.path().join("ready");
+        tokio::select! {
+            result = &mut run => panic!("skill ended before descendant was ready: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(3), async {
+                while !ready.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("descendant ready marker"),
+        }
+        let descendant: i32 = std::fs::read_to_string(workspace.path().join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(descendant > 1);
+        if cancel {
+            drop(run);
+        } else {
+            let result = run.await.unwrap();
+            assert!(!result.success);
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("timed out")
+            );
+        }
+        let result = tokio::time::timeout(Duration::from_secs(3), unrelated.wait_with_output())
+            .await
+            .expect("unrelated process finishes")
+            .unwrap();
+        assert!(result.status.success());
+        assert!(workspace.path().join("unrelated").exists());
+        assert!(
+            !workspace.path().join("escaped").exists(),
+            "cancelled skill descendant performed its side effect"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal zero only probes our fixture's recorded PID.
+                if unsafe { libc::kill(descendant, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned skill descendant must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_shell_drop_kills_owned_descendants_only() {
+        assert_skill_shell_descendant_cleanup(true, false).await;
+        assert_skill_shell_descendant_cleanup(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skill_shell_timeout_kills_owned_descendants_only() {
+        assert_skill_shell_descendant_cleanup(false, false).await;
+        assert_skill_shell_descendant_cleanup(false, true).await;
     }
 
     #[tokio::test]

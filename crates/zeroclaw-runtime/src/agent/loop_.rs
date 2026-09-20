@@ -1207,6 +1207,9 @@ pub async fn run(
     origin: TurnOrigin,
     overrides: AgentRunOverrides,
 ) -> Result<String> {
+    crate::security::estop_runtime::current()
+        .unwrap_or_else(|| crate::security::estop_runtime::EstopRuntime::from_config(&config))
+        .check(None)?;
     use ::zeroclaw_log::Instrument;
     let agent = resolved_agent_for_turn(&config, agent_alias)?;
     crate::agent::thinking::validate_thinking_config(&agent.resolved.thinking);
@@ -5683,6 +5686,562 @@ mod tests {
         }
     }
 
+    fn phased_response(phase: &str, text: &str, with_tool: bool) -> ChatResponse {
+        let mut items = vec![serde_json::json!({
+            "type":"message", "role":"assistant", "phase":phase,
+            "content":[{"type":"output_text", "text":text}],
+        })];
+        let tool_calls = if with_tool {
+            items.push(serde_json::json!({"type":"function_call", "call_id":"phase_tool", "name":"count_tool", "arguments":"{}"}));
+            vec![ToolCall {
+                id: "phase_tool".into(),
+                name: "count_tool".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }]
+        } else {
+            vec![]
+        };
+        ChatResponse {
+            text: Some(text.into()),
+            tool_calls,
+            usage: None,
+            reasoning_content: Some(
+                serde_json::json!({
+                    "provider":"openai_codex", "kind":"responses_output_items", "items":items,
+                })
+                .to_string(),
+            ),
+        }
+    }
+
+    async fn run_phased_responses(
+        provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        invocations: Arc<AtomicUsize>,
+        on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<String> {
+        let tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+            CountingTool::new("count_tool", invocations),
+        )]);
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: provider,
+                    provider_name: "test",
+                    model: "test",
+                    temperature: None,
+                },
+                tools_registry: &tools,
+                observer: &NoopObserver,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 10,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            channel_name: "telegram",
+            channel_reply_target: None,
+            cancellation_token: cancellation,
+            on_delta,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: "phase-test",
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continues_and_tool_executes_once_before_final() {
+        let provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                phased_response("commentary", "Checking now.", false),
+                phased_response("commentary", "Checking context.", false),
+                phased_response("commentary", "Checking details.", false),
+                phased_response("commentary", "Running the check.", true),
+                phased_response("commentary", "Verifying the result.", false),
+                phased_response("commentary", "Reviewing evidence.", false),
+                phased_response("commentary", "Finishing the answer.", false),
+                phased_response("final_answer", "Verified and complete.", false),
+            ]))),
+            capabilities: ProviderCapabilities {
+                native_tool_calling: true,
+                ..ProviderCapabilities::default()
+            },
+        };
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::clone(&invocations),
+            Some(tx),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "Verified and complete.");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert!(provider.responses.lock().unwrap().is_empty());
+        let phases: Vec<_> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .map(|m| {
+                let envelope: serde_json::Value = serde_json::from_str(&m.content).unwrap();
+                let replay: serde_json::Value =
+                    serde_json::from_str(envelope["reasoning_content"].as_str().unwrap()).unwrap();
+                replay["items"][0]["phase"].as_str().unwrap().to_owned()
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "commentary",
+                "final_answer"
+            ]
+        );
+        let mut visible = String::new();
+        while let Some(event) = rx.recv().await {
+            if let DraftEvent::Text(text) = event {
+                visible.push_str(&text);
+            }
+        }
+        assert_eq!(visible.matches("Checking now.").count(), 1);
+        assert_eq!(visible.matches("Verified and complete.").count(), 1);
+        assert!(!visible.contains("responses_output_items"));
+    }
+
+    struct InitialProgressProvider {
+        inner: ScriptedModelProvider,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        cancel_on_repair: Option<CancellationToken>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for InitialProgressProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Attributable::role(&self.inner)
+        }
+        fn alias(&self) -> &str {
+            "initial-progress-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for InitialProgressProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let repairing = request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[Complete the current request]"));
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            if repairing && let Some(token) = &self.cancel_on_repair {
+                token.cancel();
+                return std::future::pending().await;
+            }
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    fn initial_progress_provider(responses: Vec<ChatResponse>) -> InitialProgressProvider {
+        InitialProgressProvider {
+            inner: ScriptedModelProvider {
+                responses: Arc::new(Mutex::new(responses.into())),
+                capabilities: ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..ProviderCapabilities::default()
+                },
+            },
+            requests: Mutex::new(Vec::new()),
+            cancel_on_repair: None,
+        }
+    }
+
+    fn plain_progress_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            text: Some(text.into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_continues_unmarked_and_mislabelled_finals_once() {
+        for first in [
+            plain_progress_response("I'm checking the sample report now."),
+            phased_response(
+                "final_answer",
+                "I'm reviewing the sample report now.",
+                false,
+            ),
+        ] {
+            let expected_replay = first.reasoning_content.clone();
+            let provider = initial_progress_provider(vec![
+                first,
+                phased_response("commentary", "Checking the source.", true),
+                plain_progress_response("The sample report passed the check."),
+            ]);
+            let mut history = vec![ChatMessage::user("Please check the sample report.")];
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let result =
+                run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+                    .await
+                    .unwrap();
+            assert_eq!(result, "The sample report passed the check.");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            for (index, request) in requests.iter().enumerate() {
+                assert_eq!(
+                    request
+                        .iter()
+                        .any(|message| message.content.contains("[Complete the current request]")),
+                    index == 1
+                );
+                assert_eq!(
+                    request
+                        .iter()
+                        .find(|message| message.role == "user")
+                        .unwrap()
+                        .content,
+                    "Please check the sample report."
+                );
+            }
+            assert!(
+                !history
+                    .iter()
+                    .any(|message| message.content.contains("[Complete the current request]"))
+            );
+            if let Some(expected) = expected_replay {
+                let assistant = history
+                    .iter()
+                    .find(|message| message.role == "assistant")
+                    .unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&assistant.content).unwrap();
+                assert_eq!(
+                    envelope["reasoning_content"], expected,
+                    "repair must not rewrite the provider's phase metadata"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_stops_repeated_promises_and_remains_cancellable() {
+        let mut provider = initial_progress_provider(vec![
+            plain_progress_response("I'm checking the sample report now."),
+            plain_progress_response("I'll review the sample report now."),
+            plain_progress_response("must not request a third response"),
+        ]);
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let error = run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("task is not complete"),
+            "{error}"
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+
+        provider
+            .inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_front(plain_progress_response(
+                "I'm checking the sample report now.",
+            ));
+        let token = CancellationToken::new();
+        provider.cancel_on_repair = Some(token.clone());
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_phased_responses(
+                &provider,
+                &mut history,
+                invocations.clone(),
+                None,
+                Some(token),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(is_tool_loop_cancelled(&error), "{error}");
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_preserves_answers_plans_blockers_and_completed_actions() {
+        for (request, answer) in [
+            (
+                "Please check the report.",
+                "The report you pasted is complete.",
+            ),
+            ("Please check the report.", "I cannot access that report."),
+            ("Please check the report.", "Which report should I check?"),
+            (
+                "Give me a plan for checking reports.",
+                "I'll review the report and verify the sources.",
+            ),
+            (
+                "Rewrite this update in the first person.",
+                "I'm checking the report now.",
+            ),
+        ] {
+            let provider = initial_progress_provider(vec![plain_progress_response(answer)]);
+            let mut history = vec![ChatMessage::user(request)];
+            let result = run_phased_responses(
+                &provider,
+                &mut history,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, answer);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        }
+        // A completed tool round can have irreversible effects. This heuristic
+        // must not turn its subsequent status message into a replay request.
+        let provider = initial_progress_provider(vec![
+            phased_response("commentary", "Checking the source.", true),
+            plain_progress_response("I'm checking the sample report now."),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert!(
+            !provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|message| message.content.contains("[Complete the current request]"))
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_does_not_duplicate_streamed_preamble() {
+        let provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::TextChunks(vec![
+                "I'm checking ".into(),
+                "the sample report now.".into(),
+            ]),
+            NativeStreamTurn::ToolCall(ToolCall {
+                id: "repair-check".into(),
+                name: "count_tool".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }),
+            NativeStreamTurn::Text("The sample report passed.".into()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result =
+            run_phased_responses(&provider, &mut history, invocations.clone(), Some(tx), None)
+                .await
+                .unwrap();
+        assert_eq!(result, "The sample report passed.");
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        let mut visible = String::new();
+        while let Some(event) = rx.recv().await {
+            if let DraftEvent::Text(text) = event {
+                visible.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible
+                .matches("I'm checking the sample report now.")
+                .count(),
+            1
+        );
+        assert_eq!(visible.matches("The sample report passed.").count(), 1);
+        assert!(!visible.contains("[Complete the current request]"));
+    }
+
+    struct CancelDuringCommentaryContinuation {
+        calls: AtomicUsize,
+        cancellation: CancellationToken,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CancelDuringCommentaryContinuation {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelDuringCommentaryContinuation"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CancelDuringCommentaryContinuation {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(phased_response("commentary", "Checking now.", false));
+            }
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|m| m.content.contains("responses_output_items"))
+            );
+            self.cancellation.cancel();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continuation_remains_cancellable() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelDuringCommentaryContinuation {
+            calls: AtomicUsize::new(0),
+            cancellation: cancellation.clone(),
+        };
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_phased_responses(
+                &provider,
+                &mut history,
+                Arc::clone(&invocations),
+                None,
+                Some(cancellation),
+            ),
+        )
+        .await
+        .expect("commentary continuation must respect cancellation");
+        assert!(is_tool_loop_cancelled(&result.unwrap_err()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+        assert!(history.iter().any(|m| m.content.contains("Checking now.")));
+    }
+
+    #[tokio::test]
+    async fn responses_commentary_continuation_is_bounded_and_legacy_text_is_final() {
+        let provider = ScriptedModelProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                phased_response(
+                    "commentary",
+                    "Still checking.",
+                    false
+                );
+                5
+            ]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let mut history = vec![ChatMessage::user("Please check it.")];
+        let err = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("task is not complete"), "{err}");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+
+        let provider = ScriptedModelProvider::from_text_responses(vec![
+            "An ordinary final answer.",
+            "must not run",
+        ]);
+        let mut history = vec![ChatMessage::user("Please answer.")];
+        let result = run_phased_responses(
+            &provider,
+            &mut history,
+            Arc::new(AtomicUsize::new(0)),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "An ordinary final answer.");
+        assert_eq!(provider.responses.lock().unwrap().len(), 1);
+        assert_eq!(history.last().unwrap().content, result);
+    }
+
     #[tokio::test]
     async fn recovery_returns_control_to_zeroclaw_tool_loop() {
         let original_task = "ORIGINAL_TASK_SENTINEL: remain owned by ZeroClaw";
@@ -7759,6 +8318,33 @@ mod tests {
         }
     }
 
+    struct CompletionCheckpointJournal {
+        statuses: Mutex<Vec<zeroclaw_api::turn::TaskStatus>>,
+        fail_completion: bool,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::turn::TurnJournal for CompletionCheckpointJournal {
+        async fn checkpoint(
+            &self,
+            status: zeroclaw_api::turn::TaskStatus,
+            _: Option<String>,
+            _: bool,
+        ) -> anyhow::Result<()> {
+            let mut statuses = self.statuses.lock().unwrap();
+            let after_tools =
+                statuses.last() == Some(&zeroclaw_api::turn::TaskStatus::WaitingOnTool);
+            statuses.push(status);
+            if self.fail_completion
+                && after_tools
+                && status == zeroclaw_api::turn::TaskStatus::Running
+            {
+                anyhow::bail!("fixture completion checkpoint failed");
+            }
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_parallel_cancel_no_double_terminal_for_completed_call() {
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -7796,56 +8382,71 @@ mod tests {
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
 
-        let _ = run_tool_call_loop(ToolLoop {
-            parent_agent_alias: None,
-            sop_reassembly: None,
-            exec: ResolvedAgentExecution {
-                model_access: ResolvedModelAccess {
-                    model_provider: &model_provider,
-                    provider_name: "mock-provider",
-                    model: "mock-model",
-                    temperature: Some(0.0),
-                },
-                tools_registry: &tools_registry,
-                observer: &observer,
-                silent: true,
-                approval: Some(&approval_mgr),
-                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config: None,
-                max_tool_iterations: 4,
-                hooks: None,
-                excluded_tools: &[],
-                dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
-                pacing: &zeroclaw_config::schema::PacingConfig::default(),
-                strict_tool_parsing: false,
-                parallel_tools: true,
-                max_tool_result_chars: 0,
-                context_token_budget: 0,
-                receipt_generator: None,
-                knobs: &LoopKnobs::default(),
-            },
-            history: &mut history,
-            channel_name: "telegram",
-            channel_reply_target: None,
-            cancellation_token: Some(token.clone()),
-            on_delta: None,
-            shared_budget: None,
-            channel: None,
-            collected_receipts: None,
-            event_tx: Some(event_tx),
-            steering: None,
-            new_messages_out: None,
-            image_cache: None,
-            // Phase 1: stamp Internal/Trusted until per-transport
-            // stamping lands.
-            memory: None,
-            ingress: IngressContext::sub_turn(),
-            agent_alias: None,
-            turn_id: &turn_id,
-        })
-        .await;
+        let journal = Arc::new(CompletionCheckpointJournal {
+            statuses: Mutex::new(Vec::new()),
+            fail_completion: false,
+        });
+        let result = zeroclaw_api::turn::JOURNAL
+            .scope(
+                Some(journal.clone()),
+                run_tool_call_loop(ToolLoop {
+                    parent_agent_alias: None,
+                    sop_reassembly: None,
+                    exec: ResolvedAgentExecution {
+                        model_access: ResolvedModelAccess {
+                            model_provider: &model_provider,
+                            provider_name: "mock-provider",
+                            model: "mock-model",
+                            temperature: Some(0.0),
+                        },
+                        tools_registry: &tools_registry,
+                        observer: &observer,
+                        silent: true,
+                        approval: Some(&approval_mgr),
+                        multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                        config: None,
+                        max_tool_iterations: 4,
+                        hooks: None,
+                        excluded_tools: &[],
+                        dedup_exempt_tools: &[],
+                        activated_tools: None,
+                        model_switch_callback: None,
+                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        strict_tool_parsing: false,
+                        parallel_tools: true,
+                        max_tool_result_chars: 0,
+                        context_token_budget: 0,
+                        receipt_generator: None,
+                        knobs: &LoopKnobs::default(),
+                    },
+                    history: &mut history,
+                    channel_name: "telegram",
+                    channel_reply_target: None,
+                    cancellation_token: Some(token.clone()),
+                    on_delta: None,
+                    shared_budget: None,
+                    channel: None,
+                    collected_receipts: None,
+                    event_tx: Some(event_tx),
+                    steering: None,
+                    new_messages_out: None,
+                    image_cache: None,
+                    // Phase 1: stamp Internal/Trusted until per-transport
+                    // stamping lands.
+                    memory: None,
+                    ingress: IngressContext::sub_turn(),
+                    agent_alias: None,
+                    turn_id: &turn_id,
+                }),
+            )
+            .await;
+        assert!(is_tool_loop_cancelled(&result.unwrap_err()));
+        let statuses = journal.statuses.lock().unwrap();
+        assert_eq!(
+            statuses.last(),
+            Some(&zeroclaw_api::turn::TaskStatus::WaitingOnTool)
+        );
+        drop(statuses);
 
         drop(tools_registry);
         let mut results_by_id: std::collections::HashMap<String, Vec<String>> =
@@ -12974,72 +13575,102 @@ This is an example, not an invocation."#;
             .expect("test runtime should initialize");
 
         runtime.block_on(async {
-            let model_provider = ScriptedModelProvider::from_text_responses(vec![
-                r#"<tool_call>
+            for fail_completion in [false, true] {
+                let journal = Arc::new(CompletionCheckpointJournal {
+                    statuses: Mutex::new(Vec::new()),
+                    fail_completion,
+                });
+                let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                    r#"<tool_call>
 {"name":"verbose_checker","arguments":{"value":"check"}}
 </tool_call>"#,
-                "done",
-            ]);
+                    "done",
+                ]);
 
-            let invocations = Arc::new(AtomicUsize::new(0));
-            let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
-                "verbose_checker",
-                500, // produce 500+ chars of output
-                Arc::clone(&invocations),
-            ));
-            let tools_registry =
-                crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
-            let mut history = vec![
-                ChatMessage::system("test-system"),
-                ChatMessage::user("check"),
-            ];
-            let observer = NoopObserver;
+                let invocations = Arc::new(AtomicUsize::new(0));
+                let verbose_tool: Box<dyn Tool> = Box::new(VerboseTool::new(
+                    "verbose_checker",
+                    500, // produce 500+ chars of output
+                    Arc::clone(&invocations),
+                ));
+                let tools_registry =
+                    crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![verbose_tool]);
+                let mut history = vec![
+                    ChatMessage::system("test-system"),
+                    ChatMessage::user("check"),
+                ];
+                let observer = NoopObserver;
 
-            let result = agent_turn(
-                None,
-                &model_provider,
-                &mut history,
-                &tools_registry,
-                &observer,
-                "mock-provider",
-                "mock-model",
-                Some(0.0),
-                true,
-                "daemon",
-                None,
-                &zeroclaw_config::schema::MultimodalConfig::default(),
-                4,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                false,
-                false,
-                100, // too small for the full encoded result envelope
-                0,   // context_token_budget: disabled
-                None,
-                TurnOrigin::SubTurn,
-                None,
-                None, // agent_alias: not under test here
-                None, // turn_id: self-minted
-            )
-            .await
-            .expect_err("a tiny budget must not silently admit a larger result");
+                let result = zeroclaw_api::turn::JOURNAL
+                    .scope(
+                        Some(journal.clone()),
+                        agent_turn(
+                            None,
+                            &model_provider,
+                            &mut history,
+                            &tools_registry,
+                            &observer,
+                            "mock-provider",
+                            "mock-model",
+                            Some(0.0),
+                            true,
+                            "daemon",
+                            None,
+                            &zeroclaw_config::schema::MultimodalConfig::default(),
+                            4,
+                            None,
+                            &[],
+                            &[],
+                            None,
+                            None,
+                            false,
+                            false,
+                            100, // too small for the full encoded result envelope
+                            0,   // context_token_budget: disabled
+                            None,
+                            TurnOrigin::SubTurn,
+                            None,
+                            None, // agent_alias: not under test here
+                            None, // turn_id: self-minted
+                        ),
+                    )
+                    .await
+                    .expect_err("a tiny budget must not silently admit a larger result");
 
-            assert_eq!(
-                invocations.load(Ordering::SeqCst),
-                1,
-                "tool should be called once"
-            );
+                assert_eq!(
+                    invocations.load(Ordering::SeqCst),
+                    1,
+                    "tool should be called once"
+                );
 
-            assert!(result.is::<crate::agent::turn::results_collect::ResultBudgetExceeded>());
-            assert_eq!(history.len(), 2, "no partially admitted tool round");
-            assert_eq!(
-                model_provider.responses.lock().unwrap().len(),
-                1,
-                "no follow-up model request"
-            );
+                let rejected = result
+                    .downcast_ref::<crate::agent::turn::results_collect::ResultBudgetExceeded>()
+                    .expect("budget evidence must survive checkpoint failure");
+                let outcome = &rejected.results[0].as_ref().unwrap().2;
+                assert!(outcome.success);
+                assert_eq!(
+                    outcome.output,
+                    format!("verbose-start-verbose_checker-{}", "X".repeat(500))
+                );
+                let statuses = journal.statuses.lock().unwrap();
+                assert!(statuses.ends_with(&[
+                    zeroclaw_api::turn::TaskStatus::WaitingOnTool,
+                    zeroclaw_api::turn::TaskStatus::Running,
+                ]));
+                if fail_completion {
+                    assert!(
+                        result
+                            .to_string()
+                            .contains("fixture completion checkpoint failed")
+                    );
+                }
+                assert_eq!(history.len(), 2, "no partially admitted tool round");
+                assert_eq!(
+                    model_provider.responses.lock().unwrap().len(),
+                    1,
+                    "no follow-up model request"
+                );
+            }
         });
     }
 

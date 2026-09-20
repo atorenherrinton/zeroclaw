@@ -12,6 +12,14 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+pub(crate) const COMPLETION_CONTRACT: &str = "## Complete the Request\n\n\
+    A progress update is intermediate, not a completed response. When you say you are \
+    checking, reviewing, or doing something, continue the authorized work in this turn \
+    with the necessary tool calls. Do not stop after promising to act or report back. \
+    End with the actual result, an answer that needs no tools, a necessary clarification, \
+    or a concrete blocker. A requested plan or wording exercise is itself a valid result. \
+    Do not repeat completed actions or claim that work continues in the background unless \
+    a tool has actually started that work.\n\n";
 const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
@@ -229,6 +237,7 @@ pub fn build_system_prompt_with_mode_and_effective_tools(
              - If a tool call fails, report the error — never make up data to fill the gap.\n\
              - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
         );
+        prompt.push_str(COMPLETION_CONTRACT);
     }
 
     // ── 1. Tooling ──────────────────────────────────────────────
@@ -696,6 +705,41 @@ mod tests {
 
         assert!(prompt.contains("INLINE_FALLBACK_INSTRUCTIONS"));
         assert!(!prompt.contains("read_skill(name)"));
+    }
+
+    #[test]
+    fn completion_contract_survives_oversized_workspace_instructions() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            workspace.path().join("AGENTS.md"),
+            format!(
+                "BOOTSTRAP_START_SENTINEL\n{}\nLATE_WORKSPACE_COMPLETION_SENTINEL",
+                "fixture instructions ".repeat(1500)
+            ),
+        )
+        .unwrap();
+        for budget in [0, 6000] {
+            let prompt = build_system_prompt_with_mode_and_effective_tools(
+                workspace.path(),
+                "test-model",
+                &[("shell", "Execute commands")],
+                |_| true,
+                &[],
+                None,
+                None,
+                None,
+                false,
+                SkillsPromptInjectionMode::Full,
+                false,
+                budget,
+                false,
+                true,
+                None,
+            );
+            assert!(prompt.contains("BOOTSTRAP_START_SENTINEL"));
+            assert!(!prompt.contains("LATE_WORKSPACE_COMPLETION_SENTINEL"));
+            assert!(prompt.contains(COMPLETION_CONTRACT));
+        }
     }
 
     fn prompt_with_compact_context(compact_context: bool) -> String {

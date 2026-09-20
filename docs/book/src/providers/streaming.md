@@ -70,6 +70,30 @@ From the user's perspective: text, then a visible indicator that the agent ran a
 
 ## Transport completion and timeouts
 
+OpenAI Responses assistant items retain their original `phase` in the opaque
+replay history. An explicit `commentary`-only response advances the current
+turn rather than completing the user task. The runtime permits at most three
+consecutive commentary-only continuations within the existing turn budget;
+tool execution resets this counter. Repeated commentary or iteration exhaustion
+returns an explicit incomplete-task error. Missing or unknown phases retain
+legacy final-response behavior except for the bounded initial-progress repair
+described below. A response containing a `final_answer` uses
+that phase's text for its returned answer while preserving all original items
+for replay. The metadata itself is never streamed as user-visible reasoning.
+This follows [OpenAI's assistant phase guidance](https://developers.openai.com/api/docs/guides/reasoning#phase-parameter).
+
+Before any tool has been attempted in the current request, the runtime also
+recognizes a narrow set of short English progress-only replies such as
+"I'm checking the files now." It gives the model one corrective request to
+perform the authorized work or provide an actual answer, necessary clarification,
+or concrete blocker. Another matching promise returns an incomplete-task error.
+This applies across providers, including replies marked `final_answer`; it does
+not reinterpret their phase metadata. Ordinary answers, requested plans or
+wording exercises, and replies after tool activity keep their existing path.
+The correction shares the turn's cancellation, cost and iteration limits and
+never supplies new action permission. It is a conservative preamble guard,
+not a general test that an answer is correct or a task is complete.
+
 Streaming transports do not rely on connection close as the success signal.
 OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on

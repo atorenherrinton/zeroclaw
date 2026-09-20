@@ -97,6 +97,34 @@ pub(crate) async fn prepare_tool_calls(
     iteration: usize,
     dedup_enabled: bool,
 ) -> Result<PreparedToolCalls> {
+    // No tool is dispatched during preparation. Dropping this future also
+    // releases pending approval readers and hook/progress waits.
+    super::outcome::until_cancelled(
+        ctx.cancellation_token,
+        prepare_tool_calls_inner(
+            ctx,
+            tools_registry,
+            activated_tools,
+            tool_calls,
+            seen_tool_signatures,
+            prompt_approval_tool_signatures,
+            iteration,
+            dedup_enabled,
+        ),
+    )
+    .await?
+}
+
+async fn prepare_tool_calls_inner(
+    ctx: &TurnCtx<'_>,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    tool_calls: &[ParsedToolCall],
+    seen_tool_signatures: &mut HashSet<(String, String)>,
+    prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
+    iteration: usize,
+    dedup_enabled: bool,
+) -> Result<PreparedToolCalls> {
     let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
         (0..tool_calls.len()).map(|_| None).collect();
     let mut executable_indices: Vec<usize> = Vec::new();
@@ -223,7 +251,7 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
-        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
+        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await? {
             ApprovalGateOutcome::Proceed { approved } => approved,
             ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
                 // Streaming consumers see the denied/replaced call and its
@@ -470,6 +498,50 @@ mod tests {
             }
         }
         provenance
+    }
+
+    #[tokio::test]
+    async fn prepare_cancels_when_progress_consumer_is_stalled() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(StreamDelta::Status("occupied".into()))
+            .await
+            .unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let mut ctx = test_ctx(&observer, &pacing, &tx);
+        ctx.cancellation_token = Some(&cancellation);
+        let calls = [ParsedToolCall {
+            name: "fixture".into(),
+            arguments: serde_json::json!({}),
+            tool_call_id: Some("stalled-progress".into()),
+        }];
+        let mut seen = HashSet::new();
+        let mut prompt_seen = HashSet::new();
+        let mut prepare = Box::pin(prepare_tool_calls(
+            &ctx,
+            &[],
+            None,
+            &calls,
+            &mut seen,
+            &mut prompt_seen,
+            0,
+            false,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut prepare)
+                .await
+                .is_err()
+        );
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), prepare)
+            .await
+            .unwrap()
+            .err()
+            .expect("cancelled");
+        assert!(crate::agent::loop_::is_tool_loop_cancelled(&error));
+        assert!(matches!(rx.try_recv().unwrap(), StreamDelta::Status(_)));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

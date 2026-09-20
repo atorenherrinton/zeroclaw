@@ -54,6 +54,10 @@ impl<T: Tool> Tool for ReadPreviewTool<T> {
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
     }
+
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.inner.supports_cooperative_settlement()
+    }
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
     }
@@ -114,6 +118,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
     fn invocation_triggers(&self) -> Vec<String> {
         self.inner.invocation_triggers()
+    }
+
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.inner.supports_cooperative_settlement()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -217,6 +225,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
         self.inner.invocation_triggers()
     }
 
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.inner.supports_cooperative_settlement()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
@@ -313,6 +325,42 @@ mod tests {
                 output: "ok".into(),
                 error: None,
             })
+        }
+    }
+
+    struct SettlementProbe(bool);
+
+    zeroclaw_api::mock_tool_attribution!(SettlementProbe);
+
+    #[async_trait]
+    impl Tool for SettlementProbe {
+        fn name(&self) -> &str {
+            "settlement_probe"
+        }
+        fn description(&self) -> &str {
+            "synthetic settlement capability"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        fn supports_cooperative_settlement(&self) -> bool {
+            self.0
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult::ok("synthetic completed evidence"))
+        }
+    }
+
+    #[test]
+    fn generic_wrappers_preserve_cooperative_settlement_capability() {
+        for supported in [false, true] {
+            let security = policy(AutonomyLevel::Full);
+            let guarded = PathGuardedTool::new(SettlementProbe(supported), security.clone());
+            assert_eq!(guarded.supports_cooperative_settlement(), supported);
+            let limited = RateLimitedTool::new(guarded, security);
+            assert_eq!(limited.supports_cooperative_settlement(), supported);
+            let preview = ReadPreviewTool::new(limited);
+            assert_eq!(preview.supports_cooperative_settlement(), supported);
         }
     }
 

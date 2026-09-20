@@ -756,6 +756,11 @@ async fn execute_job_with_retry(
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
 ) -> (bool, String) {
+    let estop = crate::security::estop_runtime::current()
+        .unwrap_or_else(|| crate::security::estop_runtime::EstopRuntime::from_config(config));
+    if let Err(error) = estop.check(None) {
+        return (false, error.to_string());
+    }
     let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
         match crate::platform::create_runtime(&config.runtime) {
             Ok(runtime) => Some(runtime),
@@ -785,17 +790,35 @@ async fn execute_job_with_retry(
     let mut backoff_ms = config.reliability.provider_backoff_ms.max(200);
 
     for attempt in 0..=retries {
-        let (success, output) = match job.job_type {
-            JobType::Shell => {
-                let Some(runtime) = runtime else {
-                    return (
-                        false,
-                        "shell setup error: runtime missing for shell cron job".to_string(),
-                    );
-                };
-                run_job_command_with_runtime(config, runtime, security, job, approved).await
+        // The occurrence's receipt/finalization caller remains outside this
+        // interruptible scope. An emergency stop never retries an attempt,
+        // even when the ordinary job policy permits stateless-read retries.
+        let execution = async {
+            match job.job_type {
+                JobType::Shell => {
+                    let Some(runtime) = runtime else {
+                        return Ok((
+                            false,
+                            "shell setup error: runtime missing for shell cron job".to_string(),
+                        ));
+                    };
+                    Ok(
+                        run_job_command_with_runtime(config, runtime, security, job, approved)
+                            .await,
+                    )
+                }
+                JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
             }
-            JobType::Agent => Box::pin(run_agent_job(config, security, agent_alias, job)).await,
+        };
+        let (success, output) = match estop
+            .run(
+                matches!(job.job_type, JobType::Shell).then_some("shell"),
+                Box::pin(execution),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return (false, error.to_string()),
         };
         last_output = output;
 
@@ -810,7 +833,15 @@ async fn execute_job_with_retry(
 
         if attempt < retries {
             let jitter_ms = u64::from(Utc::now().timestamp_subsec_millis() % 250);
-            time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
+            if let Err(error) = estop
+                .run(None, async {
+                    time::sleep(Duration::from_millis(backoff_ms + jitter_ms)).await;
+                    Ok(())
+                })
+                .await
+            {
+                return (false, error.to_string());
+            }
             backoff_ms = (backoff_ms.saturating_mul(2)).min(30_000);
         }
     }
@@ -1010,26 +1041,26 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
-) -> (bool, String) {
+) -> Result<(bool, String)> {
     if !security.can_act() {
-        return (
+        return Ok((
             false,
             "blocked by security policy: autonomy is read-only".to_string(),
-        );
+        ));
     }
 
     if security.is_rate_limited() {
-        return (
+        return Ok((
             false,
             "blocked by security policy: rate limit exceeded".to_string(),
-        );
+        ));
     }
 
     if !security.record_action() {
-        return (
+        return Ok((
             false,
             "blocked by security policy: action budget exhausted".to_string(),
-        );
+        ));
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -1121,6 +1152,12 @@ async fn check_cron_agent_completion(
     job: &CronJob,
     run_result: Result<String>,
 ) -> Result<String> {
+    if run_result
+        .as_ref()
+        .is_err_and(crate::security::estop_runtime::is_estop_interrupted)
+    {
+        return run_result;
+    }
     // Declarative config is the only authority; an imperative same-ID job must
     // never acquire a command from an unrelated declaration.
     if job.source != "declarative" || job.job_type != JobType::Agent {
@@ -1141,15 +1178,21 @@ async fn check_cron_agent_completion(
     let mut check_job = job.clone();
     check_job.command = command.to_string();
     check_job.shell_output_format = CronShellOutputFormat::Wrapped;
-    let (success, output) = run_job_command_with_runtime_and_timeout(
-        config,
-        runtime.as_ref(),
-        security,
-        &check_job,
-        false,
-        Duration::from_secs(COMPLETION_CHECK_TIMEOUT_SECS),
-    )
-    .await;
+    let estop = crate::security::estop_runtime::current()
+        .unwrap_or_else(|| crate::security::estop_runtime::EstopRuntime::from_config(config));
+    let (success, output) = estop
+        .run(Some("shell"), async {
+            Ok(run_job_command_with_runtime_and_timeout(
+                config,
+                runtime.as_ref(),
+                security,
+                &check_job,
+                false,
+                Duration::from_secs(COMPLETION_CHECK_TIMEOUT_SECS),
+            )
+            .await)
+        })
+        .await?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
@@ -1185,16 +1228,16 @@ async fn finish_cron_agent_run(
     job: &CronJob,
     session_path: &std::path::Path,
     run_result: Result<String>,
-) -> (bool, String) {
+) -> Result<(bool, String)> {
     match run_result {
-        Ok(response) => (
+        Ok(response) => Ok((
             true,
             if response.trim().is_empty() {
                 "agent job executed".to_string()
             } else {
                 response
             },
-        ),
+        )),
         Err(e) => {
             if matches!(job.session_target, SessionTarget::Isolated) {
                 let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
@@ -1213,7 +1256,11 @@ async fn finish_cron_agent_run(
                     let _ = mem.purge_session(&mem_session_key).await;
                 }
             }
-            (false, format!("agent job failed: {e}"))
+            if crate::security::estop_runtime::is_estop_interrupted(&e) {
+                Err(e)
+            } else {
+                Ok((false, format!("agent job failed: {e}")))
+            }
         }
     }
 }
@@ -1494,14 +1541,23 @@ async fn deliver_announcement_with_handler(
     output: &str,
 ) -> Result<()> {
     if let Some(f) = handler {
-        f(
-            config.clone(),
-            channel.to_string(),
-            target.to_string(),
-            thread_id.map(str::to_string),
-            output.to_string(),
-        )
-        .await
+        let estop = crate::security::estop_runtime::current()
+            .unwrap_or_else(|| crate::security::estop_runtime::EstopRuntime::from_config(config));
+        if estop.check(None).is_err() {
+            return Err(notification_not_started());
+        }
+        estop
+            .run(
+                None,
+                f(
+                    config.clone(),
+                    channel.to_string(),
+                    target.to_string(),
+                    thread_id.map(str::to_string),
+                    output.to_string(),
+                ),
+            )
+            .await
     } else {
         ::zeroclaw_log::record!(
             WARN,
@@ -1608,13 +1664,25 @@ async fn run_job_command_with_runtime_and_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Own the command's descendants as well as its direct shell. Dropping the
+    // execution future (including an emergency stop) must not leave a delayed
+    // side effect running in a background child.
+    #[cfg(unix)]
+    command.process_group(0);
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return (false, format!("spawn error: {error}")),
     };
+    #[cfg(unix)]
+    let group_guard = crate::tools::shell::ChildGroupGuard::new(child.id());
 
     match time::timeout(timeout, child.wait_with_output()).await {
         Ok(Ok(output)) => {
+            // Keep ownership until output is collected too: an inherited pipe
+            // can outlive the direct shell, and a timeout must still kill the
+            // descendants holding that pipe open.
+            #[cfg(unix)]
+            group_guard.disarm();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             let combined = match output_format {
@@ -2106,7 +2174,8 @@ mod tests {
             std::path::Path::new("cron-fixture"),
             result,
         )
-        .await;
+        .await
+        .unwrap();
         assert!(success);
         assert_eq!(output, "synthetic completed result");
     }
@@ -2157,7 +2226,9 @@ mod tests {
             "deadline must drop the actual agent future"
         );
         let (success, output) =
-            finish_cron_agent_run(&config, TEST_AGENT, &job, session_path, result).await;
+            finish_cron_agent_run(&config, TEST_AGENT, &job, session_path, result)
+                .await
+                .unwrap();
         assert!(
             !success,
             "a deadline must not become a successful empty completion"
@@ -2672,6 +2743,119 @@ mod tests {
         assert!(output.contains("job timed out after"));
     }
 
+    #[cfg(unix)]
+    async fn assert_cron_descendant_cleanup(cancel: bool, owner_exits: bool) {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        };
+        std::fs::write(
+            config.data_dir.join("descendant.sh"),
+            "printf '%s\\n' \"$$\" > descendant.pid\nprintf ready > ready\nsleep 0.6\nprintf escaped > escaped\n",
+        )
+        .unwrap();
+        std::fs::write(
+            config.data_dir.join("owner.sh"),
+            if owner_exits {
+                "sh descendant.sh &\nexit 0\n"
+            } else {
+                "sh descendant.sh &\nwait\n"
+            },
+        )
+        .unwrap();
+
+        // This process deliberately remains outside the job's process group.
+        // It must finish normally after the cancelled descendant's marker time.
+        let unrelated = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 0.9; printf untouched > unrelated"])
+            .current_dir(&config.data_dir)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let job = test_job("sh owner.sh");
+        let mut run = Box::pin(run_job_command_with_timeout(
+            &config,
+            &security,
+            &job,
+            if cancel {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(300)
+            },
+        ));
+        let ready = config.data_dir.join("ready");
+        tokio::select! {
+            result = &mut run => panic!("job ended before its descendant was ready: {result:?}"),
+            result = time::timeout(Duration::from_secs(3), async {
+                while !ready.exists() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            }) => result.expect("descendant ready marker"),
+        }
+        let descendant: i32 = std::fs::read_to_string(config.data_dir.join("descendant.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(descendant > 1);
+
+        if cancel {
+            // Drop the actual production execution future, as turn cancellation
+            // does. Aborting only a test observer would not prove child cleanup.
+            drop(run);
+        } else {
+            let (success, output) = run.await;
+            assert!(!success);
+            assert!(output.contains("job timed out after"), "{output}");
+        }
+
+        let unrelated_output = time::timeout(Duration::from_secs(3), unrelated.wait_with_output())
+            .await
+            .expect("unrelated process finishes")
+            .unwrap();
+        assert!(unrelated_output.status.success());
+        assert!(config.data_dir.join("unrelated").exists());
+        assert!(
+            !config.data_dir.join("escaped").exists(),
+            "the owned descendant performed its delayed side effect"
+        );
+        time::timeout(Duration::from_secs(2), async {
+            loop {
+                // SAFETY: signal zero only probes the PID recorded by our
+                // fixture; it does not signal this or any unrelated process.
+                if unsafe { libc::kill(descendant, 0) } == -1
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("owned descendant must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_job_command_drop_kills_owned_descendants_only() {
+        assert_cron_descendant_cleanup(true, false).await;
+        assert_cron_descendant_cleanup(true, true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_job_command_timeout_kills_owned_descendants_only() {
+        assert_cron_descendant_cleanup(false, false).await;
+        assert_cron_descendant_cleanup(false, true).await;
+    }
+
     #[tokio::test]
     async fn run_job_command_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
@@ -2980,8 +3164,9 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, "test-agent", &job))
+            .await
+            .unwrap();
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -3102,7 +3287,9 @@ mod tests {
         assert!(success, "retrying cron agent run failed: {output}");
         assert_eq!(output, "done");
 
-        let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job))
+            .await
+            .unwrap();
         assert!(
             sequential.0,
             "repeated cron agent run failed: {:?}",
@@ -3115,6 +3302,7 @@ mod tests {
             run_agent_job(&config, &security, TEST_AGENT, &job),
         );
         for result in [concurrent_a, concurrent_b, concurrent_c] {
+            let result = result.unwrap();
             assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
         }
 
@@ -3168,8 +3356,9 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, "test-agent", &job))
+            .await
+            .unwrap();
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -3189,8 +3378,9 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = test_security(&config);
 
-        let (success, output) =
-            Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
+        let (success, output) = Box::pin(run_agent_job(&config, &security, "test-agent", &job))
+            .await
+            .unwrap();
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));
@@ -4420,5 +4610,112 @@ mod tests {
 
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
+    }
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn estop_cron_cancels_actual_shell_and_requires_new_explicit_run_after_resume() {
+        use crate::security::estop::{EstopLevel, EstopManager, ResumeSelector};
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.security.estop.enabled = true;
+        config.security.estop.state_file = "estop-state.json".into();
+        config.security.estop.require_otp_to_resume = false;
+        let security = SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::Full,
+            workspace_dir: config.data_dir.clone(),
+            allowed_commands: vec!["*".into()],
+            forbidden_paths: Vec::new(),
+            block_high_risk_commands: false,
+            require_approval_for_medium_risk: false,
+            ..SecurityPolicy::default()
+        };
+        std::fs::write(
+            config.data_dir.join("stop-fixture.sh"),
+            "printf ready > ready\nsleep 0.5\nprintf escaped > escaped\n",
+        )
+        .unwrap();
+        let job = test_job("sh stop-fixture.sh");
+        let mut manager = EstopManager::load(&config.security.estop, tmp.path()).unwrap();
+        let running = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ));
+        let engage = async {
+            time::timeout(Duration::from_secs(3), async {
+                while !config.data_dir.join("ready").exists() {
+                    time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            manager.engage(EstopLevel::KillAll).unwrap();
+        };
+        let ((success, output), ()) = time::timeout(Duration::from_secs(4), async {
+            tokio::join!(running, engage)
+        })
+        .await
+        .unwrap();
+        assert!(!success, "{output}");
+        assert!(output.contains("Emergency stop"), "{output}");
+        time::sleep(Duration::from_millis(600)).await;
+        assert!(!config.data_dir.join("escaped").exists());
+        let followup = test_job("echo resumed");
+        let (success, _) =
+            execute_job_with_retry(&config, &security, TEST_AGENT, &followup, None, false).await;
+        assert!(!success);
+        manager.resume(ResumeSelector::KillAll, None, None).unwrap();
+        let (success, output) =
+            execute_job_with_retry(&config, &security, TEST_AGENT, &followup, None, false).await;
+        assert!(success, "{output}");
+        assert!(output.contains("resumed"));
+        assert!(
+            !config.data_dir.join("escaped").exists(),
+            "resume cannot revive the interrupted process"
+        );
+    }
+
+    #[tokio::test]
+    async fn estop_cron_refuses_delivery_before_handler_and_preserves_typed_agent_interruption() {
+        use crate::security::estop::{EstopLevel, EstopManager};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.security.estop.enabled = true;
+        config.security.estop.state_file = "estop-state.json".into();
+        let mut manager = EstopManager::load(&config.security.estop, tmp.path()).unwrap();
+        manager.engage(EstopLevel::KillAll).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let invoked = calls.clone();
+        let handler: DeliveryFn = Box::new(move |_, _, _, _, _| {
+            invoked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        });
+        let error = deliver_announcement_with_handler(
+            Some(&handler),
+            &config,
+            "test",
+            "fixture",
+            None,
+            "fixture",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<DeliveryFailure>().unwrap().outcome,
+            EffectOutcome::NotStarted
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.session_target = SessionTarget::Main;
+        let error = finish_cron_agent_run(
+            &config,
+            TEST_AGENT,
+            &job,
+            std::path::Path::new("main"),
+            Err(crate::security::estop_runtime::EstopInterrupted.into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(crate::security::estop_runtime::is_estop_interrupted(&error));
     }
 }

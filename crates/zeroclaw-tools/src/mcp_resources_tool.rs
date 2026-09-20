@@ -99,7 +99,12 @@ impl Tool for McpResourcesTool {
                                     ))),
                                 }
                             }
-                            Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
+                            Err(e)
+                                if e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                                    || crate::mcp_lifecycle::is_lifecycle_interrupted(&e) =>
+                            {
+                                Err(e)
+                            }
                             Err(e) => Ok(Self::fail(e.to_string())),
                         }
                     }
@@ -132,7 +137,12 @@ impl Tool for McpResourcesTool {
                             crate::mcp_context::wrap_resource_contents(&server, &uri, &contents);
                         Ok(Self::ok(wrapped))
                     }
-                    Err(e) if e.is::<zeroclaw_api::deadline::DeadlineExceeded>() => Err(e),
+                    Err(e)
+                        if e.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                            || crate::mcp_lifecycle::is_lifecycle_interrupted(&e) =>
+                    {
+                        Err(e)
+                    }
                     Err(e) => Ok(Self::fail(e.to_string())),
                 }
             }

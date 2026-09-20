@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+mod activity_mcp;
 pub mod contacts;
 pub mod continuity;
 pub mod events;

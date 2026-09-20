@@ -177,7 +177,8 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage reported by the model_provider, if available.
     pub usage: Option<TokenUsage>,
-    /// Raw reasoning/thinking content from thinking models (e.g. DeepSeek-R1,
+    /// Opaque provider replay metadata, including Responses output message
+    /// phases and raw reasoning/thinking content (e.g. DeepSeek-R1,
     /// Kimi K2.5, GLM-4.7). Preserved as an opaque pass-through so it can be
     /// sent back in subsequent API requests — some model_providers reject tool-call
     /// history that omits this field.
@@ -356,8 +357,8 @@ pub enum StreamEvent {
     /// (gated by the runtime visibility policy) and never persisted into
     /// reasoning_content.
     ThinkingDelta(String),
-    /// Durable, replay-only finalized reasoning payload (signed thinking
-    /// blocks in the provider's history-replay representation). Appended to
+    /// Durable, replay-only provider payload (signed thinking blocks or
+    /// Responses output items with their original message phases). Appended to
     /// `ChatResponse::reasoning_content` for the next provider request and
     /// never surfaced as user-visible progress.
     ReasoningFinalized(String),

@@ -436,6 +436,22 @@ pub enum ToolActivity {
     Memory,
     VersionControl,
     Other,
+    BrowserOpen,
+    BrowserRead,
+    BrowserInteract,
+    BrowserWait,
+    BrowserVerify,
+    FileRead,
+    FileWrite,
+    Search,
+    CalendarRead,
+    CalendarWrite,
+    DraftMessage,
+    SendMessage,
+    CheckDelivery,
+    Contacts,
+    Delegation,
+    ToolDiscovery,
 }
 
 /// Stage of a privacy-safe tool progress update.
@@ -452,6 +468,41 @@ pub struct ToolProgressEvent {
     pub activity: ToolActivity,
     pub phase: ToolProgressPhase,
 }
+
+/// Current activity projected from canonical turn and executor events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftActivity {
+    Lifecycle(ProgressEvent),
+    Tool(ToolProgressEvent),
+}
+
+/// A coalesced view of a running turn. The updater owns the event projection;
+/// transports render it without maintaining another copy of the task state.
+#[derive(Debug, Clone, Copy)]
+pub struct DraftSnapshot<'a> {
+    /// Sanitized assistant narration, never raw tool output or model reasoning.
+    pub text: &'a str,
+    pub activity: DraftActivity,
+    pub elapsed_secs: u64,
+}
+
+/// A transport-requested delay for the next idempotent draft edit.
+#[derive(Debug)]
+pub struct DraftUpdateRateLimit {
+    pub retry_after_secs: u64,
+}
+
+impl fmt::Display for DraftUpdateRateLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "draft edit rate limited for {} seconds",
+            self.retry_after_secs
+        )
+    }
+}
+
+impl std::error::Error for DraftUpdateRateLimit {}
 
 /// Origin of a rendered draft-progress entry.
 ///
@@ -999,6 +1050,27 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _recipient: &str,
         _message_id: &str,
         _event: ToolProgressEvent,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Opt into coalesced narration/activity snapshots with periodic liveness.
+    fn supports_progress_snapshots(&self) -> bool {
+        false
+    }
+
+    /// Minimum interval between coalesced draft edits.
+    fn draft_update_interval_ms(&self) -> u64 {
+        1_000
+    }
+
+    /// Publish the latest view of an active turn. Implementations must not
+    /// spawn detached edits: finalization owns the same message after return.
+    async fn update_draft_snapshot(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _snapshot: DraftSnapshot<'_>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

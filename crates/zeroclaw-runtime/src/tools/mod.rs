@@ -191,6 +191,10 @@ pub struct ArcToolRef(pub Arc<dyn Tool>);
 
 #[async_trait]
 impl Tool for ArcToolRef {
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.0.supports_cooperative_settlement()
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -259,6 +263,10 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
 
 #[async_trait]
 impl Tool for ArcDelegatingTool {
+    fn supports_cooperative_settlement(&self) -> bool {
+        self.inner.supports_cooperative_settlement()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
