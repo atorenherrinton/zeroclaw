@@ -209,9 +209,23 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        row.map(|(intent,state,receipt)| Ok(json!({"operation_id":operation,"state":state,
-            "intent":serde_json::from_str::<Value>(&intent)?,"receipt":serde_json::from_str::<Value>(&receipt)?,
-            "automatic_retry_allowed":false}))).transpose()
+        row.map(|(intent, state, receipt)| {
+            let intent: Value = serde_json::from_str(&intent)?;
+            let mut status = json!({"operation_id":operation,"state":state,
+                "intent":intent,"receipt":serde_json::from_str::<Value>(&receipt)?,
+                "automatic_retry_allowed":false});
+            // Derive provider status even if the process died immediately after
+            // claiming, before it could persist a more detailed local receipt.
+            if matches!(
+                intent["action"].as_str(),
+                Some("native_schedule" | "native_schedule_cancel")
+            ) {
+                status["gmail_schedule_status"] = json!("unknown");
+                status["provider_verified"] = json!(false);
+            }
+            Ok(status)
+        })
+        .transpose()
     }
     /// Atomically bind the operation and (for updates/deletes) lock the exact draft.
     /// A racing caller that loses this claim MUST NOT contact the write endpoint.
