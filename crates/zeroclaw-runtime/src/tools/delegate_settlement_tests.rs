@@ -466,11 +466,7 @@ async fn estop_delegate_settlement_background_waits_for_owner_and_persists_typed
     assert!(serialized.contains("original_delegate_payload"));
     assert!(serialized.contains("unsettled"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-    assert!(
-        !DelegateTool::background_task_cancels()
-            .lock()
-            .contains_key(&task_id)
-    );
+    wait_for_background_cancel_release(&task_id).await;
     assert_eq!(fixture.calls[2].load(Ordering::SeqCst), 0);
 }
 

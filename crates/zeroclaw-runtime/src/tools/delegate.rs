@@ -4617,6 +4617,22 @@ mod tests {
         .expect("local provider receives the delegated request");
     }
 
+    /// The terminal record is written before the task's `BackgroundOwner` guard
+    /// drops at the end of the spawned future, so the live-token entry is
+    /// released just after the record becomes visible.
+    async fn wait_for_background_cancel_release(task_id: &str) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while DelegateTool::background_task_cancels()
+                .lock()
+                .contains_key(task_id)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("settled background task releases its live cancellation token");
+    }
+
     #[tokio::test]
     async fn estop_delegate_live_admission_blocks_non_agentic_provider_then_resumes() {
         use crate::security::estop::{EstopLevel, ResumeSelector};
@@ -4715,11 +4731,7 @@ mod tests {
             terminal.error.as_deref(),
             Some(crate::i18n::get_required_cli_string("estop-runtime-interrupted").as_str())
         );
-        assert!(
-            !DelegateTool::background_task_cancels()
-                .lock()
-                .contains_key(task_id)
-        );
+        wait_for_background_cancel_release(task_id).await;
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         server._task.abort();
         let _ = server._task.await;
