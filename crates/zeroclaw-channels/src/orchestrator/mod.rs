@@ -3932,6 +3932,26 @@ fn sanitize_streaming_draft_text(s: &str, known_tool_names: &HashSet<String>) ->
     truncate_at_unclosed_scratchpad_open(&cleaned)
 }
 
+/// Native assistant history contains provider replay data, including reasoning.
+/// Only its display content belongs in a failed turn's partial answer.
+fn visible_assistant_history_text(content: &str, known_tool_names: &HashSet<String>) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content)
+        && value
+            .get("tool_calls")
+            .is_some_and(serde_json::Value::is_array)
+        && value.get("content").is_some()
+    {
+        return sanitize_streaming_draft_text(
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            known_tool_names,
+        );
+    }
+    sanitize_streaming_draft_text(content, known_tool_names)
+}
+
 /// Drop the tail from a JSON value that has started, already reads as tool
 /// protocol, and has not finished arriving.
 ///
@@ -7825,7 +7845,7 @@ async fn process_channel_message_body(
             .skip(current_response_start)
             .filter(|m| m.role == "assistant")
             .map(|m| {
-                sanitize_streaming_draft_text(
+                visible_assistant_history_text(
                     &m.content,
                     &ctx.tools_registry
                         .iter()
@@ -18423,6 +18443,139 @@ api_key = "anthropic-key"
                 .contains("Saved finding")
         );
         assert!(!final_body["text"].as_str().unwrap().contains("Working"));
+    }
+
+    struct CommentaryThenErrorProvider(AtomicUsize);
+
+    impl zeroclaw_api::attribution::Attributable for CommentaryThenErrorProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "commentary-error-fixture"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CommentaryThenErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+
+        async fn chat(
+            &self,
+            _: zeroclaw_providers::ChatRequest<'_>,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            if self.0.fetch_add(1, Ordering::SeqCst) != 0 {
+                anyhow::bail!("synthetic provider failure")
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("Checking the fixture.".into()),
+                reasoning_content: Some(serde_json::json!({
+                    "provider": "openai_codex",
+                    "kind": "responses_output_items",
+                    "items": [
+                        {"type": "reasoning", "id": "PRIVATE_REASONING", "encrypted_content": "PRIVATE_REPLAY"},
+                        {"type": "message", "role": "assistant", "phase": "commentary",
+                         "content": [{"type": "output_text", "text": "Checking the fixture."}]}
+                    ]
+                }).to_string()),
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_commentary_continuation_delivers_only_visible_partial_text() {
+        let channel = Arc::new(ConfirmingTerminalChannel {
+            text: Default::default(),
+            attempts: AtomicUsize::new(0),
+            confirmed: true,
+        });
+        let provider = Arc::new(CommentaryThenErrorProvider(AtomicUsize::new(0)));
+        let mut agent = zeroclaw_config::schema::AliasedAgentConfig::default();
+        agent.precheck.enabled = false;
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel.clone(),
+            provider.clone(),
+            zeroclaw_config::schema::Config::default(),
+            agent,
+            "test-provider",
+            None,
+        );
+        let msg = ChannelMessage {
+            id: "commentary-error".into(),
+            sender: "fixture".into(),
+            reply_target: "room".into(),
+            channel: "test-channel".into(),
+            content: "Check the fixture.".into(),
+            ..Default::default()
+        };
+        process_channel_message(ctx, msg, CancellationToken::new()).await;
+        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+        let delivered = channel.text.lock().await;
+        assert_eq!(delivered.len(), 1);
+        assert!(
+            delivered[0].contains("Checking the fixture."),
+            "{}",
+            delivered[0]
+        );
+        assert!(
+            delivered[0].contains("synthetic provider failure"),
+            "{}",
+            delivered[0]
+        );
+        for private in [
+            "PRIVATE_REASONING",
+            "PRIVATE_REPLAY",
+            "reasoning_content",
+            "responses_output_items",
+            "tool_calls",
+        ] {
+            assert!(!delivered[0].contains(private), "leaked {private}");
+        }
+    }
+
+    #[test]
+    fn partial_history_keeps_only_native_display_content() {
+        let names = HashSet::new();
+        for calls in [
+            serde_json::json!([]),
+            serde_json::json!([{"id":"fixture","name":"tool","arguments":"PRIVATE_ARGUMENT"}]),
+        ] {
+            let native = serde_json::json!({
+                "content": "Visible finding.<think>PRIVATE_THOUGHT</think>",
+                "tool_calls": calls,
+                "reasoning_content": "PRIVATE_REASONING",
+            })
+            .to_string();
+            assert_eq!(
+                visible_assistant_history_text(&native, &names),
+                "Visible finding."
+            );
+        }
+        assert_eq!(
+            visible_assistant_history_text(
+                r#"{"content":null,"tool_calls":[],"reasoning_content":"PRIVATE"}"#,
+                &names
+            ),
+            ""
+        );
+        let ordinary = r#"{"content":"ordinary JSON answer","count":2}"#;
+        assert_eq!(visible_assistant_history_text(ordinary, &names), ordinary);
     }
 
     struct FormatErrorModelProvider;

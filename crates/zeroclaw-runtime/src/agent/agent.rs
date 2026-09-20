@@ -314,10 +314,13 @@ async fn forward_history_trim_notice(
     estop: Option<crate::security::estop_runtime::EstopRuntime>,
 ) {
     if let Some(notice) = notice {
-        let publish = crate::agent::turn::outcome::until_cancelled(
-            token,
-            event_tx.send(notice.into_turn_event()),
-        );
+        // History has already changed. Publish its notice without waiting when
+        // the consumer has room, even if cancellation stopped further work.
+        let event = match event_tx.try_send(notice.into_turn_event()) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => event,
+        };
+        let publish = crate::agent::turn::outcome::until_cancelled(token, event_tx.send(event));
         if let Some(estop) = estop {
             let _ = estop.run(None, publish).await;
         } else {

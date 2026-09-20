@@ -309,6 +309,16 @@ async fn publish_tool_event(
     estop: Option<&crate::security::estop_runtime::EstopRuntime>,
     tool_name: &str,
 ) -> anyhow::Result<()> {
+    // Completed results remain visible when the consumer has capacity. A
+    // pending ToolCall still follows cancellation before execution admission.
+    let event = if matches!(&event, TurnEvent::ToolCall { .. }) {
+        event
+    } else {
+        match tx.try_send(event) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => event,
+        }
+    };
     let publish = async {
         let _ = super::turn::outcome::until_cancelled(token, tx.send(event)).await?;
         Ok(())

@@ -521,16 +521,18 @@ pub(crate) async fn run_tool(
         biased;
         () = stopped => {},
         result = &mut execution => {
-            // A nested MCP/child wait can observe the stop before this monitor
-            // wakes. Publish that terminal observation to sibling settlement
-            // and detached recovery before returning the original evidence.
+            // A nested wait can observe the canonical stop before this monitor.
+            // A tool-local timeout/cancellation still terminates the turn, but
+            // cannot create an invocation-wide stop that discards sibling evidence.
             if let Err(error) = &result {
                 if is_estop_interrupted(error) {
                     if let Some(runtime) = &runtime { invocation.request_estop(runtime, tool.name()); }
-                } else if crate::agent::loop_::is_tool_loop_cancelled(error) {
+                } else if crate::agent::loop_::is_tool_loop_cancelled(error)
+                    && token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
                     invocation.request(InvocationStop::User);
-                } else if error.is::<zeroclaw_api::deadline::DeadlineExceeded>()
-                    || error.chain().any(|cause| cause.is::<zeroclaw_api::deadline::DeadlineExceeded>()) {
+                } else if (error.is::<zeroclaw_api::deadline::DeadlineExceeded>()
+                    || error.chain().any(|cause| cause.is::<zeroclaw_api::deadline::DeadlineExceeded>()))
+                    && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                     invocation.request(InvocationStop::Deadline);
                 }
             }

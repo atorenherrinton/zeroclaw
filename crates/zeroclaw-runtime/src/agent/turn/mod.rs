@@ -3,6 +3,7 @@
 pub(crate) mod approval_gate;
 pub(crate) mod batch_failures;
 pub(crate) mod call_prep;
+mod completion_repair;
 pub(crate) mod context;
 pub(crate) mod context_recovery;
 pub(crate) mod delivery_defaults;
@@ -646,6 +647,10 @@ async fn run_tool_call_loop_inner(
     // cancellation, cost and iteration limits. Repeated commentary alone must
     // not keep a turn alive forever.
     let mut consecutive_commentary_only: usize = 0;
+    // This turn owns one corrective request for an unstarted promise-only
+    // response. Execution evidence remains in history, not another counter.
+    let mut initial_progress_repairs: usize = 0;
+    let mut completion_repair_pending = false;
     let mut prompt_approval_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
     // Shared-ref context for the turn step functions. Every `&mut` the loop
@@ -969,6 +974,12 @@ async fn run_tool_call_loop_inner(
         // tool authorization; the channel owner supplies a live bounded view.
         zeroclaw_api::peer_activity::append_to_request(&mut provider_request_messages);
 
+        // Only this request receives the reminder. It cannot become a user
+        // instruction, alter tool selection, or pollute persisted history.
+        if std::mem::take(&mut completion_repair_pending) {
+            completion_repair::append_instruction(&mut provider_request_messages);
+        }
+
         let llm_started_at = outcome::until_cancelled(
             cancellation_token.as_ref(),
             announce_llm_request(
@@ -1124,7 +1135,10 @@ async fn run_tool_call_loop_inner(
                         context_token_budget,
                     ),
                 )
-                .await?;
+                .await
+                // Recovery is optional; stopping its wait cannot replace the
+                // provider's original error or already-visible stream partial.
+                .unwrap_or(false);
                 if recovered {
                     continue;
                 }
@@ -1277,7 +1291,16 @@ async fn run_tool_call_loop_inner(
             }
         }
 
-        if tool_calls.is_empty() && commentary_only {
+        // Every preceding round must be a known no-tool continuation. A tool
+        // attempt or other recovery creates a gap even if compaction removes
+        // its history evidence; prose must never cause those effects to replay.
+        let initial_progress_only = iteration
+            == consecutive_commentary_only + initial_progress_repairs
+            && tool_calls.is_empty()
+            && !commentary_only
+            && !tool_specs.is_empty()
+            && completion_repair::is_initial_progress_only(&display_text, turn_state.history);
+        if tool_calls.is_empty() && (commentary_only || initial_progress_only) {
             turn_state.push_dual(ChatMessage::assistant(assistant_history_content));
             if !response_streamed_live && !protocol_suppressed {
                 outcome::until_cancelled(
@@ -1297,12 +1320,22 @@ async fn run_tool_call_loop_inner(
                     .await??;
                 }
             }
-            consecutive_commentary_only += 1;
-            anyhow::ensure!(
-                consecutive_commentary_only <= MAX_COMMENTARY_CONTINUATIONS,
-                "{}",
-                crate::i18n::get_required_cli_string("turn-commentary-incomplete")
-            );
+            if initial_progress_only {
+                initial_progress_repairs += 1;
+                anyhow::ensure!(
+                    initial_progress_repairs <= 1,
+                    "{}",
+                    crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+                );
+                completion_repair_pending = true;
+            } else {
+                consecutive_commentary_only += 1;
+                anyhow::ensure!(
+                    consecutive_commentary_only <= MAX_COMMENTARY_CONTINUATIONS,
+                    "{}",
+                    crate::i18n::get_required_cli_string("turn-commentary-incomplete")
+                );
+            }
             if let Some(reported) = reported_input_tokens {
                 enforce_reported_budget(
                     turn_state.history,
@@ -1772,7 +1805,7 @@ async fn run_tool_call_loop_inner(
     }
 
     anyhow::ensure!(
-        consecutive_commentary_only == 0,
+        consecutive_commentary_only == 0 && !completion_repair_pending,
         "{}",
         crate::i18n::get_required_cli_string("turn-commentary-incomplete")
     );

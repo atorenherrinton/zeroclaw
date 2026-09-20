@@ -56,6 +56,7 @@
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
   - [Memory and payload lifecycle](./architecture/memory-payload-lifecycle.md)
+  - [Native recall-weighted memory promotion](./architecture/weighted-memory-promotion.md)
   - [Config lifecycle](./architecture/config-lifecycle.md)
   - [Generated documentation pipeline](./architecture/generated-documentation-pipeline.md)
   - [Localization catalog lifecycle](./architecture/localization-catalog-lifecycle.md)

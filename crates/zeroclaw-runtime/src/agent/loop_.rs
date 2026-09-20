@@ -5842,6 +5842,285 @@ mod tests {
         assert!(!visible.contains("responses_output_items"));
     }
 
+    struct InitialProgressProvider {
+        inner: ScriptedModelProvider,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
+        cancel_on_repair: Option<CancellationToken>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for InitialProgressProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Attributable::role(&self.inner)
+        }
+        fn alias(&self) -> &str {
+            "initial-progress-fixture"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for InitialProgressProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.inner.capabilities()
+        }
+        async fn chat_with_system(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected plain chat")
+        }
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let repairing = request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("[Complete the current request]"));
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
+            if repairing && let Some(token) = &self.cancel_on_repair {
+                token.cancel();
+                return std::future::pending().await;
+            }
+            self.inner.chat(request, model, temperature).await
+        }
+    }
+
+    fn initial_progress_provider(responses: Vec<ChatResponse>) -> InitialProgressProvider {
+        InitialProgressProvider {
+            inner: ScriptedModelProvider {
+                responses: Arc::new(Mutex::new(responses.into())),
+                capabilities: ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..ProviderCapabilities::default()
+                },
+            },
+            requests: Mutex::new(Vec::new()),
+            cancel_on_repair: None,
+        }
+    }
+
+    fn plain_progress_response(text: &str) -> ChatResponse {
+        ChatResponse {
+            text: Some(text.into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_continues_unmarked_and_mislabelled_finals_once() {
+        for first in [
+            plain_progress_response("I'm checking the sample report now."),
+            phased_response(
+                "final_answer",
+                "I'm reviewing the sample report now.",
+                false,
+            ),
+        ] {
+            let expected_replay = first.reasoning_content.clone();
+            let provider = initial_progress_provider(vec![
+                first,
+                phased_response("commentary", "Checking the source.", true),
+                plain_progress_response("The sample report passed the check."),
+            ]);
+            let mut history = vec![ChatMessage::user("Please check the sample report.")];
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let result =
+                run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+                    .await
+                    .unwrap();
+            assert_eq!(result, "The sample report passed the check.");
+            assert_eq!(invocations.load(Ordering::SeqCst), 1);
+            let requests = provider.requests.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            for (index, request) in requests.iter().enumerate() {
+                assert_eq!(
+                    request
+                        .iter()
+                        .any(|message| message.content.contains("[Complete the current request]")),
+                    index == 1
+                );
+                assert_eq!(
+                    request
+                        .iter()
+                        .find(|message| message.role == "user")
+                        .unwrap()
+                        .content,
+                    "Please check the sample report."
+                );
+            }
+            assert!(
+                !history
+                    .iter()
+                    .any(|message| message.content.contains("[Complete the current request]"))
+            );
+            if let Some(expected) = expected_replay {
+                let assistant = history
+                    .iter()
+                    .find(|message| message.role == "assistant")
+                    .unwrap();
+                let envelope: serde_json::Value = serde_json::from_str(&assistant.content).unwrap();
+                assert_eq!(
+                    envelope["reasoning_content"], expected,
+                    "repair must not rewrite the provider's phase metadata"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_stops_repeated_promises_and_remains_cancellable() {
+        let mut provider = initial_progress_provider(vec![
+            plain_progress_response("I'm checking the sample report now."),
+            plain_progress_response("I'll review the sample report now."),
+            plain_progress_response("must not request a third response"),
+        ]);
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let error = run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("task is not complete"),
+            "{error}"
+        );
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+
+        provider
+            .inner
+            .responses
+            .lock()
+            .unwrap()
+            .push_front(plain_progress_response(
+                "I'm checking the sample report now.",
+            ));
+        let token = CancellationToken::new();
+        provider.cancel_on_repair = Some(token.clone());
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_phased_responses(
+                &provider,
+                &mut history,
+                invocations.clone(),
+                None,
+                Some(token),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(is_tool_loop_cancelled(&error), "{error}");
+        assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_preserves_answers_plans_blockers_and_completed_actions() {
+        for (request, answer) in [
+            (
+                "Please check the report.",
+                "The report you pasted is complete.",
+            ),
+            ("Please check the report.", "I cannot access that report."),
+            ("Please check the report.", "Which report should I check?"),
+            (
+                "Give me a plan for checking reports.",
+                "I'll review the report and verify the sources.",
+            ),
+            (
+                "Rewrite this update in the first person.",
+                "I'm checking the report now.",
+            ),
+        ] {
+            let provider = initial_progress_provider(vec![plain_progress_response(answer)]);
+            let mut history = vec![ChatMessage::user(request)];
+            let result = run_phased_responses(
+                &provider,
+                &mut history,
+                Arc::new(AtomicUsize::new(0)),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, answer);
+            assert_eq!(provider.requests.lock().unwrap().len(), 1);
+        }
+        // A completed tool round can have irreversible effects. This heuristic
+        // must not turn its subsequent status message into a replay request.
+        let provider = initial_progress_provider(vec![
+            phased_response("commentary", "Checking the source.", true),
+            plain_progress_response("I'm checking the sample report now."),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        run_phased_responses(&provider, &mut history, invocations.clone(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+        assert!(
+            !provider
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|message| message.content.contains("[Complete the current request]"))
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_progress_repair_does_not_duplicate_streamed_preamble() {
+        let provider = StreamingNativeToolEventModelProvider::with_turns(vec![
+            NativeStreamTurn::TextChunks(vec![
+                "I'm checking ".into(),
+                "the sample report now.".into(),
+            ]),
+            NativeStreamTurn::ToolCall(ToolCall {
+                id: "repair-check".into(),
+                name: "count_tool".into(),
+                arguments: "{}".into(),
+                extra_content: None,
+            }),
+            NativeStreamTurn::Text("The sample report passed.".into()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let mut history = vec![ChatMessage::user("Please check the sample report.")];
+        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let result =
+            run_phased_responses(&provider, &mut history, invocations.clone(), Some(tx), None)
+                .await
+                .unwrap();
+        assert_eq!(result, "The sample report passed.");
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        let mut visible = String::new();
+        while let Some(event) = rx.recv().await {
+            if let DraftEvent::Text(text) = event {
+                visible.push_str(&text);
+            }
+        }
+        assert_eq!(
+            visible
+                .matches("I'm checking the sample report now.")
+                .count(),
+            1
+        );
+        assert_eq!(visible.matches("The sample report passed.").count(), 1);
+        assert!(!visible.contains("[Complete the current request]"));
+    }
+
     struct CancelDuringCommentaryContinuation {
         calls: AtomicUsize,
         cancellation: CancellationToken,

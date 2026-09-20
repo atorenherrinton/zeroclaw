@@ -148,13 +148,13 @@ impl PromptSection for ToolHonestySection {
             return Ok(String::new());
         }
 
-        Ok(
+        Ok(format!(
             "## CRITICAL: Tool Honesty\n\n\
              - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
              - If a tool call fails, report the error — never make up data to fill the gap.\n\
-             - When unsure whether a tool call succeeded, ask the user rather than guessing."
-                .into(),
-        )
+             - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n{}",
+            crate::agent::system_prompt::COMPLETION_CONTRACT,
+        ))
     }
 }
 
@@ -566,6 +566,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn direct_tool_honesty_uses_shared_completion_contract() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
+        let ctx = PromptContext {
+            workspace_dir: workspace.path(),
+            agent_workspace_dir: workspace.path(),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: true,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
+        };
+        let prompt = ToolHonestySection.build(&ctx).unwrap();
+        assert!(prompt.contains(crate::agent::system_prompt::COMPLETION_CONTRACT));
+        let no_tools = PromptContext { tools: &[], ..ctx };
+        assert!(ToolHonestySection.build(&no_tools).unwrap().is_empty());
     }
 
     #[test]
