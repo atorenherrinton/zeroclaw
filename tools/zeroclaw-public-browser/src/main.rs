@@ -1,4 +1,5 @@
 mod browser;
+mod lifecycle;
 mod policy;
 mod proxy;
 
@@ -40,7 +41,7 @@ async fn call(browser: &mut Option<Browser>, name: &str, args: Value) -> Result<
             bail!("close accepts an empty object");
         }
         if let Some(mut b) = browser.take() {
-            b.close().await;
+            b.close().await?;
         }
         return Ok(json!({"content":[{"type":"text","text":"Isolated Chrome session closed"}]}));
     }
@@ -159,24 +160,20 @@ async fn run(browser: &mut Option<Browser>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("--watch-driver-group") {
-        let group: i32 = std::env::args()
-            .nth(2)
-            .ok_or_else(|| anyhow::Error::msg("Missing driver group"))?
+    if std::env::args().nth(1).as_deref() == Some("--supervise-driver") {
+        let mut args = std::env::args().skip(2);
+        let parent: i32 = args
+            .next()
+            .ok_or_else(|| anyhow::Error::msg("Missing browser owner process"))?
             .parse()?;
-        if group <= 1 {
-            bail!("Invalid driver group");
+        let port: u16 = args
+            .next()
+            .ok_or_else(|| anyhow::Error::msg("Missing dedicated browser port"))?
+            .parse()?;
+        if args.next().is_some() {
+            bail!("Unexpected browser supervisor argument");
         }
-        let parent = unsafe { libc::getppid() };
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            if unsafe { libc::getppid() } != parent {
-                unsafe {
-                    libc::kill(-group, libc::SIGTERM);
-                }
-                return Ok(());
-            }
-        }
+        return lifecycle::supervise_driver(parent, port).await;
     }
     let mut browser = None;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -186,7 +183,7 @@ async fn main() -> Result<()> {
         _ = tokio::signal::ctrl_c() => Ok(()),
     };
     if let Some(b) = browser.as_mut() {
-        b.close().await;
+        b.close().await?;
     }
     result
 }

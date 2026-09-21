@@ -1,14 +1,10 @@
-use crate::{policy::validate_url, proxy};
+use crate::{lifecycle, policy::validate_url, proxy};
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, Method};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::{os::unix::process::CommandExt as _, path::Path, process::Stdio, time::Duration};
-use tokio::{
-    net::TcpListener,
-    process::{Child, Command},
-    task::JoinHandle,
-};
+use std::time::Duration;
+use tokio::{net::TcpListener, task::JoinHandle};
 
 const CHROME: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 const ELEMENT: &str = "element-6066-11e4-a52e-4f735466cecf";
@@ -128,70 +124,26 @@ pub struct Browser {
     http: Client,
     endpoint: String,
     session: Option<String>,
-    driver: Child,
-    driver_group: i32,
-    watchdog: Child,
+    driver: lifecycle::DriverSupervisor,
     proxy_task: JoinHandle<Result<()>>,
 }
 
 impl Drop for Browser {
     fn drop(&mut self) {
         self.proxy_task.abort();
-        // The driver was started in its own process group, which contains only
-        // the ephemeral Chrome it launched. Never target an existing browser.
-        if self.driver_group > 0 {
-            unsafe {
-                libc::kill(-self.driver_group, libc::SIGTERM);
-            }
-        }
-        let _ = self.watchdog.start_kill();
+        // Dropping the private lifeline lets the supervisor settle its owned
+        // group, including cancellation before startup handshake completes.
     }
 }
 
 impl Browser {
     pub async fn start() -> Result<Self> {
-        let driver_path = std::env::current_exe()?
-            .parent()
-            .context("Executable has no parent")?
-            .join("chromedriver");
-        Self::start_with_driver(&driver_path).await
-    }
-
-    pub async fn start_with_driver(driver_path: &Path) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let proxy_address = listener.local_addr()?;
         let port_listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = port_listener.local_addr()?.port();
         drop(port_listener);
-        let mut command = Command::new(driver_path);
-        command
-            .args([
-                format!("--port={port}"),
-                "--allowed-ips=127.0.0.1".into(),
-                "--log-level=OFF".into(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        command.as_std_mut().process_group(0);
-        let driver = command
-            .spawn()
-            .context("Cannot start the dedicated ChromeDriver")?;
-        let driver_group = driver
-            .id()
-            .context("Dedicated ChromeDriver has no process ID")? as i32;
-        let mut watchdog_command = Command::new(std::env::current_exe()?);
-        watchdog_command
-            .args(["--watch-driver-group", &driver_group.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        watchdog_command.as_std_mut().process_group(0);
-        let watchdog = watchdog_command
-            .spawn()
-            .context("Cannot start the browser lifecycle watchdog")?;
+        let driver = lifecycle::DriverSupervisor::start(port).await?;
         let mut this = Self {
             http: Client::builder()
                 .no_proxy()
@@ -201,30 +153,29 @@ impl Browser {
             endpoint: format!("http://127.0.0.1:{port}"),
             session: None,
             driver,
-            driver_group,
-            watchdog,
             proxy_task: zeroclaw_spawn::spawn!(proxy::serve(listener)),
         };
-        let mut ready = false;
-        for _ in 0..50 {
-            if this.driver.try_wait()?.is_some() {
-                bail!("Dedicated ChromeDriver exited at startup");
+        let ready = async {
+            loop {
+                if this.driver.exited()? {
+                    bail!("Dedicated ChromeDriver exited at startup");
+                }
+                if this
+                    .http
+                    .get(format!("{}/status", this.endpoint))
+                    .send()
+                    .await
+                    .is_ok()
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if this
-                .http
-                .get(format!("{}/status", this.endpoint))
-                .send()
-                .await
-                .is_ok()
-            {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        if !ready {
-            bail!("Dedicated ChromeDriver did not become ready");
-        }
+        };
+        // Bound the whole readiness phase, including a stalled HTTP response.
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .context("Dedicated ChromeDriver did not become ready")??;
         let capabilities = json!({"capabilities":{"alwaysMatch":{
             "browserName":"chrome", "acceptInsecureCerts":false,
             "pageLoadStrategy":"eager", "unhandledPromptBehavior":"dismiss",
@@ -439,7 +390,7 @@ impl Browser {
         self.summary(0).await.map_err(|error| anyhow::Error::msg(format!("Browser action was attempted; do not repeat it. Read the page to reconcile the outcome. Observation failed: {error}")))
     }
 
-    pub async fn close(&mut self) {
+    pub async fn close(&mut self) -> Result<()> {
         if let Some(sid) = self.session.take() {
             let _ = tokio::time::timeout(
                 Duration::from_secs(1),
@@ -447,15 +398,8 @@ impl Browser {
             )
             .await;
         }
-        if self.driver_group > 0 {
-            unsafe {
-                libc::kill(-self.driver_group, libc::SIGTERM);
-            }
-            let _ = tokio::time::timeout(Duration::from_secs(1), self.driver.wait()).await;
-            self.driver_group = 0;
-        }
-        let _ = self.watchdog.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(1), self.watchdog.wait()).await;
+        self.driver.close().await?;
+        Ok(())
     }
 }
 

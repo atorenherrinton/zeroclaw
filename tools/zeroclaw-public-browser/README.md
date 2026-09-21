@@ -54,6 +54,49 @@ any prior writes first. Do not replay a submission or transfer authentication
 state between browsers. Always close the Chrome session after completion or
 failure. Restore the prior binary/config and reload MCP to roll back.
 
+## Owned startup and shutdown
+
+The helper starts a supervisor before any ChromeDriver. A private inherited Unix
+socket performs a bounded readiness/launch handshake; only the supervisor creates
+and owns the dedicated driver process group. Closing that socket requests cleanup,
+including cancellation before the parent receives the driver handshake. The
+supervisor also checks the original parent PID, so parent death before supervisor
+boot cannot adopt PID 1 as an owner or strand a new driver.
+
+The parent never signals a cached driver group ID. The supervisor observes its
+own direct child with `waitid(WNOWAIT)`, keeping its PID reserved until the final
+TERM/KILL signal. It then reaps the child and verifies group absence without further
+destructive signals. Grace is one second, with separate two-second reap and absence
+bounds. An actual signal failure remains an error unless an exited owned leader
+can be reaped and the whole group is independently confirmed absent. This handles
+macOS all-zombie groups without treating EPERM as successful signal delivery.
+
+Both supervisor startup and the entire driver HTTP readiness phase have five-second
+bounds. Failure or cancellation drops the private lifeline; normal close waits for
+the supervisor's cleanup result. A supervisor cleanup timeout is an unknown outcome,
+not proof of shutdown. The supervisor is intentionally not killed just because its
+parent future was dropped: doing so would remove the driver owner before cleanup.
+Hard-killing the supervisor itself, an entire system crash, or descendants that
+explicitly leave the dedicated group are outside this ownership guarantee.
+
+The internal `--supervise-driver OWNER_PID PORT` mode requires a connected inherited
+Unix socket on stdin. The former post-launch `--watch-driver-group` protocol is no
+longer used. Drain existing helper sessions before replacing/reloading this helper.
+On the local macOS installation, retain the existing `public-browser` signing
+mapping and certificate. Root must sign the staged candidate with
+`zeroclaw-signed-launch public-browser --sign-only /absolute/candidate`, verify its
+certificate-pinned identity, preserve a signed rollback, then install and test the
+canonical route. Do not replace the credential-owning auth-browser core.
+
+`cargo test` includes a Python process fixture that copies the candidate beside a
+private synthetic driver; it never launches Chrome or contacts a public host. It
+checks parent SIGKILL before supervisor boot, before launch, after launch before
+readiness is received, and during active ownership; lifeline close; exited-leader
+cleanup of descendants; and the actual MCP normal-close, startup-cancel and readiness
+timeout paths. Each case keeps an unrelated process group alive as a control.
+The copied test executable and fake driver stay inside a private temporary directory.
+These process fixtures do not replace a signed installed-route browser smoke test.
+
 ## Browser regression fixture
 
 ```sh
