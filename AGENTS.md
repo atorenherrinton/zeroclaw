@@ -32,6 +32,7 @@ Prefer borrowed config, getters, resolver closures over live config, on-demand m
 8. Use a non-`master` branch, open a PR to `master`, and never push directly to `master`.
 9. Use conventional commits and the full PR template. Prefer small PRs and do not add bot or AI attribution footers.
 10. Declare stacked work with `Depends on #...` and replacement work with `Supersedes #...`.
+11. Land finished work on `master`; do not strand it on local branches or open PRs. Reconcile compatible conflicts with best engineering judgment, require the relevant tests and repository checks to pass, and never bypass branch protections. Do not merge stale, superseded, duplicate, experimental, or failing work.
 
 Subagents must set their working directory to the repository root before shell or filesystem work. Do not assume an inherited working directory.
 
