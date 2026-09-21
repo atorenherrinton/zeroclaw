@@ -114,6 +114,9 @@ hangup, and untouched signature verification, TwiML, and owner-task injection.
 
 Differences to know about:
 
+- Inbound calls that offer verified appointment holds always use Realtime,
+  whatever `engine` says, because only that session has the appointment tools.
+  Other calls use the configured engine.
 - Caller speech over a goodbye that has not finished playing now keeps the call
   open (Realtime could end it mid-sentence). The model ends it on its next turn.
 - Replies are not streamed token by token; the model answers, then synthesis

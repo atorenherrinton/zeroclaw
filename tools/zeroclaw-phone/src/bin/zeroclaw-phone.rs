@@ -564,14 +564,7 @@ async fn media(
             false,
         )
     };
-    // Appointment tools exist only in the Realtime session, so a call that needs
-    // them never uses the cascade, whatever the configured engine.
-    let engine = if appointments.is_some() {
-        VoiceEngine::Realtime
-    } else {
-        cfg.voice.engine
-    };
-    let bridge = match engine {
+    let bridge = match engine_for_call(cfg.voice.engine, appointments.is_some()) {
         VoiceEngine::Realtime => Bridge::Realtime(realtime::RealtimeOptions {
             api_key: cfg.api_key,
             instructions,
@@ -627,6 +620,17 @@ async fn media(
         };
         if let Err(error)=finish_call(&app.root,&sid,first_entries,outcome) { eprintln!("{error}"); }
     })
+}
+
+/// Appointment tools exist only in the Realtime session, so a call that needs
+/// them never uses the cascade, whatever the configured engine. Silently
+/// dropping verified scheduling from a call would be worse than using Realtime.
+fn engine_for_call(configured: VoiceEngine, needs_appointment_tools: bool) -> VoiceEngine {
+    if needs_appointment_tools {
+        VoiceEngine::Realtime
+    } else {
+        configured
+    }
 }
 
 /// The engine admitted for one call. Both produce the same `BridgeOutcome`.
@@ -1492,6 +1496,26 @@ mod tests {
             .insert("recording_consent".into(), "invalid".into());
         common::atomic_private_write(&path, toml::to_string(&config).unwrap().as_bytes()).unwrap();
         assert!(common::load(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn calls_that_need_appointment_tools_stay_on_realtime_whatever_the_engine() {
+        assert_eq!(
+            engine_for_call(VoiceEngine::Cascade, true),
+            VoiceEngine::Realtime
+        );
+        assert_eq!(
+            engine_for_call(VoiceEngine::Realtime, true),
+            VoiceEngine::Realtime
+        );
+        assert_eq!(
+            engine_for_call(VoiceEngine::Cascade, false),
+            VoiceEngine::Cascade
+        );
+        assert_eq!(
+            engine_for_call(VoiceEngine::Realtime, false),
+            VoiceEngine::Realtime
+        );
     }
 
     #[test]
