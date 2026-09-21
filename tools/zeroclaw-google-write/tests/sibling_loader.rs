@@ -288,3 +288,57 @@ printf '%s\n' '{"id":"0cfixture","summary":"Synthetic appointment"}'
     assert!(!calls.contains("calendar.events.delete"));
     assert!(!calls.contains("calendar.events.patch"));
 }
+
+#[test]
+fn tentative_create_reaches_sibling_and_persists_status_without_invites_or_replay() {
+    let install = Install::new();
+    executable(
+        &install.sibling(),
+        r##"#!/usr/bin/python3
+import json, pathlib, sys
+root = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+params = json.loads(next(a.removeprefix('--params=') for a in args if a.startswith('--params=')))
+if 'calendar.events.insert' in args:
+    assert '--single-attempt' in args and '--allow-write' in args
+    assert params['sendUpdates'] == 'none'
+    body = json.loads(next(a.removeprefix('--body=') for a in args if a.startswith('--body=')))
+    assert body['status'] == 'tentative' and 'attendees' not in body
+    assert not (root / 'event.json').exists(), 'insert must not replay'
+    (root / 'event.json').write_text(json.dumps(body))
+elif 'calendar.events.get' in args:
+    assert '--readonly' in args and '--allow-write' not in args
+    body = json.loads((root / 'event.json').read_text())
+    assert params['eventId'] == body['id']
+else:
+    raise AssertionError('unexpected provider operation')
+with (root / 'calls.jsonl').open('a') as log:
+    log.write(json.dumps(args) + '\n')
+print(json.dumps(body))
+"##,
+    );
+    let arguments = json!({"action":"create","calendar_id":"primary",
+        "idempotency_key":"tentative-process-fixture","owner_authorized":true,
+        "summary":"Tentative fixture","status":"tentative","send_updates":"none",
+        "start":"2030-01-01T10:00:00Z","end":"2030-01-01T11:00:00Z"});
+    let first = install.invoke_tool("calendar_mutate", arguments.clone());
+    let receipt = &first["result"]["structuredContent"];
+    assert_eq!(receipt["state"], "verified", "{first}");
+    assert_eq!(receipt["invitations_delivered"], false);
+    assert_eq!(receipt["evidence"]["notifications_requested"], false);
+    let duplicate = install.invoke_tool("calendar_mutate", arguments);
+    assert_eq!(
+        duplicate["result"]["structuredContent"]["duplicate_prevented"],
+        true
+    );
+    assert_eq!(
+        duplicate["result"]["structuredContent"]["event_id"],
+        receipt["event_id"]
+    );
+    let calls = fs::read_to_string(install.0.join("install with spaces/calls.jsonl")).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        2,
+        "one insert and one verification GET"
+    );
+}

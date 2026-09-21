@@ -396,3 +396,17 @@ flags and ETag headers, then verify the effect through a separate resource read.
 They do not use credentials or send events. Unit tests cover validation, preserved
 RSVP metadata, recurrence/reminder scope, idempotency, partial/uncertain recovery
 and stable event IDs.
+
+
+### Tentative creates
+
+`calendar_mutate` accepts optional `status: "tentative"` only for `action: "create"`.
+Other status values and status changes on update/delete fail argument validation.
+Omission preserves the existing default-status behavior. The status is part of the
+same immutable action intent and provider verification: a returned confirmed event
+cannot verify a tentative request, and reconciliation never replays the insert.
+For a hold without invitations, omit `attendees` and use `send_updates: "none"`.
+Tentative status does not itself suppress invitations, perform an availability
+check, authorize a caller, or change an existing appointment. Those decisions
+remain with the authenticated owner workflow. No live Calendar test is required;
+synthetic MCP/sibling tests check the outgoing status and notification mode.
