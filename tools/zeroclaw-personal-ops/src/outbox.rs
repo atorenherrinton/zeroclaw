@@ -459,6 +459,14 @@ impl Ops {
         })
         .await
     }
+    /// Read-only reconciliation of an operation's uncertain steps. Prepared steps
+    /// are left untouched, so no effect can be started or replayed.
+    pub async fn reconcile_operation(&self, id: &str) -> Result<Value> {
+        self.operation_reconcile_using(id, |step, key, reconcile| {
+            self.execute_step(step, key, reconcile)
+        })
+        .await
+    }
     async fn execute_step(&self, step: Step, key: String, reconcile: bool) -> Result<Outcome> {
         if step.tool == crate::group_text::TOOL {
             return crate::group_text::execute_using(

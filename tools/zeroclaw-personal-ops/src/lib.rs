@@ -20,6 +20,7 @@ pub mod continuity;
 pub mod events;
 mod google_push_health;
 mod group_text;
+pub mod hygiene;
 mod imessage;
 mod imessage_history;
 pub mod install;
@@ -171,6 +172,7 @@ impl Ops {
         journal::migrate(&db)?;
         continuity::migrate(&db)?;
         events::migrate(&db)?;
+        hygiene::migrate(&db)?;
         share_import::migrate(&db)?;
         Ok(Self {
             root: root.to_owned(),
