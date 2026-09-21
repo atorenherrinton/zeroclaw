@@ -877,9 +877,9 @@ async fn connect(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     zeroclaw_spawn::spawn!(async move { axum::serve(listener, router).await.unwrap() });
-    let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{address}/ws"))
-        .await
-        .unwrap();
+    // Loopback test server; there is no TLS on 127.0.0.1.
+    let url = format!("ws://{address}/ws"); // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+    let (mut client, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     for frame in [
         json!({"event":"connected","protocol":"Call","version":"1.0.0"}),
         start,
