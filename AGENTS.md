@@ -35,6 +35,18 @@ Prefer borrowed config, getters, resolver closures over live config, on-demand m
 
 Subagents must set their working directory to the repository root before shell or filesystem work. Do not assume an inherited working directory.
 
+## Master And The Installed Version Always Match
+
+`master` of the fork (`atorenherrinton/zeroclaw`) is the single source of truth, and what is installed on the operator's machine must always be exactly what is on `master`. Neither may run ahead of the other.
+
+1. **Nothing runs that is not on `master`.** Never install a build from a local branch, worktree, uncommitted tree, or a "local-only", "source-only", or "unmerged candidate". Land the change first (PR, `CI Required Gate`, squash merge), then build and install from `origin/master`.
+2. **Every merge that touches an installed component is followed by reinstalling it from `master` in the same task.** Components are the daemon and each helper or service under `tools/`. A change is not done until it is merged and installed.
+3. **Install only from a clean `origin/master` checkout.** Run `git fetch origin` first and build the exact `origin/master` head. Confirm afterwards that the installed build reports that commit (`zeroclaw --version` prints `commit:` and `source:`; helpers record theirs in `build-info.json` or the install receipt) and that `source` is `clean`.
+4. **Check for drift before every install.** If an installed build contains commits that `master` lacks (for example a local fix that was deployed first), port them to `master` as a PR before installing anything else. Reinstalling from `master` over a lineage that `master` does not contain silently deletes those features.
+5. **Anything deployed ahead of `master` is a defect to fix now, not a pattern.** Exceptions need the owner's explicit approval, name the component, and are fixed by landing the change on `master` immediately after.
+
+Squash merges mean a local branch's commits never become ancestors of `master`; that is why installs come from `master`, never from the branch that produced the change.
+
 ## User-Facing Text
 
 - User-facing runtime CLI, tool, and onboarding text uses Fluent keys through `zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args}` rather than bare literals; see `crates/zeroclaw-runtime/src/i18n.rs`.
