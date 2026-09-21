@@ -39,6 +39,75 @@ The service reads an owner-private `phone.toml`, the existing ZeroClaw encrypted
 configuration, and `screening.md` from its extension root. Credentials and live
 configuration are intentionally not part of this repository.
 
+## Voice engines
+
+Two engines can bridge call audio. Both produce the same transcript and outcome,
+use the same instructions and the same fixed `end_call`/`decline_recording` tools,
+and sit behind the same signed Twilio ingress. The default is unchanged.
+
+| Engine | Pipeline | Cost |
+| --- | --- | --- |
+| `realtime` (default) | One OpenAI Realtime session: speech in, model, speech out | Per audio minute |
+| `cascade` | Speech-to-text, then a chat model, then text-to-speech, each an HTTP endpoint | Whatever each endpoint costs; $0 for local Whisper + local model + local Kokoro |
+
+The cascade is opt-in and reversible in `phone.toml`. Settings are read per
+admission, so a call already in progress keeps its engine.
+
+```toml
+[voice]
+engine = "cascade"          # "realtime" restores the integrated session
+
+[voice.cascade]
+stt_url   = "http://127.0.0.1:8000/v1/audio/transcriptions"  # Whisper server
+stt_model = "gpt-transcribe"                                 # default; set for your server
+llm_url   = "https://api.openai.com/v1/chat/completions"
+llm_model = "your-chat-model"                                # required, no default
+tts_url   = "http://127.0.0.1:8880/v1/audio/speech"          # Kokoro-FastAPI
+tts_model = "kokoro"                                         # default
+tts_voice = "af_heart"                                       # default
+```
+
+Each stage speaks the common OpenAI-compatible shape, so any server that does
+works: the recognizer takes a multipart `file` and `model` and returns
+`{"text": ...}`; the chat endpoint is chat completions with function calling; the
+synthesizer receives `response_format: "pcm"` and must return raw 24 kHz signed
+16-bit little-endian mono audio, which is resampled to 8 kHz mu-law for Twilio.
+Kokoro is synthesis-only, so turn-taking is done here: an energy endpointer
+(300 ms preroll, 500 ms trailing silence, like the Realtime VAD settings) cuts
+caller utterances, and speaking over the assistant clears Twilio's playback
+buffer, aborts the in-flight reply, and tells the model only what was actually
+heard, using the same mark-acknowledged accounting as Realtime.
+
+Endpoint rules, enforced when the configuration loads: `https`, or plain `http`
+to this machine only; no credentials, query, or fragment in the URL. The
+account's OpenAI key is attached to `https://api.openai.com` and never to any
+other host. Redirects and environment proxies are disabled, responses are
+size-capped, and one retry is made for transient failures of these idempotent
+requests. Errors carry no provider text.
+
+Preserved from Realtime and covered by tests: AI disclosure through the shared
+instructions, beep/silence voicemail behavior, barge-in, the two-phase `end_call`
+close with a tool-free audible confirmation turn and eight-second silence
+fallback, immediate `decline_recording` and the deterministic objection-phrase
+check, byte/mark/item ceilings, the hard duration cap, transcript-drain grace on
+hangup, and untouched signature verification, TwiML, and owner-task injection.
+
+Differences to know about:
+
+- Caller speech over a goodbye that has not finished playing now keeps the call
+  open (Realtime could end it mid-sentence). The model ends it on its next turn.
+- Replies are not streamed token by token; the model answers, then synthesis
+  starts sentence by sentence, so first audio arrives later than with Realtime.
+  Token streaming is a possible follow-up.
+- Deterministic tests use fake stages and a fake Twilio; only a real call proves
+  caller timing, endpointer sensitivity on your line, and spoken quality.
+
+Check a configured cascade without placing a call (it makes one request to each
+stage): `zeroclaw-phone probe ROOT` prints `{"cascadeReady":true}`.
+
+Rollback: set `engine = "realtime"` (or delete the `[voice]` table). The
+`[voice.cascade]` section may stay for the next attempt. No data migration exists.
+
 ## Inbound recording notice
 
 The canonical `phone.toml` setting selects the admission flow for each new call:
