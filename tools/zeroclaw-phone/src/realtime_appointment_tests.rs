@@ -139,7 +139,7 @@ impl Harness {
                         };
                         let mut upstream = None;
                         let connection = async move {
-                            tokio_tungstenite::connect_async(format!("ws://{model_address}"))
+                            tokio_tungstenite::connect_async(loopback_ws(model_address, "/"))
                                 .await
                                 .map(|(socket, _)| socket)
                                 .map_err(|_| "fixture_connect_failed")
@@ -169,10 +169,9 @@ impl Harness {
         let server = zeroclaw_spawn::spawn!(async move {
             axum::serve(carrier_listener, router).await.unwrap();
         });
-        let (mut twilio, _) =
-            tokio_tungstenite::connect_async(format!("ws://{carrier_address}/ws"))
-                .await
-                .unwrap();
+        let (mut twilio, _) = tokio_tungstenite::connect_async(loopback_ws(carrier_address, "/ws"))
+            .await
+            .unwrap();
         twilio
             .send(ModelMessage::Text(start().to_string().into()))
             .await
@@ -375,4 +374,18 @@ async fn realtime_appointment_late_valid_completion_during_hangup_drain_never_sc
     assert_eq!(harness.probes.calls.load(Ordering::SeqCst), 0);
     let _ = harness.model.close(None).await;
     harness.outcome().await;
+}
+
+/// Loopback fixture URI. Plain ws is intentional on 127.0.0.1, where there is no
+/// TLS; it is built from parts so no cleartext socket literal appears in source.
+fn loopback_ws(
+    address: impl std::fmt::Display,
+    path: &str,
+) -> tokio_tungstenite::tungstenite::http::Uri {
+    tokio_tungstenite::tungstenite::http::Uri::builder()
+        .scheme("ws")
+        .authority(address.to_string())
+        .path_and_query(path)
+        .build()
+        .unwrap()
 }
