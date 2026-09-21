@@ -10,7 +10,7 @@ async fn main() -> Result<()> {
     let mode = args.get(1).map(String::as_str).unwrap_or("help");
     if mode == "help" {
         println!(
-            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | enable-messages CONFIG_DIR | dispatch-messages CONFIG_DIR | upgrade-operations CONFIG_DIR | serve CONFIG_DIR | dashboard-url CONFIG_DIR | activity CONFIG_DIR | call CONFIG_DIR TOOL | tools"
+            "zeroclaw-personal-ops mcp CONFIG_DIR | install CONFIG_DIR GITHUB_ROOT | repair-routing CONFIG_DIR | enable-messages CONFIG_DIR | dispatch-messages CONFIG_DIR | weekly-hygiene CONFIG_DIR [--dry-run] | upgrade-operations CONFIG_DIR | serve CONFIG_DIR | dashboard-url CONFIG_DIR | activity CONFIG_DIR | call CONFIG_DIR TOOL | tools"
         );
         return Ok(());
     }
@@ -50,6 +50,11 @@ async fn main() -> Result<()> {
     }
     if mode == "dispatch-messages" {
         println!("{}", Ops::open(root)?.dispatch_due().await?);
+        return Ok(());
+    }
+    if mode == "weekly-hygiene" {
+        let dry_run = args.get(3).map(String::as_str) == Some("--dry-run");
+        println!("{}", Ops::open(root)?.run_weekly_hygiene(dry_run).await?);
         return Ok(());
     }
     if mode == "enable-messages" {

@@ -464,3 +464,54 @@ snapshots, all-record pagination, revision mismatch, failures, exception filters
 and unchanged exact reviews. No external send is performed. Roll back only the
 helper executable using its preserved signing identity and reconnect MCP clients;
 keep the ledger and all later delivery receipts intact.
+
+## Weekly operations hygiene
+
+`zeroclaw-personal-ops weekly-hygiene CONFIG_DIR [--dry-run]` is a scheduled
+housekeeping pass. It sends one line to the owner's Telegram, or nothing when
+there is nothing new to say.
+
+- **Uncertain sends:** each authorized operation with an `uncertain` step is
+  rechecked through the adapter's read-only reconcile path only (a Gmail sent-mail
+  lookup or `calendar_reconcile`). It never claims or executes a `prepared` step,
+  never fails a late schedule, and never replays a send. iMessage and Telegram have
+  no exact receipt, so those steps stay uncertain and are reported instead.
+- **Dead letters:** `dead_letter` events are reported with a next step derived from
+  the last error (for example an expired refresh token asks for a fresh sign-in).
+  Nothing is requeued or deleted.
+- **Stale reminders:** each open reminder is recorded when the periodic Reminders
+  refresh first sees it. Deadlines written in the text (`today`, `tonight`,
+  `tomorrow`, `this afternoon`, `2026-09-17`, `Sep 17`) are resolved against that
+  first-seen day, and the latest one wins. An explicit due date only extends the
+  deadline. A reminder is flagged once its last stated day has passed. Reminders
+  that state no deadline are never flagged. Reminders first seen before this
+  update are anchored to the day of the first refresh, so they are flagged from the
+  following day at the earliest.
+- **Quiet by default:** an item is mentioned once, then again only after four
+  weeks if still unresolved. `--dry-run` prints the report and digest without
+  notifying or recording what was reported; the read-only recheck still runs.
+
+Schedule it with a native shell cron job whose delivery mode is `none` (the helper
+sends through the existing at-most-once owner alert), for example:
+
+```toml
+[cron.weekly_ops_hygiene]
+command = "'/Users/you/.zeroclaw/bin/zeroclaw-personal-ops' weekly-hygiene '/Users/you/.zeroclaw'"
+enabled = true
+job_type = "shell"
+name = "Weekly operations hygiene"
+shell_output_format = "raw"
+uses_memory = false
+
+[cron.weekly_ops_hygiene.delivery]
+mode = "none"
+
+[cron.weekly_ops_hygiene.schedule]
+expr = "0 9 * * 1"
+kind = "cron"
+tz = "America/Los_Angeles"
+```
+
+Attach the job to an agent whose risk profile allows this executable. Rolling back
+is removing the cron entry; the two new tables (`reminder_seen`,
+`hygiene_reported`) are additive and can stay.

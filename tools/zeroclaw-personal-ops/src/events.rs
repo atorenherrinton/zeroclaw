@@ -415,6 +415,7 @@ impl Ops {
         let reminders = value["reminders"]
             .as_array()
             .context("Reminders list missing")?;
+        self.reminders_seen(reminders)?;
         let overdue: Vec<_> = reminders
             .iter()
             .filter(|r| {

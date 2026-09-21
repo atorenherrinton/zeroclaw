@@ -228,7 +228,29 @@ impl Ops {
         tx.commit()?;
         self.operation_status(id)
     }
-    pub async fn operation_execute_using<F, Fut>(&self, id: &str, mut execute: F) -> Result<Value>
+    pub async fn operation_execute_using<F, Fut>(&self, id: &str, execute: F) -> Result<Value>
+    where
+        F: FnMut(Step, String, bool) -> Fut,
+        Fut: Future<Output = Result<Outcome>>,
+    {
+        self.run_operation(id, execute, false).await
+    }
+    /// Resolve only steps already claimed as `uncertain`, through the adapter's
+    /// read-only reconcile path. Never claims or executes a `prepared` step and
+    /// never fails a late schedule, so it cannot cause an external effect.
+    pub async fn operation_reconcile_using<F, Fut>(&self, id: &str, execute: F) -> Result<Value>
+    where
+        F: FnMut(Step, String, bool) -> Fut,
+        Fut: Future<Output = Result<Outcome>>,
+    {
+        self.run_operation(id, execute, true).await
+    }
+    async fn run_operation<F, Fut>(
+        &self,
+        id: &str,
+        mut execute: F,
+        reconcile_only: bool,
+    ) -> Result<Value>
     where
         F: FnMut(Step, String, bool) -> Fut,
         Fut: Future<Output = Result<Outcome>>,
@@ -240,7 +262,7 @@ impl Ops {
         );
         ensure!(status["state"] != "cancelled", "operation was cancelled");
         let now = Utc::now().timestamp_millis();
-        if let Some(at) = status["send_at_ms"].as_i64() {
+        if let Some(at) = status["send_at_ms"].as_i64().filter(|_| !reconcile_only) {
             if now < at {
                 return Ok(status);
             }
@@ -266,6 +288,9 @@ impl Ops {
                 break;
             }
             let reconcile = old == "uncertain";
+            if !reconcile && reconcile_only {
+                break;
+            }
             if !reconcile {
                 let tx =
                     rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
