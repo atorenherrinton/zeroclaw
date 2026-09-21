@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["LEGACY","MODEL","TYPED"],"fn":["check","cli","get","leaf","list","main","openclaw_dir","operation","private_read","required_path","run","status","toml_document","verify","zeroclaw_dir"],"type":["SafeResult"]};

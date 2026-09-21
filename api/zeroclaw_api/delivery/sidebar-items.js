@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EffectOutcome"],"fn":["current_journal","record_summary","take_summary"],"static":["JOURNAL","SUMMARY"],"struct":["ChunkReceipt","DeliveryFailure","DeliverySummary"],"trait":["DeliveryJournal"]};

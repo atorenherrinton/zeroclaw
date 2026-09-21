@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["current","deliver","deliver_route","inherit","inherit_delivery"],"static":["ACTIVE_CONVERSATION"],"struct":["ConversationRoute","Question"]};

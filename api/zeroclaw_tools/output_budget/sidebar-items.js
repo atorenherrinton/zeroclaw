@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_BATCH_CALLS","READ_PREVIEW_BYTES","ROUND_PAYLOAD_BYTES"],"fn":["bound_output","bounded_text_preview","encoded_size","exact_read_result","per_result_budget","preview_limit","preview_read_result","read_text_preview","with_round_preview_budget"]};
