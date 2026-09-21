@@ -18373,6 +18373,104 @@ api_key = "anthropic-key"
         assert!(output.contains("deadline") || output.contains("timed out"));
     }
 
+    struct NeverReturningTool;
+    zeroclaw_api::tool_attribution!(
+        NeverReturningTool,
+        zeroclaw_api::attribution::ToolKind::Plugin
+    );
+    #[async_trait::async_trait]
+    impl Tool for NeverReturningTool {
+        fn name(&self) -> &str {
+            "mock_price"
+        }
+        fn description(&self) -> &str {
+            "Synthetic tool call that never returns"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+        async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+            std::future::pending().await
+        }
+    }
+    /// A turn blocked inside a tool call (for example a long delegate wait) when
+    /// its deadline fires is journaled as `waiting_on_tool`. The terminal notice
+    /// must still be saved, submitted and confirmed instead of being dropped as an
+    /// illegal transition that leaves the turn uncertain with nothing delivered.
+    #[tokio::test]
+    async fn deadline_during_tool_call_still_delivers_terminal_notice() {
+        use zeroclaw_runtime::control_plane::ControlPlaneHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let plane = ControlPlaneHandle::start_with_boot_id(dir.path(), "fixture".into())
+            .await
+            .unwrap();
+        let channel = Arc::new(ConfirmingTerminalChannel {
+            text: Default::default(),
+            attempts: AtomicUsize::new(0),
+            confirmed: true,
+        });
+        let mut cfg = zeroclaw_config::schema::AliasedAgentConfig::default();
+        cfg.precheck.enabled = false;
+        let mut ctx = Arc::try_unwrap(test_runtime_ctx_with_observer_and_tools(
+            channel.clone(),
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            cfg,
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(NeverReturningTool)],
+        ))
+        .ok()
+        .unwrap();
+        ctx.message_timeout_secs = 1;
+        let (tx, rx) = zeroclaw_api::inbound::channel(2);
+        tx.send(ChannelMessage {
+            id: "tool-timeout-fixture".into(),
+            sender: "fixture".into(),
+            reply_target: "room".into(),
+            channel: "test-channel".into(),
+            content: "synthetic test".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_message_dispatch_loop_supervised(
+                rx,
+                AgentRouter::single(Arc::new(ctx)),
+                1,
+                Some(plane),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(channel.attempts.load(Ordering::SeqCst), 1);
+        let conn = rusqlite::Connection::open(dir.path().join("control_plane.db")).unwrap();
+        let (status, delivered, output): (String, bool, String) = conn
+            .query_row(
+                "SELECT status,delivered,output FROM tasks WHERE kind='channel_turn'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let events: String = conn
+            .query_row(
+                "SELECT group_concat(state) FROM task_turn_events",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "delivered", "{events}");
+        assert!(delivered);
+        assert!(output.contains("deadline") || output.contains("timed out"));
+        assert!(
+            events.contains("waiting_on_tool,response_ready,submitting,delivered"),
+            "{events}"
+        );
+    }
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     async fn telegram_terminal_notice_replaces_progress_through_http_and_records_delivery() {
