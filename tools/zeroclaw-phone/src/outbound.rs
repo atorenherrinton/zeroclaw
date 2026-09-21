@@ -754,6 +754,7 @@ mod tests {
         common::private_dir(&root).unwrap();
         let store = SecretStore::new(&native, true);
         let config = common::PhoneConfig {
+            voice: common::VoiceConfig::default(),
             voicemail: None,
             recording_consent: common::RecordingConsentMode::Explicit,
             enabled: true,

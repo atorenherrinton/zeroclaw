@@ -97,6 +97,126 @@ pub struct PhoneConfig {
     /// Optional owner-only private channel for inbound voicemail deliveries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voicemail: Option<VoicemailConfig>,
+    /// Which engine bridges call audio. Absent means the integrated Realtime session.
+    #[serde(default, skip_serializing_if = "VoiceConfig::is_default")]
+    pub voice: VoiceConfig,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEngine {
+    /// One integrated OpenAI Realtime session (speech in, model, speech out).
+    #[default]
+    Realtime,
+    /// Separate speech-to-text, chat model, and text-to-speech stages.
+    Cascade,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceConfig {
+    #[serde(default)]
+    pub engine: VoiceEngine,
+    /// Kept when the engine is switched back so the fallback is one line to undo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<CascadeConfig>,
+}
+
+impl VoiceConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Endpoints for the cascade. Speech recognition and synthesis speak the common
+/// OpenAI-compatible HTTP shapes (`/v1/audio/transcriptions`, `/v1/audio/speech`,
+/// `/v1/chat/completions`), so a local Kokoro or Whisper server, a local model
+/// server, or OpenAI itself can fill any stage.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CascadeConfig {
+    pub stt_url: String,
+    #[serde(default = "default_stt_model")]
+    pub stt_model: String,
+    /// Optional ISO-639-1 hint passed to the recognizer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_language: Option<String>,
+    pub llm_url: String,
+    pub llm_model: String,
+    pub tts_url: String,
+    #[serde(default = "default_tts_model")]
+    pub tts_model: String,
+    #[serde(default = "default_tts_voice")]
+    pub tts_voice: String,
+}
+
+fn default_stt_model() -> String {
+    "gpt-transcribe".into()
+}
+
+fn default_tts_model() -> String {
+    "kokoro".into()
+}
+
+fn default_tts_voice() -> String {
+    "af_heart".into()
+}
+
+/// Endpoints must be `https`, or plain `http` to this machine. The OpenAI
+/// credential is only ever attached to `https://api.openai.com` (see cascade).
+pub fn validate_endpoint(value: &str) -> SafeResult<url::Url> {
+    let url = url::Url::parse(value).map_err(|_| "cascade_endpoint_invalid")?;
+    let loopback = match url.host() {
+        Some(url::Host::Domain(name)) => name == "localhost",
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    check(
+        (url.scheme() == "https" || (url.scheme() == "http" && loopback))
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && value.len() <= 512,
+        "cascade_endpoint_unsafe",
+    )?;
+    Ok(url)
+}
+
+fn valid_model_name(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+impl CascadeConfig {
+    pub fn validate(&self) -> SafeResult<()> {
+        validate_endpoint(&self.stt_url)?;
+        validate_endpoint(&self.llm_url)?;
+        validate_endpoint(&self.tts_url)?;
+        check(
+            valid_model_name(&self.stt_model)
+                && valid_model_name(&self.llm_model)
+                && valid_model_name(&self.tts_model)
+                && valid_model_name(&self.tts_voice)
+                && self.stt_language.as_deref().is_none_or(|l| {
+                    (2..=8).contains(&l.len())
+                        && l.chars().all(|c| c.is_ascii_alphabetic() || c == '-')
+                }),
+            "cascade_model_invalid",
+        )
+    }
+}
+
+impl VoiceConfig {
+    fn validate(&self) -> SafeResult<()> {
+        if let Some(cascade) = &self.cascade {
+            cascade.validate()?;
+        }
+        check(
+            self.engine != VoiceEngine::Cascade || self.cascade.is_some(),
+            "cascade_config_missing",
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +253,7 @@ pub struct Settings {
     pub api_key: String,
     pub instructions: String,
     pub config_dir: PathBuf,
+    pub voice: VoiceConfig,
 }
 
 pub fn native_dir(root: &Path) -> SafeResult<PathBuf> {
@@ -169,6 +290,7 @@ fn load_delivery(root: &Path, voicemail: bool) -> SafeResult<Settings> {
         .map_err(|_| "phone_config_invalid")?;
     let native: toml::Value = toml::from_str(&private_read(&config_dir.join("config.toml"))?)
         .map_err(|_| "native_config_invalid")?;
+    p.voice.validate()?;
     let base = url::Url::parse(&p.public_base).map_err(|_| "public_url_invalid")?;
     check(
         base.scheme() == "https"
@@ -307,6 +429,7 @@ fn load_delivery(root: &Path, voicemail: bool) -> SafeResult<Settings> {
         api_key,
         instructions,
         config_dir,
+        voice: p.voice,
     })
 }
 
@@ -375,4 +498,75 @@ pub fn open_db(root: &Path) -> SafeResult<Connection> {
             summary_status TEXT NOT NULL DEFAULT 'pending', summary_text TEXT, summary_message_id INTEGER
         );").map_err(|_| "database_initialize_failed")?;
     Ok(c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CASCADE: &str = r#"
+engine = "cascade"
+[cascade]
+stt_url = "http://127.0.0.1:8000/v1/audio/transcriptions"
+llm_url = "https://api.openai.com/v1/chat/completions"
+llm_model = "chat-model"
+tts_url = "http://127.0.0.1:8880/v1/audio/speech"
+"#;
+
+    #[test]
+    fn absent_voice_settings_keep_the_realtime_engine_and_stay_absent_on_write() {
+        let voice = VoiceConfig::default();
+        assert_eq!(voice.engine, VoiceEngine::Realtime);
+        assert!(voice.is_default());
+        assert!(voice.validate().is_ok());
+        let parsed: VoiceConfig = toml::from_str("").unwrap();
+        assert!(parsed.is_default());
+    }
+
+    #[test]
+    fn cascade_settings_parse_with_documented_defaults() {
+        let voice: VoiceConfig = toml::from_str(CASCADE).unwrap();
+        assert_eq!(voice.engine, VoiceEngine::Cascade);
+        let cascade = voice.cascade.as_ref().unwrap();
+        assert_eq!(cascade.tts_model, "kokoro");
+        assert_eq!(cascade.tts_voice, "af_heart");
+        assert_eq!(cascade.stt_model, "gpt-transcribe");
+        assert!(voice.validate().is_ok());
+        assert!(!voice.is_default());
+        let round_trip: VoiceConfig = toml::from_str(&toml::to_string(&voice).unwrap()).unwrap();
+        assert_eq!(round_trip, voice);
+    }
+
+    #[test]
+    fn switching_back_to_realtime_keeps_the_cascade_section_valid_and_dormant() {
+        let mut voice: VoiceConfig = toml::from_str(CASCADE).unwrap();
+        voice.engine = VoiceEngine::Realtime;
+        assert!(voice.validate().is_ok());
+        assert!(!voice.is_default());
+    }
+
+    #[test]
+    fn invalid_cascade_settings_are_rejected() {
+        let missing: VoiceConfig = toml::from_str("engine = \"cascade\"").unwrap();
+        assert_eq!(missing.validate(), Err("cascade_config_missing"));
+        assert!(toml::from_str::<VoiceConfig>("engine = \"other\"").is_err());
+        assert!(toml::from_str::<VoiceConfig>("surprise = 1").is_err());
+        assert!(toml::from_str::<VoiceConfig>("[cascade]\nstt_url = \"x\"").is_err());
+
+        for (from, to) in [
+            (
+                "http://127.0.0.1:8880/v1/audio/speech",
+                "http://tts.example.com/v1/audio/speech",
+            ),
+            ("llm_model = \"chat-model\"", "llm_model = \"\""),
+            ("llm_model = \"chat-model\"", "llm_model = \"bad\\nmodel\""),
+        ] {
+            let text = CASCADE.replace(from, to);
+            let voice: VoiceConfig = toml::from_str(&text).unwrap();
+            assert!(voice.validate().is_err(), "{to}");
+        }
+        let language = format!("{CASCADE}stt_language = \"english is fine!\"\n");
+        let voice: VoiceConfig = toml::from_str(&language).unwrap();
+        assert_eq!(voice.validate(), Err("cascade_model_invalid"));
+    }
 }

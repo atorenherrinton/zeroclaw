@@ -29,25 +29,27 @@ pub const MODEL: &str = "gpt-realtime-2.1";
 pub const VOICE: &str = "marin";
 const TRANSCRIPTION_MODEL: &str = "gpt-transcribe";
 const ENDPOINT: &str = "wss://api.openai.com/v1/realtime?model=gpt-realtime-2.1";
-const MAX_SECONDS: u64 = 180;
+pub(crate) const MAX_SECONDS: u64 = 180;
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_AUDIO_DELTA: usize = 64 * 1024;
 const MAX_PENDING_INPUT: usize = 64 * 1024; // 8 seconds at 8 kHz, 8-bit mu-law.
 const MAX_PENDING_CHUNKS: usize = 512;
-const MAX_QUEUED_OUTPUT: usize = 240 * 1024; // Fail closed above ~30 seconds.
-const MAX_TOTAL_INPUT: usize = 8_000 * 181;
-const MAX_TOTAL_OUTPUT: usize = 8_000 * 360; // Includes interrupted generations.
-const PLAYBACK_CHUNK: usize = 800; // Acknowledged playback granularity: <=100 ms.
-const MAX_MARKS: usize = 2048;
-const MAX_ITEMS: usize = 256;
-const MAX_TRANSCRIPT: usize = 128 * 1024;
-const MAX_INSTRUCTIONS: usize = 32 * 1024;
+pub(crate) const MAX_QUEUED_OUTPUT: usize = 240 * 1024; // Fail closed above ~30 seconds.
+pub(crate) const MAX_TOTAL_INPUT: usize = 8_000 * 181;
+pub(crate) const MAX_TOTAL_OUTPUT: usize = 8_000 * 360; // Includes interrupted generations.
+pub(crate) const PLAYBACK_CHUNK: usize = 800; // Acknowledged playback granularity: <=100 ms.
+pub(crate) const MAX_MARKS: usize = 2048;
+pub(crate) const MAX_ITEMS: usize = 256;
+pub(crate) const MAX_TRANSCRIPT: usize = 128 * 1024;
+pub(crate) const MAX_INSTRUCTIONS: usize = 32 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-const END_CONFIRM_SILENCE: Duration = Duration::from_secs(8);
+pub(crate) const END_CONFIRM_SILENCE: Duration = Duration::from_secs(8);
 const END_CONFIRM_PURPOSE: &str = "zeroclaw_end_call_confirmation";
-const END_CONFIRM_INSTRUCTIONS: &str = "The call must remain open for one final confirmation turn. Briefly recap the current outcome in one sentence, ask whether the other party needs anything else before you go, then add that if not, you thank them and say goodbye. Do not call any tool in this response and never speak a tool name aloud. Do not claim the call has already ended. Wait for their reply. After they reply, invoke the end_call tool without saying its name aloud unless they continue the authorized task.";
+pub(crate) const END_CONFIRM_INSTRUCTIONS: &str = "The call must remain open for one final confirmation turn. Briefly recap the current outcome in one sentence, ask whether the other party needs anything else before you go, then add that if not, you thank them and say goodbye. Do not call any tool in this response and never speak a tool name aloud. Do not claim the call has already ended. Wait for their reply. After they reply, invoke the end_call tool without saying its name aloud unless they continue the authorized task.";
+pub(crate) const END_CALL_DESCRIPTION: &str = "Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Invoke this as a tool call; never say the tool name aloud. Interactive calls may return a fixed confirmation requirement. Follow it, wait for the other party's reply, then invoke this tool again unless they continue the authorized task.";
+pub(crate) const DECLINE_RECORDING_DESCRIPTION: &str = "Immediately stop this call and discard its recording and transcript when the caller objects to being recorded or withdraws recording consent. Invoke this fixed no-argument tool immediately; do not say goodbye, ask for confirmation, or continue the conversation.";
 type Upstream = WebSocketStream<MaybeTlsStream<TcpStream>>;
-type BridgeResult<T> = Result<T, EndReason>;
+pub(crate) type BridgeResult<T> = Result<T, EndReason>;
 
 // Intentionally no Debug: these fields include a secret and private instructions.
 pub struct RealtimeOptions {
@@ -190,7 +192,7 @@ struct State {
     ending: bool,
 }
 
-fn valid_sid(value: &str, prefix: &str) -> bool {
+pub(crate) fn valid_sid(value: &str, prefix: &str) -> bool {
     value.len() == 34
         && value.starts_with(prefix)
         && value.as_bytes()[2..].iter().all(u8::is_ascii_hexdigit)
@@ -204,11 +206,37 @@ fn valid_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
-fn string<'a>(value: &'a Value, key: &str) -> BridgeResult<&'a str> {
+pub(crate) fn string<'a>(value: &'a Value, key: &str) -> BridgeResult<&'a str> {
     value
         .get(key)
         .and_then(Value::as_str)
         .ok_or(EndReason::ProtocolError)
+}
+
+/// Bind a Twilio `start` event to the expected account/call and the exact
+/// 8 kHz mono mu-law media format. Returns the stream SID.
+pub(crate) fn validate_start(
+    value: &Value,
+    expected_account_sid: &str,
+    expected_call_sid: &str,
+) -> BridgeResult<String> {
+    if value["event"] != "start" {
+        return Err(EndReason::ProtocolError);
+    }
+    let start = &value["start"];
+    let stream_sid = string(start, "streamSid")?;
+    if !valid_sid(stream_sid, "MZ")
+        || value["streamSid"] != stream_sid
+        || start["accountSid"] != expected_account_sid
+        || start["callSid"] != expected_call_sid
+        || start["tracks"] != json!(["inbound"])
+        || start["mediaFormat"]["encoding"] != "audio/x-mulaw"
+        || start["mediaFormat"]["sampleRate"] != 8000
+        || start["mediaFormat"]["channels"] != 1
+    {
+        return Err(EndReason::ProtocolError);
+    }
+    Ok(stream_sid.to_owned())
 }
 
 fn item_id(value: &Value, key: &str) -> BridgeResult<String> {
@@ -233,7 +261,7 @@ fn decode_audio(encoded: &str) -> BridgeResult<Vec<u8>> {
 }
 
 fn end_call_tool() -> Value {
-    json!({"type":"function","name":"end_call","description":"Request to end this phone call only when the bounded task is complete, refused, a wrong number, or cannot continue. Invoke this as a tool call; never say the tool name aloud. Interactive calls may return a fixed confirmation requirement. Follow it, wait for the other party's reply, then invoke this tool again unless they continue the authorized task.","parameters":{"type":"object","additionalProperties":false,"properties":{}}})
+    json!({"type":"function","name":"end_call","description":END_CALL_DESCRIPTION,"parameters":{"type":"object","additionalProperties":false,"properties":{}}})
 }
 
 fn session_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value {
@@ -243,7 +271,7 @@ fn session_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value
         Vec::new()
     };
     if stop_on_recording_decline {
-        tools.push(json!({"type":"function","name":"decline_recording","description":"Immediately stop this call and discard its recording and transcript when the caller objects to being recorded or withdraws recording consent. Invoke this fixed no-argument tool immediately; do not say goodbye, ask for confirmation, or continue the conversation.","parameters":{"type":"object","additionalProperties":false,"properties":{}}}));
+        tools.push(json!({"type":"function","name":"decline_recording","description":DECLINE_RECORDING_DESCRIPTION,"parameters":{"type":"object","additionalProperties":false,"properties":{}}}));
     }
     json!(tools)
 }
@@ -338,23 +366,14 @@ impl State {
     }
 
     fn start(&mut self, value: &Value, options: &RealtimeOptions) -> BridgeResult<()> {
-        if self.stream_sid.is_some() || value["event"] != "start" {
+        if self.stream_sid.is_some() {
             return Err(EndReason::ProtocolError);
         }
-        let start = &value["start"];
-        let stream_sid = string(start, "streamSid")?;
-        if !valid_sid(stream_sid, "MZ")
-            || value["streamSid"] != stream_sid
-            || start["accountSid"] != options.expected_account_sid
-            || start["callSid"] != options.expected_call_sid
-            || start["tracks"] != json!(["inbound"])
-            || start["mediaFormat"]["encoding"] != "audio/x-mulaw"
-            || start["mediaFormat"]["sampleRate"] != 8000
-            || start["mediaFormat"]["channels"] != 1
-        {
-            return Err(EndReason::ProtocolError);
-        }
-        self.stream_sid = Some(stream_sid.to_owned());
+        self.stream_sid = Some(validate_start(
+            value,
+            &options.expected_account_sid,
+            &options.expected_call_sid,
+        )?);
         Ok(())
     }
 
@@ -952,7 +971,7 @@ fn operation_deadline(deadline: Instant) -> Instant {
     deadline.min(Instant::now() + IO_TIMEOUT)
 }
 
-async fn send_twilio(
+pub(crate) async fn send_twilio(
     socket: &mut WebSocket,
     message: TwilioMessage,
     deadline: Instant,
@@ -974,7 +993,7 @@ async fn send_model(
         .map_err(|_| EndReason::UpstreamClosed)
 }
 
-async fn next_twilio(socket: &mut WebSocket, deadline: Instant) -> BridgeResult<Value> {
+pub(crate) async fn next_twilio(socket: &mut WebSocket, deadline: Instant) -> BridgeResult<Value> {
     loop {
         let frame = timeout_at(deadline, socket.recv())
             .await

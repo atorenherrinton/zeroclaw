@@ -12,7 +12,8 @@ use std::{
     sync::Arc,
 };
 use zeroclaw_phone_extension::{
-    common::{self, RecordingConsentMode, SafeResult, Settings, check},
+    cascade, cascade_http,
+    common::{self, RecordingConsentMode, SafeResult, Settings, VoiceEngine, check},
     outbound,
     protocol::{self, Form},
     realtime, recording, summary,
@@ -543,15 +544,46 @@ async fn media(
             false,
         )
     };
-    let opts = realtime::RealtimeOptions {
-        api_key: cfg.api_key,
-        instructions,
-        expected_account_sid: cfg.account_sid,
-        expected_call_sid: sid.clone(),
-        max_duration_secs: remaining,
-        allow_end_call,
-        confirm_end_call,
-        stop_on_recording_decline,
+    let bridge = match cfg.voice.engine {
+        VoiceEngine::Realtime => Bridge::Realtime(realtime::RealtimeOptions {
+            api_key: cfg.api_key,
+            instructions,
+            expected_account_sid: cfg.account_sid,
+            expected_call_sid: sid.clone(),
+            max_duration_secs: remaining,
+            allow_end_call,
+            confirm_end_call,
+            stop_on_recording_decline,
+        }),
+        VoiceEngine::Cascade => {
+            let pipeline = cfg
+                .voice
+                .cascade
+                .as_ref()
+                .ok_or("cascade_config_missing")
+                .and_then(|config| cascade_http::build_pipeline(config, &cfg.api_key));
+            let Ok(pipeline) = pipeline else {
+                if let Ok(db) = common::open_db(&app.root) {
+                    let _ = db.execute(
+                        "UPDATE calls SET phase='ended',outcome='cascade_setup_failed' WHERE call_sid=?1",
+                        [&sid],
+                    );
+                }
+                return fail();
+            };
+            Bridge::Cascade(
+                cascade::CascadeOptions {
+                    instructions,
+                    expected_account_sid: cfg.account_sid,
+                    expected_call_sid: sid.clone(),
+                    max_duration_secs: remaining,
+                    allow_end_call,
+                    confirm_end_call,
+                    stop_on_recording_decline,
+                },
+                Arc::new(pipeline),
+            )
+        }
     };
     let failed_root = app.root.clone();
     let failed_sid = sid.clone();
@@ -561,9 +593,18 @@ async fn media(
         } else {eprintln!("upgrade_cleanup_failed");}
     }).on_upgrade(move|socket|async move {
         let _permit=permit;
-        let outcome=realtime::bridge(socket,opts).await;
+        let outcome = match bridge {
+            Bridge::Realtime(opts) => realtime::bridge(socket, opts).await,
+            Bridge::Cascade(opts, pipeline) => cascade::bridge(socket, opts, pipeline).await,
+        };
         if let Err(error)=finish_call(&app.root,&sid,first_entries,outcome) { eprintln!("{error}"); }
     })
+}
+
+/// The engine admitted for one call. Both produce the same `BridgeOutcome`.
+enum Bridge {
+    Realtime(realtime::RealtimeOptions),
+    Cascade(cascade::CascadeOptions, Arc<cascade::Pipeline>),
 }
 
 fn finish_call(
@@ -860,9 +901,25 @@ async fn main() {
         "mcp" => outbound::run_mcp(&root).await,
         "check" => common::load(&root).map(|_| println!("{{\"configValid\":true}}")),
         "probe" => match common::load(&root) {
-            Ok(cfg) => realtime::probe(&cfg.api_key)
-                .await
-                .map(|_| println!("{{\"realtimeReady\":true}}")),
+            Ok(cfg) => match cfg.voice.engine {
+                VoiceEngine::Realtime => realtime::probe(&cfg.api_key)
+                    .await
+                    .map(|_| println!("{{\"realtimeReady\":true}}")),
+                VoiceEngine::Cascade => {
+                    match cfg
+                        .voice
+                        .cascade
+                        .as_ref()
+                        .ok_or("cascade_config_missing")
+                        .and_then(|config| cascade_http::build_pipeline(config, &cfg.api_key))
+                    {
+                        Ok(pipeline) => cascade_http::probe(&pipeline)
+                            .await
+                            .map(|_| println!("{{\"cascadeReady\":true}}")),
+                        Err(e) => Err(e),
+                    }
+                }
+            },
             Err(e) => Err(e),
         },
         "preflight" => preflight(&root).await,
@@ -920,6 +977,7 @@ mod tests {
             common::atomic_private_write(&native.join("config.toml"), native_text.as_bytes())
                 .unwrap();
             let config = common::PhoneConfig {
+                voice: common::VoiceConfig::default(),
                 voicemail: None,
                 enabled: true,
                 port: 43335,
@@ -1376,6 +1434,47 @@ mod tests {
             .unwrap()
             .insert("recording_consent".into(), "invalid".into());
         common::atomic_private_write(&path, toml::to_string(&config).unwrap().as_bytes()).unwrap();
+        assert!(common::load(&fixture.root).is_err());
+    }
+
+    #[test]
+    fn voice_engine_defaults_to_realtime_and_cascade_is_an_explicit_reversible_opt_in() {
+        let fixture = Fixture::new();
+        let path = fixture.root.join("phone.toml");
+        let original = common::private_read(&path).unwrap();
+        assert!(!original.contains("voice"), "existing files are unchanged");
+        assert_eq!(
+            common::load(&fixture.root).unwrap().voice.engine,
+            VoiceEngine::Realtime
+        );
+
+        let cascade = format!(
+            "{original}\n[voice]\nengine = \"cascade\"\n[voice.cascade]\n\
+             stt_url = \"http://127.0.0.1:8000/v1/audio/transcriptions\"\n\
+             llm_url = \"http://127.0.0.1:11434/v1/chat/completions\"\n\
+             llm_model = \"local-chat\"\n\
+             tts_url = \"http://127.0.0.1:8880/v1/audio/speech\"\n"
+        );
+        common::atomic_private_write(&path, cascade.as_bytes()).unwrap();
+        let settings = common::load(&fixture.root).unwrap();
+        assert_eq!(settings.voice.engine, VoiceEngine::Cascade);
+        let pipeline = cascade_http::build_pipeline(
+            settings.voice.cascade.as_ref().unwrap(),
+            &settings.api_key,
+        );
+        assert!(pipeline.is_ok());
+
+        // One line restores Realtime; the cascade section stays for the next try.
+        let back = cascade.replace("engine = \"cascade\"", "engine = \"realtime\"");
+        common::atomic_private_write(&path, back.as_bytes()).unwrap();
+        assert_eq!(
+            common::load(&fixture.root).unwrap().voice.engine,
+            VoiceEngine::Realtime
+        );
+
+        // A cascade pointed at an unsafe endpoint never admits a call.
+        let unsafe_cascade = cascade.replace("http://127.0.0.1:8880", "http://tts.example.com");
+        common::atomic_private_write(&path, unsafe_cascade.as_bytes()).unwrap();
         assert!(common::load(&fixture.root).is_err());
     }
 
