@@ -1,19 +1,18 @@
 //! Operator-only additive installer. Uses ZeroClaw's atomic validated patch API.
 use crate::{private_dir, private_write, schema};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 const COMMON: &str = include_str!("../templates/common.md");
 const ROUTING: &str = include_str!("../templates/routing.md");
-const ROLES: [(&str, &str); 4] = [
+const ROLES: [(&str, &str); 3] = [
     (
         "communications",
         include_str!("../templates/communications.md"),
     ),
     ("calendar_tasks", include_str!("../templates/calendar.md")),
     ("task_scheduler", include_str!("../templates/scheduler.md")),
-    ("coding", include_str!("../templates/coding.md")),
 ];
 
 fn push_unique(array: &mut Value, value: Value) -> Result<()> {
@@ -24,7 +23,10 @@ fn push_unique(array: &mut Value, value: Value) -> Result<()> {
     Ok(())
 }
 
-pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
+/// `_github` keeps the documented `plan CONFIG_DIR GITHUB_ROOT` signature stable.
+/// It bounded the coding specialist's roots, which no longer exists: no
+/// specialist changes code.
+pub fn patch(config: &Value, root: &Path, _github: &Path) -> Result<Value> {
     let mut ops = Vec::new();
     let mut add =
         |path: String, value: Value| ops.push(json!({"op":"add","path":path,"value":value}));
@@ -99,20 +101,6 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
         "/mcp_bundles/personal_ops".into(),
         json!({"servers":["personal_ops"],"exclude":[]}),
     );
-    let mut astra = config["providers"]["models"]["openai"]["sol"].clone();
-    ensure!(
-        astra.is_object(),
-        "existing native OpenAI provider required"
-    );
-    astra["model"] = json!("gpt-6-astra");
-    astra["fallback"] = json!([]);
-    astra["timeout_secs"] = json!(300);
-    astra["fallback_models"] = json!([]);
-    astra
-        .as_object_mut()
-        .context("provider")?
-        .remove("temperature");
-    add("/providers/models/openai/astra".into(), astra);
     for (alias, _) in ROLES {
         ensure!(
             config["agents"].get(alias).is_none(),
@@ -171,20 +159,7 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
                 vec![],
                 "openai.terra",
             ),
-            _ => (
-                vec![
-                    "file_read",
-                    "file_write",
-                    "file_edit",
-                    "glob_search",
-                    "content_search",
-                    "git_operations",
-                    "github_cli__run",
-                    "shell",
-                ],
-                vec!["github_cli"],
-                "openai.astra",
-            ),
+            other => bail!("unknown specialist alias {other}"),
         };
         tools.sort();
         let mut risk = default.clone();
@@ -192,26 +167,15 @@ pub fn patch(config: &Value, root: &Path, github: &Path) -> Result<Value> {
         risk["auto_approve"] = json!(tools);
         risk["always_ask"] = json!([]);
         risk["delegation_policy"] = json!({"mode":"forbidden"});
-        risk["allowed_roots"] = if alias == "coding" {
-            json!([github])
-        } else {
-            json!([])
-        };
-        risk["allowed_commands"] = if alias == "coding" {
-            json!(["cargo", "rustc", "git", "npm", "node"])
-        } else {
-            json!([])
-        };
+        risk["allowed_roots"] = json!([]);
+        risk["allowed_commands"] = json!([]);
         add(format!("/risk_profiles/{alias}"), risk);
         let mut runtime = config["runtime_profiles"]["default"].clone();
         runtime["agentic"] = json!(true);
         runtime["max_delegation_depth"] = json!(0);
-        runtime["max_tool_iterations"] = json!(if alias == "coding" { 40 } else { 16 });
-        runtime["delegation_timeout_secs"] = json!(if alias == "coding" { 900 } else { 180 });
+        runtime["max_tool_iterations"] = json!(16);
+        runtime["delegation_timeout_secs"] = json!(180);
         runtime["parallel_tools"] = json!(false);
-        if alias == "coding" {
-            runtime["thinking"]["default_level"] = json!("high");
-        }
         add(format!("/runtime_profiles/{alias}"), runtime);
         add(
             format!("/agents/{alias}"),
@@ -537,11 +501,7 @@ pub fn install(root: &Path, github: &Path) -> Result<()> {
             .output()?;
         ensure!(
             check.status.success()
-                && String::from_utf8_lossy(&check.stdout).contains(if alias == "coding" {
-                    "openai.astra"
-                } else {
-                    "openai.terra"
-                }),
+                && String::from_utf8_lossy(&check.stdout).contains("openai.terra"),
             "native loader lost specialist {alias}"
         );
     }
@@ -614,7 +574,7 @@ pub fn install(root: &Path, github: &Path) -> Result<()> {
     )?;
     fs::rename(next, &main_path)?;
     println!(
-        "Installed four bounded specialists. Backup: {}. Restart the main daemon to load them; do not restart the phone service.",
+        "Installed three bounded specialists. Backup: {}. Restart the main daemon to load them; do not restart the phone service.",
         backup.display()
     );
     Ok(())
@@ -831,13 +791,12 @@ mod tests {
                     && !path.contains("phone_calls")
             );
         }
-        assert!(
-            p.as_array()
-                .context("array")?
-                .iter()
-                .any(|op| op["path"] == "/providers/models/openai/astra"
-                    && op["value"]["model"] == "gpt-6-astra")
-        );
+        // No specialist writes code, so no coding model profile is created.
+        assert!(!p.as_array().context("array")?.iter().any(|op| {
+            op["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("astra") || path.starts_with("/agents/coding"))
+        }));
         Ok(())
     }
 
@@ -888,12 +847,7 @@ mod tests {
             }
             assert!(!op["path"].as_str().context("path")?.contains("denied"));
         }
-        for alias in [
-            "calendar_tasks",
-            "communications",
-            "task_scheduler",
-            "coding",
-        ] {
+        for alias in ["calendar_tasks", "communications", "task_scheduler"] {
             let path = format!("/risk_profiles/{alias}");
             let profile = &patch
                 .as_array()

@@ -13,14 +13,14 @@ It does not replace the runtime or phone service.
 | communications | Email/text drafts and file-sharing plans | openai.terra |
 | calendar_tasks | Google Calendar and Apple Reminders | openai.terra |
 | task_scheduler | Native task schedules and status | openai.terra |
-| coding | GitHub work and reusable Rust helper development | openai.astra, gpt-6-astra |
 
 The coordinator uses explicit one-hop bounded delegation. Each specialist has
 an explicit tool allowlist and no delegation or shared-memory tools. Bounded
 delegation intersects the caller's existing tool registry with the specialist
 allowlist; it is not a separate OS sandbox. Existing tool wrappers retain their
-own execution boundaries. Main keeps the existing model and tools. Coding
-uses the existing native OpenAI authentication route with no model fallback.
+own execution boundaries. Main keeps the existing model and tools. There is no
+coding specialist: ZeroClaw does not change code. It files GitHub issues through
+the GitHub helper instead (see `tools/zeroclaw-github-cli`).
 
 Simple named operations can run directly without paying for another agent turn.
 Language understanding and writing still use a model; the helper performs file
@@ -43,7 +43,7 @@ tools/zeroclaw-personal-ops/target/release/zeroclaw-personal-ops install "$HOME/
 ```
 
 The operator-only installer backs up configuration and main's instructions,
-validates a private candidate with the installed native loader, creates four
+validates a private candidate with the installed native loader, creates three
 managed workspaces, installs the binary, and atomically replaces configuration.
 It refuses existing specialist aliases, workspaces or helper installations.
 It preserves all existing cron, channel, scheduler, recovery, transcription and
@@ -60,7 +60,7 @@ the source of truth. Templates apply only at initial installation.
 
 The installer configures `openai.sol` to fall back to `openai.terra`, with no
 further fallback from Terra. Both must use native OpenAI authentication. This
-also affects other agents using these shared profiles. Astra remains pinned.
+also affects other agents using these shared profiles.
 
 ZeroClaw resolves native tool support across the entire fallback chain. A
 text-only fallback such as the current Gemini adapter suppresses native tool
@@ -248,8 +248,8 @@ changing a destination; this helper does not substitute phone/email aliases.
 The durable operations extension below adds Calendar editing/invitations and
 email sending through fixed provider adapters. Reminders reuse the native connector.
 The scheduler uses the existing native cron interface and preserves task state.
-The coding specialist builds/test helpers in repository source and returns an
-installation proposal; development does not authorize live deployment.
+No specialist changes code. Requests for code changes become GitHub issues in the
+respective repository, filed through the GitHub helper's issue-only policy.
 
 ## Validation and rollback
 
@@ -259,8 +259,8 @@ and symlink boundaries, immutable snapshots, attachment tampering, expiry,
 missing owner-request assertions, duplicate claims across connections/restarts,
 partial failure, phone read-only access and recording consent.
 
-Live validation should include all four native aliases, delegation to each
-specialist, an Astra/GitHub read, MCP tools/list, and existing phone health and
+Live validation should include all three native aliases, delegation to each
+specialist, a read-only GitHub inspection, MCP tools/list, and existing phone health and
 unsigned-request rejection. A live message, attachment or phone call requires
 an explicit owner test request; health checks do not prove delivery.
 
