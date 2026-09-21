@@ -1,7 +1,18 @@
 // No cc crate/download needed. These commands compile only
 // the bridge into the phone binary; they do not sign, install, or spawn a helper.
 use std::{path::PathBuf, process::Command};
+
+// The repository build-info script records the commit, clean/dirty state, and
+// compiler in the binary (`--version`). Reuse it instead of copying it.
+#[path = "../../build.rs"]
+mod build_info;
+
 fn main() {
+    build_info::main();
+    maps_bridge();
+}
+
+fn maps_bridge() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
