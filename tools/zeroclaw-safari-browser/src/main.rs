@@ -1,4 +1,5 @@
 mod display;
+mod output;
 mod policy;
 mod safari;
 
@@ -213,8 +214,11 @@ async fn call(safari: &mut Safari, name: &str, args: Value) -> Result<Value> {
         }
         _ => bail!("Unknown tool"),
     };
-    Ok(
-        json!({"content":[{"type":"text","text":serde_json::to_string(&result)?}],"structuredContent":result}),
+    output::format_result(
+        result,
+        args.get("expected_selector")
+            .or_else(|| args.get("selector"))
+            .and_then(Value::as_str),
     )
 }
 
