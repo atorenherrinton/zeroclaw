@@ -848,6 +848,26 @@ fn render_summary(job: &Job, response: &str) -> SafeResult<String> {
 }
 
 fn store_generated(root: &Path, job: &Job, text: &str) -> SafeResult<()> {
+    let text = if job.outbound_on_behalf_of.is_none() {
+        match crate::appointment_backend::summary_note(root, &job.call_sid)? {
+            Some(note) => format!(
+                "{}\n\n{}",
+                text.replace(
+                    "No callback or other action has been performed.",
+                    "Calendar actions, if any, are reported in the scheduling receipt below."
+                ),
+                note
+            ),
+            None => text.to_owned(),
+        }
+    } else {
+        text.to_owned()
+    };
+    common::check(
+        text.encode_utf16().count() <= 3900,
+        "summary_message_too_large",
+    )?;
+    let text = text.as_str();
     let mut conn = common::open_db(root)?;
     let tx = conn
         .transaction()

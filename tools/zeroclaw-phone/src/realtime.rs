@@ -3,19 +3,22 @@
 //! The ingress must verify Twilio's upgrade signature and consume a single-use
 //! call nonce BEFORE calling `bridge`. This module additionally binds the start
 //! event to the expected account/call. It reads no configuration, memory, files,
-//! environment variables, or tools; it never logs credentials, audio, or text.
+//! environment variables, or general tools; an optional call-bound local scheduler
+//! handles one narrow proposal function. It never logs credentials, audio, or text.
 //!
 //! Protocol references (GA schema, checked 2026-09-03):
 //! https://developers.openai.com/api/reference/resources/realtime/client-events
 //! https://developers.openai.com/api/docs/guides/realtime-conversations
 //! https://www.twilio.com/docs/voice/media-streams/websocket-messages
 
+use crate::appointments::{self, AppointmentScheduler, SchedulingFuture};
 use axum::extract::ws::{Message as TwilioMessage, WebSocket};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::{Instant, timeout_at};
@@ -66,6 +69,8 @@ pub struct RealtimeOptions {
     /// Signed ingress enables this only for inbound recorded calls. Caller
     /// refusal or withdrawal discards the transcript and terminates immediately.
     pub stop_on_recording_decline: bool,
+    /// Present only for an authenticated inbound call with local scheduling enabled.
+    pub appointments: Option<Arc<dyn AppointmentScheduler>>,
 }
 
 /// Text is generated/transcribed, NOT a word-accurate record of what was heard.
@@ -133,12 +138,14 @@ struct EndCall {
     response_id: String,
     argument_bytes: usize,
     arguments_done: bool,
+    arguments: Option<Value>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CallTool {
     EndCall,
     DeclineRecording,
+    Appointment,
 }
 
 impl CallTool {
@@ -146,6 +153,7 @@ impl CallTool {
         match name {
             "end_call" => Ok(Self::EndCall),
             "decline_recording" => Ok(Self::DeclineRecording),
+            appointments::TOOL_NAME => Ok(Self::Appointment),
             _ => Err(EndReason::ProtocolError),
         }
     }
@@ -186,6 +194,10 @@ struct State {
     confirm_end_call: bool,
     stop_on_recording_decline: bool,
     session_instructions: String,
+    allow_appointments: bool,
+    pending_appointment: Option<(String, appointments::Request)>,
+    appointment_busy: bool,
+    appointment_response_pending: bool,
     end_calls: BTreeMap<String, EndCall>,
     close_phase: ClosePhase,
     close_deadline: Option<Instant>,
@@ -264,7 +276,11 @@ fn end_call_tool() -> Value {
     json!({"type":"function","name":"end_call","description":END_CALL_DESCRIPTION,"parameters":{"type":"object","additionalProperties":false,"properties":{}}})
 }
 
-fn session_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value {
+fn session_tools(
+    allow_end_call: bool,
+    stop_on_recording_decline: bool,
+    allow_appointments: bool,
+) -> Value {
     let mut tools = if allow_end_call {
         vec![end_call_tool()]
     } else {
@@ -272,6 +288,9 @@ fn session_tools(allow_end_call: bool, stop_on_recording_decline: bool) -> Value
     };
     if stop_on_recording_decline {
         tools.push(json!({"type":"function","name":"decline_recording","description":DECLINE_RECORDING_DESCRIPTION,"parameters":{"type":"object","additionalProperties":false,"properties":{}}}));
+    }
+    if allow_appointments {
+        tools.push(appointments::tool_definition());
     }
     json!(tools)
 }
@@ -304,8 +323,13 @@ fn session_update(
     instructions: &str,
     allow_end_call: bool,
     stop_on_recording_decline: bool,
+    allow_appointments: bool,
 ) -> Value {
-    let tools = session_tools(allow_end_call, stop_on_recording_decline);
+    let tools = session_tools(
+        allow_end_call,
+        stop_on_recording_decline,
+        allow_appointments,
+    );
     json!({
         "type": "session.update",
         "session": {
@@ -327,13 +351,18 @@ fn session_update(
             "reasoning": {"effort": "low"},
             "max_output_tokens": 1024,
             "tools": tools,
-            "tool_choice": if allow_end_call || stop_on_recording_decline { "auto" } else { "none" },
+            "tool_choice": if allow_end_call || stop_on_recording_decline || allow_appointments { "auto" } else { "none" },
             "tracing": null
         }
     })
 }
 
-fn verify_session(event: &Value, allow_end_call: bool, stop_on_recording_decline: bool) -> bool {
+fn verify_session(
+    event: &Value,
+    allow_end_call: bool,
+    stop_on_recording_decline: bool,
+    allow_appointments: bool,
+) -> bool {
     let s = &event["session"];
     s["type"] == "realtime"
         && s["model"] == MODEL
@@ -349,8 +378,13 @@ fn verify_session(event: &Value, allow_end_call: bool, stop_on_recording_decline
         && s["audio"]["input"]["turn_detection"]["silence_duration_ms"] == 500
         && s["reasoning"]["effort"] == "low"
         && s["output_modalities"] == json!(["audio"])
-        && if allow_end_call || stop_on_recording_decline {
-            s["tools"] == session_tools(allow_end_call, stop_on_recording_decline)
+        && if allow_end_call || stop_on_recording_decline || allow_appointments {
+            s["tools"]
+                == session_tools(
+                    allow_end_call,
+                    stop_on_recording_decline,
+                    allow_appointments,
+                )
                 && s["tool_choice"] == "auto"
         } else {
             s["tools"].as_array().is_some_and(Vec::is_empty) && s["tool_choice"] == "none"
@@ -362,6 +396,7 @@ impl State {
         match tool {
             CallTool::EndCall => self.allow_end_call,
             CallTool::DeclineRecording => self.stop_on_recording_decline,
+            CallTool::Appointment => self.allow_appointments,
         }
     }
 
@@ -569,7 +604,12 @@ impl State {
             return Err(EndReason::UpstreamError);
         }
         if event_type == "session.updated" {
-            if !verify_session(&value, self.allow_end_call, self.stop_on_recording_decline) {
+            if !verify_session(
+                &value,
+                self.allow_end_call,
+                self.stop_on_recording_decline,
+                self.allow_appointments,
+            ) {
                 return Err(EndReason::SetupFailed);
             }
             if self.ready || self.draining {
@@ -684,6 +724,7 @@ impl State {
                             response_id,
                             argument_bytes: 0,
                             arguments_done: false,
+                            arguments: None,
                         },
                     );
                     return Ok(Vec::new());
@@ -776,6 +817,7 @@ impl State {
                     return Err(EndReason::ProtocolError);
                 }
                 let mut completed_end_call = None;
+                let mut completed_appointment = None;
                 if let Some(output) = response["output"].as_array() {
                     for item in output {
                         if item["type"] == "function_call" {
@@ -793,7 +835,7 @@ impl State {
                                 || binding.item_id != output_item_id
                                 || binding.response_id != response_id
                                 || !binding.arguments_done
-                                || arguments != json!({})
+                                || binding.arguments.as_ref() != Some(&arguments)
                             {
                                 return Err(EndReason::ProtocolError);
                             }
@@ -801,9 +843,22 @@ impl State {
                                 return Err(EndReason::RecordingDeclined);
                             }
                             if status == "completed"
-                                && completed_end_call.replace(call_id).is_some()
+                                && !self.cancelled_responses.contains(&response_id)
                             {
-                                return Err(EndReason::ProtocolError);
+                                if tool == CallTool::Appointment {
+                                    let request = appointments::Request::parse(arguments)
+                                        .map_err(|_| EndReason::ProtocolError)?;
+                                    if self.draining
+                                        || self.appointment_busy
+                                        || completed_appointment
+                                            .replace((call_id, request))
+                                            .is_some()
+                                    {
+                                        return Err(EndReason::ProtocolError);
+                                    }
+                                } else if completed_end_call.replace(call_id).is_some() {
+                                    return Err(EndReason::ProtocolError);
+                                }
                             }
                             continue;
                         }
@@ -836,6 +891,13 @@ impl State {
                     }
                     return Ok(Vec::new());
                 }
+                if let Some(request) = completed_appointment {
+                    if completed_end_call.is_some() {
+                        return Err(EndReason::ProtocolError);
+                    }
+                    self.pending_appointment = Some(request);
+                    self.appointment_busy = true;
+                }
                 if let Some(call_id) = completed_end_call {
                     if self.confirm_end_call && self.close_phase != ClosePhase::Ready {
                         return Ok(self.request_close_confirmation(&call_id));
@@ -867,7 +929,13 @@ impl State {
                     .argument_bytes
                     .checked_add(delta.len())
                     .ok_or(EndReason::ResourceLimit)?;
-                if binding.argument_bytes > 64 {
+                if binding.argument_bytes
+                    > if binding.tool == CallTool::Appointment {
+                        appointments::MAX_ARGUMENT_BYTES
+                    } else {
+                        64
+                    }
+                {
                     return Err(EndReason::ResourceLimit);
                 }
                 Ok(Vec::new())
@@ -877,12 +945,15 @@ impl State {
                 let output_item_id = item_id(&value, "item_id")?;
                 let call_id = item_id(&value, "call_id")?;
                 let raw_arguments = string(&value, "arguments")?;
-                if raw_arguments.len() > 64 {
+                if raw_arguments.len() > appointments::MAX_ARGUMENT_BYTES {
                     return Err(EndReason::ResourceLimit);
                 }
                 let arguments: Value =
                     serde_json::from_str(raw_arguments).map_err(|_| EndReason::ProtocolError)?;
                 let tool = CallTool::from_name(string(&value, "name")?)?;
+                if tool != CallTool::Appointment && raw_arguments.len() > 64 {
+                    return Err(EndReason::ResourceLimit);
+                }
                 if !self.tool_allowed(tool) {
                     return Err(EndReason::ProtocolError);
                 }
@@ -891,13 +962,19 @@ impl State {
                     .get_mut(&call_id)
                     .ok_or(EndReason::ProtocolError)?;
                 if binding.tool != tool
-                    || arguments != json!({})
+                    || (tool != CallTool::Appointment && arguments != json!({}))
+                    || (tool == CallTool::Appointment
+                        && appointments::Request::parse(arguments.clone()).is_err())
                     || binding.response_id != response_id
                     || binding.item_id != output_item_id
                 {
                     return Err(EndReason::ProtocolError);
                 }
+                if binding.arguments_done {
+                    return Err(EndReason::ProtocolError);
+                }
                 binding.arguments_done = true;
+                binding.arguments = Some(arguments);
                 if tool == CallTool::DeclineRecording {
                     // Unlike ordinary end_call, a refusal must not wait for
                     // response completion, playback marks, or a close check.
@@ -1125,6 +1202,7 @@ where
                 &options.instructions,
                 options.allow_end_call,
                 options.stop_on_recording_decline,
+                options.appointments.is_some(),
             )
             .to_string()
             .into(),
@@ -1132,7 +1210,29 @@ where
         setup_deadline,
     )
     .await?;
+    let mut appointment_job: Option<(String, SchedulingFuture)> = None;
     loop {
+        if let Some((id, request)) = state.pending_appointment.take() {
+            let scheduler = options
+                .appointments
+                .as_ref()
+                .ok_or(EndReason::ProtocolError)?;
+            if appointment_job.is_some() {
+                return Err(EndReason::ProtocolError);
+            }
+            appointment_job = Some((id, scheduler.schedule(request)));
+        }
+        if state.appointment_response_pending && state.active_response.is_none() && !state.speaking
+        {
+            state.appointment_response_pending = false;
+            actions(
+                twilio,
+                model,
+                vec![Action::Model(json!({"type":"response.create"}))],
+                deadline,
+            )
+            .await?;
+        }
         let bridge_deadline = if state.ready {
             deadline
         } else {
@@ -1143,6 +1243,9 @@ where
             .map(|value| value.min(bridge_deadline))
             .unwrap_or(bridge_deadline);
         let generated_actions = tokio::select! {
+            // Caller disconnect/refusal and the hard call deadline remain polled
+            // while local lookup runs. No scheduling task escapes this owner.
+            biased;
             _ = tokio::time::sleep_until(current_deadline) => {
                 if close_timeout.is_some_and(|value| value <= bridge_deadline && Instant::now() >= value) {
                     return Err(EndReason::AssistantEnded);
@@ -1151,6 +1254,19 @@ where
             }
             value = next_twilio(twilio, current_deadline) => state.twilio(value?)?,
             value = next_model(model, current_deadline) => state.model(value?)?,
+            result = async {
+                match appointment_job.as_mut() {
+                    Some((_, future)) => future.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let (id, _) = appointment_job.take().ok_or(EndReason::ProtocolError)?;
+                state.appointment_busy = false;
+                state.appointment_response_pending = true;
+                vec![Action::Model(json!({"type":"conversation.item.create","item":{
+                    "type":"function_call_output","call_id":id,"output":result.to_string()
+                }}))]
+            },
         };
         actions(twilio, model, generated_actions, current_deadline).await?;
     }
@@ -1257,6 +1373,7 @@ pub async fn bridge(mut socket: WebSocket, options: RealtimeOptions) -> BridgeOu
         confirm_end_call: options.confirm_end_call,
         stop_on_recording_decline: options.stop_on_recording_decline,
         session_instructions: options.instructions.clone(),
+        allow_appointments: options.appointments.is_some(),
         ..State::default()
     };
     let mut upstream = None;
@@ -1310,6 +1427,7 @@ pub async fn probe(api_key: &str) -> Result<(), &'static str> {
                     "Configuration validation only. Do not speak or invoke tools.",
                     false,
                     false,
+                    false,
                 )
                 .to_string()
                 .into(),
@@ -1323,7 +1441,9 @@ pub async fn probe(api_key: &str) -> Result<(), &'static str> {
                 .await
                 .map_err(|_| "realtime configuration response unavailable")?;
             match value["type"].as_str() {
-                Some("session.updated") if verify_session(&value, false, false) => return Ok(()),
+                Some("session.updated") if verify_session(&value, false, false, false) => {
+                    return Ok(());
+                }
                 Some("session.created" | "rate_limits.updated") => {}
                 _ => return Err("realtime session configuration rejected"),
             }
@@ -1353,6 +1473,7 @@ mod tests {
             allow_end_call: false,
             confirm_end_call: false,
             stop_on_recording_decline: false,
+            appointments: None,
         }
     }
 
@@ -1367,7 +1488,7 @@ mod tests {
     }
 
     fn ready_event() -> Value {
-        let mut event = session_update("Synthetic isolated instructions", false, false);
+        let mut event = session_update("Synthetic isolated instructions", false, false, false);
         event["type"] = json!("session.updated");
         event["session"]["model"] = json!(MODEL);
         event
@@ -1446,14 +1567,14 @@ mod tests {
 
     #[test]
     fn session_is_exact_and_tool_free_greeting_only_after_ack() {
-        let update = session_update("Screen only", false, false);
+        let update = session_update("Screen only", false, false, false);
         assert_eq!(update["session"]["tools"], json!([]));
         assert_eq!(update["session"]["tool_choice"], "none");
         assert!(update["session"]["audio"]["input"]["format"]["rate"].is_null());
-        assert!(verify_session(&ready_event(), false, false));
+        assert!(verify_session(&ready_event(), false, false, false));
         let mut bad = ready_event();
         bad["session"]["tools"] = json!([{"type":"function","name":"private_memory"}]);
-        assert!(!verify_session(&bad, false, false));
+        assert!(!verify_session(&bad, false, false, false));
         let mut state = State::default();
         assert!(
             state
@@ -1469,11 +1590,11 @@ mod tests {
 
     #[test]
     fn outbound_session_exposes_only_end_call_and_waits_for_response_completion() {
-        let update = session_update("One bounded outbound task", true, false);
+        let update = session_update("One bounded outbound task", true, false, false);
         let mut ready = update.clone();
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
-        assert!(verify_session(&ready, true, false));
+        assert!(verify_session(&ready, true, false, false));
         assert_eq!(update["session"]["tools"], json!([end_call_tool()]));
 
         let mut outbound = State {
@@ -1534,7 +1655,7 @@ mod tests {
             ..State::default()
         };
         inbound.start(&start_event(), &options()).unwrap();
-        let mut ready = session_update("Synthetic inbound recording", true, true);
+        let mut ready = session_update("Synthetic inbound recording", true, true, false);
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
         inbound.model(ready).unwrap();
@@ -1555,15 +1676,15 @@ mod tests {
 
     #[test]
     fn inbound_recording_tool_schema_is_exact_and_outbound_cannot_use_it() {
-        let mut ready = session_update("Synthetic inbound recording", true, true);
+        let mut ready = session_update("Synthetic inbound recording", true, true, false);
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
-        assert!(verify_session(&ready, true, true));
-        assert!(!verify_session(&ready, true, false));
+        assert!(verify_session(&ready, true, true, false));
+        assert!(!verify_session(&ready, true, false, false));
         assert_eq!(ready["session"]["tools"].as_array().unwrap().len(), 2);
         assert_eq!(ready["session"]["tools"][1]["name"], "decline_recording");
         ready["session"]["tools"][1]["parameters"]["properties"] = json!({"url":{"type":"string"}});
-        assert!(!verify_session(&ready, true, true));
+        assert!(!verify_session(&ready, true, true, false));
 
         let mut outbound = state();
         outbound.allow_end_call = true;
@@ -1686,7 +1807,7 @@ mod tests {
 
     #[test]
     fn interactive_end_call_authorization_survives_separate_goodbye_and_tool_responses() {
-        let mut ready = session_update("One bounded outbound task", true, false);
+        let mut ready = session_update("One bounded outbound task", true, false, false);
         ready["type"] = json!("session.updated");
         ready["session"]["model"] = json!(MODEL);
         let mut outbound = State {
@@ -2047,7 +2168,7 @@ mod tests {
                     let mut model = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     let update = model.next().await.unwrap().unwrap().into_text().unwrap();
                     let mut ready: Value = serde_json::from_str(&update).unwrap();
-                    assert_eq!(ready["session"]["tools"], session_tools(true, true));
+                    assert_eq!(ready["session"]["tools"], session_tools(true, true, false));
                     ready["type"] = json!("session.updated");
                     ready["session"]["model"] = json!(MODEL);
                     model
@@ -2405,3 +2526,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "realtime_appointment_tests.rs"]
+mod appointment_tests;

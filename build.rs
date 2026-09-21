@@ -12,7 +12,7 @@ fn command_text(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn main() {
+pub fn main() {
     println!("cargo:rerun-if-changed={}", file!());
     let sha = command_text("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let state = match command_text(
