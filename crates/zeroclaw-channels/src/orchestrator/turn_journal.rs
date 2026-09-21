@@ -564,6 +564,55 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn interrupted_tool_call_delivers_terminal_notice_through_response_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let plane = ControlPlaneHandle::start_with_boot_id(dir.path(), "old".into())
+            .await
+            .unwrap();
+        let msg = ChannelMessage {
+            id: "fixture".into(),
+            ..Default::default()
+        };
+        let journal = ChannelTurnJournal::admit(&plane, "main", &msg)
+            .await
+            .unwrap()
+            .unwrap();
+        journal
+            .checkpoint(TaskStatus::Queued, None, false)
+            .await
+            .unwrap();
+        journal
+            .checkpoint(TaskStatus::Running, None, false)
+            .await
+            .unwrap();
+        journal
+            .checkpoint(TaskStatus::WaitingOnTool, None, false)
+            .await
+            .unwrap();
+        // The notice may not skip the response checkpoint.
+        assert!(
+            journal
+                .checkpoint(TaskStatus::Submitting, None, false)
+                .await
+                .is_err()
+        );
+        journal
+            .checkpoint(TaskStatus::ResponseReady, Some("notice".into()), false)
+            .await
+            .unwrap();
+        journal
+            .checkpoint(TaskStatus::Submitting, None, false)
+            .await
+            .unwrap();
+        journal
+            .checkpoint(TaskStatus::Delivered, None, true)
+            .await
+            .unwrap();
+        let task = plane.store.get(&journal.id).await.unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Delivered);
+        assert!(task.delivered);
+    }
+    #[tokio::test]
     async fn crash_in_each_active_phase_is_uncertain_and_terminal_cannot_be_overwritten() {
         for phase in [
             TaskStatus::Running,

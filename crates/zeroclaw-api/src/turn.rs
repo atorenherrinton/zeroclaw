@@ -62,7 +62,12 @@ impl TaskStatus {
                 next,
                 Running | WaitingOnTool | ResponseReady | Failed | Cancelled | Uncertain
             ),
-            WaitingOnTool => matches!(next, Running | Failed | Uncertain),
+            // A tool cancelled by the deadline, /stop or a newer message leaves the
+            // journal here on purpose (its effect may have applied, so it is
+            // quarantined, never replayed). The terminal notice then saves its
+            // response directly from this state; without this edge the notice is
+            // rejected and the turn ends Uncertain with nothing delivered.
+            WaitingOnTool => matches!(next, Running | ResponseReady | Failed | Uncertain),
             ResponseReady => matches!(next, Submitting | Failed | Cancelled | Uncertain),
             Submitting => matches!(next, Delivered | PartiallyDelivered | Failed | Uncertain),
             _ => false,
@@ -115,4 +120,62 @@ pub async fn record_error(error: String) -> anyhow::Result<()> {
         journal.record_error(error).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TaskStatus::{self, *};
+
+    const ALL: [TaskStatus; 15] = [
+        Running,
+        Received,
+        Queued,
+        WaitingOnTool,
+        ResponseReady,
+        Submitting,
+        Delivered,
+        PartiallyDelivered,
+        Uncertain,
+        Paused,
+        Completed,
+        Failed,
+        Cancelled,
+        Lost,
+        TimedOut,
+    ];
+
+    /// A tool interrupted by the deadline, /stop or a newer message leaves the
+    /// journal in `WaitingOnTool` on purpose (its effect may have applied, so it
+    /// is quarantined rather than replayed). The terminal notice must be able to
+    /// leave that state, otherwise it is dropped and the user hears nothing.
+    #[test]
+    fn interrupted_tool_call_can_hand_off_a_terminal_notice() {
+        assert!(WaitingOnTool.permits_channel_transition(ResponseReady));
+    }
+
+    #[test]
+    fn waiting_on_tool_still_cannot_skip_the_response_checkpoint() {
+        for next in [
+            Received,
+            Queued,
+            Submitting,
+            Delivered,
+            PartiallyDelivered,
+            Cancelled,
+        ] {
+            assert!(!WaitingOnTool.permits_channel_transition(next), "{next:?}");
+        }
+        for next in [Running, ResponseReady, Failed, Uncertain] {
+            assert!(WaitingOnTool.permits_channel_transition(next), "{next:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_states_permit_no_channel_transition() {
+        for from in ALL.into_iter().filter(|s| s.is_terminal()) {
+            for next in ALL {
+                assert!(!from.permits_channel_transition(next), "{from:?}->{next:?}");
+            }
+        }
+    }
 }
