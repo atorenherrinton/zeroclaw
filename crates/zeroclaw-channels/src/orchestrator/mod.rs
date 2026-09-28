@@ -16007,7 +16007,12 @@ fn hydrate_session_transcript(
 
     let mut orphan_closed = false;
     if msgs.last().is_some_and(|msg| msg.role == "user") {
-        let closure = ChatMessage::assistant("[Session interrupted — not continuing this request]");
+        // The existing user row remains the authoritative request. This records
+        // the missing final result; it does not establish whether tools ran,
+        // replay the turn, or claim a notification was delivered to the channel.
+        let closure = ChatMessage::assistant(zeroclaw_runtime::i18n::get_required_cli_string(
+            "channel-runtime-interrupted-request",
+        ));
         if let Err(e) = store.append(session_key, &closure) {
             ::zeroclaw_log::record!(
                 DEBUG,
@@ -22722,6 +22727,66 @@ api_key = "anthropic-key"
 
     fn breadcrumb_text() -> String {
         zeroclaw_runtime::agent::history::HISTORY_TRIM_BREADCRUMB_CANONICAL.to_string()
+    }
+
+    #[test]
+    fn hydration_closes_consecutive_interruptions_once_and_preserves_retry_intent() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let sender = "synthetic_interrupted_channel";
+        let closure =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-interrupted-request");
+        assert!(!closure.starts_with('{'), "English fallback must resolve");
+        let requests = [
+            "Apply the reviewed setting and report its actual result.",
+            "Continue that setting request after checking the current value.",
+        ];
+        for (index, request) in requests.iter().enumerate() {
+            // Reopening the real durable backend models consecutive restarts.
+            let store = zeroclaw_infra::session_store::SessionStore::new(temporary.path()).unwrap();
+            store.append(sender, &ChatMessage::user(*request)).unwrap();
+            let recovered = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+            assert!(recovered.orphan_closed);
+            assert_eq!(recovered.messages.len(), (index + 1) * 2);
+            assert_eq!(recovered.messages[index * 2].content, *request);
+            assert_eq!(recovered.messages[index * 2 + 1].content, closure);
+            for _ in 0..3 {
+                let repeated = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+                assert!(!repeated.orphan_closed);
+                assert_eq!(repeated.messages.len(), recovered.messages.len());
+                assert_eq!(store.load(sender).len(), recovered.messages.len());
+            }
+        }
+        let store = zeroclaw_infra::session_store::SessionStore::new(temporary.path()).unwrap();
+        let retry = "Inspect the current state and receipts before any repeated mutation.";
+        store.append(sender, &ChatMessage::user(retry)).unwrap();
+        store
+            .append(
+                sender,
+                &ChatMessage::assistant(
+                    "The existing result was verified without replaying the action.",
+                ),
+            )
+            .unwrap();
+        let completed = hydrate_session_transcript(&store, sender).unwrap().unwrap();
+        assert!(!completed.orphan_closed);
+        assert_eq!(completed.messages.len(), 6);
+        assert_eq!(completed.messages[0].content, requests[0]);
+        assert_eq!(completed.messages[2].content, requests[1]);
+        assert_eq!(completed.messages[4].content, retry);
+        assert_eq!(
+            completed
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant" && message.content == closure)
+                .count(),
+            2
+        );
+        let normalized = normalize_cached_channel_turns(completed.messages);
+        assert_eq!(
+            normalized.len(),
+            6,
+            "retry must retain both interrupted requests and their closures"
+        );
     }
 
     #[test]
