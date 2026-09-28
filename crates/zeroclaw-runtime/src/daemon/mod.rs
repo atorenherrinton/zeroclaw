@@ -1999,6 +1999,40 @@ async fn retry_heartbeat_mcp_registry(
 }
 
 async fn run_heartbeat_worker(config: Config) -> Result<()> {
+    use crate::heartbeat::{deadman, store};
+
+    store::start_deadman(&config.data_dir, Utc::now())?;
+    let delivery = if let Some(channel) = &config.heartbeat.deadman_channel {
+        let target = config
+            .heartbeat
+            .deadman_to
+            .as_deref()
+            .or(config.heartbeat.to.as_deref())
+            .unwrap_or_default();
+        Some((channel.clone(), target.to_owned()))
+    } else {
+        resolve_heartbeat_delivery(&config)?
+    };
+    // No destination means no attempt. Keep the watcher owned by the same
+    // generation even during MCP startup or a stalled first tick.
+    let watcher = async {
+        let Some((channel, target)) = delivery else {
+            return std::future::pending().await;
+        };
+        let timeout = config.heartbeat.deadman_timeout_minutes;
+        let alert = crate::i18n::get_required_cli_string_with_args(
+            "cli-heartbeat-deadman-alert",
+            &[("minutes", &timeout.to_string())],
+        );
+        deadman::watch(&config.data_dir, timeout, || {
+            crate::cron::scheduler::deliver_announcement(&config, &channel, &target, None, &alert)
+        })
+        .await
+    };
+    deadman::supervise(run_heartbeat_tasks(config.clone()), watcher).await
+}
+
+async fn run_heartbeat_tasks(config: Config) -> Result<()> {
     use crate::heartbeat::engine::{
         HeartbeatEngine, HeartbeatTask, TaskPriority, TaskStatus, compute_adaptive_interval,
     };
@@ -2028,71 +2062,6 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
     let two_phase = config.heartbeat.two_phase;
     let adaptive = config.heartbeat.adaptive;
     let start_time = std::time::Instant::now();
-
-    // ── Deadman watcher ──────────────────────────────────────────
-    let deadman_timeout = config.heartbeat.deadman_timeout_minutes;
-    if deadman_timeout > 0 {
-        let dm_metrics = Arc::clone(&metrics);
-        let dm_config = config.clone();
-        let dm_delivery = delivery.clone();
-        zeroclaw_spawn::spawn!(async move {
-            let check_interval = Duration::from_secs(60);
-            let timeout = chrono::Duration::minutes(i64::from(deadman_timeout));
-            loop {
-                tokio::time::sleep(check_interval).await;
-                let last_tick = dm_metrics.lock().last_tick_at;
-                if let Some(last) = last_tick
-                    && chrono::Utc::now() - last > timeout
-                {
-                    let alert = format!(
-                        "⚠️ Heartbeat dead-man's switch: no tick in {deadman_timeout} minutes"
-                    );
-                    let (channel, target) = if let Some(ch) = &dm_config.heartbeat.deadman_channel {
-                        let to = dm_config
-                            .heartbeat
-                            .deadman_to
-                            .as_deref()
-                            .or(dm_config.heartbeat.to.as_deref())
-                            .unwrap_or_default();
-                        (ch.clone(), to.to_string())
-                    } else if let Some((ch, to)) = &dm_delivery {
-                        (ch.clone(), to.clone())
-                    } else {
-                        continue;
-                    };
-                    let delivery_fut = crate::cron::scheduler::deliver_announcement(
-                        &dm_config, &channel, &target, None, &alert,
-                    );
-                    match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
-                        Ok(Err(e)) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "Deadman alert delivery failed"
-                            );
-                        }
-                        Err(_) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                "Deadman alert delivery timed out (30s)"
-                            );
-                        }
-                        Ok(Ok(())) => {}
-                    }
-                }
-            }
-        });
-    }
 
     let base_interval = config.heartbeat.interval_minutes.max(1);
     let mut sleep_mins = base_interval;
@@ -2136,6 +2105,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 #[allow(clippy::cast_precision_loss)]
                 let elapsed = tick_start.elapsed().as_millis() as f64;
                 metrics.lock().record_success(elapsed);
+                crate::heartbeat::deadman::completed_tick(&config.data_dir)?;
                 continue;
             }
         }
@@ -2210,6 +2180,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         #[allow(clippy::cast_precision_loss)]
                         let elapsed = tick_start.elapsed().as_millis() as f64;
                         metrics.lock().record_success(elapsed);
+                        crate::heartbeat::deadman::completed_tick(&config.data_dir)?;
                         continue;
                     }
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"selected": indices.len(), "total": tasks.len()})), "heartbeat phase 1: running task subset");
@@ -2467,6 +2438,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 m.record_success(tick_elapsed);
             }
         }
+
+        crate::heartbeat::deadman::completed_tick(&config.data_dir)?;
 
         // Compute next sleep interval
         if adaptive {
