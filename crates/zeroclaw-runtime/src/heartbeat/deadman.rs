@@ -99,7 +99,7 @@ mod tests {
         let root = tmp.path().to_owned();
         let observed = sends.clone();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(async move {
+        let task = ::zeroclaw_spawn::spawn!(async move {
             supervise(
                 async {
                     let _ = stop_rx.await;
@@ -150,7 +150,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let observed = drops.clone();
         let root = tmp.path().to_owned();
-        let task = tokio::spawn(async move {
+        let task = ::zeroclaw_spawn::spawn!(async move {
             supervise(
                 std::future::pending(),
                 watch_with_clock(
