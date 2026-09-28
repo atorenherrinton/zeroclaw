@@ -15157,7 +15157,7 @@ impl HeartbeatQuietHoursConfig {
             "heartbeat.deadman_quiet_hours endpoints must differ; use deadman_timeout_minutes=0 to mute"
         );
         let timezone = self.timezone.parse::<chrono_tz::Tz>().map_err(|_| {
-            anyhow::anyhow!("heartbeat.deadman_quiet_hours.timezone must be an IANA timezone")
+            anyhow::Error::msg("heartbeat.deadman_quiet_hours.timezone must be an IANA timezone")
         })?;
         Ok((start, end, timezone))
     }
@@ -25676,6 +25676,9 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        if let Some(quiet) = &self.heartbeat.deadman_quiet_hours {
+            quiet.validate()?;
+        }
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
         // Stamp the current schema version on every write. The in-memory
@@ -25759,6 +25762,11 @@ impl Config {
     /// written. Falls back to a full `save()` when the file doesn't
     /// exist yet. Clears the dirty set on success.
     pub async fn save_dirty(&mut self) -> Result<()> {
+        // RPC and gateway publish their live snapshot only after this succeeds.
+        // Reject incomplete/invalid notification policy before disk or live swap.
+        if let Some(quiet) = &self.heartbeat.deadman_quiet_hours {
+            quiet.validate()?;
+        }
         if self.dirty_paths.is_empty() {
             return Ok(());
         }
@@ -31753,6 +31761,47 @@ log_tool_io = "off"
                 .to_string()
                 .contains("deadman_quiet_hours")
         );
+    }
+
+    #[test]
+    async fn heartbeat_quiet_hours_save_rejects_invalid_live_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: tmp.path().join("config.toml"),
+            data_dir: tmp.path().join("data"),
+            ..Config::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.start", "22:00")
+            .unwrap();
+        // A partial optional object must not reach disk or a live swap.
+        assert!(config.save().await.is_err());
+        assert!(!config.config_path.exists());
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.end", "07:00")
+            .unwrap();
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.timezone", "UTC")
+            .unwrap();
+        config.mark_dirty("heartbeat.deadman_quiet_hours");
+        config.save_dirty().await.unwrap();
+        let before = tokio::fs::read(&config.config_path).await.unwrap();
+        let restored: Config = toml::from_str(std::str::from_utf8(&before).unwrap()).unwrap();
+        assert_eq!(restored.heartbeat.deadman_quiet_hours.unwrap().end, "07:00");
+        config
+            .set_prop("heartbeat.deadman_quiet_hours.timezone", "Invalid/Zone")
+            .unwrap();
+        config.mark_dirty("heartbeat.deadman_quiet_hours.timezone");
+        assert!(config.save_dirty().await.is_err());
+        assert_eq!(tokio::fs::read(&config.config_path).await.unwrap(), before);
+        config.clear_dirty();
+        assert!(
+            config.save_dirty().await.is_err(),
+            "a zero-dirty live swap must validate too"
+        );
+        assert!(config.save().await.is_err());
+        assert_eq!(tokio::fs::read(&config.config_path).await.unwrap(), before);
     }
 
     #[test]

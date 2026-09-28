@@ -1008,6 +1008,7 @@ pub async fn run(
 
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
+        let heartbeat_live_config = std::sync::Arc::clone(&live_config);
         handles.push(spawn_component_supervisor(
             "heartbeat",
             initial_backoff,
@@ -1015,7 +1016,8 @@ pub async fn run(
             channels_cancel.clone(),
             move || {
                 let cfg = heartbeat_cfg.clone();
-                async move { Box::pin(run_heartbeat_worker(cfg)).await }
+                let live = std::sync::Arc::clone(&heartbeat_live_config);
+                async move { Box::pin(run_heartbeat_worker(cfg, live)).await }
             },
         ));
     }
@@ -1998,40 +2000,70 @@ async fn retry_heartbeat_mcp_registry(
     Ok(())
 }
 
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
+async fn run_heartbeat_worker(
+    config: Config,
+    live_config: std::sync::Arc<parking_lot::RwLock<Config>>,
+) -> Result<()> {
     use crate::heartbeat::{deadman, store};
 
     store::start_deadman(&config.data_dir, Utc::now())?;
-    let delivery = if let Some(channel) = &config.heartbeat.deadman_channel {
+    // Resolve from the daemon's canonical live handle on every check. RPC and
+    // gateway policy changes reach this generation without caching a second
+    // timeout/quiet-window/route. File-only edits still need normal config reload.
+    deadman::run(
+        run_heartbeat_tasks(config.clone()),
+        &config.data_dir,
+        || {
+            let current = live_config.read().clone();
+            if !current.heartbeat.enabled
+                || current.heartbeat.deadman_timeout_minutes == 0
+                || resolve_deadman_delivery(&current)?.is_none()
+            {
+                return Ok(None);
+            }
+            Ok(Some(std::sync::Arc::new(current)))
+        },
+        |current, sequence| async move {
+            let (channel, target) = resolve_deadman_delivery(&current)?
+                .ok_or_else(|| anyhow::Error::msg("Deadman notification has no delivery target"))?;
+            let alert = crate::i18n::get_required_cli_string_with_args(
+                "cli-heartbeat-deadman-alert",
+                &[
+                    (
+                        "minutes",
+                        &current.heartbeat.deadman_timeout_minutes.to_string(),
+                    ),
+                    ("incident", &sequence.to_string()),
+                ],
+            );
+            crate::cron::scheduler::deliver_required_announcement(
+                &current, &channel, &target, None, &alert,
+            )
+            .await
+        },
+    )
+    .await
+}
+
+fn resolve_deadman_delivery(config: &Config) -> Result<Option<(String, String)>> {
+    if let Some(channel) = &config.heartbeat.deadman_channel {
+        let channel = channel.trim();
         let target = config
             .heartbeat
             .deadman_to
             .as_deref()
             .or(config.heartbeat.to.as_deref())
+            .map(str::trim)
             .unwrap_or_default();
-        Some((channel.clone(), target.to_owned()))
-    } else {
-        resolve_heartbeat_delivery(&config)?
-    };
-    // No destination means no attempt. Keep the watcher owned by the same
-    // generation even during MCP startup or a stalled first tick.
-    let watcher = async {
-        let Some((channel, target)) = delivery else {
-            return std::future::pending().await;
-        };
-        let timeout = config.heartbeat.deadman_timeout_minutes;
-        let alert = crate::i18n::get_required_cli_string_with_args(
-            "cli-heartbeat-deadman-alert",
-            &[("minutes", &timeout.to_string())],
+        anyhow::ensure!(
+            !channel.is_empty() && !target.is_empty(),
+            "heartbeat.deadman_channel requires a nonempty deadman_to or heartbeat.to"
         );
-        deadman::watch(&config.data_dir, timeout, || {
-            crate::cron::scheduler::deliver_required_announcement(
-                &config, &channel, &target, None, &alert,
-            )
-        })
-        .await
-    };
-    deadman::supervise(run_heartbeat_tasks(config.clone()), watcher).await
+        validate_heartbeat_channel_config(config, channel)?;
+        Ok(Some((channel.to_owned(), target.to_owned())))
+    } else {
+        resolve_heartbeat_delivery(config)
+    }
 }
 
 async fn run_heartbeat_tasks(config: Config) -> Result<()> {
