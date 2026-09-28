@@ -2025,7 +2025,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             &[("minutes", &timeout.to_string())],
         );
         deadman::watch(&config.data_dir, timeout, || {
-            crate::cron::scheduler::deliver_announcement(&config, &channel, &target, None, &alert)
+            crate::cron::scheduler::deliver_required_announcement(
+                &config, &channel, &target, None, &alert,
+            )
         })
         .await
     };

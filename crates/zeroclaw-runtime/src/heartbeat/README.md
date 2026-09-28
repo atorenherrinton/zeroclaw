@@ -17,6 +17,11 @@ generation, and most recent notification attempt. Live metrics and per-task
 history are observational and cannot settle/re-arm an incident. First startup
 records a baseline so failure to complete any initial tick is monitored too.
 Reload/restart preserves that baseline rather than postponing the deadline.
+Every worker generation checks the durable baseline immediately, before polling
+the worker. Repeated startup failures shorter than the polling interval therefore
+cannot starve an overdue incident. Subsequent checks remain one minute apart.
+If the worker fails while that first delivery is pending, the attempt is
+cancelled and remains uncertain; the initial poll does not guarantee delivery.
 
 After the configured interval is exceeded, a SQLite update atomically claims
 the current tick generation and commits `unknown` with full synchronization
@@ -24,6 +29,9 @@ before calling the channel. Repeated checks, concurrent connections, timeout,
 cancellation, and process death cannot claim that same generation again. A
 successful delivery callback records `delivered`; this reflects the delivery
 adapter's acknowledgement, not a separate readback from the destination.
+The watchdog requires a registered delivery adapter; an absent handler retains
+`unknown` and can never be recorded as `delivered`. Ordinary cron announcements
+keep their existing missing-handler behavior.
 Failure or timeout retains `unknown`, without automatic retry. A crash between
 claim and send may suppress an alert that was never sent; avoiding duplicate
 uncertain delivery takes precedence over guaranteed notification.

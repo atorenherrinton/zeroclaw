@@ -21,8 +21,12 @@ pub(crate) async fn supervise(
     watcher: impl Future<Output = Result<()>>,
 ) -> Result<()> {
     tokio::select! {
-        result = worker => result,
+        // Give the watcher its immediate durable-state check even when startup
+        // fails synchronously. Otherwise repeated short worker generations can
+        // starve the check forever despite an overdue persisted baseline.
+        biased;
         result = watcher => result,
+        result = worker => result,
     }
 }
 
@@ -48,23 +52,22 @@ where
         return std::future::pending().await;
     }
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        let Some(sequence) = store::claim_deadman_alert(data_dir, now(), timeout_minutes)? else {
-            continue;
-        };
-        let delivered = matches!(
-            tokio::time::timeout(Duration::from_secs(30), deliver()).await,
-            Ok(Ok(()))
-        );
-        store::finish_deadman_alert(data_dir, sequence, delivered)?;
-        if !delivered {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "Deadman alert delivery unconfirmed; incident will not be retried"
+        if let Some(sequence) = store::claim_deadman_alert(data_dir, now(), timeout_minutes)? {
+            let delivered = matches!(
+                tokio::time::timeout(Duration::from_secs(30), deliver()).await,
+                Ok(Ok(()))
             );
+            store::finish_deadman_alert(data_dir, sequence, delivered)?;
+            if !delivered {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "Deadman alert delivery unconfirmed; incident will not be retried"
+                );
+            }
         }
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 
@@ -88,6 +91,81 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_immediate_worker_failures_do_not_starve_overdue_incident() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Utc::now();
+        store::start_deadman(tmp.path(), base).unwrap();
+        let attempts = AtomicUsize::new(0);
+        for minute in 0..70 {
+            let now = base + chrono::Duration::minutes(minute);
+            // Recreate the exact parent ownership boundary each generation:
+            // startup fails before any minute-long timer could have fired.
+            store::start_deadman(tmp.path(), now).unwrap();
+            let result = supervise(
+                async { anyhow::bail!("synthetic worker startup failure") },
+                watch_with_clock(
+                    tmp.path(),
+                    45,
+                    || now,
+                    || async {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    },
+                ),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(attempts.load(Ordering::SeqCst), usize::from(minute > 45));
+        }
+        assert!(
+            store::record_completed_tick(tmp.path(), base + chrono::Duration::minutes(70)).unwrap()
+        );
+        let result = supervise(
+            async { anyhow::bail!("synthetic later startup failure") },
+            watch_with_clock(
+                tmp.path(),
+                45,
+                || base + chrono::Duration::minutes(116),
+                || async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_worker_failure_cancels_pending_attempt_without_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        store::start_deadman(tmp.path(), now - chrono::Duration::hours(1)).unwrap();
+        let attempts = AtomicUsize::new(0);
+        let result = supervise(
+            async { anyhow::bail!("synthetic immediate startup failure") },
+            watch_with_clock(
+                tmp.path(),
+                45,
+                || now,
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<()>>()
+                },
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        store::start_deadman(tmp.path(), now).unwrap();
+        assert_eq!(
+            store::claim_deadman_alert(tmp.path(), now + chrono::Duration::hours(1), 45).unwrap(),
+            None
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn timeout_after_possible_delivery_is_not_retried_and_parent_drop_cancels() {
@@ -169,8 +247,8 @@ mod tests {
             .await
         });
         tokio::task::yield_now().await;
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::task::yield_now().await;
+        // The overdue check now starts immediately. Abort while its delivery
+        // is still pending, before the 30-second delivery timeout.
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(drops.load(Ordering::SeqCst), 1);
