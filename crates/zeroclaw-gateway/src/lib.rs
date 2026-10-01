@@ -33,7 +33,6 @@ pub mod api_webauthn;
 pub mod api_webhook;
 pub mod auth_rate_limit;
 pub mod canvas;
-pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
@@ -696,6 +695,7 @@ pub struct AppState {
     /// that writer's change — clobbered in memory and, if its save hadn't
     /// landed yet, on disk too.
     pub config_write_lock: Arc<tokio::sync::Mutex<()>>,
+    pub agent_lifecycle: zeroclaw_runtime::live_config_authority::AgentLifecycleCoordinator,
     pub model_provider: Arc<dyn ModelProvider>,
     pub model: String,
     /// `None` means "let the provider decide" — required for models
@@ -756,7 +756,7 @@ pub struct AppState {
     /// here; the daemon's wait loop reacts and re-instantiates every
     /// subsystem in place. `None` when running standalone (`zeroclaw gateway start`)
     /// — reload then degrades to a 503 with a clear message.
-    pub reload_tx: Option<tokio::sync::watch::Sender<bool>>,
+    pub reload_tx: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     /// Registry of dynamically connected nodes
     pub node_registry: Arc<nodes::NodeRegistry>,
     /// LAN-local peer hints discovered by multicast. These are informational
@@ -801,10 +801,24 @@ pub struct AppState {
     pub sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
 }
 
+impl AppState {
+    pub(crate) fn reserve_agent_turn_at(
+        &self,
+        alias: impl Into<String>,
+        generation: u64,
+    ) -> Result<
+        zeroclaw_runtime::live_config_authority::AgentTurnLease,
+        zeroclaw_runtime::live_config_authority::AgentAdmissionError,
+    > {
+        self.agent_lifecycle.reserve_turn_at(alias, generation)
+    }
+}
+
 /// Daemon-owned services whose lifecycle matches one supervised gateway run.
 pub struct GatewaySupervision {
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
     plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
     /// The daemon generation's driver supervisor set. Approval surfaces
     /// register resumed headless drivers here so a reload drains them with the
     /// generation that owns them. `None` standalone, where no generation exists.
@@ -817,11 +831,13 @@ impl GatewaySupervision {
     pub fn new(
         readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
         plugin_webhooks: Arc<zeroclaw_api::webhook::PluginWebhookRegistry>,
+        authority: zeroclaw_runtime::LiveConfigAuthority,
         sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     ) -> Self {
         Self {
             readiness,
             plugin_webhooks,
+            authority,
             sop_driver_handles,
         }
     }
@@ -932,7 +948,10 @@ pub async fn run_gateway(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    // The daemon's event bus. The daemon owns the observer broadcast hook, so a
+    // supervised gateway reuses its sender and history and installs nothing;
+    // a standalone gateway (`None`) builds and installs its own.
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     // Reload controls owned by the daemon for supervised runs. RPC reloads
     // write to `shutdown_tx` before signalling daemon reload so the listener
     // releases its socket before the replacement gateway binds. /admin/reload
@@ -953,11 +972,48 @@ pub async fn run_gateway(
     sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
+    let authority = zeroclaw_runtime::LiveConfigAuthority::new_owned(config.clone())?;
+    run_gateway_with_authority(
+        host,
+        port,
+        config,
+        external_event_bus,
+        reload_controls,
+        tui_registry,
+        canvas_store,
+        sop_engine,
+        sop_audit,
+        daemon_authority,
+        sop_driver_handles,
+        readiness,
+        authority,
+    )
+    .await
+}
+
+/// Run the gateway with the live config authority owned by its daemon
+/// generation.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_gateway_with_authority(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
+    reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
+    tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
+    canvas_store: Option<CanvasStore>,
+    sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
+    sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    daemon_authority: Option<zeroclaw_runtime::daemon::DaemonInboundAuthority>,
+    sop_driver_handles: Option<zeroclaw_runtime::sop::SopDriverHandles>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
+    authority: zeroclaw_runtime::LiveConfigAuthority,
+) -> Result<()> {
     Box::pin(run_gateway_with_plugin_webhooks(
         host,
         port,
         config,
-        external_event_tx,
+        external_event_bus,
         reload_controls,
         tui_registry,
         canvas_store,
@@ -967,6 +1023,7 @@ pub async fn run_gateway(
         GatewaySupervision::new(
             readiness,
             Arc::new(zeroclaw_api::webhook::PluginWebhookRegistry::new()),
+            authority,
             sop_driver_handles,
         ),
     ))
@@ -974,15 +1031,14 @@ pub async fn run_gateway(
 }
 
 /// Run the supervised gateway with the daemon generation's channel-plugin
-/// webhook registry. Standalone callers use [`run_gateway`], because no channel
-/// supervisor exists there to publish live routes.
+/// webhook registry and live-config authority.
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror run_gateway plus the plugin webhook registry
 pub async fn run_gateway_with_plugin_webhooks(
     host: &str,
     port: u16,
     config: Config,
-    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+    external_event_bus: Option<zeroclaw_runtime::observability::EventBus>,
     reload_controls: Option<zeroclaw_runtime::daemon::GatewayReloadControls>,
     tui_registry: Option<Arc<zeroclaw_runtime::rpc::tui_identity::TuiRegistry>>,
     canvas_store: Option<CanvasStore>,
@@ -998,6 +1054,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     let GatewaySupervision {
         readiness,
         plugin_webhooks,
+        authority,
         sop_driver_handles,
     } = supervision;
     let (shared_pairing, shared_inbound_auth, shared_config) = match daemon_authority {
@@ -1026,17 +1083,7 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Supervised runs read and write the daemon's live configuration, the
     // one the RPC context holds, so a persist through either surface is the
     // state the other next reads and compiles policy from.
-    let config_state = shared_config.unwrap_or_else(|| Arc::new(RwLock::new(config.clone())));
-
-    // ── Hooks ──────────────────────────────────────────────────────
-    let hooks: Option<std::sync::Arc<zeroclaw_runtime::hooks::HookRunner>> = if config.hooks.enabled
-    {
-        Some(std::sync::Arc::new(
-            zeroclaw_runtime::hooks::HookRunner::new(),
-        ))
-    } else {
-        None
-    };
+    let config_state = shared_config.unwrap_or_else(|| authority.config());
 
     let addr: SocketAddr = match zeroclaw_infra::parse_gateway_bind_socket_addr(host, port) {
         Ok(a) => a,
@@ -1415,20 +1462,26 @@ pub async fn run_gateway_with_plugin_webhooks(
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.data_dir);
 
-    // Live model-pricing refresher (once per process; idempotent, no-op unless a
-    // provider sets `live_pricing = true`). Each call re-binds the refresher's
-    // config handle, so reloads that re-instantiate the config Arc are honored
-    // without a restart; shares the global price snapshot the cost path reads.
-    zeroclaw_providers::pricing::spawn_refresher(config_state.clone());
+    // The live-pricing refresher and the gateway-start hook belong to the
+    // process that owns this listener (the daemon, or the standalone
+    // `zeroclaw gateway` command), not to the listener: the refresher must run
+    // with the gateway disabled, and the hook fires from the readiness report.
+    // The gateway does own the live config handle its config API writes in
+    // place, so it points the refresher at that handle. An operator's change
+    // (an opt-out, a new endpoint or model) then reaches the next refresh
+    // without a reload.
+    zeroclaw_providers::pricing::bind_config(config_state.clone());
 
     // SSE broadcast channel for real-time events.
     // Use an externally provided sender (e.g. from the daemon) so that other
     // components (cron, heartbeat) can publish events to the same bus.
-    let event_tx = external_event_tx.unwrap_or_else(|| {
-        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
-        tx
-    });
-    let event_buffer = Arc::new(sse::EventBuffer::new(500));
+    // Under the daemon the bus and its observer hook are already live; a
+    // standalone gateway builds and installs its own. Either way there is one
+    // hook, so each observer event is delivered once and buffered once.
+    let (event_bus, broadcast_hook_guard) =
+        zeroclaw_runtime::observability::EventBus::shared_or_installed(external_event_bus);
+    let event_tx = event_bus.sender().clone();
+    let event_buffer = Arc::clone(event_bus.history());
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1873,21 +1926,10 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     zeroclaw_runtime::health::mark_component_ok("gateway");
 
-    // Fire gateway start hook
-    if let Some(ref hooks) = hooks {
-        hooks.fire_gateway_start(host, actual_port).await;
-    }
-
-    let broadcast_layer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::new(
-        sse::BroadcastObserver::new(event_tx.clone(), event_buffer.clone()),
-    );
-    let broadcast_hook_guard =
-        zeroclaw_runtime::observability::set_scoped_broadcast_hook(broadcast_layer);
-
     zeroclaw_log::set_broadcast_hook(event_tx.clone());
 
-    // Bound into AppState. Not a broadcaster — the broadcaster is the
-    // `broadcast_layer` installed above as the global hook. This is the
+    // Bound into AppState. Not a broadcaster — the broadcaster is the event
+    // bus's hook (`EventBus::shared_or_installed` above). This is the
     // configured backend (Log/Prometheus/...) wrapped by `TeeObserver`,
     // which tees events into the hook on every record.
     let state_observer: Arc<dyn zeroclaw_runtime::observability::Observer> = Arc::from(
@@ -1896,7 +1938,7 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let (owned_shutdown_tx, _) = tokio::sync::watch::channel(false);
     let (shutdown_tx, reload_tx) = reload_controls
-        .map(|controls| (controls.shutdown_tx, Some(controls.reload_tx)))
+        .map(|controls| (controls.shutdown_tx.clone(), Some(controls)))
         .unwrap_or((owned_shutdown_tx, None));
     let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -1989,7 +2031,8 @@ pub async fn run_gateway_with_plugin_webhooks(
 
     let state = AppState {
         config: config_state,
-        config_write_lock: zeroclaw_config::write_lock::shared_config_write_lock(),
+        config_write_lock: authority.config_write_lock(),
+        agent_lifecycle: authority.agent_lifecycle(),
         model_provider,
         model,
         temperature,
@@ -3012,8 +3055,25 @@ pub(crate) async fn run_gateway_chat_with_tools(
 
     #[cfg(not(test))]
     {
-        let config = state.config.read().clone();
-        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let initial_config = state.config.read().clone();
+        let requested_alias = require_gateway_chat_agent_alias(&initial_config, agent_override)?;
+        let execution_capability =
+            zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+                std::sync::Arc::clone(&state.config),
+                state.agent_lifecycle.clone(),
+            );
+        let execution_admission = execution_capability
+            .resolve_and_admit(&requested_alias)
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        let agent_alias = execution_admission.alias().to_string();
+        let config = execution_admission.config().as_ref().clone();
+        // The admission snapshot is authoritative for both the alias and the
+        // target config, so a delete/recreate cannot run with predecessor data.
+        let current_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        anyhow::ensure!(
+            current_alias == agent_alias,
+            "gateway chat agent changed during turn admission"
+        );
 
         // Scope the cost tracking context so per-LLM-call usage flows into
         // the gateway's cost tracker and costs.jsonl. A separate
@@ -3040,13 +3100,14 @@ pub(crate) async fn run_gateway_chat_with_tools(
             turn_usage.clone(),
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message_with_live_config(
+                zeroclaw_runtime::agent::loop_::process_message_with_live_config_and_admission(
                     config,
                     Arc::clone(&state.config),
                     &agent_alias,
                     message,
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    Some(execution_admission),
                 ),
             ),
         ))
@@ -4587,6 +4648,14 @@ async fn process_nextcloud_talk_webhook(
 #[cfg(feature = "channel-email")]
 const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
 
+/// Compare the presented Gmail push bearer against the configured secret in
+/// constant time, so a wrong token's rejection latency does not reveal how
+/// many leading bytes matched.
+#[cfg(feature = "channel-email")]
+fn gmail_bearer_matches(provided: &str, secret: &str) -> bool {
+    zeroclaw_config::pairing::constant_time_eq(provided, secret)
+}
+
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
 #[cfg(feature = "channel-email")]
 async fn handle_gmail_push_webhook(
@@ -4618,7 +4687,7 @@ async fn handle_gmail_push_webhook(
             .and_then(|auth| auth.strip_prefix("Bearer "))
             .unwrap_or("");
 
-        if provided != secret {
+        if !gmail_bearer_matches(provided, &secret) {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5088,6 +5157,12 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 
     (StatusCode::OK, Json(body))
 }
+
+/// Serializes tests that start `run_gateway`, which binds the process-global
+/// pricing config handle, so a test that reads that handle sees its own bind.
+#[cfg(test)]
+pub(crate) static PRICING_BINDING_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -5569,6 +5644,7 @@ mod tests {
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -5630,6 +5706,28 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    #[test]
+    fn gateway_and_ws_turn_admission_blocks_destructive_alias_work() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&temp, false, false);
+        let generation = state.agent_lifecycle.alias_generation("alpha");
+        let turn = state
+            .reserve_agent_turn_at("alpha", generation)
+            .expect("gateway turn is admitted");
+
+        assert!(matches!(
+            state.agent_lifecycle.begin_delete("alpha"),
+            Err(
+                zeroclaw_runtime::live_config_authority::AgentDeleteBlocker::ActiveTurns {
+                    count: 1,
+                    ..
+                }
+            )
+        ));
+        drop(turn);
+        assert!(state.agent_lifecycle.begin_delete("alpha").is_ok());
     }
 
     fn webhook_sop_state(
@@ -6567,6 +6665,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_zero_agents() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         // Isolate data_dir so parallel nextest runs don't race on the
         // real ~/.zeroclaw/data
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6633,6 +6733,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_unresolved_agent_risk_profile() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         use zeroclaw_config::schema::AliasedAgentConfig;
 
         // Isolate data_dir so parallel nextest runs don't race on the
@@ -6697,6 +6799,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn run_gateway_starts_with_mismatched_provider_api_key() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let mut config = Config::default();
         config.providers.models.anthropic.insert(
             "default".to_string(),
@@ -6754,6 +6858,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -6768,10 +6874,10 @@ path = "{trigger_path}"
 
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (reload_tx, _) = tokio::sync::watch::channel(false);
-        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls {
-            shutdown_tx: shutdown_tx.clone(),
+        let reload_controls = zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            shutdown_tx.clone(),
             reload_tx,
-        };
+        );
         let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
         let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
             let _ = ready_tx.send(Some(addr));
@@ -6831,6 +6937,8 @@ path = "{trigger_path}"
 
     #[tokio::test]
     async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        // `run_gateway` binds the process-global pricing config handle.
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let mut config = zeroclaw_config::schema::Config {
             data_dir: tmp.path().join("workspace"),
@@ -6880,6 +6988,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -6967,6 +7076,7 @@ path = "{trigger_path}"
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: Arc::new(MockModelProvider::default()),
             model: "test-model".into(),
             temperature: None,
@@ -7638,6 +7748,7 @@ path = "{trigger_path}"
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -9223,6 +9334,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10143,6 +10255,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10265,6 +10378,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "startup-model".into(),
             temperature: None,
@@ -10366,6 +10480,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10574,6 +10689,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10662,6 +10778,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10755,6 +10872,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10853,6 +10971,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -10948,6 +11067,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11049,6 +11169,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -11190,6 +11311,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider: provider,
             model: "test-model".into(),
             temperature: None,
@@ -11828,7 +11950,10 @@ data: [DONE]\n\n";
             tokens,
             PairingCodePolicy::default(),
         ));
-        state.reload_tx = Some(tokio::sync::watch::channel(false).0);
+        state.reload_tx = Some(zeroclaw_runtime::daemon::GatewayReloadControls::standalone(
+            tokio::sync::watch::channel(false).0,
+            tokio::sync::watch::channel(false).0,
+        ));
         state
     }
 
@@ -12082,6 +12207,7 @@ data: [DONE]\n\n";
         AppState {
             config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12168,6 +12294,7 @@ data: [DONE]\n\n";
         let state = AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -12781,6 +12908,7 @@ data: [DONE]\n\n";
         AppState {
             config: Arc::new(RwLock::new(Config::default())),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            agent_lifecycle: Default::default(),
             model_provider,
             model: "test-model".into(),
             temperature: None,
@@ -13289,5 +13417,130 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+
+    /// The gateway points the pricing refresher at the live config handle its
+    /// config API writes. An operator opt-out made through `PUT
+    /// /api/config/prop` on a running standalone gateway must therefore reach
+    /// the refresher without a restart, instead of being lost on a private
+    /// copy of the startup config.
+    #[tokio::test]
+    async fn a_config_api_opt_out_reaches_the_pricing_refresher_without_a_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _pricing_binding = crate::PRICING_BINDING_TEST_LOCK.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.gateway.require_pairing = false;
+        config.providers.models.ollama.insert(
+            "priced".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    model: Some("priced-model".to_string()),
+                    live_pricing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+
+        // The exact property path the config API accepts for this flag, taken
+        // from the schema rather than spelled by hand.
+        let live_pricing_path = config
+            .prop_fields()
+            .into_iter()
+            .map(|field| field.name)
+            .find(|name| name.contains(".priced.") && name.contains("live"))
+            .expect("the schema exposes the provider's live-pricing flag");
+
+        let (addr_tx, addr_rx) = tokio::sync::oneshot::channel();
+        let addr_tx = std::sync::Mutex::new(Some(addr_tx));
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            if let Some(tx) = addr_tx.lock().unwrap().take() {
+                let _ = tx.send(addr);
+            }
+        });
+        let server = zeroclaw_spawn::spawn!(async move {
+            crate::run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(readiness),
+            )
+            .await
+        });
+        let addr = tokio::time::timeout(std::time::Duration::from_secs(10), addr_rx)
+            .await
+            .expect("the gateway reports readiness")
+            .expect("the readiness sender is kept until it fires");
+        assert!(
+            zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the refresher is bound to the gateway's config, which opts in"
+        );
+
+        let body = serde_json::json!({
+            "path": live_pricing_path,
+            "value": false,
+        })
+        .to_string();
+        let request = format!(
+            "PUT /api/config/prop HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "the config API accepts the opt-out: {response}"
+        );
+
+        assert!(
+            !zeroclaw_providers::pricing::live_pricing_enabled(),
+            "the opt-out written through the config API must reach the refresher \
+             without a restart"
+        );
+        server.abort();
+    }
+}
+
+#[cfg(all(test, feature = "channel-email"))]
+mod gmail_bearer_tests {
+    use super::gmail_bearer_matches;
+
+    #[test]
+    fn matching_bearer_is_accepted() {
+        assert!(gmail_bearer_matches("s3cret-token", "s3cret-token"));
+    }
+
+    #[test]
+    fn prefix_and_same_length_mismatches_are_rejected() {
+        // A correct prefix must fail exactly like an equal-length mismatch:
+        // the compare runs over the longer input regardless of where the
+        // first differing byte is, so neither shape leaks progress.
+        assert!(!gmail_bearer_matches("s3cret", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-tokeN", "s3cret-token"));
+        assert!(!gmail_bearer_matches("s3cret-token-longer", "s3cret-token"));
+    }
+
+    #[test]
+    fn missing_bearer_never_matches_a_configured_secret() {
+        assert!(!gmail_bearer_matches("", "s3cret-token"));
     }
 }
