@@ -1464,6 +1464,7 @@ async fn run_tool_call_loop_inner(
             executable_indices,
             executable_calls,
             stream_calls,
+            owner_confirmations,
         } = prepare_tool_calls(
             &ctx,
             tools_registry,
@@ -1476,50 +1477,54 @@ async fn run_tool_call_loop_inner(
         )
         .await?;
 
-        let executed_slots = zeroclaw_tools::output_budget::with_round_preview_budget(
-            max_tool_result_chars,
-            tool_calls.len(),
-            crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
-                if allow_parallel_execution && executable_calls.len() > 1 {
-                    let meta = ctx.meta();
-                    let dispatch = ToolDispatchContext {
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                        model_switch_callback: model_switch_callback.as_ref(),
-                    };
-                    execute_tools_parallel(
-                        &executable_calls,
-                        dispatch,
-                        &meta,
-                        observer,
-                        cancellation_token.as_ref(),
-                        receipt_generator,
-                        ctx.event_tx,
-                    )
-                    .await
-                } else {
-                    let meta = ctx.meta();
-                    let dispatch = ToolDispatchContext {
-                        tools_registry,
-                        activated_tools,
-                        excluded_tools,
-                        model_switch_callback: model_switch_callback.as_ref(),
-                    };
-                    execute_tools_sequential(
-                        &executable_calls,
-                        dispatch,
-                        &meta,
-                        observer,
-                        cancellation_token.as_ref(),
-                        receipt_generator,
-                        ctx.event_tx,
-                    )
-                    .await
-                }
-            }),
-        )
-        .await;
+        let executed_slots = zeroclaw_api::owner_confirmation::OWNER_CONFIRMATIONS
+            .scope(
+                owner_confirmations,
+                zeroclaw_tools::output_budget::with_round_preview_budget(
+                    max_tool_result_chars,
+                    tool_calls.len(),
+                    crate::sop::executor::scope_live_action_queue(live_sop_queue.clone(), async {
+                        if allow_parallel_execution && executable_calls.len() > 1 {
+                            let meta = ctx.meta();
+                            let dispatch = ToolDispatchContext {
+                                tools_registry,
+                                activated_tools,
+                                excluded_tools,
+                                model_switch_callback: model_switch_callback.as_ref(),
+                            };
+                            execute_tools_parallel(
+                                &executable_calls,
+                                dispatch,
+                                &meta,
+                                observer,
+                                cancellation_token.as_ref(),
+                                receipt_generator,
+                                ctx.event_tx,
+                            )
+                            .await
+                        } else {
+                            let meta = ctx.meta();
+                            let dispatch = ToolDispatchContext {
+                                tools_registry,
+                                activated_tools,
+                                excluded_tools,
+                                model_switch_callback: model_switch_callback.as_ref(),
+                            };
+                            execute_tools_sequential(
+                                &executable_calls,
+                                dispatch,
+                                &meta,
+                                observer,
+                                cancellation_token.as_ref(),
+                                receipt_generator,
+                                ctx.event_tx,
+                            )
+                            .await
+                        }
+                    }),
+                ),
+            )
+            .await;
         let stopped_mid_batch = executed_slots
             .iter()
             .any(|slot| !matches!(slot, ToolExecutionSlot::Completed(_)));

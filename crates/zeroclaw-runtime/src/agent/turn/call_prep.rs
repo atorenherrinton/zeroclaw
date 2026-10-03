@@ -22,6 +22,7 @@ pub(crate) struct PreparedToolCalls {
     pub(crate) executable_calls: Vec<ParsedToolCall>,
     /// Per-call immutable snapshot for draft start/completion events.
     pub(crate) stream_calls: Vec<Option<StreamToolCall>>,
+    pub(crate) owner_confirmations: Vec<zeroclaw_api::owner_confirmation::OwnerConfirmation>,
 }
 
 /// Per-call draft metadata retained only until the matching completion event.
@@ -130,6 +131,7 @@ async fn prepare_tool_calls_inner(
     let mut executable_indices: Vec<usize> = Vec::new();
     let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
     let mut executable_stream_calls = Vec::new();
+    let mut owner_confirmations = Vec::new();
     let mut prompt_approval_tool_signatures_this_round: HashSet<(String, String)> = HashSet::new();
 
     for (idx, call) in tool_calls.iter().enumerate() {
@@ -319,6 +321,15 @@ async fn prepare_tool_calls_inner(
         }
 
         executable_indices.push(idx);
+        if approved
+            && let Some(confirmation) =
+                zeroclaw_api::owner_confirmation::OwnerConfirmation::after_owner_decision(
+                    tool_name.clone(),
+                    tool_args.clone(),
+                )
+        {
+            owner_confirmations.push(confirmation);
+        }
         executable_stream_calls.push(stream_call);
         let call_id = super::events::resolve_tool_call_id(&ParsedToolCall {
             name: tool_name.clone(),
@@ -341,6 +352,7 @@ async fn prepare_tool_calls_inner(
         executable_indices,
         executable_calls,
         stream_calls: executable_stream_calls,
+        owner_confirmations,
     })
 }
 

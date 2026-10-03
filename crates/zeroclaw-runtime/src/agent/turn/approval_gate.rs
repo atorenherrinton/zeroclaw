@@ -44,7 +44,10 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: crate::approval::approval_arguments_summary(
+                        &request.tool_name,
+                        &request.arguments,
+                    ),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
@@ -106,6 +109,13 @@ pub(crate) async fn gate_tool_approval(
                 }) => ApprovalResponse::ReplaceWith(replacement),
                 // Channel doesn't support approval — auto-deny.
                 None => ApprovalResponse::No,
+            };
+            let decision = if unanswerable
+                && zeroclaw_api::owner_confirmation::requires_fresh_decision(tool_name)
+            {
+                ApprovalResponse::No
+            } else {
+                decision
             };
             (decision, decided_by, unanswerable)
         } else {
