@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["owner_intent","relevant"]};

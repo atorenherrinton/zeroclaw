@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["AGENT","ALLOWED_HOSTS","INBOX"],"fn":["classify_target_metadata","load_config","main","make_tool","native_data","native_error_code","page_flags","private_read","validate_browser","verify"],"struct":["BrowserOverlay"],"type":["SafeResult"]};

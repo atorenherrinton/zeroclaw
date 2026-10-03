@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["arguments","main","require_private_file","run"]};

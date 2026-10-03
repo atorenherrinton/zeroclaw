@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["META_KEY"],"fn":["requires_fresh_decision"],"static":["OWNER_CONFIRMATIONS"],"struct":["OwnerConfirmation"]};

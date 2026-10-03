@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HALF_LIFE_DAYS","MAX_AGE_DAYS","MAX_PROMOTIONS","MAX_SNIPPET_BYTES","MIN_SCORE","POLICY_VERSION"],"fn":["normalize_query","owner_context"],"struct":["PromotionReport"]};
