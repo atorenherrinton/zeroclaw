@@ -175,6 +175,15 @@ impl ApprovalManager {
     }
 
     pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
+        // These local native routes require an exact decision for every call.
+        // Full/auto/session approvals cannot become fresh owner confirmation.
+        if zeroclaw_api::owner_confirmation::requires_fresh_decision(tool_name) {
+            return if self.autonomy_level == AutonomyLevel::ReadOnly {
+                ApprovalRequirement::NotRequired
+            } else {
+                ApprovalRequirement::Prompt
+            };
+        }
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
             return ApprovalRequirement::Approved;
@@ -221,6 +230,13 @@ impl ApprovalManager {
         decision: &ApprovalResponse,
         channel: &str,
     ) {
+        let decision = if zeroclaw_api::owner_confirmation::requires_fresh_decision(tool_name)
+            && *decision == ApprovalResponse::Always
+        {
+            &ApprovalResponse::Yes
+        } else {
+            decision
+        };
         // If "Always", add to session allowlist.
         if *decision == ApprovalResponse::Always {
             let mut allowlist = self.session_allowlist.lock();
@@ -289,9 +305,22 @@ fn format_cli_approval_prompt(request: &ApprovalRequest) -> String {
     format!(
         "\n{}\n   {}\n{}",
         crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args),
-        summarize_args(&request.arguments),
+        approval_arguments_summary(&request.tool_name, &request.arguments),
         crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args),
     )
+}
+
+/// Exact native decisions show complete bounded arguments. Other tools retain
+/// their compact summary; audit storage remains compact.
+pub(crate) fn approval_arguments_summary(tool_name: &str, args: &serde_json::Value) -> String {
+    if zeroclaw_api::owner_confirmation::requires_fresh_decision(tool_name) {
+        if serde_json::to_vec(args).map_or(true, |v| v.len() > 8192) {
+            return String::new();
+        }
+        return serde_json::to_string_pretty(&crate::agent::scrub_credentials_value(args.clone()))
+            .unwrap_or_default();
+    }
+    summarize_args(args)
 }
 
 fn parse_cli_approval_response(line: &str) -> ApprovalResponse {
@@ -433,6 +462,60 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::RiskProfileConfig;
+
+    #[test]
+    fn fresh_dot_ignores_full_auto_and_session_grants() {
+        for level in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+                level,
+                auto_approve: vec!["*".into()],
+                ..RiskProfileConfig::default()
+            });
+            for tool in [
+                "dot_reminders__confirm",
+                "dot_photos__confirm",
+                "dot_media__confirm",
+            ] {
+                assert_eq!(mgr.approval_requirement(tool), ApprovalRequirement::Prompt);
+                mgr.record_decision(
+                    tool,
+                    &serde_json::json!({"scope":{"caption":"exact"}}),
+                    &ApprovalResponse::Always,
+                    "synthetic-test",
+                );
+                assert!(!mgr.session_allowlist().contains(tool));
+                assert_eq!(mgr.approval_requirement(tool), ApprovalRequirement::Prompt);
+            }
+        }
+    }
+    #[test]
+    fn fresh_dot_readonly_has_no_owner_decision() {
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..RiskProfileConfig::default()
+        });
+        assert_eq!(
+            mgr.approval_requirement("dot_media__confirm"),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[test]
+    fn fresh_dot_displays_complete_action_and_scrubs_credentials() {
+        let caption = "exact caption ".repeat(40);
+        let args = serde_json::json!({"scope":{"caption":caption,"export_sha256":"a".repeat(64),"api_key":"synthetic-secret"}});
+        let summary = approval_arguments_summary("dot_media__confirm", &args);
+        assert!(summary.contains(&caption));
+        assert!(summary.contains(&"a".repeat(64)));
+        assert!(!summary.contains("synthetic-secret"));
+        let prompt = format_cli_approval_prompt(&ApprovalRequest {
+            tool_name: "dot_media__confirm".into(),
+            arguments: args,
+        });
+        assert!(prompt.contains(&caption));
+        assert!(prompt.contains(&"a".repeat(64)));
+        assert!(!prompt.contains("synthetic-secret"));
+    }
 
     #[test]
     fn sanitize_replacement_strips_control_chars_keeps_whitespace() {

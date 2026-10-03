@@ -1089,16 +1089,33 @@ impl McpServer {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        run_inherited_phase(Phase::Tool, self.call_tool_inner(tool_name, arguments)).await
+        self.call_tool_with_meta(tool_name, arguments, None).await
+    }
+
+    async fn call_tool_with_meta(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        run_inherited_phase(
+            Phase::Tool,
+            self.call_tool_inner(tool_name, arguments, meta),
+        )
+        .await
     }
 
     async fn call_tool_inner(
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let tool_timeout = {
             let inner = self.inner.lock().await;
+            if meta.is_some() && inner.config.transport != McpTransport::Stdio {
+                bail!("Owner confirmation is limited to the enrolled local stdio route");
+            }
             inner
                 .config
                 .tool_timeout_secs
@@ -1106,13 +1123,12 @@ impl McpServer {
                 .min(MAX_TOOL_TIMEOUT_SECS)
         };
         let operation = format!("tool call `{tool_name}`");
+        let mut params = json!({ "name": tool_name, "arguments": arguments });
+        if let Some(meta) = meta {
+            params["_meta"] = meta;
+        }
         let resp = self
-            .dispatch_rpc(
-                "tools/call",
-                json!({ "name": tool_name, "arguments": arguments }),
-                tool_timeout,
-                &operation,
-            )
+            .dispatch_rpc("tools/call", params, tool_timeout, &operation)
             .await?;
 
         if let Some(err) = resp.error {
@@ -1597,6 +1613,21 @@ impl McpRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        self.call_tool_with_meta(prefixed_name, arguments, None)
+            .await
+    }
+
+    pub(crate) async fn call_tool_with_meta(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        meta: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        if meta.is_some()
+            && !zeroclaw_api::owner_confirmation::requires_fresh_decision(prefixed_name)
+        {
+            bail!("Owner confirmation cannot be forwarded to another tool");
+        }
         let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1608,7 +1639,7 @@ impl McpRegistry {
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
         self.servers[*server_idx]
-            .call_tool(original_name, arguments)
+            .call_tool_with_meta(original_name, arguments, meta)
             .await
     }
 
